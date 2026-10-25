@@ -4,11 +4,13 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use regex::Regex;
 use serde::Serialize;
 
-use crate::schema::{NEEDS_QUOTE, NEEDS_TIER, OPEN_KINDS, OPEN_STATES};
+use crate::config::RULES_FILE;
+use crate::records_schema::{self, SchemaViolation};
+use crate::schema::{today_utc, NEEDS_QUOTE, NEEDS_TIER, OPEN_KINDS, OPEN_STATES};
 use crate::tree::{wikilinks, Doc, Resolution, Tree};
 
 #[derive(Debug, Serialize)]
@@ -44,6 +46,10 @@ pub struct Findings {
     pub unquoted: Vec<String>,
     pub negatives: Vec<String>,
     pub orphans: Vec<String>,
+    pub rules_missing: bool,
+    pub rules_wrong_type: bool,
+    pub rules_oversize: Option<usize>,
+    pub schema_violations: Vec<SchemaViolation>,
 }
 
 impl Findings {
@@ -57,6 +63,10 @@ impl Findings {
             && self.unquoted.is_empty()
             && self.negatives.is_empty()
             && self.orphans.is_empty()
+            && !self.rules_missing
+            && !self.rules_wrong_type
+            && self.rules_oversize.is_none()
+            && self.schema_violations.is_empty()
     }
 
     /// Nothing to report at all: structure is clean and no record is stale.
@@ -65,6 +75,8 @@ impl Findings {
         self.structural_clean() && self.stale.is_empty()
     }
 }
+
+const RULES_MAX_BYTES: usize = 8_192;
 
 fn negative_claim_re() -> Result<Regex> {
     Regex::new(
@@ -174,7 +186,15 @@ fn scan_negatives(
     reason = "one tree scan gathers interdependent findings"
 )]
 pub fn run(tree: &Tree) -> Result<Findings> {
-    let today = Utc::now().date_naive();
+    let today = today_utc();
+    let (rules_missing, rules_wrong_type, rules_oversize) = match tree.rules() {
+        Some(rules) => (
+            false,
+            rules.front.kind.as_deref() != Some("rules"),
+            (rules.raw.len() > RULES_MAX_BYTES).then_some(rules.raw.len()),
+        ),
+        None => (true, false, None),
+    };
     let negative_re = negative_claim_re()?;
     let paragraph_re = paragraph_re()?;
     let mut gaps = Vec::new();
@@ -251,9 +271,10 @@ pub fn run(tree: &Tree) -> Result<Findings> {
         .docs
         .iter()
         .enumerate()
-        .filter(|(position, doc)| doc.rel != Path::new("index.md") && !linked.contains(position))
+        .filter(|(position, doc)| doc.rel != Path::new(RULES_FILE) && !linked.contains(position))
         .map(|(_, doc)| doc.rel.to_string_lossy().into_owned())
         .collect();
+    let schema_violations = records_schema::validate(tree)?;
 
     Ok(Findings {
         files: tree.docs.len(),
@@ -264,6 +285,10 @@ pub fn run(tree: &Tree) -> Result<Findings> {
         unquoted,
         negatives,
         orphans,
+        rules_missing,
+        rules_wrong_type,
+        rules_oversize,
+        schema_violations,
     })
 }
 

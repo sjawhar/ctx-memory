@@ -192,6 +192,19 @@ impl Doc {
         body
     }
 
+    pub(crate) fn frontmatter_json(&self) -> Result<serde_json::Value> {
+        let (frontmatter, _) = split_front(&self.raw);
+        frontmatter.map_or_else(
+            || Ok(serde_json::Value::Object(serde_json::Map::new())),
+            |frontmatter| {
+                serde_saphyr::from_str_with_options(frontmatter.as_ref(), yaml_options())
+                    .with_context(|| {
+                        format!("parsing frontmatter in {}", self.rel.to_string_lossy())
+                    })
+            },
+        )
+    }
+
     #[must_use]
     pub fn stem(&self) -> String {
         self.rel.with_extension("").to_string_lossy().into_owned()
@@ -358,7 +371,7 @@ fn split_front(text: &str) -> (Option<Cow<'_, str>>, usize) {
     (None, 0)
 }
 
-fn yaml_options() -> Options {
+pub(crate) fn yaml_options() -> Options {
     let mut options = Options::default();
     options.strict_booleans = true;
     options

@@ -326,6 +326,41 @@ pub fn run_external(arguments: &[OsString], environment: &PluginEnv) -> Result<I
     Err(error).with_context(|| format!("running {executable}"))
 }
 
+fn print_rules_findings(findings: &Findings) {
+    if findings.rules_missing {
+        println!("{}", "RULES — missing root rules.md".bold());
+        println!();
+    }
+    if findings.rules_wrong_type {
+        println!("{}", "RULES — rules.md must have type: rules".bold());
+        println!();
+    }
+    if let Some(bytes) = findings.rules_oversize {
+        println!(
+            "{}",
+            format!("RULES — rules.md exceeds 8192 bytes ({bytes})").bold()
+        );
+        println!();
+    }
+    if !findings.schema_violations.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "SCHEMAS — records that do not match their type ({})",
+                findings.schema_violations.len()
+            )
+            .bold()
+        );
+        for violation in &findings.schema_violations {
+            println!(
+                "  {}{} — {}",
+                violation.path, violation.pointer, violation.message
+            );
+        }
+        println!();
+    }
+}
+
 fn print_sweep(findings: &Findings) {
     println!("{} files\n", findings.files);
 
@@ -404,8 +439,10 @@ fn print_sweep(findings: &Findings) {
         println!();
     }
 
+    print_rules_findings(findings);
+
     if findings.clean() {
-        println!("{}", "no gaps, nothing stale".green());
+        println!("{}", "no findings".green());
     } else if findings.structural_clean() {
         println!(
             "{}",

@@ -2,7 +2,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context as _, Result};
-use ctx_memory::{config::TreeConfig, sweep, tree::Tree};
+use chrono::{NaiveDate, Utc};
+use ctx_memory::{
+    config::TreeConfig,
+    open::{open_items, open_items_at},
+    schema::today_utc,
+    sweep,
+    tree::Tree,
+};
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -141,5 +148,245 @@ fn crlf_paragraphs_do_not_hide_an_unsourced_negative() -> Result<()> {
     remove_test_root(&lf_root)?;
 
     assert_eq!(crlf?.negatives, lf?.negatives);
+    Ok(())
+}
+
+#[test]
+fn missing_rules_page_is_structural() -> Result<()> {
+    let root = test_root("missing-rules")?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    let result = result?;
+    assert!(result.rules_missing);
+    assert!(!result.structural_clean());
+    Ok(())
+}
+
+#[test]
+fn wrong_type_rules_page_is_structural() -> Result<()> {
+    let root = test_root("wrong-type-rules")?;
+    write(&root, "rules.md", "---\ntype: note\n---\n# Rules\n")?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    let result = result?;
+    assert!(result.rules_wrong_type);
+    assert!(!result.structural_clean());
+    Ok(())
+}
+
+#[test]
+fn oversize_rules_page_is_structural() -> Result<()> {
+    let root = test_root("oversize-rules")?;
+    let prefix = "---\ntype: rules\n---\n";
+    let content = format!("{prefix}{}", "x".repeat(8_193 - prefix.len()));
+    write(&root, "rules.md", &content)?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    let result = result?;
+    assert_eq!(result.rules_oversize, Some(8_193));
+    assert!(!result.structural_clean());
+    Ok(())
+}
+
+#[test]
+fn nested_rules_page_is_still_an_orphan() -> Result<()> {
+    let root = test_root("nested-rules")?;
+    write(&root, "rules.md", "---\ntype: rules\n---\n# Rules\n")?;
+    write(
+        &root,
+        "sub/rules.md",
+        "---\ntype: note\n---\n# Nested rules\n",
+    )?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    assert_eq!(result?.orphans, vec!["sub/rules.md"]);
+    Ok(())
+}
+
+#[test]
+fn nested_memory_md_is_an_orphan() -> Result<()> {
+    let root = test_root("nested-memory")?;
+    write(&root, "rules.md", "---\ntype: rules\n---\n# Rules\n")?;
+    write(&root, "sub/memory.md", "# Nested memory\n")?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    assert_eq!(result?.orphans, vec!["sub/memory.md"]);
+    Ok(())
+}
+
+#[test]
+fn schema_violation_is_structural_and_names_the_field() -> Result<()> {
+    let root = test_root("schema-violation")?;
+    write(
+        &root,
+        "rules.md",
+        "---\ntype: rules\n---\n[[decisions/x]]\n",
+    )?;
+    write(
+        &root,
+        "schemas/decision.yaml",
+        r"$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+required: [status, what]
+properties:
+  status:
+    enum: [open, decided]
+",
+    )?;
+    write(
+        &root,
+        "decisions/x.md",
+        "---\n\
+         type: decision\n\
+         status: maybe\n\
+         what: Example decision\n\
+         tier: external\n\
+         quote: quoted\n\
+         ---\n\
+         # Example\n",
+    )?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    let result = result?;
+    assert_eq!(result.schema_violations.len(), 1);
+    let violation = result
+        .schema_violations
+        .first()
+        .context("schema violation was not reported")?;
+    assert_eq!(violation.path, "decisions/x.md");
+    assert_eq!(violation.pointer, "/status");
+    assert!(violation.message.contains("maybe"));
+    assert!(!result.structural_clean());
+    Ok(())
+}
+
+#[test]
+fn schema_required_field_is_reported_when_frontmatter_omits_it() -> Result<()> {
+    let root = test_root("schema-required")?;
+    write(
+        &root,
+        "rules.md",
+        "---\ntype: rules\n---\n[[decisions/x]]\n",
+    )?;
+    write(
+        &root,
+        "schemas/decision.yaml",
+        "type: object\nrequired: [what]\n",
+    )?;
+    write(
+        &root,
+        "decisions/x.md",
+        "---\ntype: decision\nstatus: open\ntier: external\nquote: quoted\n---\n# Example\n",
+    )?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    let result = result?;
+    assert_eq!(result.schema_violations.len(), 1);
+    let violation = result
+        .schema_violations
+        .first()
+        .context("missing required field was not reported")?;
+    assert_eq!(violation.path, "decisions/x.md");
+    assert!(violation.message.contains("what"));
+    assert!(!result.structural_clean());
+    Ok(())
+}
+
+#[test]
+fn clean_sweep_summary_says_no_findings() -> Result<()> {
+    let root = test_root("clean-summary")?;
+    write(&root, "rules.md", "---\ntype: rules\n---\n# Rules\n")?;
+    let root_text = root.to_str().context("test tree path is not valid UTF-8")?;
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ctx"))
+        .args(["--memory", root_text, "sweep"])
+        .output()
+        .context("running clean ctx sweep")?;
+    remove_test_root(&root)?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no findings"));
+    Ok(())
+}
+
+#[test]
+fn summary_never_claims_nothing_stale_when_items_are_listed() -> Result<()> {
+    let root = test_root("stale-summary")?;
+    write(
+        &root,
+        "rules.md",
+        "---\ntype: rules\n---\n[[decisions/example]]\n",
+    )?;
+    write(
+        &root,
+        "decisions/example.md",
+        "---\n\
+         type: decision\n\
+         status: open\n\
+         tier: external\n\
+         quote: quoted\n\
+         ---\n\
+         # Example\n",
+    )?;
+    let root_text = root.to_str().context("test tree path is not valid UTF-8")?;
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ctx"))
+        .args(["--memory", root_text, "sweep"])
+        .output()
+        .context("running stale ctx sweep")?;
+    remove_test_root(&root)?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("structure clean — 1 stale item(s) need review"));
+    assert!(!stdout.contains("nothing stale"));
+    Ok(())
+}
+
+#[test]
+fn overdue_days_use_the_utc_date() -> Result<()> {
+    let root = test_root("utc-date")?;
+    write(
+        &root,
+        "decision.md",
+        "---\n\
+         type: decision\n\
+         status: open\n\
+         revisit_by: 2026-10-23\n\
+         ---\n\
+         # Example\n",
+    )?;
+    let tree = Tree::load(&root, &TreeConfig::default());
+    remove_test_root(&root)?;
+
+    let tree = tree?;
+    let fixed_today =
+        NaiveDate::from_ymd_opt(2026, 10, 25).context("fixed UTC date was invalid")?;
+    let fixed_items = open_items_at(&tree, fixed_today);
+    assert_eq!(
+        fixed_items.first().and_then(|item| item.days_overdue),
+        Some(2)
+    );
+
+    assert_eq!(today_utc(), Utc::now().date_naive());
+    let current_items = open_items(&tree);
+    let expected_items = open_items_at(&tree, today_utc());
+    assert_eq!(
+        current_items.first().and_then(|item| item.days_overdue),
+        expected_items.first().and_then(|item| item.days_overdue)
+    );
     Ok(())
 }

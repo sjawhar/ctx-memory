@@ -1,9 +1,9 @@
 //! Open-item retrieval.
 
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde::Serialize;
 
-use crate::schema::{OPEN_KINDS, OPEN_STATES};
+use crate::schema::{today_utc, OPEN_KINDS, OPEN_STATES};
 use crate::tree::Tree;
 
 #[derive(Debug, Serialize)]
@@ -18,9 +18,15 @@ pub struct OpenItem {
     pub opened: Option<NaiveDate>,
 }
 
+/// Returns the currently open items using today's UTC date.
 #[must_use]
 pub fn open_items(tree: &Tree) -> Vec<OpenItem> {
-    let today = Utc::now().date_naive();
+    open_items_at(tree, today_utc())
+}
+
+/// Returns open items and overdue durations relative to `today`.
+#[must_use]
+pub fn open_items_at(tree: &Tree, today: NaiveDate) -> Vec<OpenItem> {
     let mut items: Vec<OpenItem> = tree
         .docs
         .iter()

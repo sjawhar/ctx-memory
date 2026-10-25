@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod open;
 pub mod output;
+pub mod records_schema;
 pub mod schema;
 pub mod search;
 pub mod sweep;
