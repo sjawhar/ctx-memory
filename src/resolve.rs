@@ -266,11 +266,12 @@ fn refresh_quote_sources(
         return Ok(());
     }
     for source in quote_sources {
+        let pointer = thread_refresh_pointer(store, schemes, &source.pointer)?;
         let resolved = resolve_with_live(
             context,
             store,
             schemes,
-            &source.pointer,
+            &pointer,
             true,
             ResolutionMode::Verify {
                 live,
@@ -294,6 +295,14 @@ fn refresh_quote_sources(
             .join("\n");
     }
     Ok(())
+}
+
+fn thread_refresh_pointer(store: &Store, schemes: &Schemes, pointer: &Pointer) -> Result<Pointer> {
+    let thread = store.get(pointer)?.and_then(|record| record.thread);
+    Ok(thread
+        .as_deref()
+        .and_then(|thread| schemes.parse(thread))
+        .unwrap_or_else(|| pointer.clone()))
 }
 
 fn verify_quote(

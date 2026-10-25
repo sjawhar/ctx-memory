@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -203,12 +204,43 @@ fn response_data(output: &std::process::Output) -> Result<Value> {
     serde_json::from_slice(&output.stdout).context("parsing ctx JSON output")
 }
 
-fn echo_fixture_path() -> Result<std::ffi::OsString> {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+fn path_with(first: &Path) -> Result<std::ffi::OsString> {
     let path = std::env::var_os("PATH").context("reading PATH")?;
-    let mut paths = vec![fixture];
+    let mut paths = vec![first.to_path_buf()];
     paths.extend(std::env::split_paths(&path));
     std::env::join_paths(paths).context("building fixture PATH")
+}
+
+fn echo_fixture_path() -> Result<std::ffi::OsString> {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    path_with(&fixture)
+}
+
+fn fake_gws(root: &Path) -> Result<PathBuf> {
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).with_context(|| format!("creating {}", bin.display()))?;
+    let program = bin.join("gws");
+    std::fs::write(
+        &program,
+        r#"#!/bin/sh
+set -eu
+
+case "$1:$2:$3" in
+    gmail:users:threads)
+        printf '%s\n' '{"messages":[{"id":"aaaaaaaaaaaaaaaa","threadId":"cccccccccccccccc","internalDate":"1792944000000","payload":{"headers":[{"name":"Subject","value":"First message"}],"mimeType":"text/plain","body":{"data":"bG9jYWwgcGFyZW50"}}},{"id":"bbbbbbbbbbbbbbbb","threadId":"cccccccccccccccc","internalDate":"1792947600000","payload":{"headers":[{"name":"Subject","value":"Second message"}],"mimeType":"text/plain","body":{"data":"bGl2ZSBHbWFpbCBzaWJsaW5n"}}}]}'
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+"#,
+    )
+    .with_context(|| format!("writing {}", program.display()))?;
+    let mut permissions = std::fs::metadata(&program)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&program, permissions)
+        .with_context(|| format!("marking {} executable", program.display()))?;
+    Ok(bin)
 }
 
 #[test]
@@ -630,4 +662,59 @@ fn quote_mismatch_names_the_verbatim_source_that_was_checked() -> Result<()> {
     );
 
     remove_scratch(&root)
+}
+
+#[test]
+fn live_verification_fills_a_partially_stored_gmail_thread() -> Result<()> {
+    let root = scratch("quote-live-gmail-thread")?;
+    let tree = root.join("tree");
+    let state_base = root.join("state");
+    let gws = fake_gws(&root)?;
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"gmail\"\nkind = \"gmail\"\n",
+    )?;
+    std::fs::write(
+        tree.join("decision.md"),
+        "---\ntype: decision\nstatus: open\nquote: \"live Gmail sibling\"\nsource: \"gmail:aaaaaaaaaaaaaaaa\"\n---\n",
+    )?;
+    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    store.put_all(
+        "gmail",
+        &[record(
+            "gmail:aaaaaaaaaaaaaaaa",
+            Some("gmail:thread/cccccccccccccccc"),
+            1_700_000_000,
+            "local parent",
+        )?],
+    )?;
+    let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;
+
+    let local = binary()
+        .args(["--json", "--memory", tree_text, "cite", "verify"])
+        .env("CTX_STATE_DIR", &state_base)
+        .env("PATH", path_with(&gws)?)
+        .output()
+        .context("running local Gmail citation verification")?;
+    assert_eq!(local.status.code(), Some(1));
+
+    let live = binary()
+        .args(["--json", "--memory", tree_text, "cite", "verify", "--live"])
+        .env("CTX_STATE_DIR", &state_base)
+        .env("PATH", path_with(&gws)?)
+        .output()
+        .context("running live Gmail citation verification")?;
+    remove_scratch(&root)?;
+
+    assert_eq!(live.status.code(), Some(0));
+    let response = response_data(&live)?;
+    let data = response
+        .get("data")
+        .context("live Gmail verification response has data")?;
+    assert_eq!(
+        data.get("broken").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    Ok(())
 }
