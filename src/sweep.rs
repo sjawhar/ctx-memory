@@ -57,17 +57,15 @@ impl Findings {
     }
 }
 
-pub(crate) fn wikilink_re() -> Regex {
-    #[allow(clippy::unwrap_used, reason = "literal pattern is valid")]
-    Regex::new(r"\[\[([^\]|#]+)").unwrap()
+pub(crate) fn wikilink_re() -> Result<Regex> {
+    Regex::new(r"\[\[([^\]|#]+)").map_err(Into::into)
 }
 
-fn negative_claim_re() -> Regex {
-    #[allow(clippy::unwrap_used, reason = "literal pattern is valid")]
+fn negative_claim_re() -> Result<Regex> {
     Regex::new(
         r"(?i)\bnever\s+(told|informed|notified|received|heard|answered|replied|responded|communicated|paid|invoiced|asked)\b|\b(was|were|has|had)\s+never\s+(been\s+)?(told|informed|notified|paid|invoiced|asked|answered|sent|contacted|given)\b|\bno\s+evidence\s+\w+\s+(was\s+|were\s+)?ever\b|\b(nobody|no\s+one)\s+(ever\s+)?(told|asked|answered|informed)\b",
     )
-    .unwrap()
+    .map_err(Into::into)
 }
 
 /// A negative is exempt when its paragraph identifies a direct source or search surface.
@@ -146,22 +144,21 @@ fn scan_negatives(doc: &Doc, negative_re: &Regex, negatives: &mut Vec<String>) {
 ///
 /// # Errors
 ///
-/// This implementation performs no fallible operations, but the result type leaves room
-/// for additional structural checks.
+/// Returns an error when a regex cannot be constructed.
 #[allow(
     clippy::too_many_lines,
     reason = "one tree scan gathers interdependent findings"
 )]
 pub fn run(tree: &Tree) -> Result<Findings> {
     let today = Utc::now().date_naive();
-    let wikilink_re = wikilink_re();
+    let wikilink_re = wikilink_re()?;
     let known: HashSet<String> = tree
         .docs
         .iter()
         .flat_map(|doc| doc.link_names(&[]))
         .collect();
 
-    let negative_re = negative_claim_re();
+    let negative_re = negative_claim_re()?;
     let mut gaps = Vec::new();
     let mut negatives = Vec::new();
     let mut linked: HashSet<&str> = HashSet::new();
@@ -243,8 +240,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn negative_claims_flag_unsourced_and_exempt_bounded() {
-        let re = negative_claim_re();
+    fn negative_claims_flag_unsourced_and_exempt_bounded() -> Result<()> {
+        let re = negative_claim_re()?;
         assert!(re.is_match("the record says Alice was never told an outcome"));
         assert!(re.is_match("nobody answered Alice"));
         assert!(re.is_match("no evidence Alice was ever paid"));
@@ -253,17 +250,19 @@ mod tests {
         assert!(has_tier1_marker("no reply in the thread (tier 1)"));
         assert!(has_tier1_marker("searched the email archive: nothing"));
         assert!(!has_tier1_marker("the payment table is silent"));
+        Ok(())
     }
 
     #[test]
-    fn wikilink_pattern_extracts_targets_ignoring_alias_and_heading() {
-        let re = wikilink_re();
+    fn wikilink_pattern_extracts_targets_ignoring_alias_and_heading() -> Result<()> {
+        let re = wikilink_re()?;
         let body = "see [[people/alice]] and [[a/b|Alice]] and [[c/d#Section]]";
         let found: Vec<&str> = re
             .captures_iter(body)
             .filter_map(|capture| capture.get(1).map(|match_| match_.as_str()))
             .collect();
         assert_eq!(found, vec!["people/alice", "a/b", "c/d"]);
+        Ok(())
     }
 
     #[test]
