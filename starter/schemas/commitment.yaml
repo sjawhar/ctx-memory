@@ -1,0 +1,41 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+type: object
+required:
+  - type
+  - status
+  - owner
+  - what
+  - due
+  - quote
+  - source
+  - tier
+properties:
+  type:
+    const: commitment
+  status:
+    enum: [open, completed, deferred, superseded, closed]
+  owner:
+    type: string
+    minLength: 1
+  what:
+    type: string
+    minLength: 1
+  due:
+    type: string
+    format: date
+  quote:
+    type: string
+    minLength: 1
+  source:
+    type: string
+    minLength: 1
+  tier:
+    $ref: "#/$defs/tier"
+additionalProperties: true
+$defs:
+  tier:
+    anyOf:
+      - type: integer
+        enum: [1, 2, 3, 4]
+      - type: string
+        enum: ["1", "2", "3", "4", external, counterparty, internal, principal, summary, recollection]

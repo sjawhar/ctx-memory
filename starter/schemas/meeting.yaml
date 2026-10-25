@@ -1,0 +1,41 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+type: object
+required:
+  - type
+  - title
+  - date
+  - attendees
+  - quote
+  - source
+  - tier
+properties:
+  type:
+    const: meeting
+  title:
+    type: string
+    minLength: 1
+  date:
+    type: string
+    format: date
+  attendees:
+    type: array
+    minItems: 1
+    items:
+      type: string
+      minLength: 1
+  quote:
+    type: string
+    minLength: 1
+  source:
+    type: string
+    minLength: 1
+  tier:
+    $ref: "#/$defs/tier"
+additionalProperties: true
+$defs:
+  tier:
+    anyOf:
+      - type: integer
+        enum: [1, 2, 3, 4]
+      - type: string
+        enum: ["1", "2", "3", "4", external, counterparty, internal, principal, summary, recollection]

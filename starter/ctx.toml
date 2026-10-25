@@ -1,0 +1,18 @@
+version = 1
+id = "starter"
+folder_notes = ["index.md"]
+
+[dossier]
+vitals = ["status", "last_reviewed"]
+
+# Add sources for the systems this tree should read.
+# [[sources]]
+# id = "slack"
+# kind = "slack"
+# workspace = "example"
+# channels = ["C0EXAMPLE01"]
+
+# [[sources]]
+# id = "gmail"
+# kind = "gmail"
+# query = ""
