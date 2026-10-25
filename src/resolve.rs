@@ -20,6 +20,8 @@ pub struct Resolved {
     pub pointer: Option<String>,
     pub text: Option<String>,
     pub error: Option<String>,
+    #[serde(skip)]
+    pub source_error: bool,
 }
 
 /// A citation whose target or quoted text cannot be verified locally.
@@ -37,11 +39,14 @@ pub struct Verification {
     pub checked: usize,
     pub broken: Vec<Broken>,
     pub skipped: BTreeMap<String, usize>,
+    #[serde(skip)]
+    pub source_errors: bool,
 }
 
 struct ResolvedText {
     text: Option<String>,
     verbatim: bool,
+    source_error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -84,11 +89,13 @@ pub fn resolve(context: &Context, pointers: &[String], thread: bool) -> Result<V
                     thread,
                     ResolutionMode::Resolve,
                 )?;
+                let source_error = resolved.source_error;
                 Ok(Resolved {
                     input: input.clone(),
                     pointer: Some(pointer.to_string()),
                     text: resolved.text,
-                    error: None,
+                    error: source_error.clone(),
+                    source_error: source_error.is_some(),
                 })
             }
             None => Ok(Resolved {
@@ -96,6 +103,7 @@ pub fn resolve(context: &Context, pointers: &[String], thread: bool) -> Result<V
                 pointer: None,
                 text: None,
                 error: Some("invalid or unregistered pointer".to_owned()),
+                source_error: false,
             }),
         })
         .collect()
@@ -124,6 +132,16 @@ pub fn verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Verifi
                 false,
                 ResolutionMode::Verify { live },
             )?;
+            if let Some(error) = resolved.source_error {
+                verification.source_errors = true;
+                verification.broken.push(Broken {
+                    file: document.rel.to_string_lossy().into_owned(),
+                    line: line_number(&document.raw, found.start),
+                    pointer: found.pointer.to_string(),
+                    why: error,
+                });
+                continue;
+            }
             if !resolved.verbatim {
                 *verification
                     .skipped
@@ -152,8 +170,10 @@ pub fn verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Verifi
     Ok(verification)
 }
 
-fn is_verbatim(scheme: &str) -> bool {
-    matches!(scheme, "slack" | "gmail")
+fn default_verbatim(source: Option<&SourceConfig>, scheme: &str) -> bool {
+    source.map_or(matches!(scheme, "slack" | "gmail"), |source| {
+        matches!(source.kind.as_str(), "slack" | "gmail")
+    })
 }
 
 fn is_builtin_source(source: &SourceConfig) -> bool {
@@ -195,7 +215,7 @@ fn resolve_with_live(
     } else {
         None
     };
-    let default_verbatim = is_verbatim(&pointer.scheme);
+    let default_verbatim = default_verbatim(source, &pointer.scheme);
     let needs_verbatim_hello = needs_verbatim
         && live
         && text.is_some()
@@ -205,17 +225,23 @@ fn resolve_with_live(
         return Ok(ResolvedText {
             text,
             verbatim: source_verbatim.unwrap_or(default_verbatim),
+            source_error: None,
         });
     }
     let Some(source) = source else {
         return Ok(ResolvedText {
             text: None,
             verbatim: default_verbatim,
+            source_error: None,
         });
     };
     let outcome = resolve_from_source(context, source, &pointer.scheme, pointer, schemes)?;
     if let Some(error) = outcome.error.as_deref() {
-        return Err(anyhow!("source {} resolve failed: {error}", source.id));
+        return Ok(ResolvedText {
+            text: None,
+            verbatim: source_verbatim.unwrap_or(default_verbatim),
+            source_error: Some(format!("source {} resolve failed: {error}", source.id)),
+        });
     }
     let verbatim = outcome.verbatim.unwrap_or(default_verbatim);
     store.set_source_verbatim(&source.id, verbatim)?;
@@ -223,6 +249,7 @@ fn resolve_with_live(
     Ok(ResolvedText {
         text: resolve_local(store, schemes, pointer, thread)?,
         verbatim,
+        source_error: None,
     })
 }
 

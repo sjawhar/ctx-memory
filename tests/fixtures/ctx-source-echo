@@ -15,6 +15,10 @@ if [ -n "${ECHO_SLEEP-}" ]; then
     sleep "$ECHO_SLEEP"
 fi
 
+if [ "${ECHO_EXIT-}" = "1" ]; then
+    exit 1
+fi
+
 if [ "${ECHO_NO_HELLO-}" = "1" ]; then
     exit 0
 fi
@@ -41,9 +45,14 @@ for stream in $(printf '%s' "$streams" | tr ',' ' ' | tr -d '"'); do
         pointer_scheme=other
     fi
     printf '{"type":"record","pointer":"%s:%s/record","stream":"%s","ts":"%s","text":"echo %s","raw":null}\n' "$pointer_scheme" "$stream" "$stream" "$record_time" "$stream"
-    if [ "${ECHO_FAIL_STREAM-}" = "$stream" ]; then
+    if [ "${ECHO_ERROR_CURSOR-}" = "$stream" ]; then
+        printf '{"type":"stream_end","stream":"%s","status":"error","cursor":"%s","error":"echo failure"}\n' "$stream" "$window_end"
+    elif [ "${ECHO_FAIL_STREAM-}" = "$stream" ]; then
         printf '{"type":"stream_end","stream":"%s","status":"error","error":"echo failure"}\n' "$stream"
     elif [ "${ECHO_NO_END-}" != "$stream" ]; then
         printf '{"type":"stream_end","stream":"%s","status":"ok","cursor":"%s"}\n' "$stream" "$window_end"
+        if [ "${ECHO_AFTER_END-}" = "$stream" ]; then
+            printf '{"type":"record","pointer":"%s:%s/after-end","stream":"%s","ts":"%s","text":"echo after end","raw":null}\n' "$scheme" "$stream" "$stream" "$record_time"
+        fi
     fi
 done

@@ -415,6 +415,20 @@ impl<'a> Session<'a> {
             if !self.planned.contains(&record.stream) {
                 bail!("record stream {} was not planned", record.stream);
             }
+            if self.seen_end.contains(&record.stream) {
+                self.streams.insert(
+                    record.stream.clone(),
+                    StreamResult {
+                        status: StreamStatus::Error,
+                        cursor: None,
+                        error: Some("record emitted after stream_end".to_owned()),
+                    },
+                );
+                bail!(
+                    "record stream {} was emitted after stream_end",
+                    record.stream
+                );
+            }
             if !record.context && record.ts > request.window_end {
                 bail!(
                     "record {} occurs after window end {}",
@@ -440,11 +454,14 @@ impl<'a> Session<'a> {
         if !self.planned.contains(&stream) {
             bail!("stream_end for unplanned stream {stream}");
         }
-        if !self.seen_end.insert(stream.clone()) {
-            bail!("stream {stream} emitted stream_end more than once");
-        }
         if status == StreamStatus::Ok && cursor.is_none() {
             bail!("successful stream {stream} did not provide a cursor");
+        }
+        if status == StreamStatus::Error && cursor.is_some() {
+            bail!("errored stream {stream} must not provide a cursor");
+        }
+        if !self.seen_end.insert(stream.clone()) {
+            bail!("stream {stream} emitted stream_end more than once");
         }
         self.streams.insert(
             stream,
@@ -496,4 +513,120 @@ fn candidate_streams(request: &Request) -> BTreeSet<String> {
             .map(|stream| stream.stream.clone()),
     );
     streams
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::{Context as _, Result};
+    use chrono::{TimeZone as _, Utc};
+
+    use super::{
+        FetchRequest, Message, Op, Request, Session, SourceRef, StreamStatus, PROTOCOL_VERSION,
+    };
+    use crate::pointer::Schemes;
+    use crate::record::Record;
+
+    fn request() -> Result<Request> {
+        let window_end = Utc
+            .timestamp_opt(1_700_000_000, 0)
+            .single()
+            .context("constructing test timestamp")?;
+        Ok(Request::Fetch(FetchRequest {
+            protocol: PROTOCOL_VERSION,
+            source: SourceRef {
+                id: "echo".to_owned(),
+                kind: "echo".to_owned(),
+                scheme: "echo".to_owned(),
+            },
+            config: serde_json::json!({ "streams": ["C0EXAMPLE01"] }),
+            window_end,
+            backfill_hours: 24,
+            cursors: std::collections::BTreeMap::default(),
+            discovered: Vec::new(),
+            state_dir: std::env::temp_dir(),
+        }))
+    }
+
+    fn hello() -> Message {
+        Message::Hello {
+            protocol: PROTOCOL_VERSION,
+            scheme: "echo".to_owned(),
+            ops: vec![Op::Fetch],
+            verbatim: true,
+            streams: vec!["C0EXAMPLE01".to_owned()],
+        }
+    }
+
+    fn record() -> Result<Record> {
+        let ts = Utc
+            .timestamp_opt(1_699_999_999, 0)
+            .single()
+            .context("constructing record timestamp")?;
+        Ok(Record {
+            pointer: "echo:C0EXAMPLE01/record".to_owned(),
+            stream: "C0EXAMPLE01".to_owned(),
+            ts,
+            label: None,
+            author: None,
+            author_id: None,
+            thread: None,
+            title: None,
+            url: None,
+            text: "record".to_owned(),
+            aliases: Vec::new(),
+            context: false,
+            raw: serde_json::Value::Null,
+        })
+    }
+
+    #[test]
+    fn errored_stream_end_cannot_propose_a_cursor() -> Result<()> {
+        let request = request()?;
+        let schemes = Schemes::new(["echo".to_owned()]);
+        let mut session = Session::new(&request, &schemes);
+        session.accept(hello())?;
+        let rejected = session.accept(Message::StreamEnd {
+            stream: "C0EXAMPLE01".to_owned(),
+            status: StreamStatus::Error,
+            cursor: Some("unexpected".to_owned()),
+            error: Some("failed".to_owned()),
+        });
+        let error = rejected.err().context("errored stream accepted a cursor")?;
+        let outcome = session.finish(Err(error));
+
+        let stream = outcome
+            .streams
+            .get("C0EXAMPLE01")
+            .context("failed stream is recorded")?;
+        assert_eq!(stream.status, StreamStatus::Error);
+        assert_eq!(stream.cursor, None);
+        Ok(())
+    }
+
+    #[test]
+    fn records_after_stream_end_fail_the_stream() -> Result<()> {
+        let request = request()?;
+        let schemes = Schemes::new(["echo".to_owned()]);
+        let mut session = Session::new(&request, &schemes);
+        session.accept(hello())?;
+        session.accept(Message::StreamEnd {
+            stream: "C0EXAMPLE01".to_owned(),
+            status: StreamStatus::Ok,
+            cursor: Some("cursor".to_owned()),
+            error: None,
+        })?;
+        let rejected = session.accept(Message::Record(Box::new(record()?)));
+        let error = rejected
+            .err()
+            .context("record after stream end was accepted")?;
+        let outcome = session.finish(Err(error));
+
+        let stream = outcome
+            .streams
+            .get("C0EXAMPLE01")
+            .context("failed stream is recorded")?;
+        assert_eq!(stream.status, StreamStatus::Error);
+        assert_eq!(stream.cursor, None);
+        Ok(())
+    }
 }

@@ -356,8 +356,13 @@ fn run_resolve(context: &Context, pointers: &[String], thread: bool) -> Result<O
     let payload = ResolvePayload {
         results: resolve::resolve(context, pointers, thread)?,
     };
+    let source_errors = payload.results.iter().any(|result| result.source_error);
     output::emit(context.json, "resolve", &payload, print_resolved)?;
-    Ok(Outcome::Pass)
+    Ok(if source_errors {
+        Outcome::SourceErrors
+    } else {
+        Outcome::Pass
+    })
 }
 
 fn run_verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Outcome> {
@@ -368,7 +373,9 @@ fn run_verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Outcom
         &verification,
         print_verification,
     )?;
-    Ok(if verification.broken.is_empty() {
+    Ok(if verification.source_errors {
+        Outcome::SourceErrors
+    } else if verification.broken.is_empty() {
         Outcome::Pass
     } else {
         Outcome::StructuralDefects

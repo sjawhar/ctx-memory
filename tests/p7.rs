@@ -361,3 +361,23 @@ fn external_source_requires_an_explicit_scheme() -> Result<()> {
     assert!(format!("{error:#}").contains("scheme"));
     Ok(())
 }
+
+#[test]
+fn sources_must_not_share_an_effective_scheme() -> Result<()> {
+    let root = scratch("duplicate-scheme")?;
+    std::fs::write(
+        root.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"slack-one\"\nkind = \"slack\"\n\n[[sources]]\nid = \"echo\"\nkind = \"echo\"\nscheme = \"slack\"\n",
+    )?;
+
+    let result = TreeConfig::load(&root);
+    remove_scratch(&root)?;
+
+    let error = result
+        .err()
+        .context("duplicate effective source schemes unexpectedly loaded")?;
+    let error = format!("{error:#}");
+    assert!(error.contains("slack-one"));
+    assert!(error.contains("echo"));
+    Ok(())
+}

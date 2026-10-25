@@ -1,6 +1,6 @@
 //! Tree configuration, user configuration, and state-directory resolution.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -122,6 +122,7 @@ impl TreeConfig {
         }
 
         let mut source_ids = HashSet::new();
+        let mut source_schemes = HashMap::new();
         for source in &self.sources {
             if source.id.is_empty() {
                 bail!("source id must not be empty");
@@ -129,15 +130,25 @@ impl TreeConfig {
             if source.kind.is_empty() {
                 bail!("source {} kind must not be empty", source.id);
             }
-            if source.scheme.is_none() && default_scheme(&source.kind).is_none() {
-                bail!(
-                    "source {} kind {} requires an explicit scheme",
-                    source.id,
-                    source.kind
-                );
-            }
+            let scheme = source
+                .scheme
+                .as_deref()
+                .or_else(|| default_scheme(&source.kind))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "source {} kind {} requires an explicit scheme",
+                        source.id,
+                        source.kind
+                    )
+                })?;
             if !source_ids.insert(source.id.as_str()) {
                 bail!("source id {} appears more than once", source.id);
+            }
+            if let Some(other_id) = source_schemes.insert(scheme, source.id.as_str()) {
+                bail!(
+                    "sources {other_id} and {} share pointer scheme {scheme}",
+                    source.id
+                );
             }
         }
         Ok(())
