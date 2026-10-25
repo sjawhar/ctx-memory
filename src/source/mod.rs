@@ -1,10 +1,10 @@
 //! Source protocol types and validation shared by built-in and external sources.
 
-mod calendar;
-mod drive;
+pub mod calendar;
+pub mod drive;
 mod external;
 pub mod gmail;
-mod slack;
+pub mod slack;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
