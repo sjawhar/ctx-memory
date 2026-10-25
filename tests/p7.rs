@@ -350,7 +350,10 @@ fn verify_reports_a_quote_missing_from_the_resolved_text() -> Result<()> {
 #[test]
 fn calendar_kind_uses_gcal_without_registering_calendar_as_generic() -> Result<()> {
     let schemes = Schemes::new([]);
-    assert!(schemes.find_all("calendar:x").is_empty());
+    assert_eq!(
+        schemes.find_all("calendar:x"),
+        [] as [ctx_memory::pointer::Found; 0]
+    );
     assert_eq!(schemes.find_all("gcal:primary/evt1").len(), 1);
 
     let root = scratch("calendar-scheme")?;

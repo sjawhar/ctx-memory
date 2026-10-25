@@ -1075,7 +1075,7 @@ mod tests {
         let Message::Hello { streams, .. } = hello else {
             bail!("Slack source did not emit hello first");
         };
-        assert!(streams.is_empty());
+        assert_eq!(streams.as_slice(), [] as [String; 0]);
         assert_eq!(
             warnings(&messages),
             vec!["ignoring malformed discovered Slack channel \"not-a-channel\""]

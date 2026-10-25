@@ -179,7 +179,7 @@ fn delta_matches_thread_alias_quote_owner_and_owned_streams() -> Result<()> {
         ]
     );
     let unowned = match_for(&delta, "echo:C0EXAMPLE01/unowned")?;
-    assert!(unowned.matches.is_empty());
+    assert_eq!(unowned.matches, [] as [ctx_memory::delta::Match; 0]);
     Ok(())
 }
 
