@@ -8,13 +8,15 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize as _;
 use serde::Serialize;
 
 use crate::config::{locate_tree, state_base, TreeConfig, UserConfig};
 use crate::context::Context;
+use crate::cursor::{self, AdvanceOutcome, Cursors};
+use crate::fetch::{self, FetchOptions};
 use crate::open::{open_items_with_filters, parse_linked, LinkedFilter, OpenItemView};
 use crate::output::{self, Outcome};
 use crate::resolve::{self, Resolved, Verification};
@@ -24,6 +26,7 @@ use crate::source::{
     self, FetchRequest, Request as SourceRequest, ResolveRequest, Session, SourceRef,
 };
 use crate::sweep::{self, Findings};
+use crate::windows::{self, SourceManifest, Status, Window};
 
 #[derive(Parser)]
 #[command(name = "ctx", version, arg_required_else_help = true)]
@@ -83,6 +86,18 @@ pub enum Command {
         #[arg(long, value_name = "NAME", value_delimiter = ',')]
         owner: Vec<String>,
     },
+    /// Fetch all configured sources into a durable window.
+    Fetch {
+        #[arg(long, value_parser = parse_window_end)]
+        window_end: Option<DateTime<Utc>>,
+        #[arg(long = "source", value_name = "ID", num_args = 1..)]
+        source: Vec<String>,
+    },
+    /// Inspect or advance durable source cursors.
+    Cursor {
+        #[command(subcommand)]
+        command: CursorCommand,
+    },
     /// Resolve citation pointers from the local store.
     Resolve {
         #[arg(long)]
@@ -140,6 +155,14 @@ pub enum StateCommand {
     Path,
 }
 
+#[derive(Subcommand)]
+pub enum CursorCommand {
+    /// Print every stored source-stream cursor.
+    Show,
+    /// Advance successful source-stream cursors from one completed window.
+    Advance { window: String },
+}
+
 impl Command {
     #[must_use]
     pub fn name(&self) -> String {
@@ -149,6 +172,13 @@ impl Command {
             Self::Search { .. } => "search".to_owned(),
             Self::Dossier { .. } => "dossier".to_owned(),
             Self::Open { .. } => "open".to_owned(),
+            Self::Fetch { .. } => "fetch".to_owned(),
+            Self::Cursor {
+                command: CursorCommand::Show,
+            } => "cursor show".to_owned(),
+            Self::Cursor {
+                command: CursorCommand::Advance { .. },
+            } => "cursor advance".to_owned(),
             Self::Resolve { .. } => "resolve".to_owned(),
             Self::Cite {
                 command: CiteCommand::Verify { .. },
@@ -202,6 +232,18 @@ struct StatePathPayload {
     store: String,
 }
 
+#[derive(Serialize)]
+struct FetchPayload<'a> {
+    window: &'a str,
+    exit_status: Status,
+    sources: &'a BTreeMap<String, SourceManifest>,
+}
+
+#[derive(Serialize)]
+struct CursorShowPayload {
+    cursors: Cursors,
+}
+
 /// Runs the selected command.
 ///
 /// # Errors
@@ -252,6 +294,14 @@ pub fn run(cli: &Cli) -> Result<Outcome> {
             })?;
             Ok(Outcome::Pass)
         }
+        Command::Fetch { window_end, source } => run_fetch(
+            &context,
+            &FetchOptions {
+                window_end: window_end.unwrap_or_else(Utc::now),
+                only: source.clone(),
+            },
+        ),
+        Command::Cursor { command } => run_cursor(&context, command),
         Command::Resolve { thread, pointers } => run_resolve(&context, pointers, *thread),
         Command::Cite {
             command: CiteCommand::Verify { live, files },
@@ -327,6 +377,40 @@ fn run_source(context: &Context, id: &str, op: SourceOperation) -> Result<Outcom
     } else {
         Outcome::Pass
     })
+}
+
+fn run_fetch(context: &Context, options: &FetchOptions) -> Result<Outcome> {
+    let outcome = fetch::fetch(context, options)?;
+    let payload = FetchPayload {
+        window: outcome.window.id.as_str(),
+        exit_status: outcome.manifest.exit_status,
+        sources: &outcome.manifest.sources,
+    };
+    output::emit(context.json, "fetch", &payload, print_fetch)?;
+    Ok(if outcome.errored.is_empty() {
+        Outcome::Pass
+    } else {
+        Outcome::SourceErrors
+    })
+}
+
+fn run_cursor(context: &Context, command: &CursorCommand) -> Result<Outcome> {
+    match command {
+        CursorCommand::Show => {
+            let payload = CursorShowPayload {
+                cursors: cursor::show(context)?,
+            };
+            output::emit(context.json, "cursor show", &payload, print_cursors)?;
+        }
+        CursorCommand::Advance { window } => {
+            let state = context.state()?;
+            let directory = windows::resolve_arg(window, &state.windows())?;
+            let window = Window::open(directory)?;
+            let payload = cursor::advance(context, &window)?;
+            output::emit(context.json, "cursor advance", &payload, print_advance)?;
+        }
+    }
+    Ok(Outcome::Pass)
 }
 
 fn run_rules(context: &Context) -> Result<Outcome> {
@@ -468,6 +552,49 @@ pub fn run_external(arguments: &[OsString], environment: &PluginEnv) -> Result<I
         bail!("unknown command `{name}` (no {executable} on PATH)");
     }
     Err(error).with_context(|| format!("running {executable}"))
+}
+
+fn parse_window_end(value: &str) -> std::result::Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| format!("window end must be RFC 3339: {error}"))
+}
+
+fn print_fetch(payload: &FetchPayload<'_>) {
+    println!("{}", payload.window);
+    for (source, manifest) in payload.sources {
+        println!("{source}: {}", status_label(manifest.status));
+    }
+}
+
+fn print_cursors(payload: &CursorShowPayload) {
+    for (source, streams) in &payload.cursors.sources {
+        for (stream, cursor) in streams {
+            println!("{source} {stream} {} {}", cursor.cursor, cursor.window);
+        }
+    }
+}
+
+fn print_advance(payload: &AdvanceOutcome) {
+    for advanced in &payload.advanced {
+        println!(
+            "advanced {} {} {}",
+            advanced.source, advanced.stream, advanced.cursor
+        );
+    }
+    for skipped in &payload.skipped {
+        println!(
+            "skipped {} {} {}",
+            skipped.source, skipped.stream, skipped.why
+        );
+    }
+}
+
+const fn status_label(status: Status) -> &'static str {
+    match status {
+        Status::Ok => "ok",
+        Status::Error => "error",
+    }
 }
 
 fn print_rules_findings(findings: &Findings) {
