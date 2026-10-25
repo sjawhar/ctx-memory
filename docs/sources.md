@@ -22,7 +22,7 @@ Its protocol stream can look like this:
 {"type":"stream_end","stream":"ENG","status":"ok","cursor":"2026-01-02T18:00:00Z"}
 ```
 
-`ctx` treats a nonzero source exit, timeout, invalid JSON, a mismatched pointer scheme, an unplanned stream, a record outside the window, or a missing `stream_end` as an error for every unfinished stream. Error streams do not propose a usable cursor.
+`ctx` treats a nonzero source exit, timeout, invalid JSON, a mismatched pointer scheme, an unplanned stream, a non-context record outside the window, or a missing `stream_end` as an error for every unfinished stream. Context records may fall outside the fetch window and never advance a cursor. Error streams do not propose a usable cursor.
 
 ## Cursors
 
