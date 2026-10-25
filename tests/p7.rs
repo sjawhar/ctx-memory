@@ -216,7 +216,7 @@ fn verify_reports_a_quote_missing_from_the_resolved_text() -> Result<()> {
     let document = tree.join("decision.md");
     std::fs::write(
         &document,
-        "---\ntype: decision\nstatus: open\nquote: \"beta gamma\"\n---\nslack:C0EXAMPLE01/1700000000.000001\n",
+        "---\ntype: decision\nstatus: open\nquote: \"beta gamma\"\nsource: \"slack:C0EXAMPLE01/1700000000.000001\"\n---\nEvidence.\n",
     )?;
     let store = Store::open(&state_base.join("example/store.sqlite3"))?;
     store.put_all(
@@ -267,10 +267,9 @@ fn verify_reports_a_quote_missing_from_the_resolved_text() -> Result<()> {
             .map(Vec::len),
         Some(0)
     );
-
     std::fs::write(
         &document,
-        "---\ntype: decision\nstatus: open\nquote: \"omega\"\n---\nslack:C0EXAMPLE01/1700000000.000001\n",
+        "---\ntype: decision\nstatus: open\nquote: \"omega\"\nsource: \"slack:C0EXAMPLE01/1700000000.000001\"\n---\nEvidence.\n",
     )?;
     let broken = run_ctx(&tree, &state_base, &["cite", "verify"])?;
     assert_eq!(broken.status.code(), Some(1));
@@ -380,4 +379,143 @@ fn sources_must_not_share_an_effective_scheme() -> Result<()> {
     assert!(error.contains("slack-one"));
     assert!(error.contains("echo"));
     Ok(())
+}
+
+#[test]
+fn quote_in_a_sibling_reply_of_the_source_pointer_verifies() -> Result<()> {
+    let root = scratch("quote-sibling")?;
+    let tree = root.join("tree");
+    let state_base = root.join("state");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
+    )?;
+    std::fs::write(
+        tree.join("decision.md"),
+        "---\ntype: decision\nstatus: open\nquote: \"the sibling contains the evidence\"\nsource: \"slack:C0EXAMPLE01/1700000000.000002\"\n---\n",
+    )?;
+    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    store.put_all(
+        "slack",
+        &[
+            record(
+                "slack:C0EXAMPLE01/1700000000.000001",
+                None,
+                1_700_000_000,
+                "thread parent",
+            )?,
+            record(
+                "slack:C0EXAMPLE01/1700000000.000002",
+                Some("slack:C0EXAMPLE01/1700000000.000001"),
+                1_700_000_001,
+                "source reply context",
+            )?,
+            record(
+                "slack:C0EXAMPLE01/1700000000.000003",
+                Some("slack:C0EXAMPLE01/1700000000.000001"),
+                1_700_000_002,
+                "the sibling contains the evidence",
+            )?,
+        ],
+    )?;
+
+    let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
+    assert_eq!(verified.status.code(), Some(0));
+    let data = response_data(&verified)?
+        .get("data")
+        .context("sibling verification response has data")?
+        .clone();
+    assert_eq!(
+        data.get("broken").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        data.get("quotes_unchecked").and_then(Value::as_u64),
+        Some(0)
+    );
+
+    remove_scratch(&root)
+}
+
+#[test]
+fn quote_matching_only_a_body_pointer_is_unchecked() -> Result<()> {
+    let root = scratch("quote-body")?;
+    let tree = root.join("tree");
+    let state_base = root.join("state");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
+    )?;
+    std::fs::write(
+        tree.join("decision.md"),
+        "---\ntype: decision\nstatus: open\nquote: \"body-only evidence\"\nsource: \"meetings/example/transcript.txt:12\"\n---\nContext: slack:C0EXAMPLE01/1700000000.000004\n",
+    )?;
+    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    store.put_all(
+        "slack",
+        &[record(
+            "slack:C0EXAMPLE01/1700000000.000004",
+            None,
+            1_700_000_000,
+            "body-only evidence",
+        )?],
+    )?;
+
+    let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
+    assert_eq!(verified.status.code(), Some(0));
+    let data = response_data(&verified)?
+        .get("data")
+        .context("body-only verification response has data")?
+        .clone();
+    assert_eq!(
+        data.get("broken").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        data.get("quotes_unchecked").and_then(Value::as_u64),
+        Some(1)
+    );
+
+    remove_scratch(&root)
+}
+
+#[test]
+fn normalized_source_quote_matches_markup_mentions_and_ellipsis() -> Result<()> {
+    let root = scratch("quote-normalized")?;
+    let tree = root.join("tree");
+    let state_base = root.join("state");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
+    )?;
+    std::fs::write(
+        tree.join("decision.md"),
+        "---\ntype: decision\nstatus: open\nquote: \"portal hello \\\"world\\\" - @Alice ... later\"\nsource: \"slack:C0EXAMPLE01/1700000000.000005\"\n---\n",
+    )?;
+    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    store.put_all(
+        "slack",
+        &[record(
+            "slack:C0EXAMPLE01/1700000000.000005",
+            None,
+            1_700_000_000,
+            "<https://example.com|Portal>  *HELLO*\n“WORLD” — <@U0EXAMPLE9> after later",
+        )?],
+    )?;
+
+    let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
+    assert_eq!(verified.status.code(), Some(0));
+    let data = response_data(&verified)?
+        .get("data")
+        .context("normalization verification response has data")?
+        .clone();
+    assert_eq!(
+        data.get("broken").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+
+    remove_scratch(&root)
 }

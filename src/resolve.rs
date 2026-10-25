@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context as _, Result};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::config::SourceConfig;
 use crate::context::Context;
@@ -12,6 +13,7 @@ use crate::pointer::{Pointer, Schemes};
 use crate::record::render;
 use crate::source::{self, Request as SourceRequest, ResolveRequest, Session, SourceRef};
 use crate::store::Store;
+use crate::tree::Doc;
 
 /// The outcome for one `ctx resolve` input.
 #[derive(Debug, Serialize)]
@@ -39,6 +41,7 @@ pub struct Verification {
     pub checked: usize,
     pub broken: Vec<Broken>,
     pub skipped: BTreeMap<String, usize>,
+    pub quotes_unchecked: usize,
     #[serde(skip)]
     pub source_errors: bool,
 }
@@ -120,19 +123,78 @@ pub fn verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Verifi
     let store = Store::open(&context.state()?.store())?;
     let mut verification = Verification::default();
     for document in &context.tree.docs {
-        if !files.is_empty() && !files.contains(&document.rel) {
+        if files.is_empty() || files.contains(&document.rel) {
+            verify_document(context, &store, &schemes, document, live, &mut verification)?;
+        }
+    }
+    Ok(verification)
+}
+
+fn verify_document(
+    context: &Context,
+    store: &Store,
+    schemes: &Schemes,
+    document: &Doc,
+    live: bool,
+    verification: &mut Verification,
+) -> Result<()> {
+    let source_pointers = source_pointers(document, schemes)?;
+    let mut source_location = None;
+    let mut has_verbatim_source = false;
+    let mut source_thread_texts = Vec::new();
+    for found in schemes.find_all(&document.raw) {
+        let is_source_pointer = source_pointers.contains(&found.pointer);
+        if is_source_pointer && source_location.is_none() {
+            source_location = Some((found.pointer.to_string(), found.start));
+        }
+        let resolved = resolve_with_live(
+            context,
+            store,
+            schemes,
+            &found.pointer,
+            false,
+            ResolutionMode::Verify { live },
+        )?;
+        if is_source_pointer && resolved.verbatim {
+            has_verbatim_source = true;
+        }
+        if let Some(error) = resolved.source_error {
+            verification.source_errors = true;
+            verification.broken.push(Broken {
+                file: document.rel.to_string_lossy().into_owned(),
+                line: line_number(&document.raw, found.start),
+                pointer: found.pointer.to_string(),
+                why: error,
+            });
             continue;
         }
-        for found in schemes.find_all(&document.raw) {
-            let resolved = resolve_with_live(
+        if !resolved.verbatim {
+            *verification
+                .skipped
+                .entry(found.pointer.scheme.clone())
+                .or_default() += 1;
+            continue;
+        }
+        verification.checked += 1;
+        if resolved.text.is_none() {
+            verification.broken.push(Broken {
+                file: document.rel.to_string_lossy().into_owned(),
+                line: line_number(&document.raw, found.start),
+                pointer: found.pointer.to_string(),
+                why: "does not resolve in the local store".to_owned(),
+            });
+            continue;
+        }
+        if is_source_pointer {
+            let thread_resolved = resolve_with_live(
                 context,
-                &store,
-                &schemes,
+                store,
+                schemes,
                 &found.pointer,
-                false,
+                true,
                 ResolutionMode::Verify { live },
             )?;
-            if let Some(error) = resolved.source_error {
+            if let Some(error) = thread_resolved.source_error {
                 verification.source_errors = true;
                 verification.broken.push(Broken {
                     file: document.rel.to_string_lossy().into_owned(),
@@ -142,32 +204,53 @@ pub fn verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Verifi
                 });
                 continue;
             }
-            if !resolved.verbatim {
-                *verification
-                    .skipped
-                    .entry(found.pointer.scheme.clone())
-                    .or_default() += 1;
-                continue;
-            }
-            verification.checked += 1;
-            let why = match (resolved.text.as_deref(), document.front.quote.as_deref()) {
-                (None, _) => Some("does not resolve in the local store"),
-                (Some(text), Some(quote)) if !text.contains(quote) => {
-                    Some("quote does not appear in the resolved text")
-                }
-                _ => None,
-            };
-            if let Some(why) = why {
-                verification.broken.push(Broken {
-                    file: document.rel.to_string_lossy().into_owned(),
-                    line: line_number(&document.raw, found.start),
-                    pointer: found.pointer.to_string(),
-                    why: why.to_owned(),
-                });
-            }
+            source_thread_texts.push(
+                local_records(store, schemes, &found.pointer, true)?
+                    .into_iter()
+                    .map(|record| record.text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
         }
     }
-    Ok(verification)
+    verify_quote(
+        document,
+        &source_thread_texts,
+        source_location,
+        has_verbatim_source,
+        verification,
+    );
+    Ok(())
+}
+
+fn verify_quote(
+    document: &Doc,
+    source_thread_texts: &[String],
+    source_location: Option<(String, usize)>,
+    has_verbatim_source: bool,
+    verification: &mut Verification,
+) {
+    let Some(quote) = document.front.quote.as_deref() else {
+        return;
+    };
+    if !has_verbatim_source {
+        verification.quotes_unchecked += 1;
+        return;
+    }
+    if source_thread_texts.is_empty()
+        || source_thread_texts
+            .iter()
+            .any(|text| quote_matches(text, quote))
+    {
+        return;
+    }
+    let (pointer, start) = source_location.unwrap_or_else(|| (String::new(), 0));
+    verification.broken.push(Broken {
+        file: document.rel.to_string_lossy().into_owned(),
+        line: line_number(&document.raw, start),
+        pointer,
+        why: "quote does not appear in the resolved text".to_owned(),
+    });
 }
 
 fn default_verbatim(source: Option<&SourceConfig>, scheme: &str) -> bool {
@@ -286,11 +369,23 @@ fn resolve_local(
     pointer: &Pointer,
     thread: bool,
 ) -> Result<Option<String>> {
+    let records = local_records(store, schemes, pointer, thread)?;
+    (!records.is_empty())
+        .then(|| records.iter().map(render).collect::<Vec<_>>().join("\n\n"))
+        .map_or(Ok(None), |text| Ok(Some(text)))
+}
+
+fn local_records(
+    store: &Store,
+    schemes: &Schemes,
+    pointer: &Pointer,
+    thread: bool,
+) -> Result<Vec<crate::record::Record>> {
     let is_gmail_thread = pointer.scheme == "gmail" && pointer.locator.starts_with("thread/");
     if !thread && !is_gmail_thread {
         return store
             .get(pointer)
-            .map(|record| record.map(|record| render(&record)));
+            .map(|record| record.into_iter().collect());
     }
     let mut records = store.thread(pointer)?;
     let pointer_text = pointer.to_string();
@@ -305,9 +400,175 @@ fn resolve_local(
         })?;
         records = store.thread(&thread_pointer)?;
     }
-    (!records.is_empty())
-        .then(|| records.iter().map(render).collect::<Vec<_>>().join("\n\n"))
-        .map_or(Ok(None), |text| Ok(Some(text)))
+    Ok(records)
+}
+
+fn source_pointers(document: &Doc, schemes: &Schemes) -> Result<Vec<Pointer>> {
+    let frontmatter = document.frontmatter_json()?;
+    let mut pointers = Vec::new();
+    let Some(fields) = frontmatter.as_object() else {
+        return Ok(pointers);
+    };
+    for field in ["source", "sources"] {
+        if let Some(value) = fields.get(field) {
+            collect_source_pointers(value, schemes, &mut pointers);
+        }
+    }
+    Ok(pointers)
+}
+
+fn collect_source_pointers(value: &Value, schemes: &Schemes, pointers: &mut Vec<Pointer>) {
+    match value {
+        Value::String(text) => {
+            for found in schemes.find_all(text) {
+                if !pointers.contains(&found.pointer) {
+                    pointers.push(found.pointer);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_source_pointers(value, schemes, pointers);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                collect_source_pointers(value, schemes, pointers);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn quote_matches(text: &str, quote: &str) -> bool {
+    let text = normalise_quote_text(text);
+    let quote = normalise_quote_text(quote);
+    let mut cursor = 0;
+    let mut matched_fragment = false;
+    for fragment in quote
+        .split("...")
+        .map(str::trim)
+        .filter(|fragment| !fragment.is_empty())
+    {
+        let Some(relative) = text
+            .get(cursor..)
+            .and_then(|remaining| remaining.find(fragment))
+        else {
+            return false;
+        };
+        matched_fragment = true;
+        cursor += relative + fragment.len();
+    }
+    matched_fragment
+}
+
+fn normalise_quote_text(text: &str) -> String {
+    let text = strip_mentions(&unwrap_slack_links(text));
+    let mut normalised = String::new();
+    let mut whitespace = false;
+    for character in text.chars() {
+        if character.is_whitespace() {
+            whitespace = !normalised.is_empty();
+            continue;
+        }
+        if matches!(character, '*' | '_' | '~' | '`') {
+            continue;
+        }
+        if whitespace {
+            normalised.push(' ');
+            whitespace = false;
+        }
+        match character {
+            '‘' | '’' | 'ʼ' => normalised.push('\''),
+            '“' | '”' => normalised.push('"'),
+            '–' | '—' | '−' => normalised.push('-'),
+            '…' => normalised.push_str("..."),
+            character => normalised.extend(character.to_lowercase()),
+        }
+    }
+    normalised
+}
+
+fn unwrap_slack_links(text: &str) -> String {
+    let mut unwrapped = String::new();
+    let mut remaining = text;
+    while let Some(open) = remaining.find('<') {
+        let Some(before) = remaining.get(..open) else {
+            break;
+        };
+        unwrapped.push_str(before);
+        let Some(after_open) = remaining.get(open + '<'.len_utf8()..) else {
+            break;
+        };
+        let Some(close) = after_open.find('>') else {
+            unwrapped.push('<');
+            unwrapped.push_str(after_open);
+            return unwrapped;
+        };
+        let Some(content) = after_open.get(..close) else {
+            break;
+        };
+        let Some(after_close) = after_open.get(close + '>'.len_utf8()..) else {
+            break;
+        };
+        if content.starts_with("http://") || content.starts_with("https://") {
+            unwrapped.push_str(content.split_once('|').map_or(content, |(_, label)| label));
+        } else {
+            unwrapped.push('<');
+            unwrapped.push_str(content);
+            unwrapped.push('>');
+        }
+        remaining = after_close;
+    }
+    unwrapped.push_str(remaining);
+    unwrapped
+}
+
+fn strip_mentions(text: &str) -> String {
+    let mut stripped = String::new();
+    let mut remaining = text;
+    while let Some(character) = remaining.chars().next() {
+        if let Some(after) = remaining.strip_prefix("<@") {
+            if let Some(close) = after.find('>') {
+                let identifier = after.get(..close);
+                if identifier.is_some_and(|identifier| identifier.starts_with('U')) {
+                    let Some(after_mention) = after.get(close + '>'.len_utf8()..) else {
+                        break;
+                    };
+                    remaining = after_mention;
+                    continue;
+                }
+            }
+        }
+        let mention_boundary = stripped.chars().next_back().is_none_or(|previous| {
+            !previous.is_alphanumeric() && previous != '_' && previous != '-'
+        });
+        if character == '@' && mention_boundary {
+            let Some(after) = remaining.get(character.len_utf8()..) else {
+                break;
+            };
+            let name_end = after
+                .char_indices()
+                .find_map(|(offset, character)| {
+                    (!character.is_alphanumeric() && character != '_' && character != '-')
+                        .then_some(offset)
+                })
+                .unwrap_or(after.len());
+            if name_end > 0 {
+                let Some(after_mention) = after.get(name_end..) else {
+                    break;
+                };
+                remaining = after_mention;
+                continue;
+            }
+        }
+        stripped.push(character);
+        let Some(after_character) = remaining.get(character.len_utf8()..) else {
+            break;
+        };
+        remaining = after_character;
+    }
+    stripped
 }
 
 fn line_number(text: &str, offset: usize) -> usize {
