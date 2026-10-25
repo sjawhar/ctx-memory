@@ -22,9 +22,10 @@ static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 static ENVIRONMENT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const STREAMS: [&str; 2] = ["C0EXAMPLE01", "C0EXAMPLE02"];
-const ECHO_ENV_NAMES: [&str; 7] = [
+const ECHO_ENV_NAMES: [&str; 8] = [
     "ECHO_FAIL_STREAM",
     "ECHO_BAD_SCHEME",
+    "ECHO_DUPLICATE_END",
     "ECHO_NO_END",
     "ECHO_LATE",
     "ECHO_NO_HELLO",
@@ -131,6 +132,137 @@ fn source_run_prints_the_external_jsonl_stream() -> Result<()> {
     assert_eq!(record.get("type"), Some(&serde_json::json!("record")));
     let end: Value = serde_json::from_str(lines.next().context("source output has stream end")?)?;
     assert_eq!(end.get("type"), Some(&serde_json::json!("stream_end")));
+    Ok(())
+}
+
+#[test]
+fn source_run_json_emits_one_validated_message_envelope() -> Result<()> {
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .map_err(|error| anyhow::anyhow!("locking the test environment: {error}"))?;
+    let root = scratch("source-run-json")?;
+    let tree = source_tree(&root)?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let mut command = binary();
+    command
+        .args(["--json", "--memory", tree_text, "source", "run", "echo"])
+        .env("CTX_STATE_DIR", root.join("state"))
+        .env("PATH", fixture_path()?);
+    clear_echo_environment(&mut command);
+    let output = command.output().context("running ctx --json source run")?;
+    remove_scratch(&root)?;
+
+    assert_eq!(output.status.code(), Some(0));
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value.get("version"), Some(&serde_json::json!(1)));
+    assert_eq!(value.get("command"), Some(&serde_json::json!("source run")));
+    assert_eq!(
+        value
+            .get("data")
+            .and_then(|data| data.get("source"))
+            .and_then(Value::as_str),
+        Some("echo")
+    );
+    assert_eq!(
+        value
+            .get("data")
+            .and_then(|data| data.get("op"))
+            .and_then(Value::as_str),
+        Some("fetch")
+    );
+    assert!(value
+        .get("data")
+        .and_then(|data| data.get("messages"))
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .first()
+                .is_some_and(|message| message.get("type") == Some(&serde_json::json!("hello")))
+        }));
+    assert_eq!(
+        value
+            .get("data")
+            .and_then(|data| data.get("outcome"))
+            .and_then(|outcome| outcome.get("error")),
+        Some(&Value::Null)
+    );
+    Ok(())
+}
+
+#[test]
+fn source_run_json_exits_one_for_an_errored_stream() -> Result<()> {
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .map_err(|error| anyhow::anyhow!("locking the test environment: {error}"))?;
+    let root = scratch("source-run-json-error")?;
+    let tree = source_tree(&root)?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let mut command = binary();
+    command
+        .args(["--json", "--memory", tree_text, "source", "run", "echo"])
+        .env("CTX_STATE_DIR", root.join("state"))
+        .env("PATH", fixture_path()?)
+        .env("ECHO_FAIL_STREAM", "C0EXAMPLE01");
+    clear_echo_environment(&mut command);
+    command.env("ECHO_FAIL_STREAM", "C0EXAMPLE01");
+    let output = command
+        .output()
+        .context("running errored ctx --json source run")?;
+    remove_scratch(&root)?;
+
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value.get("version"), Some(&serde_json::json!(1)));
+    assert_eq!(value.get("command"), Some(&serde_json::json!("source run")));
+    assert_eq!(
+        value
+            .get("data")
+            .and_then(|data| data.get("outcome"))
+            .and_then(|outcome| outcome.get("streams"))
+            .and_then(|streams| streams.get("C0EXAMPLE01"))
+            .and_then(|stream| stream.get("status")),
+        Some(&serde_json::json!("error"))
+    );
+    Ok(())
+}
+
+#[test]
+fn unsafe_source_ids_fail_before_fetch_resolve_or_source_run_create_state() -> Result<()> {
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .map_err(|error| anyhow::anyhow!("locking the test environment: {error}"))?;
+    let root = scratch("unsafe-source-id")?;
+    let tree = root.join("tree");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"../x\"\nkind = \"echo\"\nscheme = \"echo\"\nstreams = [\"C0EXAMPLE01\"]\n",
+    )?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let commands: [&[&str]; 3] = [
+        &["fetch"],
+        &["resolve", "echo:C0EXAMPLE01/record"],
+        &["source", "run", "../x"],
+    ];
+    let mut results = Vec::new();
+    for arguments in commands {
+        let state = root.join(format!("state-{}", results.len()));
+        let output = binary()
+            .args(["--memory", tree_text])
+            .args(arguments)
+            .env("CTX_STATE_DIR", &state)
+            .env("PATH", fixture_path()?)
+            .output()
+            .with_context(|| format!("running ctx {}", arguments.join(" ")))?;
+        results.push((output, state.exists()));
+    }
+    remove_scratch(&root)?;
+
+    for (output, state_exists) in results {
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("../x"));
+        assert!(!state_exists);
+    }
     Ok(())
 }
 

@@ -255,14 +255,14 @@ pub enum Accepted {
 }
 
 /// A warning retained from a source protocol stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SourceWarning {
     pub stream: Option<String>,
     pub message: String,
 }
 
 /// A source's terminal result for one fetch stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StreamResult {
     pub status: StreamStatus,
     pub cursor: Option<String>,
@@ -270,7 +270,7 @@ pub struct StreamResult {
 }
 
 /// The validated records, stream results, and warnings from one source execution.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SourceOutcome {
     pub records: Vec<Record>,
     pub streams: BTreeMap<String, StreamResult>,
@@ -461,15 +461,25 @@ impl<'a> Session<'a> {
         if !self.planned.contains(&stream) {
             bail!("stream_end for unplanned stream {stream}");
         }
+        if self.seen_end.contains(&stream) {
+            let error = format!("stream {stream} emitted stream_end more than once");
+            self.streams.insert(
+                stream,
+                StreamResult {
+                    status: StreamStatus::Error,
+                    cursor: None,
+                    error: Some(error.clone()),
+                },
+            );
+            bail!("{error}");
+        }
         if status == StreamStatus::Ok && cursor.is_none() {
             bail!("successful stream {stream} did not provide a cursor");
         }
         if status == StreamStatus::Error && cursor.is_some() {
             bail!("errored stream {stream} must not provide a cursor");
         }
-        if !self.seen_end.insert(stream.clone()) {
-            bail!("stream {stream} emitted stream_end more than once");
-        }
+        self.seen_end.insert(stream.clone());
         self.streams.insert(
             stream,
             StreamResult {

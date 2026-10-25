@@ -124,9 +124,7 @@ impl TreeConfig {
         let mut source_ids = HashSet::new();
         let mut source_schemes = HashMap::new();
         for source in &self.sources {
-            if source.id.is_empty() {
-                bail!("source id must not be empty");
-            }
+            validate_source_id(&source.id)?;
             if source.kind.is_empty() {
                 bail!("source {} kind must not be empty", source.id);
             }
@@ -167,6 +165,25 @@ fn validate_tree_id(id: &str) -> Result<()> {
         })
     {
         bail!("ctx.toml id must match [a-z0-9][a-z0-9-]{{0,62}}");
+    }
+    Ok(())
+}
+
+fn validate_source_id(id: &str) -> Result<()> {
+    let mut characters = id.bytes();
+    let Some(first) = characters.next() else {
+        bail!("source id {id:?} must match [a-z0-9][a-z0-9_-]{{0,62}}");
+    };
+    if id.len() > 63
+        || !first.is_ascii_lowercase() && !first.is_ascii_digit()
+        || !characters.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == b'-'
+                || character == b'_'
+        })
+    {
+        bail!("source id {id:?} must match [a-z0-9][a-z0-9_-]{{0,62}}");
     }
     Ok(())
 }
@@ -415,6 +432,26 @@ mod tests {
 
         assert!(result.is_err());
         Ok(())
+    }
+
+    #[test]
+    fn source_id_must_be_a_safe_state_key() -> Result<()> {
+        let root = scratch()?;
+        for source_id in ["../x", "/tmp/x", "source/id"] {
+            std::fs::write(
+                root.join("ctx.toml"),
+                format!(
+                    "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"{source_id}\"\nkind = \"echo\"\nscheme = \"echo\"\n"
+                ),
+            )?;
+
+            let result = TreeConfig::load(&root);
+            let error = result
+                .err()
+                .context("unsafe source id unexpectedly loaded")?;
+            assert!(format!("{error:#}").contains(source_id));
+        }
+        remove_scratch(&root)
     }
 
     #[test]

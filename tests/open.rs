@@ -159,6 +159,23 @@ fn owner_filter_matches_the_resolved_target_stem_or_name() -> Result<()> {
 }
 
 #[test]
+fn owner_filter_matches_literal_owner_in_starter_tree() -> Result<()> {
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("starter");
+    let response = ctx(&starter, &["--owner", "alice"])?;
+    let paths = response
+        .get("data")
+        .and_then(|data| data.get("items"))
+        .and_then(Value::as_array)
+        .context("starter open items are missing")?
+        .iter()
+        .filter_map(|item| item.get("path").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+
+    assert_eq!(paths, ["decisions/record-provenance.md"]);
+    Ok(())
+}
+
+#[test]
 fn owner_linked_matches_the_filtered_target() -> Result<()> {
     let root = fixture_tree()?;
 

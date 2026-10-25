@@ -123,12 +123,16 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
             request.window_end,
             request.backfill_hours,
         )
-        .and_then(|start| fetch_events(api, calendar, start, request.window_end))
-        .and_then(|events| {
-            events
-                .into_iter()
-                .map(|event| record_from_event(&event, calendar, &request.source.scheme))
-                .collect::<Result<Vec<_>>>()
+        .and_then(|start| {
+            fetch_events(api, calendar, start).and_then(|events| {
+                records_from_events(
+                    events,
+                    calendar,
+                    &request.source.scheme,
+                    start,
+                    request.window_end,
+                )
+            })
         });
         match result {
             Ok(records) => {
@@ -161,17 +165,37 @@ fn fetch_events<C: CalendarApi + ?Sized>(
     api: &C,
     calendar: &str,
     start: DateTime<Utc>,
-    end: DateTime<Utc>,
 ) -> Result<Vec<Value>> {
     api.events(&json!({
         "calendarId": calendar,
-        "timeMin": start.to_rfc3339_opts(SecondsFormat::Secs, true),
-        "timeMax": end.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "updatedMin": start.to_rfc3339_opts(SecondsFormat::Secs, true),
         "singleEvents": true,
     }))
 }
 
-fn record_from_event(event: &Value, calendar: &str, scheme: &str) -> Result<Record> {
+fn records_from_events(
+    events: Vec<Value>,
+    calendar: &str,
+    scheme: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<Record>> {
+    let mut records = Vec::new();
+    for event in events {
+        let timestamp = event_timestamp(&event)?;
+        if timestamp > start && timestamp <= end {
+            records.push(record_from_event(&event, calendar, scheme, timestamp)?);
+        }
+    }
+    Ok(records)
+}
+
+fn record_from_event(
+    event: &Value,
+    calendar: &str,
+    scheme: &str,
+    timestamp: DateTime<Utc>,
+) -> Result<Record> {
     let id = required_event_string(event, "id")?;
     let title = event
         .get("summary")
@@ -206,7 +230,7 @@ fn record_from_event(event: &Value, calendar: &str, scheme: &str) -> Result<Reco
     Ok(Record {
         pointer: format!("{scheme}:{calendar}/{id}"),
         stream: calendar.to_owned(),
-        ts: event_timestamp(event)?,
+        ts: timestamp,
         label: Some(calendar.to_owned()),
         author,
         author_id,
@@ -247,17 +271,18 @@ mod tests {
     #[derive(Default)]
     struct FakeCalendarApi {
         calls: RefCell<Vec<Value>>,
+        events: Vec<Value>,
     }
 
     impl CalendarApi for FakeCalendarApi {
         fn events(&self, params: &Value) -> Result<Vec<Value>> {
             self.calls.borrow_mut().push(params.clone());
-            Ok(Vec::new())
+            Ok(self.events.clone())
         }
     }
 
     #[test]
-    fn configured_calendar_id_is_sent_to_gws() -> Result<()> {
+    fn calendar_fetches_events_updated_in_the_window() -> Result<()> {
         let config = parse_config(&json!({"calendars": ["team@example.com"]}))?;
         let window_end = DateTime::parse_from_rfc3339("2026-10-25T18:00:00Z")?.with_timezone(&Utc);
         let request = FetchRequest {
@@ -270,22 +295,81 @@ mod tests {
             config: json!({"calendars": ["team@example.com"]}),
             window_end,
             backfill_hours: 24,
-            cursors: std::collections::BTreeMap::new(),
+            cursors: std::collections::BTreeMap::from([(
+                "team@example.com".to_owned(),
+                "2026-10-25T16:00:00Z".to_owned(),
+            )]),
             discovered: Vec::new(),
             state_dir: std::env::temp_dir(),
         };
-        let api = FakeCalendarApi::default();
-        fetch_with_api(&request, &config, &api, &mut |_| Ok(()))?;
+        let api = FakeCalendarApi {
+            events: vec![
+                json!({
+                    "id": "past-edited",
+                    "updated": "2026-10-25T17:00:00Z",
+                    "start": {"dateTime": "2020-01-01T09:00:00Z"},
+                    "end": {"dateTime": "2020-01-01T10:00:00Z"},
+                }),
+                json!({
+                    "id": "future-created",
+                    "updated": "2026-10-25T17:30:00Z",
+                    "start": {"dateTime": "2030-01-01T09:00:00Z"},
+                    "end": {"dateTime": "2030-01-01T10:00:00Z"},
+                }),
+                json!({
+                    "id": "updated-later",
+                    "updated": "2026-10-25T18:01:00Z",
+                    "start": {"dateTime": "2026-10-25T09:00:00Z"},
+                    "end": {"dateTime": "2026-10-25T10:00:00Z"},
+                }),
+            ],
+            ..FakeCalendarApi::default()
+        };
+        let mut messages = Vec::new();
+        fetch_with_api(&request, &config, &api, &mut |message| {
+            messages.push(message);
+            Ok(())
+        })?;
 
-        let calendar = api
-            .calls
-            .borrow()
-            .first()
-            .and_then(|params| params.get("calendarId"))
-            .and_then(Value::as_str)
-            .context("Calendar request contains calendarId")?
-            .to_owned();
-        assert_eq!(calendar, "team@example.com");
+        let records = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Record(record) => Some((
+                    record.pointer.as_str(),
+                    record.ts.to_rfc3339_opts(SecondsFormat::Secs, true),
+                )),
+                Message::Hello { .. } | Message::Warning { .. } | Message::StreamEnd { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records,
+            vec![
+                (
+                    "gcal:team@example.com/past-edited",
+                    "2026-10-25T17:00:00Z".to_owned()
+                ),
+                (
+                    "gcal:team@example.com/future-created",
+                    "2026-10-25T17:30:00Z".to_owned()
+                ),
+            ]
+        );
+        let calls = api.calls.borrow();
+        let params = calls.first().context("Calendar request has parameters")?;
+        assert_eq!(
+            params.get("calendarId").and_then(Value::as_str),
+            Some("team@example.com")
+        );
+        assert_eq!(
+            params.get("updatedMin").and_then(Value::as_str),
+            Some("2026-10-25T16:00:00Z")
+        );
+        assert_eq!(params.get("timeMin"), None);
+        assert_eq!(params.get("timeMax"), None);
+        assert_eq!(
+            params.get("singleEvents").and_then(Value::as_bool),
+            Some(true)
+        );
         Ok(())
     }
 }

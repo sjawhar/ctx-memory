@@ -73,7 +73,7 @@ token_env = "LINEAR_TOKEN"
 team = "ENG"
 ```
 
-Every source needs a unique `id` and pointer scheme. Built-in kinds choose their own default schemes; an external kind needs `scheme`. Source-specific keys are passed unchanged as the request's `config` object.
+Every source needs a unique `id` matching `[a-z0-9][a-z0-9_-]{0,62}` and a unique pointer scheme. Built-in kinds choose their own default schemes; an external kind needs `scheme`. Source-specific keys are passed unchanged as the request's `config` object.
 
 ## Conformance
 
@@ -84,4 +84,4 @@ ctx source run linear
 ctx source run linear --op resolve
 ```
 
-The command prints the protocol stream for inspection. Use it to develop a source before including it in a full fetch, and keep source output free of credentials.
+Without `--json`, the command prints the raw protocol stream for inspection. With `--json`, it emits one v1 envelope containing the validated messages and source outcome. Use it to develop a source before including it in a full fetch, and keep source output free of credentials.

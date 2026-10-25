@@ -154,7 +154,8 @@ pub enum SourceCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceOperation {
     Fetch,
     Resolve,
@@ -261,6 +262,14 @@ struct FetchDeltaPayload {
 #[derive(Serialize)]
 struct CursorShowPayload {
     cursors: Cursors,
+}
+
+#[derive(Serialize)]
+struct SourceRunPayload<'a> {
+    source: &'a str,
+    op: SourceOperation,
+    messages: Vec<source::Message>,
+    outcome: source::SourceOutcome,
 }
 
 /// Runs the selected command.
@@ -381,20 +390,31 @@ fn run_source(context: &Context, id: &str, op: SourceOperation) -> Result<Outcom
     };
     let schemes = source::configured_schemes(&context.config.sources)?;
     let mut session = Session::new(&request, &schemes);
+    let mut messages = Vec::new();
     let run = source.run(&request, &mut |message| {
-        println!("{}", serde_json::to_string(&message)?);
-        session.accept(message).map(|_| ())
+        if !context.json {
+            println!("{}", serde_json::to_string(&message)?);
+        }
+        session.accept(message.clone()).map(|_| {
+            messages.push(message);
+        })
     });
-    let outcome = session.finish(run);
-    if let Some(error) = outcome.error.as_deref() {
+    let payload = SourceRunPayload {
+        source: id,
+        op,
+        messages,
+        outcome: session.finish(run),
+    };
+    if let Some(error) = payload.outcome.error.as_deref() {
         eprintln!("source {id}: {error}");
     }
-    for (stream, result) in &outcome.streams {
+    for (stream, result) in &payload.outcome.streams {
         if let Some(error) = result.error.as_deref() {
             eprintln!("source {id} stream {stream}: {error}");
         }
     }
-    Ok(if outcome.has_errors() {
+    output::emit(context.json, "source run", &payload, |_| {})?;
+    Ok(if payload.outcome.has_errors() {
         Outcome::SourceErrors
     } else {
         Outcome::Pass

@@ -51,6 +51,7 @@ fn command(tree: &Path, state: &Path) -> Result<Command> {
     for name in [
         "ECHO_AFTER_END",
         "ECHO_BAD_SCHEME",
+        "ECHO_DUPLICATE_END",
         "ECHO_ERROR_CURSOR",
         "ECHO_EXIT",
         "ECHO_FAIL_STREAM",
@@ -260,5 +261,67 @@ fn cursor_advance_applies_only_ok_streams_and_rejects_older_windows() -> Result<
         .and_then(Value::as_str)
         .context("stale advance reports an error")?;
     assert!(message.contains("older"));
+    Ok(())
+}
+
+#[test]
+fn duplicate_stream_end_errors_manifest_stream_and_cursor_advance_skips_it() -> Result<()> {
+    let root = scratch("duplicate-stream-end")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    let mut fetch = command(&tree, &state)?;
+    fetch
+        .args(["fetch", "--window-end", "2026-10-25T18:00:00Z"])
+        .env("ECHO_DUPLICATE_END", "C0EXAMPLE01");
+    let fetched = fetch.output().context("fetching duplicate stream end")?;
+    let window = window_id(&fetched)?;
+    let manifest: Value = serde_json::from_slice(&fs::read(
+        state.join(format!("example/windows/{window}/manifest.json")),
+    )?)?;
+    let advanced = command(&tree, &state)?
+        .args(["cursor", "advance", &window])
+        .output()
+        .context("advancing duplicate stream window")?;
+    remove_scratch(&root)?;
+
+    let stream = manifest
+        .get("sources")
+        .and_then(|sources| sources.get("echo"))
+        .and_then(|source| source.get("streams"))
+        .and_then(|streams| streams.get("C0EXAMPLE01"))
+        .context("manifest has the duplicate stream")?;
+    assert_eq!(fetched.status.code(), Some(1));
+    assert_eq!(
+        stream.get("status"),
+        Some(&Value::String("error".to_owned()))
+    );
+    assert_eq!(stream.get("cursor_next"), Some(&Value::Null));
+    assert!(stream
+        .get("error")
+        .and_then(Value::as_str)
+        .is_some_and(|error| error.contains("more than once")));
+    assert!(advanced.status.success());
+    let advanced: Value = serde_json::from_slice(&advanced.stdout)?;
+    assert!(advanced
+        .get("data")
+        .and_then(|data| data.get("advanced"))
+        .and_then(Value::as_array)
+        .is_some_and(|streams| {
+            streams.iter().all(|stream| {
+                stream.get("source") != Some(&Value::String("echo".to_owned()))
+                    || stream.get("stream") != Some(&Value::String("C0EXAMPLE01".to_owned()))
+            })
+        }));
+    assert!(advanced
+        .get("data")
+        .and_then(|data| data.get("skipped"))
+        .and_then(Value::as_array)
+        .is_some_and(|streams| {
+            streams.iter().any(|stream| {
+                stream.get("source") == Some(&Value::String("echo".to_owned()))
+                    && stream.get("stream") == Some(&Value::String("C0EXAMPLE01".to_owned()))
+                    && stream.get("why") == Some(&Value::String("stream errored".to_owned()))
+            })
+        }));
     Ok(())
 }

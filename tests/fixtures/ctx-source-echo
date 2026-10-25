@@ -51,6 +51,9 @@ for stream in $(printf '%s' "$streams" | tr ',' ' ' | tr -d '"'); do
         printf '{"type":"stream_end","stream":"%s","status":"error","error":"echo failure"}\n' "$stream"
     elif [ "${ECHO_NO_END-}" != "$stream" ]; then
         printf '{"type":"stream_end","stream":"%s","status":"ok","cursor":"%s"}\n' "$stream" "$window_end"
+        if [ "${ECHO_DUPLICATE_END-}" = "$stream" ]; then
+            printf '{"type":"stream_end","stream":"%s","status":"ok","cursor":"%s"}\n' "$stream" "$window_end"
+        fi
         if [ "${ECHO_AFTER_END-}" = "$stream" ]; then
             printf '{"type":"record","pointer":"%s:%s/after-end","stream":"%s","ts":"%s","text":"echo after end","raw":null}\n' "$scheme" "$stream" "$stream" "$record_time"
         fi

@@ -231,6 +231,12 @@ fn owner_matches(
     let Some(owner) = document.front.owner.as_deref() else {
         return Ok(false);
     };
+    if owners
+        .iter()
+        .any(|name| name != "linked" && owner.eq_ignore_ascii_case(name))
+    {
+        return Ok(true);
+    }
     for link in wikilinks(owner) {
         let Resolution::Found(owner_position) = tree.resolve(document, &link.target) else {
             continue;

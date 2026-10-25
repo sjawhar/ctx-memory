@@ -22,13 +22,13 @@ ctx --memory ~/example-memory dossier Alice
 ctx --memory ~/example-memory open
 ```
 
-Use `--json` with any command to receive a versioned JSON envelope. `--memory` overrides tree discovery; `CTX_MEMORY` supplies the same option. Without either, `ctx` looks for the nearest ancestor containing `ctx.toml`, then for `memory` in the user configuration file at `$XDG_CONFIG_HOME/ctx/config.toml` or `~/.config/ctx/config.toml`.
+Built-in commands emit one versioned JSON envelope with `--json`; `ctx source run` otherwise prints its raw protocol stream. Built-in commands exit `0` on success, `1` for findings or source errors, and `2` for operational or usage errors. `--memory` overrides tree discovery; `CTX_MEMORY` supplies the same option. Without either, `ctx` looks for the nearest ancestor containing `ctx.toml`, then for `memory` in the user configuration file at `$XDG_CONFIG_HOME/ctx/config.toml` or `~/.config/ctx/config.toml`.
 
 ## What is distinctive
 
 Markdown records and structural linting are established tools. `ctx-memory` adds five rules that keep a team memory useful under change:
 
-1. **Authority tiers drive retrieval.** Numeric tiers 1–4 distinguish external verbatim, internal verbatim, summaries, and recollections. Search ranks direct sources first; `ctx search --verbatim` excludes summaries.
+1. **Authority tiers drive retrieval.** Numeric tiers 1–4 distinguish external verbatim, internal verbatim, summaries, and recollections. Search orders hits by matching query-term coverage, then authority tier, so a direct source outranks a summary with equal coverage. `ctx search --verbatim` excludes summaries.
 2. **Absence is documented work.** A `not_found` result names what was searched and is logged as demand for future conversion.
 3. **Open work has a revisit date.** Decisions, commitments, and questions remain visible through `ctx open`; `ctx sweep` separates structural defects that fail CI from stale records that require review.
 4. **Universal negatives need evidence.** The sweep flags claims such as “never told” when they do not identify a direct source or searched surface.
@@ -42,7 +42,7 @@ Run `ctx --help` for the current interface.
 | --- | --- |
 | `ctx rules` | Print the tree's root `rules.md` page. |
 | `ctx sweep` | Report broken links, orphans, missing provenance, schema violations, and stale open records. Structural findings exit nonzero; stale records remain visible without failing the command. |
-| `ctx search <query>` | Search records, ranking stronger tiers first. Use `--verbatim` for direct-source records only and `--limit <n>` to change the result limit. |
+| `ctx search <query>` | Search records by matching query-term coverage, then stronger authority tiers. A direct source outranks a summary with the same coverage. Use `--verbatim` for direct-source records only and `--limit <n>` to change the result limit. |
 | `ctx dossier <entity>` | Show the entity page, configured vital fields, and related records. |
 | `ctx open` | List open decisions, commitments, and questions. Filter with `--owner <name>` or `--linked FIELD=VALUE[,VALUE…]`. |
 | `ctx fetch` | Fetch configured sources into a durable window. Use `--window-end <RFC3339>` or one or more `--source <id>` values to narrow a run. |
@@ -51,7 +51,7 @@ Run `ctx --help` for the current interface.
 | `ctx cursor advance <window>` | Apply successful cursor proposals after the corresponding tree commit. |
 | `ctx resolve <pointer>...` | Resolve citation pointers from the local store. Use `--thread` to include a pointer's thread. |
 | `ctx cite verify [files...]` | Verify citation pointers and quotes. Use `--live` to permit configured sources to resolve missing local records. |
-| `ctx source run <id>` | Run one configured source and print its protocol stream. Use `--op fetch` or `--op resolve`. |
+| `ctx source run <id>` | Run one configured source. Without `--json`, print its raw protocol stream; with `--json`, emit one envelope containing validated messages and the source outcome. Use `--op fetch` or `--op resolve`. |
 | `ctx state path` | Print the active state directory and SQLite store path. |
 
 ## Tree configuration
@@ -75,7 +75,7 @@ State is stored under `CTX_STATE_DIR`, then `state_dir` in the user configuratio
 
 A source is declared in `ctx.toml` and may be built in or external. An external source named `kind = "linear"` runs `ctx-source-linear` from `PATH`; it receives one JSON request on standard input and emits a JSON Lines protocol on standard output. See [docs/sources.md](docs/sources.md) for the protocol, cursor rules, and conformance command.
 
-Unknown commands use the same convention: `ctx report ...` runs `ctx-report` from `PATH` when `report` is not a built-in command. The public command passes the resolved tree and state paths through environment variables so an extension can use the same context.
+Unknown commands use the same convention: `ctx report ...` runs `ctx-report` from `PATH` when `report` is not a built-in command. Like git and cargo plugins, external commands own their stdout and exit status; `ctx` passes the resolved tree and state paths, JSON flag, and `ctx` version through `CTX_*` environment variables. The v1 JSON envelope and `0`/`1`/`2` exit-code contract apply only to built-in commands.
 
 The agent-facing reading and writing protocol lives in [skills/ctx-memory/SKILL.md](skills/ctx-memory/SKILL.md). The reasoning behind its rules is in [docs/method.md](docs/method.md).
 
