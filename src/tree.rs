@@ -1,7 +1,7 @@
 //! Loading and modelling a markdown context tree.
 
 use std::borrow::Cow;
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -579,29 +579,6 @@ impl Tree {
                     .is_some_and(|name| names_match(name, basename, true))
             }) || has_path_suffix(stem, target_without_suffix)
         })
-    }
-
-    #[must_use]
-    pub fn index_by_name(&self) -> HashMap<String, usize> {
-        let mut index = HashMap::new();
-        let mut duplicates = HashSet::new();
-        for (position, doc) in self.docs.iter().enumerate() {
-            for name in doc.link_names(&self.folder_notes) {
-                if duplicates.contains(&name) {
-                    continue;
-                }
-                match index.entry(name) {
-                    Entry::Occupied(entry) => {
-                        let (name, _) = entry.remove_entry();
-                        duplicates.insert(name);
-                    }
-                    Entry::Vacant(entry) => {
-                        entry.insert(position);
-                    }
-                }
-            }
-        }
-        index
     }
 
     #[must_use]

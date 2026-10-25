@@ -94,10 +94,14 @@ fn dossier_follows_resolved_wikilinks() -> Result<()> {
     )
     .with_context(|| format!("writing {}", records.display()))?;
 
-    let tree = Tree::load(&root, &TreeConfig::default())?;
+    let config = TreeConfig::default();
+    let tree = Tree::load(&root, &config)?;
     remove_test_root(&root)?;
 
-    let hits = search::dossier(&tree, "entities/alice");
-    assert!(hits.iter().any(|hit| hit.path == "records/reference.md"));
+    let dossier = search::dossier(&tree, "entities/alice", &config)?;
+    assert!(dossier
+        .hits
+        .iter()
+        .any(|hit| hit.path == "records/reference.md"));
     Ok(())
 }

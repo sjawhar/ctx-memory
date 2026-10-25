@@ -1,6 +1,5 @@
 //! Command-line parsing and dispatch for tree commands.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt as _;
@@ -14,12 +13,11 @@ use serde::Serialize;
 
 use crate::config::{locate_tree, state_base, TreeConfig, UserConfig};
 use crate::context::Context;
-use crate::open::{open_items, OpenItem};
+use crate::open::{open_items_with_filters, parse_linked, LinkedFilter, OpenItemView};
 use crate::output::{self, Outcome};
 use crate::schema::today_utc;
 use crate::search;
 use crate::sweep::{self, Findings};
-use crate::tree::{Doc, Resolution, Tree};
 
 #[derive(Parser)]
 #[command(name = "ctx", version, arg_required_else_help = true)]
@@ -69,7 +67,16 @@ pub enum Command {
     /// Find documents that mention an entity.
     Dossier { entity: String },
     /// List open decisions, commitments, and questions.
-    Open,
+    Open {
+        #[arg(
+            long,
+            value_name = "FIELD=VALUE[,VALUE…]",
+            value_parser = parse_linked
+        )]
+        linked: Vec<LinkedFilter>,
+        #[arg(long, value_name = "NAME", value_delimiter = ',')]
+        owner: Vec<String>,
+    },
     #[command(external_subcommand)]
     External(Vec<OsString>),
 }
@@ -82,7 +89,7 @@ impl Command {
             Self::Sweep => "sweep".to_owned(),
             Self::Search { .. } => "search".to_owned(),
             Self::Dossier { .. } => "dossier".to_owned(),
-            Self::Open => "open".to_owned(),
+            Self::Open { .. } => "open".to_owned(),
             Self::External(arguments) => arguments
                 .first()
                 .and_then(|argument| argument.to_str())
@@ -111,21 +118,8 @@ struct SearchPayload<'a> {
 }
 
 #[derive(Serialize)]
-struct DossierPayload<'entity, 'vitals, 'document> {
-    entity: &'entity str,
-    page: Option<DossierPage<'vitals, 'document>>,
-    hits: Vec<search::Hit>,
-}
-
-#[derive(Serialize)]
-struct DossierPage<'vitals, 'document> {
-    path: String,
-    vitals: BTreeMap<&'vitals str, &'document str>,
-}
-
-#[derive(Serialize)]
 struct OpenPayload {
-    items: Vec<OpenItem>,
+    items: Vec<OpenItemView>,
 }
 
 /// Runs the selected command.
@@ -166,12 +160,12 @@ pub fn run(cli: &Cli) -> Result<Outcome> {
             Ok(Outcome::Pass)
         }
         Command::Dossier { entity } => run_dossier(&context, entity),
-        Command::Open => {
+        Command::Open { linked, owner } => {
             if !context.config.sources.is_empty() {
                 context.state()?;
             }
             let payload = OpenPayload {
-                items: open_items(&context.tree),
+                items: open_items_with_filters(&context.tree, linked, owner)?,
             };
             output::emit(context.json, "open", &payload, |payload| {
                 print_open(&payload.items);
@@ -200,55 +194,9 @@ fn run_rules(context: &Context) -> Result<Outcome> {
 }
 
 fn run_dossier(context: &Context, entity: &str) -> Result<Outcome> {
-    if entity.trim().is_empty() {
-        bail!("dossier entity must not be empty");
-    }
-    let payload = DossierPayload {
-        entity,
-        page: dossier_page(&context.tree, entity, &context.config.dossier.vitals),
-        hits: search::dossier(&context.tree, entity),
-    };
-    output::emit(context.json, "dossier", &payload, |payload| {
-        search::print_dossier(payload.entity, &payload.hits);
-    })?;
+    let payload = search::dossier(&context.tree, entity, &context.config)?;
+    output::emit(context.json, "dossier", &payload, search::print_dossier)?;
     Ok(Outcome::Pass)
-}
-
-fn dossier_page<'vitals, 'document>(
-    tree: &'document Tree,
-    entity: &str,
-    vital_fields: &'vitals [String],
-) -> Option<DossierPage<'vitals, 'document>> {
-    let position = tree
-        .docs
-        .iter()
-        .find_map(|from| match tree.resolve(from, entity) {
-            Resolution::Found(position) => Some(position),
-            Resolution::Missing | Resolution::Ambiguous(_) => None,
-        })?;
-    let document = tree.docs.get(position)?;
-    let vitals = vital_fields
-        .iter()
-        .filter_map(|field| front_vital(document, field).map(|value| (field.as_str(), value)))
-        .collect();
-    Some(DossierPage {
-        path: document.rel.to_string_lossy().into_owned(),
-        vitals,
-    })
-}
-
-fn front_vital<'a>(document: &'a Doc, field: &str) -> Option<&'a str> {
-    let front = &document.front;
-    match field {
-        "type" => front.kind.as_deref(),
-        "status" => front.status.as_deref(),
-        "title" => front.title.as_deref(),
-        "name" => front.name.as_deref(),
-        "owner" => front.owner.as_deref(),
-        "what" => front.what.as_deref(),
-        "question" => front.question.as_deref(),
-        _ => front.extra_str(field),
-    }
 }
 
 fn plugin_environment(global: &GlobalArgs) -> Result<PluginEnv> {
@@ -455,7 +403,7 @@ fn print_sweep(findings: &Findings) {
     }
 }
 
-fn print_open(items: &[OpenItem]) {
+fn print_open(items: &[OpenItemView]) {
     if items.is_empty() {
         println!("nothing open");
         return;
