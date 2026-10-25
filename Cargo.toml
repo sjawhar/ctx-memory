@@ -19,12 +19,13 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 fs2 = "0.4"
+ignore = "0.4"
+jsonschema = { version = "0.60", default-features = false }
+libc = "0.2"
 owo-colors = "4"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ignore = "0.4"
-jsonschema = { version = "0.60", default-features = false }
 serde-saphyr = "2"
 toml = "0.8"
 [lints.rust]
