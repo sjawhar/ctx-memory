@@ -23,9 +23,9 @@ owo-colors = "4"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+ignore = "0.4"
+serde-saphyr = "2"
 toml = "0.8"
-walkdir = "2"
 
 [lints.rust]
 unused_must_use = "deny"

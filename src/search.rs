@@ -3,7 +3,7 @@
 use owo_colors::OwoColorize as _;
 use serde::Serialize;
 
-use crate::tree::{Doc, Tier, Tree};
+use crate::tree::{wikilinks, Doc, Resolution, Tier, Tree};
 
 #[derive(Debug, Serialize)]
 pub struct Hit {
@@ -75,17 +75,35 @@ pub fn run(tree: &Tree, query: &str, verbatim_only: bool, limit: usize) -> Vec<H
         .collect()
 }
 
-/// Every document that names an entity, plus the entity's own page, verbatim first.
+/// Every document that names an entity, links to its resolved page, plus the entity's own page.
 #[must_use]
 pub fn dossier(tree: &Tree, entity: &str) -> Vec<Hit> {
     let needle = entity.to_lowercase();
+    let entity_position = tree
+        .docs
+        .iter()
+        .find_map(|from| match tree.resolve(from, entity) {
+            Resolution::Found(position) => Some(position),
+            Resolution::Missing | Resolution::Ambiguous(_) => None,
+        });
     let mut hits: Vec<(u8, Hit)> = tree
         .docs
         .iter()
-        .filter_map(|doc| {
+        .enumerate()
+        .filter_map(|(position, doc)| {
             let searchable =
                 format!("{}\n{}", doc.rel.to_string_lossy(), doc.body()).to_lowercase();
-            let named = searchable.contains(&needle)
+            let linked = entity_position.is_some_and(|entity_position| {
+                wikilinks(&doc.raw).iter().any(|link| {
+                    matches!(
+                        tree.resolve(doc, &link.target),
+                        Resolution::Found(target) if target == entity_position
+                    )
+                })
+            });
+            let named = entity_position.is_some_and(|entity_position| position == entity_position)
+                || linked
+                || searchable.contains(&needle)
                 || doc
                     .front
                     .aliases

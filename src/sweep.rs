@@ -3,18 +3,25 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{NaiveDate, Utc};
 use regex::Regex;
 use serde::Serialize;
 
 use crate::schema::{NEEDS_QUOTE, NEEDS_TIER, OPEN_KINDS, OPEN_STATES};
-use crate::tree::{Doc, Tree};
+use crate::tree::{wikilinks, Doc, Resolution, Tree};
 
 #[derive(Debug, Serialize)]
 pub struct Gap {
     pub target: String,
     pub from: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Ambiguous {
+    pub target: String,
+    pub from: String,
+    pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,6 +38,7 @@ pub struct Stale {
 pub struct Findings {
     pub files: usize,
     pub gaps: Vec<Gap>,
+    pub ambiguous: Vec<Ambiguous>,
     pub stale: Vec<Stale>,
     pub untiered: Vec<String>,
     pub unquoted: Vec<String>,
@@ -44,6 +52,7 @@ impl Findings {
     #[must_use]
     pub const fn structural_clean(&self) -> bool {
         self.gaps.is_empty()
+            && self.ambiguous.is_empty()
             && self.untiered.is_empty()
             && self.unquoted.is_empty()
             && self.negatives.is_empty()
@@ -57,15 +66,15 @@ impl Findings {
     }
 }
 
-pub(crate) fn wikilink_re() -> Result<Regex> {
-    Regex::new(r"\[\[([^\]|#]+)").map_err(Into::into)
-}
-
 fn negative_claim_re() -> Result<Regex> {
     Regex::new(
         r"(?i)\bnever\s+(told|informed|notified|received|heard|answered|replied|responded|communicated|paid|invoiced|asked)\b|\b(was|were|has|had)\s+never\s+(been\s+)?(told|informed|notified|paid|invoiced|asked|answered|sent|contacted|given)\b|\bno\s+evidence\s+\w+\s+(was\s+|were\s+)?ever\b|\b(nobody|no\s+one)\s+(ever\s+)?(told|asked|answered|informed)\b",
     )
     .map_err(Into::into)
+}
+
+fn paragraph_re() -> Result<Regex> {
+    Regex::new(r"\r?\n\r?\n").map_err(Into::into)
 }
 
 /// A negative is exempt when its paragraph identifies a direct source or search surface.
@@ -112,22 +121,36 @@ fn is_closeable(doc: &Doc) -> bool {
 }
 
 /// Scan a document for universal negatives that do not name a direct source.
-fn scan_negatives(doc: &Doc, negative_re: &Regex, negatives: &mut Vec<String>) {
+fn scan_negatives(
+    doc: &Doc,
+    negative_re: &Regex,
+    paragraph_re: &Regex,
+    negatives: &mut Vec<String>,
+) -> Result<()> {
     if doc.rel.starts_with("raw") || doc.front.kind.as_deref() == Some("meeting") {
-        return;
+        return Ok(());
     }
     let mut line_number = 1usize;
-    for paragraph in doc.raw.split("\n\n") {
+    for paragraph in paragraph_re.split(&doc.raw) {
         if !has_tier1_marker(paragraph) {
-            if let Some(match_) = negative_re
-                .find_iter(paragraph)
-                .find(|match_| paragraph[..match_.start()].matches('"').count() % 2 == 0)
-            {
-                let snippet: String = paragraph[match_.start()..]
+            if let Some(match_) = negative_re.find_iter(paragraph).find(|match_| {
+                paragraph
+                    .get(..match_.start())
+                    .is_some_and(|before| before.matches('"').count() % 2 == 0)
+            }) {
+                let snippet: String = paragraph
+                    .get(match_.start()..)
+                    .ok_or_else(|| anyhow!("negative-claim match was not a paragraph boundary"))?
                     .chars()
                     .take(80)
-                    .collect::<String>()
-                    .replace('\n', " ");
+                    .map(|character| {
+                        if matches!(character, '\r' | '\n') {
+                            ' '
+                        } else {
+                            character
+                        }
+                    })
+                    .collect();
                 negatives.push(format!(
                     "{}:{} — \"{}\" (source it directly or identify the searched surface)",
                     doc.rel.to_string_lossy(),
@@ -138,6 +161,7 @@ fn scan_negatives(doc: &Doc, negative_re: &Regex, negatives: &mut Vec<String>) {
         }
         line_number += paragraph.matches('\n').count() + 2;
     }
+    Ok(())
 }
 
 /// Runs the structural sweep for a loaded tree.
@@ -151,32 +175,44 @@ fn scan_negatives(doc: &Doc, negative_re: &Regex, negatives: &mut Vec<String>) {
 )]
 pub fn run(tree: &Tree) -> Result<Findings> {
     let today = Utc::now().date_naive();
-    let wikilink_re = wikilink_re()?;
-    let known: HashSet<String> = tree
-        .docs
-        .iter()
-        .flat_map(|doc| doc.link_names(&tree.folder_notes))
-        .collect();
-
     let negative_re = negative_claim_re()?;
+    let paragraph_re = paragraph_re()?;
     let mut gaps = Vec::new();
+    let mut ambiguous = Vec::new();
     let mut negatives = Vec::new();
-    let mut linked: HashSet<&str> = HashSet::new();
-    for doc in &tree.docs {
-        for capture in wikilink_re.captures_iter(&doc.raw) {
-            let Some(target) = capture.get(1).map(|match_| match_.as_str().trim()) else {
-                continue;
-            };
-            if let Some(name) = known.get(target) {
-                linked.insert(name);
-            } else {
-                gaps.push(Gap {
-                    target: target.to_owned(),
+    let mut linked = HashSet::new();
+    for (from_position, doc) in tree.docs.iter().enumerate() {
+        for link in wikilinks(&doc.raw) {
+            match tree.resolve(doc, &link.target) {
+                Resolution::Found(position) if position != from_position => {
+                    linked.insert(position);
+                }
+                Resolution::Found(_) => {}
+                Resolution::Missing => gaps.push(Gap {
+                    target: link.target,
                     from: doc.rel.to_string_lossy().into_owned(),
-                });
+                }),
+                Resolution::Ambiguous(positions) => {
+                    let candidates = positions
+                        .into_iter()
+                        .map(|position| {
+                            tree.docs
+                                .get(position)
+                                .map(|candidate| candidate.rel.to_string_lossy().into_owned())
+                                .ok_or_else(|| {
+                                    anyhow!("resolver returned an invalid document position")
+                                })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    ambiguous.push(Ambiguous {
+                        target: link.target,
+                        from: doc.rel.to_string_lossy().into_owned(),
+                        candidates,
+                    });
+                }
             }
         }
-        scan_negatives(doc, &negative_re, &mut negatives);
+        scan_negatives(doc, &negative_re, &paragraph_re, &mut negatives)?;
     }
 
     let mut stale = Vec::new();
@@ -214,19 +250,15 @@ pub fn run(tree: &Tree) -> Result<Findings> {
     let orphans = tree
         .docs
         .iter()
-        .filter(|doc| {
-            doc.rel != Path::new("index.md")
-                && !doc
-                    .link_names(&tree.folder_notes)
-                    .iter()
-                    .any(|name| linked.contains(name.as_str()))
-        })
-        .map(|doc| doc.rel.to_string_lossy().into_owned())
+        .enumerate()
+        .filter(|(position, doc)| doc.rel != Path::new("index.md") && !linked.contains(position))
+        .map(|(_, doc)| doc.rel.to_string_lossy().into_owned())
         .collect();
 
     Ok(Findings {
         files: tree.docs.len(),
         gaps,
+        ambiguous,
         stale,
         untiered,
         unquoted,
@@ -250,18 +282,6 @@ mod tests {
         assert!(has_tier1_marker("no reply in the thread (tier 1)"));
         assert!(has_tier1_marker("searched the email archive: nothing"));
         assert!(!has_tier1_marker("the payment table is silent"));
-        Ok(())
-    }
-
-    #[test]
-    fn wikilink_pattern_extracts_targets_ignoring_alias_and_heading() -> Result<()> {
-        let re = wikilink_re()?;
-        let body = "see [[people/alice]] and [[a/b|Alice]] and [[c/d#Section]]";
-        let found: Vec<&str> = re
-            .captures_iter(body)
-            .filter_map(|capture| capture.get(1).map(|match_| match_.as_str()))
-            .collect();
-        assert_eq!(found, vec!["people/alice", "a/b", "c/d"]);
         Ok(())
     }
 
@@ -338,6 +358,14 @@ mod tests {
             }],
             ..Findings::default()
         };
+        let with_ambiguous = Findings {
+            ambiguous: vec![Ambiguous {
+                target: "note".to_owned(),
+                from: "reference.md".to_owned(),
+                candidates: vec!["a/note.md".to_owned(), "b/note.md".to_owned()],
+            }],
+            ..Findings::default()
+        };
         let with_untiered = Findings {
             untiered: vec!["meetings/example.md".to_owned()],
             ..Findings::default()
@@ -350,7 +378,13 @@ mod tests {
             orphans: vec!["notes/example.md".to_owned()],
             ..Findings::default()
         };
-        for findings in [with_gap, with_untiered, with_unquoted, with_orphan] {
+        for findings in [
+            with_gap,
+            with_ambiguous,
+            with_untiered,
+            with_unquoted,
+            with_orphan,
+        ] {
             assert!(!findings.structural_clean());
             assert!(!findings.clean());
         }

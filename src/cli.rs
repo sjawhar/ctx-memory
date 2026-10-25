@@ -19,7 +19,7 @@ use crate::open::{open_items, OpenItem};
 use crate::output::{self, Outcome};
 use crate::search;
 use crate::sweep::{self, Findings};
-use crate::tree::Doc;
+use crate::tree::{Doc, Resolution, Tree};
 
 #[derive(Parser)]
 #[command(name = "ctx", version, arg_required_else_help = true)]
@@ -205,12 +205,7 @@ fn run_dossier(context: &Context, entity: &str) -> Result<Outcome> {
     }
     let payload = DossierPayload {
         entity,
-        page: dossier_page(
-            &context.tree.docs,
-            &context.tree.index_by_name(),
-            entity,
-            &context.config.dossier.vitals,
-        ),
+        page: dossier_page(&context.tree, entity, &context.config.dossier.vitals),
         hits: search::dossier(&context.tree, entity),
     };
     output::emit(context.json, "dossier", &payload, |payload| {
@@ -220,13 +215,18 @@ fn run_dossier(context: &Context, entity: &str) -> Result<Outcome> {
 }
 
 fn dossier_page<'vitals, 'document>(
-    documents: &'document [Doc],
-    index: &std::collections::HashMap<String, usize>,
+    tree: &'document Tree,
     entity: &str,
     vital_fields: &'vitals [String],
 ) -> Option<DossierPage<'vitals, 'document>> {
-    let position = *index.get(entity)?;
-    let document = documents.get(position)?;
+    let position = tree
+        .docs
+        .iter()
+        .find_map(|from| match tree.resolve(from, entity) {
+            Resolution::Found(position) => Some(position),
+            Resolution::Missing | Resolution::Ambiguous(_) => None,
+        })?;
+    let document = tree.docs.get(position)?;
     let vitals = vital_fields
         .iter()
         .filter_map(|field| front_vital(document, field).map(|value| (field.as_str(), value)))
@@ -337,6 +337,26 @@ fn print_sweep(findings: &Findings) {
         );
         for gap in &findings.gaps {
             println!("  {}  <- {}", gap.target.yellow(), gap.from.dimmed());
+        }
+        println!();
+    }
+
+    if !findings.ambiguous.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "AMBIGUOUS — links with multiple files ({})",
+                findings.ambiguous.len()
+            )
+            .bold()
+        );
+        for ambiguous in &findings.ambiguous {
+            println!(
+                "  {}  <- {}  candidates={}",
+                ambiguous.target.yellow(),
+                ambiguous.from.dimmed(),
+                ambiguous.candidates.join(", ")
+            );
         }
         println!();
     }

@@ -1,13 +1,15 @@
 //! Loading and modelling a markdown context tree.
 
-use std::collections::{BTreeMap, HashMap};
+use std::borrow::Cow;
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use chrono::NaiveDate;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
+use serde_saphyr::Options;
 
 use crate::config::{TreeConfig, RULES_FILE};
 
@@ -61,13 +63,27 @@ impl Tier {
         }
     }
 
-    fn from_value(value: &serde_yaml::Value) -> Option<Self> {
+    fn from_value(value: &TierValue) -> Option<Self> {
         match value {
-            serde_yaml::Value::Number(number) => number.as_u64().and_then(Self::from_numeric),
-            serde_yaml::Value::String(name) => Self::from_name(name),
+            TierValue::Numeric(number) => Self::from_numeric(*number),
+            TierValue::Named(name) => Self::from_name(name),
+        }
+    }
+
+    fn from_json_value(value: &serde_json::Value) -> Option<Self> {
+        match value {
+            serde_json::Value::Number(number) => number.as_u64().and_then(Self::from_numeric),
+            serde_json::Value::String(name) => Self::from_name(name),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TierValue {
+    Numeric(u64),
+    Named(String),
 }
 
 impl<'de> Deserialize<'de> for Tier {
@@ -75,7 +91,7 @@ impl<'de> Deserialize<'de> for Tier {
     where
         D: Deserializer<'de>,
     {
-        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let value = TierValue::deserialize(deserializer)?;
         Self::from_value(&value).ok_or_else(|| D::Error::custom("invalid authority tier"))
     }
 }
@@ -106,12 +122,12 @@ pub struct Front {
     pub last_reviewed: Option<NaiveDate>,
     #[serde(default)]
     pub aliases: Vec<String>,
-    tier: Option<serde_yaml::Value>,
-    source_tier: Option<serde_yaml::Value>,
+    tier: Option<TierValue>,
+    source_tier: Option<TierValue>,
     #[serde(default)]
-    sources: Vec<BTreeMap<String, serde_yaml::Value>>,
+    sources: Vec<BTreeMap<String, serde_json::Value>>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_yaml::Value>,
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl Front {
@@ -125,7 +141,7 @@ impl Front {
         let nested = self
             .sources
             .iter()
-            .filter_map(|source| source.get("tier").and_then(Tier::from_value))
+            .filter_map(|source| source.get("tier").and_then(Tier::from_json_value))
             .min();
         match (direct, nested) {
             (Some(first), Some(second)) => Some(first.min(second)),
@@ -155,7 +171,7 @@ impl Front {
 
     /// Returns a string-valued frontmatter field that is not part of the generic schema.
     pub fn extra_str(&self, key: &str) -> Option<&str> {
-        self.extra.get(key).and_then(serde_yaml::Value::as_str)
+        self.extra.get(key).and_then(serde_json::Value::as_str)
     }
 }
 
@@ -172,7 +188,8 @@ pub struct Doc {
 impl Doc {
     #[must_use]
     pub fn body(&self) -> &str {
-        self.raw.get(self.body_start..).unwrap_or_default()
+        let (_, body) = self.raw.split_at(self.body_start);
+        body
     }
 
     #[must_use]
@@ -180,17 +197,21 @@ impl Doc {
         self.rel.with_extension("").to_string_lossy().into_owned()
     }
 
+    fn is_folder_note(&self, folder_notes: &[String]) -> bool {
+        self.rel.file_name().is_some_and(|file_name| {
+            let file_name = file_name.to_string_lossy();
+            folder_notes
+                .iter()
+                .any(|folder_note| folder_note == &file_name)
+        })
+    }
+
     /// Wikilink targets this document answers to: its relative stem and, for configured
     /// folder-note file names, its containing directory.
     #[must_use]
     pub fn link_names(&self, folder_notes: &[String]) -> Vec<String> {
         let mut names = vec![self.stem()];
-        let is_folder_note = self.rel.file_name().is_some_and(|file_name| {
-            let file_name = file_name.to_string_lossy();
-            folder_notes
-                .iter()
-                .any(|folder_note| folder_note == &file_name)
-        });
+        let is_folder_note = self.is_folder_note(folder_notes);
         if is_folder_note {
             if let Some(directory) = self.rel.parent() {
                 names.push(directory.to_string_lossy().into_owned());
@@ -216,24 +237,205 @@ impl Doc {
     }
 }
 
+/// A parsed Obsidian-style wikilink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wikilink {
+    pub target: String,
+    pub heading: Option<String>,
+    pub alias: Option<String>,
+    pub embed: bool,
+    pub start: usize,
+}
+
+/// Parses wikilinks from Markdown and frontmatter text.
+#[must_use]
+pub fn wikilinks(text: &str) -> Vec<Wikilink> {
+    let mut links = Vec::new();
+    let mut offset = 0;
+    while let Some(relative_open) = text
+        .get(offset..)
+        .and_then(|remaining| remaining.find("[["))
+    {
+        let open = offset + relative_open;
+        let after_open = open + "[[".len();
+        let Some(relative_close) = text
+            .get(after_open..)
+            .and_then(|remaining| remaining.find("]]"))
+        else {
+            break;
+        };
+        let close = after_open + relative_close;
+        offset = close + "]]".len();
+
+        let Some(content) = text.get(after_open..close) else {
+            continue;
+        };
+        if content.contains('[') || content.contains(']') {
+            continue;
+        }
+        let (target_and_heading, alias) = match content.split_once('|') {
+            Some((target, alias)) if !alias.is_empty() => (target, Some(alias.to_owned())),
+            Some(_) => continue,
+            None => (content, None),
+        };
+        let (target, heading) = match target_and_heading.split_once('#') {
+            Some((target, heading)) if !heading.is_empty() => (target, Some(heading.to_owned())),
+            Some(_) => continue,
+            None => (target_and_heading, None),
+        };
+        let target = target.trim();
+        let target = target.strip_suffix('\\').unwrap_or(target).trim();
+        let target = strip_markdown_suffix(target).trim();
+        if target.is_empty() {
+            continue;
+        }
+
+        let embed = text
+            .get(..open)
+            .and_then(|before| before.chars().next_back())
+            .is_some_and(|character| character == '!');
+        links.push(Wikilink {
+            target: target.to_owned(),
+            heading,
+            alias,
+            embed,
+            start: if embed {
+                open.saturating_sub('!'.len_utf8())
+            } else {
+                open
+            },
+        });
+    }
+    links
+}
+
+/// The result of resolving a wikilink target within a tree.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resolution {
+    Found(usize),
+    Missing,
+    Ambiguous(Vec<usize>),
+}
+
 pub struct Tree {
     pub root: PathBuf,
     pub docs: Vec<Doc>,
     pub(crate) folder_notes: Vec<String>,
 }
 
-/// Split a file into its YAML frontmatter and the byte offset of its markdown body.
-fn split_front(text: &str) -> (Option<&str>, usize) {
-    let Some(rest) = text.strip_prefix("---\n") else {
+/// Split a file into normalized YAML frontmatter and the byte offset of its Markdown body.
+fn split_front(text: &str) -> (Option<Cow<'_, str>>, usize) {
+    let without_bom = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let bom_len = text.len().saturating_sub(without_bom.len());
+    let (frontmatter, opening_len) = if let Some(rest) = without_bom.strip_prefix("---\r\n") {
+        (rest, "---\r\n".len())
+    } else if let Some(rest) = without_bom.strip_prefix("---\n") {
+        (rest, "---\n".len())
+    } else {
         return (None, 0);
     };
-    match rest.find("\n---") {
-        Some(end) => {
-            let body_start = "---\n".len() + end + "\n---".len();
-            (Some(&rest[..end]), body_start)
+
+    let mut frontmatter_len = 0;
+    for line in frontmatter.split_inclusive('\n') {
+        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let closing_candidate = line_without_newline
+            .strip_suffix('\r')
+            .unwrap_or(line_without_newline);
+        if closing_candidate == "---" {
+            let (front, _) = frontmatter.split_at(frontmatter_len);
+            let front = if front.contains("\r\n") {
+                Cow::Owned(front.replace("\r\n", "\n"))
+            } else {
+                Cow::Borrowed(front)
+            };
+            return (
+                Some(front),
+                bom_len + opening_len + frontmatter_len + line.len(),
+            );
         }
-        None => (None, 0),
+        frontmatter_len += line.len();
     }
+    (None, 0)
+}
+
+fn yaml_options() -> Options {
+    let mut options = Options::default();
+    options.strict_booleans = true;
+    options
+}
+
+fn parse_front(raw: &str, path: &Path) -> Result<Front> {
+    serde_saphyr::from_str_with_options(raw, yaml_options())
+        .with_context(|| format!("parsing frontmatter in {}", path.display()))
+}
+
+fn strip_markdown_suffix(target: &str) -> &str {
+    target.strip_suffix(".md").unwrap_or(target)
+}
+
+fn relative_target(from: &Doc, target: &str) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in from.rel.parent().unwrap_or(Path::new("")).components() {
+        if let Component::Normal(part) = component {
+            relative.push(part);
+        }
+    }
+    for component in Path::new(target).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !relative.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => relative.push(part),
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(relative)
+}
+
+fn names_match(left: &str, right: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn document_link_name_matches(
+    doc: &Doc,
+    target: &str,
+    folder_notes: &[String],
+    case_insensitive: bool,
+) -> bool {
+    let relative_path = doc.rel.to_string_lossy();
+    let stem = relative_path
+        .strip_suffix(".md")
+        .unwrap_or(relative_path.as_ref());
+    if names_match(stem, target, case_insensitive) {
+        return true;
+    }
+    doc.is_folder_note(folder_notes)
+        && doc.rel.parent().is_some_and(|directory| {
+            names_match(
+                directory.to_string_lossy().as_ref(),
+                target,
+                case_insensitive,
+            )
+        })
+}
+fn has_path_suffix(path: &str, suffix: &str) -> bool {
+    let Some(start) = path.len().checked_sub(suffix.len()) else {
+        return false;
+    };
+    path.get(start..).is_some_and(|end| {
+        end.eq_ignore_ascii_case(suffix)
+            && (start == 0
+                || path
+                    .get(..start)
+                    .is_some_and(|prefix| prefix.ends_with('/')))
+    })
 }
 
 impl Tree {
@@ -248,9 +450,18 @@ impl Tree {
             .canonicalize()
             .with_context(|| format!("no markdown tree at {}", root.display()))?;
         let mut docs = Vec::new();
-        for entry in walkdir::WalkDir::new(&root).sort_by_file_name() {
+        let mut builder = ignore::WalkBuilder::new(&root);
+        builder
+            .sort_by_file_name(std::cmp::Ord::cmp)
+            .require_git(false)
+            .hidden(true);
+        let walker = builder.build();
+        for entry in walker {
             let entry = entry.with_context(|| format!("walking {}", root.display()))?;
-            if !entry.file_type().is_file() {
+            if entry
+                .file_type()
+                .is_none_or(|file_type| !file_type.is_file())
+            {
                 continue;
             }
             let path = entry.path();
@@ -260,13 +471,16 @@ impl Tree {
             let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let (frontmatter, body_start) = split_front(&raw);
-            let front = match frontmatter {
-                Some(frontmatter) => serde_yaml::from_str(frontmatter)
-                    .with_context(|| format!("parsing frontmatter in {}", path.display()))?,
-                None => Front::default(),
-            };
+            let front = frontmatter.map_or_else(
+                || Ok(Front::default()),
+                |frontmatter| parse_front(frontmatter.as_ref(), path),
+            )?;
+            let rel = path
+                .strip_prefix(&root)
+                .with_context(|| format!("deriving a tree-relative path for {}", path.display()))?
+                .to_path_buf();
             docs.push(Doc {
-                rel: path.strip_prefix(&root).unwrap_or(path).to_path_buf(),
+                rel,
                 front,
                 raw,
                 body_start,
@@ -279,12 +493,99 @@ impl Tree {
         })
     }
 
+    fn resolve_matching(&self, predicate: impl Fn(&Doc) -> bool) -> Resolution {
+        let mut positions = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter_map(|(position, doc)| predicate(doc).then_some(position));
+        let Some(first) = positions.next() else {
+            return Resolution::Missing;
+        };
+        let Some(second) = positions.next() else {
+            return Resolution::Found(first);
+        };
+        let mut candidates = vec![first, second];
+        candidates.extend(positions);
+        Resolution::Ambiguous(candidates)
+    }
+
+    /// Resolves a target using path, relative-path, case-insensitive, and unique-shortest forms.
+    #[must_use]
+    pub fn resolve(&self, from: &Doc, target: &str) -> Resolution {
+        match self.resolve_matching(|doc| doc.rel == Path::new(target)) {
+            Resolution::Missing => {}
+            resolution => return resolution,
+        }
+
+        let target_without_suffix = strip_markdown_suffix(target);
+        match self.resolve_matching(|doc| {
+            document_link_name_matches(doc, target_without_suffix, &self.folder_notes, false)
+        }) {
+            Resolution::Missing => {}
+            resolution => return resolution,
+        }
+
+        if let Some(relative) = relative_target(from, target) {
+            let relative = relative.to_string_lossy();
+            let relative_without_suffix = strip_markdown_suffix(&relative);
+            match self.resolve_matching(|doc| {
+                names_match(doc.rel.to_string_lossy().as_ref(), relative.as_ref(), false)
+                    || document_link_name_matches(
+                        doc,
+                        relative_without_suffix,
+                        &self.folder_notes,
+                        false,
+                    )
+            }) {
+                Resolution::Missing => {}
+                resolution => return resolution,
+            }
+        }
+
+        match self.resolve_matching(|doc| {
+            names_match(doc.rel.to_string_lossy().as_ref(), target, true)
+                || document_link_name_matches(doc, target_without_suffix, &self.folder_notes, true)
+        }) {
+            Resolution::Missing => {}
+            resolution => return resolution,
+        }
+
+        let target_basename = Path::new(target_without_suffix)
+            .file_name()
+            .and_then(|name| name.to_str());
+        self.resolve_matching(|doc| {
+            let relative_path = doc.rel.to_string_lossy();
+            let stem = relative_path
+                .strip_suffix(".md")
+                .unwrap_or(relative_path.as_ref());
+            target_basename.is_some_and(|basename| {
+                Path::new(stem)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| names_match(name, basename, true))
+            }) || has_path_suffix(stem, target_without_suffix)
+        })
+    }
+
     #[must_use]
     pub fn index_by_name(&self) -> HashMap<String, usize> {
         let mut index = HashMap::new();
+        let mut duplicates = HashSet::new();
         for (position, doc) in self.docs.iter().enumerate() {
             for name in doc.link_names(&self.folder_notes) {
-                index.insert(name, position);
+                if duplicates.contains(&name) {
+                    continue;
+                }
+                match index.entry(name) {
+                    Entry::Occupied(entry) => {
+                        let (name, _) = entry.remove_entry();
+                        duplicates.insert(name);
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(position);
+                    }
+                }
             }
         }
         index
@@ -307,7 +608,7 @@ mod tests {
 
     use crate::config::TreeConfig;
 
-    use super::{Tier, Tree};
+    use super::{split_front, wikilinks, Front, Tier, Tree};
 
     static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -323,6 +624,35 @@ mod tests {
 
     fn remove_test_root(root: &Path) -> Result<()> {
         std::fs::remove_dir_all(root).with_context(|| format!("removing {}", root.display()))
+    }
+
+    fn front_and_body(text: &str) -> (Option<String>, &str) {
+        let (front, body_start) = split_front(text);
+        (
+            front.map(std::borrow::Cow::into_owned),
+            text.get(body_start..).unwrap_or_default(),
+        )
+    }
+
+    fn parse_front(text: &str, path: &Path) -> Result<Front> {
+        let root = test_root("parse-front")?;
+        let document = root.join(path);
+        let parent = document
+            .parent()
+            .ok_or_else(|| anyhow!("test document has no parent"))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::write(&document, format!("---\n{text}---\nbody\n"))
+            .with_context(|| format!("writing {}", document.display()))?;
+        let result = Tree::load(&root, &TreeConfig::default()).and_then(|tree| {
+            tree.docs
+                .into_iter()
+                .next()
+                .map(|doc| doc.front)
+                .ok_or_else(|| anyhow!("frontmatter document was not loaded"))
+        });
+        remove_test_root(&root)?;
+        result
     }
 
     #[test]
@@ -358,27 +688,79 @@ mod tests {
     }
 
     #[test]
-    fn parses_canonical_and_legacy_tier_names() -> Result<()> {
+    fn crlf_frontmatter_is_parsed() {
+        let (front, body) =
+            front_and_body("---\r\ntype: decision\r\nstatus: open\r\n---\r\nbody\r\n");
+        assert_eq!(front, Some("type: decision\nstatus: open\n".to_owned()));
+        assert_eq!(body.trim(), "body");
+    }
+
+    #[test]
+    fn four_dashes_do_not_close_frontmatter() {
+        assert_eq!(front_and_body("---\ntype: decision\n----\nbody\n").0, None);
+    }
+
+    #[test]
+    fn bom_does_not_hide_frontmatter() {
+        assert!(front_and_body("\u{feff}---\ntype: decision\n---\nx\n")
+            .0
+            .is_some());
+    }
+
+    #[test]
+    fn quoted_numeral_tier_is_a_tier() -> Result<()> {
+        let front = parse_front("type: meeting\ntier: \"1\"\n", Path::new("m.md"))?;
+        assert_eq!(front.best_tier(), Some(Tier::External));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_and_neutral_tier_names_agree() -> Result<()> {
         for (value, expected) in [
-            ("external", Tier::External),
             ("counterparty", Tier::External),
-            ("internal", Tier::Internal),
+            ("external", Tier::External),
             ("principal", Tier::Internal),
-            ("summary", Tier::Summary),
-            ("recollection", Tier::Recollection),
-            ("1", Tier::External),
-            ("2", Tier::Internal),
-            ("3", Tier::Summary),
-            ("4", Tier::Recollection),
-            ("\"1\"", Tier::External),
-            ("\"2\"", Tier::Internal),
-            ("\"3\"", Tier::Summary),
-            ("\"4\"", Tier::Recollection),
+            ("internal", Tier::Internal),
         ] {
-            let frontmatter = format!("tier: {value}\n");
-            let tree = serde_yaml::from_str::<super::Front>(&frontmatter)?;
-            assert_eq!(tree.best_tier(), Some(expected));
+            let front = parse_front(&format!("tier: {value}\n"), Path::new("x.md"))?;
+            assert_eq!(front.best_tier(), Some(expected));
         }
         Ok(())
+    }
+
+    #[test]
+    fn yaml_1_1_booleans_stay_strings() -> Result<()> {
+        let front = parse_front("status: no\n", Path::new("x.md"))?;
+        assert_eq!(front.status.as_deref(), Some("no"));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_keys_are_an_error_naming_the_file() -> Result<()> {
+        let error = parse_front("type: a\ntype: b\n", Path::new("dup.md"))
+            .err()
+            .ok_or_else(|| anyhow!("duplicate frontmatter keys unexpectedly loaded"))?;
+        assert!(format!("{error:#}").contains("dup.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn wikilink_forms() {
+        let got: Vec<_> = wikilinks("[[a]] [[b|B]] [[c#h]] [[d.md]] [[e\\|E]] ![[f]] [[ g ]]")
+            .into_iter()
+            .map(|link| (link.target, link.heading, link.alias.is_some(), link.embed))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_owned(), None, false, false),
+                ("b".to_owned(), None, true, false),
+                ("c".to_owned(), Some("h".to_owned()), false, false),
+                ("d".to_owned(), None, false, false),
+                ("e".to_owned(), None, true, false),
+                ("f".to_owned(), None, false, true),
+                ("g".to_owned(), None, false, false),
+            ]
+        );
     }
 }

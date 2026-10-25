@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context as _, Result};
 use chrono::NaiveDate;
-use ctx_memory::{config::TreeConfig, open::open_items, tree::Tree};
+use ctx_memory::{config::TreeConfig, open::open_items, search, tree::Tree};
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -75,5 +75,29 @@ fn folder_aliases_require_an_explicit_file_name() -> Result<()> {
         doc.link_names(&["index.md".to_owned()]),
         vec!["decisions/index", "decisions"]
     );
+    Ok(())
+}
+
+#[test]
+fn dossier_follows_resolved_wikilinks() -> Result<()> {
+    let root = test_root("dossier-links")?;
+    let entities = root.join("entities");
+    let records = root.join("records");
+    std::fs::create_dir_all(&entities)
+        .with_context(|| format!("creating {}", entities.display()))?;
+    std::fs::create_dir_all(&records).with_context(|| format!("creating {}", records.display()))?;
+    std::fs::write(entities.join("alice.md"), "# Alice\n")
+        .with_context(|| format!("writing {}", entities.display()))?;
+    std::fs::write(
+        records.join("reference.md"),
+        "This record links to [[ALICE]] without naming the tree-relative path.\n",
+    )
+    .with_context(|| format!("writing {}", records.display()))?;
+
+    let tree = Tree::load(&root, &TreeConfig::default())?;
+    remove_test_root(&root)?;
+
+    let hits = search::dossier(&tree, "entities/alice");
+    assert!(hits.iter().any(|hit| hit.path == "records/reference.md"));
     Ok(())
 }

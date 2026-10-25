@@ -116,6 +116,30 @@ fn rules_prints_the_rules_page() -> Result<()> {
 }
 
 #[test]
+fn dossier_page_resolves_a_unique_basename() -> Result<()> {
+    let tree = fixture_tree()?;
+    let entities = tree.join("entities");
+    std::fs::create_dir(&entities).with_context(|| format!("creating {}", entities.display()))?;
+    std::fs::write(
+        entities.join("alice.md"),
+        "---\ntitle: Alice\n---\n# Alice\n",
+    )
+    .with_context(|| format!("writing {}", entities.display()))?;
+
+    let value = ctx(&tree, &["--json", "dossier", "alice"])?;
+    remove_scratch(&tree)?;
+
+    assert_eq!(
+        value
+            .get("data")
+            .and_then(|data| data.get("page"))
+            .and_then(|page| page.get("path")),
+        Some(&serde_json::json!("entities/alice.md"))
+    );
+    Ok(())
+}
+
+#[test]
 fn unknown_command_runs_ctx_dash_name_from_path_with_context_env() -> Result<()> {
     let bin = scratch()?;
     let executable = bin.join("ctx-hello");
