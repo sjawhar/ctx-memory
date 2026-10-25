@@ -1,12 +1,13 @@
 //! Open-item retrieval.
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 
 use anyhow::{anyhow, bail, Result};
 use chrono::NaiveDate;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::delta::Staleness;
 use crate::schema::{today_utc, OPEN_KINDS, OPEN_STATES};
 use crate::tree::{wikilinks, Doc, Resolution, Tree};
 
@@ -53,7 +54,7 @@ pub struct OpenItemView {
     pub days_overdue: Option<i64>,
     pub title: String,
     pub opened: Option<NaiveDate>,
-    pub unreviewed: Option<Vec<Value>>,
+    pub unreviewed: Option<Vec<Staleness>>,
 }
 
 /// Returns the currently open items using today's UTC date.
@@ -122,6 +123,12 @@ pub fn open_items_with_filters(
     }
     sort_items(&mut items);
     Ok(items)
+}
+/// Adds current unreviewed-reply flags to open-item views.
+pub fn apply_staleness(items: &mut [OpenItemView], stale: &BTreeMap<String, Vec<Staleness>>) {
+    for item in items {
+        item.unreviewed = stale.get(&item.path).cloned();
+    }
 }
 
 fn is_open(document: &Doc) -> bool {

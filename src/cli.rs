@@ -16,8 +16,11 @@ use serde::Serialize;
 use crate::config::{locate_tree, state_base, TreeConfig, UserConfig};
 use crate::context::Context;
 use crate::cursor::{self, AdvanceOutcome, Cursors};
+use crate::delta;
 use crate::fetch::{self, FetchOptions};
-use crate::open::{open_items_with_filters, parse_linked, LinkedFilter, OpenItemView};
+use crate::open::{
+    apply_staleness, open_items_with_filters, parse_linked, LinkedFilter, OpenItemView,
+};
 use crate::output::{self, Outcome};
 use crate::resolve::{self, Resolved, Verification};
 use crate::schema::today_utc;
@@ -93,6 +96,14 @@ pub enum Command {
         #[arg(long = "source", value_name = "ID", num_args = 1..)]
         source: Vec<String>,
     },
+    /// Inspect or write a window's record delta.
+    Delta {
+        #[arg(long)]
+        window: Option<String>,
+        #[arg(long)]
+        write: bool,
+    },
+
     /// Inspect or advance durable source cursors.
     Cursor {
         #[command(subcommand)]
@@ -173,6 +184,7 @@ impl Command {
             Self::Dossier { .. } => "dossier".to_owned(),
             Self::Open { .. } => "open".to_owned(),
             Self::Fetch { .. } => "fetch".to_owned(),
+            Self::Delta { .. } => "delta".to_owned(),
             Self::Cursor {
                 command: CursorCommand::Show,
             } => "cursor show".to_owned(),
@@ -237,6 +249,13 @@ struct FetchPayload<'a> {
     window: &'a str,
     exit_status: Status,
     sources: &'a BTreeMap<String, SourceManifest>,
+    delta: FetchDeltaPayload,
+}
+
+#[derive(Serialize)]
+struct FetchDeltaPayload {
+    summary: String,
+    new_messages: usize,
 }
 
 #[derive(Serialize)]
@@ -283,12 +302,14 @@ pub fn run(cli: &Cli) -> Result<Outcome> {
         }
         Command::Dossier { entity } => run_dossier(&context, entity),
         Command::Open { linked, owner } => {
-            if !context.config.sources.is_empty() {
-                context.state()?;
-            }
-            let payload = OpenPayload {
-                items: open_items_with_filters(&context.tree, linked, owner)?,
+            let stale = if context.config.sources.is_empty() {
+                BTreeMap::new()
+            } else {
+                delta::staleness(&context.state()?.windows(), &context.tree)?
             };
+            let mut items = open_items_with_filters(&context.tree, linked, owner)?;
+            apply_staleness(&mut items, &stale);
+            let payload = OpenPayload { items };
             output::emit(context.json, "open", &payload, |payload| {
                 print_open(&payload.items);
             })?;
@@ -301,6 +322,7 @@ pub fn run(cli: &Cli) -> Result<Outcome> {
                 only: source.clone(),
             },
         ),
+        Command::Delta { window, write } => run_delta(&context, window.as_deref(), *write),
         Command::Cursor { command } => run_cursor(&context, command),
         Command::Resolve { thread, pointers } => run_resolve(&context, pointers, *thread),
         Command::Cite {
@@ -385,6 +407,10 @@ fn run_fetch(context: &Context, options: &FetchOptions) -> Result<Outcome> {
         window: outcome.window.id.as_str(),
         exit_status: outcome.manifest.exit_status,
         sources: &outcome.manifest.sources,
+        delta: FetchDeltaPayload {
+            summary: delta::summary(&outcome.delta),
+            new_messages: outcome.delta.new_messages.len(),
+        },
     };
     output::emit(context.json, "fetch", &payload, print_fetch)?;
     Ok(if outcome.errored.is_empty() {
@@ -392,6 +418,31 @@ fn run_fetch(context: &Context, options: &FetchOptions) -> Result<Outcome> {
     } else {
         Outcome::SourceErrors
     })
+}
+
+fn run_delta(context: &Context, requested: Option<&str>, write: bool) -> Result<Outcome> {
+    let state = context.state()?;
+    let directory = windows::resolve_arg(requested.unwrap_or("newest"), &state.windows())?;
+    let window = Window::open(directory)?;
+    let previous = windows::previous(&state.windows(), &window.id)?;
+    let schemes = source::configured_schemes(&context.config.sources)?;
+    let owners = delta::Owners::discover(&context.tree, &context.config.sources);
+    let snapshot = delta::open_snapshot(&context.tree, Utc::now());
+    let computed = delta::compute(
+        &context.tree,
+        &schemes,
+        &owners,
+        &window,
+        previous.as_ref(),
+        snapshot.generated_at,
+    )?;
+    if write {
+        delta::write(&window, &snapshot, &computed)?;
+    }
+    output::emit(context.json, "delta", &computed, |delta| {
+        println!("{}", delta::render(delta));
+    })?;
+    Ok(Outcome::Pass)
 }
 
 fn run_cursor(context: &Context, command: &CursorCommand) -> Result<Outcome> {
@@ -752,7 +803,17 @@ fn print_open(items: &[OpenItemView]) {
             item.owner.as_deref().unwrap_or("unassigned").dimmed()
         );
         println!("     {}", item.title);
-        println!("     {}\n", item.path.dimmed());
+        println!("     {}", item.path.dimmed());
+        if let Some(unreviewed) = item.unreviewed.as_deref() {
+            for reply in unreviewed {
+                let same_day = if reply.same_day { " (same day)" } else { "" };
+                println!(
+                    "     unreviewed {} {} ({}){}",
+                    reply.ts, reply.pointer, reply.how, same_day
+                );
+            }
+        }
+        println!();
     }
 }
 

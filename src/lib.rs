@@ -6,6 +6,7 @@ pub mod cli;
 pub mod config;
 pub mod context;
 pub mod cursor;
+pub mod delta;
 pub mod fetch;
 pub mod open;
 pub mod output;

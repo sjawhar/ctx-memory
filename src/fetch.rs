@@ -11,6 +11,7 @@ use crate::atomic::write_replace;
 use crate::config::{SourceConfig, StateDir};
 use crate::context::Context;
 use crate::cursor::{self, Cursors};
+use crate::delta::{self, Delta};
 use crate::record::Record;
 use crate::render;
 use crate::source::{
@@ -34,6 +35,7 @@ pub struct FetchOptions {
 pub struct FetchOutcome {
     pub window: Window,
     pub manifest: Manifest,
+    pub delta: Delta,
     pub errored: Vec<(String, String)>,
 }
 
@@ -92,12 +94,24 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
         exit_status,
     };
     write_window(&staged, &records, &manifest)?;
-
-    // Additional window artifacts are written after the base files and before this completion rename.
+    let previous = windows::previous(&state.windows(), &staged.id)?;
+    let owners = delta::Owners::discover(&context.tree, &context.config.sources);
+    let snapshot = delta::open_snapshot(&context.tree, generated_at);
+    let delta = delta::compute(
+        &context.tree,
+        &schemes,
+        &owners,
+        &staged,
+        previous.as_ref(),
+        generated_at,
+    )?;
+    // Write delta.json, delta.md, and open-snapshot.json before completing the staged window.
+    delta::write(&staged, &snapshot, &delta)?;
     let window = windows::complete(staged, &state.windows())?;
     Ok(FetchOutcome {
         window,
         manifest,
+        delta,
         errored,
     })
 }
