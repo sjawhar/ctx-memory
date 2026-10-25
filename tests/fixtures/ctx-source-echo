@@ -30,6 +30,9 @@ if [ "$op" = "resolve" ]; then
     for pointer in $pointers; do
         stream=${pointer#*:}
         printf '{"type":"record","pointer":"%s","stream":"%s","ts":"1970-01-01T00:00:00Z","text":"echo %s","raw":null}\n' "$pointer" "$stream" "$pointer"
+        if [ "${ECHO_THREAD_SIBLING-}" = "1" ]; then
+            printf '{"type":"record","pointer":"%s/sibling","stream":"%s","thread":"%s","ts":"1970-01-01T00:00:01Z","text":"live sibling evidence","raw":null}\n' "$pointer" "$stream" "$pointer"
+        fi
     done
     exit 0
 fi

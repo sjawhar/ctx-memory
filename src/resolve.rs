@@ -52,22 +52,32 @@ struct ResolvedText {
     source_error: Option<String>,
 }
 
+struct QuoteSource {
+    pointer: Pointer,
+    start: usize,
+    text: String,
+}
+
 #[derive(Clone, Copy)]
 enum ResolutionMode {
     Resolve,
-    Verify { live: bool },
+    Verify { live: bool, refresh: bool },
 }
 
 impl ResolutionMode {
     const fn live(self) -> bool {
         match self {
             Self::Resolve => true,
-            Self::Verify { live } => live,
+            Self::Verify { live, .. } => live,
         }
     }
 
     const fn needs_verbatim(self) -> bool {
         matches!(self, Self::Verify { .. })
+    }
+
+    const fn force_live(self) -> bool {
+        matches!(self, Self::Verify { refresh: true, .. })
     }
 }
 
@@ -139,21 +149,20 @@ fn verify_document(
     verification: &mut Verification,
 ) -> Result<()> {
     let source_pointers = source_pointers(document, schemes)?;
-    let mut source_location = None;
     let mut has_verbatim_source = false;
-    let mut source_thread_texts = Vec::new();
+    let mut quote_sources = Vec::new();
     for found in schemes.find_all(&document.raw) {
         let is_source_pointer = source_pointers.contains(&found.pointer);
-        if is_source_pointer && source_location.is_none() {
-            source_location = Some((found.pointer.to_string(), found.start));
-        }
         let resolved = resolve_with_live(
             context,
             store,
             schemes,
             &found.pointer,
             false,
-            ResolutionMode::Verify { live },
+            ResolutionMode::Verify {
+                live,
+                refresh: false,
+            },
         )?;
         if is_source_pointer && resolved.verbatim {
             has_verbatim_source = true;
@@ -192,7 +201,10 @@ fn verify_document(
                 schemes,
                 &found.pointer,
                 true,
-                ResolutionMode::Verify { live },
+                ResolutionMode::Verify {
+                    live,
+                    refresh: false,
+                },
             )?;
             if let Some(error) = thread_resolved.source_error {
                 verification.source_errors = true;
@@ -204,29 +216,89 @@ fn verify_document(
                 });
                 continue;
             }
-            source_thread_texts.push(
-                local_records(store, schemes, &found.pointer, true)?
+            if !quote_sources
+                .iter()
+                .any(|source: &QuoteSource| source.pointer == found.pointer)
+            {
+                let text = local_records(store, schemes, &found.pointer, true)?
                     .into_iter()
                     .map(|record| record.text)
                     .collect::<Vec<_>>()
-                    .join("\n"),
-            );
+                    .join("\n");
+                quote_sources.push(QuoteSource {
+                    pointer: found.pointer,
+                    start: found.start,
+                    text,
+                });
+            }
         }
     }
-    verify_quote(
+    refresh_quote_sources(
+        context,
+        store,
+        schemes,
         document,
-        &source_thread_texts,
-        source_location,
-        has_verbatim_source,
+        live,
+        &mut quote_sources,
         verification,
-    );
+    )?;
+    verify_quote(document, &quote_sources, has_verbatim_source, verification);
+    Ok(())
+}
+
+fn refresh_quote_sources(
+    context: &Context,
+    store: &Store,
+    schemes: &Schemes,
+    document: &Doc,
+    live: bool,
+    quote_sources: &mut [QuoteSource],
+    verification: &mut Verification,
+) -> Result<()> {
+    let Some(quote) = document.front.quote.as_deref() else {
+        return Ok(());
+    };
+    if !live
+        || quote_sources
+            .iter()
+            .any(|source| quote_matches(&source.text, quote))
+    {
+        return Ok(());
+    }
+    for source in quote_sources {
+        let resolved = resolve_with_live(
+            context,
+            store,
+            schemes,
+            &source.pointer,
+            true,
+            ResolutionMode::Verify {
+                live,
+                refresh: true,
+            },
+        )?;
+        if let Some(error) = resolved.source_error {
+            verification.source_errors = true;
+            verification.broken.push(Broken {
+                file: document.rel.to_string_lossy().into_owned(),
+                line: line_number(&document.raw, source.start),
+                pointer: source.pointer.to_string(),
+                why: error,
+            });
+            continue;
+        }
+        source.text = local_records(store, schemes, &source.pointer, true)?
+            .into_iter()
+            .map(|record| record.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
     Ok(())
 }
 
 fn verify_quote(
     document: &Doc,
-    source_thread_texts: &[String],
-    source_location: Option<(String, usize)>,
+    quote_sources: &[QuoteSource],
     has_verbatim_source: bool,
     verification: &mut Verification,
 ) {
@@ -237,18 +309,20 @@ fn verify_quote(
         verification.quotes_unchecked += 1;
         return;
     }
-    if source_thread_texts.is_empty()
-        || source_thread_texts
+    if quote_sources.is_empty()
+        || quote_sources
             .iter()
-            .any(|text| quote_matches(text, quote))
+            .any(|source| quote_matches(&source.text, quote))
     {
         return;
     }
-    let (pointer, start) = source_location.unwrap_or_else(|| (String::new(), 0));
+    let Some(source) = quote_sources.first() else {
+        return;
+    };
     verification.broken.push(Broken {
         file: document.rel.to_string_lossy().into_owned(),
-        line: line_number(&document.raw, start),
-        pointer,
+        line: line_number(&document.raw, source.start),
+        pointer: source.pointer.to_string(),
         why: "quote does not appear in the resolved text".to_owned(),
     });
 }
@@ -286,7 +360,8 @@ fn resolve_with_live(
     let text = resolve_local(store, schemes, pointer, thread)?;
     let live = mode.live();
     let needs_verbatim = mode.needs_verbatim();
-    let source = (text.is_none() || needs_verbatim)
+    let force_live = mode.force_live();
+    let source = (text.is_none() || needs_verbatim || force_live)
         .then(|| source_for_scheme(context, &pointer.scheme))
         .transpose()?
         .flatten();
@@ -304,7 +379,7 @@ fn resolve_with_live(
         && text.is_some()
         && source.is_some_and(|source| !is_builtin_source(source))
         && source_verbatim.is_none();
-    if (text.is_some() && !needs_verbatim_hello) || !live {
+    if (text.is_some() && !needs_verbatim_hello && !force_live) || !live {
         return Ok(ResolvedText {
             text,
             verbatim: source_verbatim.unwrap_or(default_verbatim),

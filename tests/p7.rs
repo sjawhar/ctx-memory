@@ -203,6 +203,14 @@ fn response_data(output: &std::process::Output) -> Result<Value> {
     serde_json::from_slice(&output.stdout).context("parsing ctx JSON output")
 }
 
+fn echo_fixture_path() -> Result<std::ffi::OsString> {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let path = std::env::var_os("PATH").context("reading PATH")?;
+    let mut paths = vec![fixture];
+    paths.extend(std::env::split_paths(&path));
+    std::env::join_paths(paths).context("building fixture PATH")
+}
+
 #[test]
 fn verify_reports_a_quote_missing_from_the_resolved_text() -> Result<()> {
     let root = scratch("resolve-verify")?;
@@ -515,6 +523,110 @@ fn normalized_source_quote_matches_markup_mentions_and_ellipsis() -> Result<()> 
     assert_eq!(
         data.get("broken").and_then(Value::as_array).map(Vec::len),
         Some(0)
+    );
+
+    remove_scratch(&root)
+}
+
+#[test]
+fn live_verification_fills_a_partially_stored_source_thread() -> Result<()> {
+    let root = scratch("quote-live-thread")?;
+    let tree = root.join("tree");
+    let state_base = root.join("state");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"echo\"\nkind = \"echo\"\nscheme = \"echo\"\n",
+    )?;
+    std::fs::write(
+        tree.join("decision.md"),
+        "---\ntype: decision\nstatus: open\nquote: \"live sibling evidence\"\nsource: \"echo:parent\"\n---\n",
+    )?;
+    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    store.set_source_verbatim("echo", true)?;
+    store.put_all(
+        "echo",
+        &[record("echo:parent", None, 1_700_000_000, "local parent")?],
+    )?;
+    let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;
+
+    let local = binary()
+        .args(["--json", "--memory", tree_text, "cite", "verify"])
+        .env("CTX_STATE_DIR", &state_base)
+        .env("PATH", echo_fixture_path()?)
+        .output()
+        .context("running local citation verification")?;
+    assert_eq!(local.status.code(), Some(1));
+
+    let live = binary()
+        .args(["--json", "--memory", tree_text, "cite", "verify", "--live"])
+        .env("CTX_STATE_DIR", &state_base)
+        .env("PATH", echo_fixture_path()?)
+        .env("ECHO_THREAD_SIBLING", "1")
+        .output()
+        .context("running live citation verification")?;
+    remove_scratch(&root)?;
+
+    assert_eq!(live.status.code(), Some(0));
+    let live_response = response_data(&live)?;
+    let data = live_response
+        .get("data")
+        .context("live verification response has data")?;
+    assert_eq!(
+        data.get("broken").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    Ok(())
+}
+
+#[test]
+fn quote_mismatch_names_the_verbatim_source_that_was_checked() -> Result<()> {
+    let root = scratch("quote-mismatch-source")?;
+    let tree = root.join("tree");
+    let state_base = root.join("state");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"drive\"\nkind = \"drive\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
+    )?;
+    std::fs::write(
+        tree.join("decision.md"),
+        "---\ntype: decision\nstatus: open\nquote: \"a different quote\"\nsource: \"drive:abcdefghijklmnopqrst; slack:C0EXAMPLE01/1700000000.000006\"\n---\n",
+    )?;
+    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    store.put_all(
+        "drive",
+        &[record(
+            "drive:abcdefghijklmnopqrst",
+            None,
+            1_700_000_000,
+            "file contents",
+        )?],
+    )?;
+    store.put_all(
+        "slack",
+        &[record(
+            "slack:C0EXAMPLE01/1700000000.000006",
+            None,
+            1_700_000_000,
+            "actual Slack text",
+        )?],
+    )?;
+
+    let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
+    assert_eq!(verified.status.code(), Some(1));
+    let verified_response = response_data(&verified)?;
+    let data = verified_response
+        .get("data")
+        .context("mixed-source verification response has data")?;
+    let broken = data
+        .get("broken")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .context("mixed-source verification has a broken entry")?;
+    assert_eq!(
+        broken.get("pointer").and_then(Value::as_str),
+        Some("slack:C0EXAMPLE01/1700000000.000006")
     );
 
     remove_scratch(&root)
