@@ -1,0 +1,46 @@
+[package]
+name = "ctx-memory"
+version = "0.1.0"
+edition = "2021"
+description = "A markdown-backed context graph for agents."
+license = "MIT"
+repository = "https://github.com/sjawhar/ctx-memory"
+
+[lib]
+name = "ctx_memory"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ctx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+fs2 = "0.4"
+owo-colors = "4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+walkdir = "2"
+
+[lints.rust]
+unused_must_use = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
