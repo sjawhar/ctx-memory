@@ -9,6 +9,8 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::atomic::write_replace;
+
 use crate::api::http::env_token;
 use crate::api::slack::{html_unescape, SlackClient};
 use crate::record::Record;
@@ -107,7 +109,7 @@ trait SlackApi {
         oldest: DateTime<Utc>,
         latest: DateTime<Utc>,
     ) -> Result<Vec<Value>>;
-    fn replies(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>>;
+    fn thread_messages(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>>;
     fn channel_info(&self, channel: &str) -> Result<Value>;
     fn user_info(&self, user: &str) -> Result<Option<Value>>;
 }
@@ -122,8 +124,8 @@ impl SlackApi for SlackClient<'_> {
         Self::history(self, channel, oldest, latest)
     }
 
-    fn replies(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>> {
-        Self::replies(self, channel, thread_ts)
+    fn thread_messages(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>> {
+        Self::thread_messages(self, channel, thread_ts)
     }
 
     fn channel_info(&self, channel: &str) -> Result<Value> {
@@ -322,7 +324,6 @@ fn fetch_channel<C: SlackApi + ?Sized>(
     let horizon = end - Duration::days(i64::from(config.thread_poll_days));
     let mut reply_parents = BTreeSet::new();
     let mut skipped_threads = 0_usize;
-    let mut history_by_ts = BTreeMap::new();
     let mut messages = Vec::new();
     let mut emitted = BTreeSet::new();
 
@@ -340,9 +341,6 @@ fn fetch_channel<C: SlackApi + ?Sized>(
 
     for message in history {
         let timestamp = message_timestamp(&message)?;
-        history_by_ts
-            .entry(timestamp.to_owned())
-            .or_insert_with(|| message.clone());
         if is_thread_parent(&message) {
             if let Some(latest) = message.get("latest_reply").and_then(Value::as_str) {
                 update_thread_activity(thread_index, channel, timestamp, latest)?;
@@ -357,34 +355,30 @@ fn fetch_channel<C: SlackApi + ?Sized>(
     }
 
     let mut replies = Vec::new();
-    let mut parents_with_replies = BTreeSet::new();
+    let mut contexts = Vec::new();
     for parent in reply_parents {
         let found = api
-            .replies(channel, &parent)
+            .thread_messages(channel, &parent)
             .with_context(|| format!("reading Slack replies for {channel}/{parent}"))?;
+        let mut parent_message = None;
+        let mut emitted_reply = false;
         for reply in found {
             let timestamp = message_timestamp(&reply)?;
             if timestamp == parent {
+                parent_message = Some(reply);
                 continue;
             }
             update_thread_activity(thread_index, channel, &parent, timestamp)?;
             if inside_window(&reply, start, end)? && emitted.insert(timestamp.to_owned()) {
-                parents_with_replies.insert(parent.clone());
+                emitted_reply = true;
                 replies.push(reply);
             }
         }
-    }
-
-    let mut contexts = Vec::new();
-    for parent in parents_with_replies {
-        if emitted.contains(&parent) {
-            continue;
+        if emitted_reply && !emitted.contains(&parent) {
+            contexts.push(parent_message.ok_or_else(|| {
+                anyhow!("Slack thread {channel}/{parent} did not return its parent message")
+            })?);
         }
-        let parent_message = match history_by_ts.remove(&parent) {
-            Some(message) => message,
-            None => fetch_parent(api, channel, &parent)?,
-        };
-        contexts.push(parent_message);
     }
 
     let names = resolve_user_names(
@@ -418,17 +412,6 @@ fn is_thread_parent(message: &Value) -> bool {
     let timestamp = message.get("ts").and_then(Value::as_str);
     let thread = message.get("thread_ts").and_then(Value::as_str);
     has_replies && (thread.is_none() || thread == timestamp)
-}
-
-fn fetch_parent<C: SlackApi + ?Sized>(api: &C, channel: &str, parent: &str) -> Result<Value> {
-    let timestamp = slack_timestamp(parent)?;
-    let history = api
-        .history(channel, timestamp, timestamp)
-        .with_context(|| format!("reading Slack parent {channel}/{parent}"))?;
-    history
-        .into_iter()
-        .find(|message| message.get("ts").and_then(Value::as_str) == Some(parent))
-        .ok_or_else(|| anyhow!("Slack parent {channel}/{parent} is absent from history"))
 }
 
 fn resolve_with_api<C: SlackApi + ?Sized>(
@@ -483,16 +466,21 @@ fn resolve_messages<C: SlackApi + ?Sized>(
     channel: &str,
     timestamp: &str,
 ) -> Result<Vec<Value>> {
-    let timestamp_at = slack_timestamp(timestamp)?;
-    let mut messages = api.replies(channel, timestamp).unwrap_or_default();
-    messages.extend(
-        api.history(channel, timestamp_at, timestamp_at)
-            .with_context(|| format!("reading Slack message {channel}/{timestamp}"))?,
-    );
-    let has_requested = messages
+    let mut messages = api.thread_messages(channel, timestamp).unwrap_or_default();
+    if !messages
         .iter()
-        .any(|message| message.get("ts").and_then(Value::as_str) == Some(timestamp));
-    if !has_requested {
+        .any(|message| message.get("ts").and_then(Value::as_str) == Some(timestamp))
+    {
+        let timestamp_at = slack_timestamp(timestamp)?;
+        messages.extend(
+            api.history(channel, timestamp_at, timestamp_at)
+                .with_context(|| format!("reading Slack message {channel}/{timestamp}"))?,
+        );
+    }
+    if !messages
+        .iter()
+        .any(|message| message.get("ts").and_then(Value::as_str) == Some(timestamp))
+    {
         return Ok(Vec::new());
     }
     let mut seen = BTreeSet::new();
@@ -728,25 +716,61 @@ fn read_thread_index(state_dir: &Path) -> Result<ThreadIndex> {
 }
 
 fn write_thread_index(state_dir: &Path, index: &ThreadIndex) -> Result<()> {
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("creating {}", state_dir.display()))?;
     let path = state_dir.join(THREAD_INDEX_FILE);
     let text =
         serde_json::to_string(index).with_context(|| format!("serializing {}", path.display()))?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    write_replace(&path, text.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::thread::JoinHandle;
 
     use super::*;
     use serde_json::json;
 
+    type RecordingApi = (String, Arc<Mutex<Vec<String>>>, JoinHandle<Result<()>>);
+
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
     static ENVIRONMENT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn fake_http_api(responses: Vec<String>) -> Result<RecordingApi> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let server = std::thread::spawn(move || -> Result<()> {
+            for body in responses {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = BufReader::new(stream.try_clone()?);
+                let mut first_line = String::new();
+                request.read_line(&mut first_line)?;
+                captured
+                    .lock()
+                    .map_err(|error| anyhow!("locking requests: {error}"))?
+                    .push(first_line);
+                loop {
+                    let mut line = String::new();
+                    let bytes_read = request.read_line(&mut line)?;
+                    if bytes_read == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes())?;
+            }
+            Ok(())
+        });
+        Ok((format!("http://{address}"), requests, server))
+    }
 
     #[derive(Default)]
     struct FakeSlackApi {
@@ -771,7 +795,7 @@ mod tests {
                 .unwrap_or_default())
         }
 
-        fn replies(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>> {
+        fn thread_messages(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>> {
             self.reply_calls
                 .borrow_mut()
                 .push((channel.to_owned(), thread_ts.to_owned()));
@@ -928,19 +952,13 @@ mod tests {
         index.insert("C0EXAMPLE01".to_owned(), tracked);
         write_index(&root, &index)?;
         let reply = slack_ts(end - Duration::hours(1));
-        let oldest_at = slack_timestamp(&oldest)?;
         let mut api = FakeSlackApi::default();
         api.replies_by_thread.insert(
             ("C0EXAMPLE01".to_owned(), oldest.clone()),
-            vec![json!({"ts": reply, "text": "new reply", "user": "U0EXAMPLE9"})],
-        );
-        api.histories.insert(
-            (
-                "C0EXAMPLE01".to_owned(),
-                oldest_at.timestamp(),
-                oldest_at.timestamp(),
-            ),
-            vec![json!({"ts": oldest, "text": "parent", "user": "U0EXAMPLE9"})],
+            vec![
+                json!({"ts": oldest, "text": "parent", "user": "U0EXAMPLE9"}),
+                json!({"ts": reply, "text": "new reply", "user": "U0EXAMPLE9"}),
+            ],
         );
 
         let request = fetch_request(&root, end, vec!["C0EXAMPLE01".to_owned()], Vec::new());
@@ -1003,7 +1021,6 @@ mod tests {
         let root = scratch("pre-window-parent")?;
         let end = at("2026-10-25T18:00:00Z")?;
         let parent = slack_ts(end - Duration::days(2));
-        let parent_at = slack_timestamp(&parent)?;
         let mut index = ThreadIndex::new();
         index.insert(
             "C0EXAMPLE01".to_owned(),
@@ -1014,20 +1031,15 @@ mod tests {
         let mut api = FakeSlackApi::default();
         api.replies_by_thread.insert(
             ("C0EXAMPLE01".to_owned(), parent.clone()),
-            vec![json!({
-                "ts": reply,
-                "thread_ts": parent,
-                "text": "reply",
-                "user": "U0EXAMPLE9"
-            })],
-        );
-        api.histories.insert(
-            (
-                "C0EXAMPLE01".to_owned(),
-                parent_at.timestamp(),
-                parent_at.timestamp(),
-            ),
-            vec![json!({"ts": parent, "text": "parent", "user": "U0EXAMPLE9"})],
+            vec![
+                json!({"ts": parent, "text": "parent", "user": "U0EXAMPLE9"}),
+                json!({
+                    "ts": reply,
+                    "thread_ts": parent,
+                    "text": "reply",
+                    "user": "U0EXAMPLE9"
+                }),
+            ],
         );
 
         let request = fetch_request(&root, end, vec!["C0EXAMPLE01".to_owned()], Vec::new());
@@ -1224,6 +1236,103 @@ mod tests {
                 .map(|record| record.pointer.as_str()),
             Some(expected.as_str())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fractional_parent_is_retained_for_fetch_and_live_resolution() -> Result<()> {
+        let _environment = ENVIRONMENT_LOCK
+            .lock()
+            .map_err(|error| anyhow!("locking test environment: {error}"))?;
+        let root = scratch("fractional-parent")?;
+        let end = at("2026-10-25T18:00:00Z")?;
+        let parent = format!("{}.123456", (end - Duration::days(2)).timestamp());
+        let reply = format!("{}.654321", (end - Duration::hours(1)).timestamp());
+        let thread = format!(
+            r#"{{"ok":true,"messages":[{{"ts":"{parent}","text":"parent"}},{{"ts":"{reply}","thread_ts":"{parent}","text":"reply"}}]}}"#
+        );
+        let mut index = ThreadIndex::new();
+        index.insert(
+            "C0EXAMPLE01".to_owned(),
+            BTreeMap::from([(parent.clone(), slack_ts(end - Duration::days(1)))]),
+        );
+        write_index(&root, &index)?;
+        let request = fetch_request(&root, end, vec!["C0EXAMPLE01".to_owned()], Vec::new());
+        let (fetch_api, fetch_requests, fetch_server) = fake_http_api(vec![
+            r#"{"ok":true,"channel":{"name":"general"}}"#.to_owned(),
+            r#"{"ok":true,"messages":[]}"#.to_owned(),
+            thread.clone(),
+        ])?;
+        let previous = std::env::var_os("SLACK_TOKEN");
+        std::env::set_var("SLACK_TOKEN", "test-token");
+        let source = SlackSource::with_api(fetch_api);
+        let mut fetched = Vec::new();
+        source.run(&Request::Fetch(request), &mut |message| {
+            fetched.push(message);
+            Ok(())
+        })?;
+        fetch_server
+            .join()
+            .map_err(|_| anyhow!("fetch fake API server panicked"))??;
+        let fetch_request = fetch_requests
+            .lock()
+            .map_err(|error| anyhow!("locking fetch requests: {error}"))?
+            .iter()
+            .find(|request| request.contains("conversations.replies"))
+            .cloned()
+            .context("fetch called conversations.replies")?;
+        assert!(fetch_request.contains(&format!("ts={parent}")));
+        assert_eq!(records(&fetched).len(), 2);
+        assert!(records(&fetched)
+            .iter()
+            .any(|record| record.pointer.ends_with(&parent) && record.context));
+
+        let resolve_request = Request::Resolve(ResolveRequest {
+            protocol: PROTOCOL_VERSION,
+            source: super::super::SourceRef {
+                id: "slack".to_owned(),
+                kind: "slack".to_owned(),
+                scheme: "slack".to_owned(),
+            },
+            config: json!({"workspace": "acme"}),
+            pointers: vec![format!("slack:C0EXAMPLE01/{parent}")],
+            state_dir: root.join("state"),
+        });
+        let (resolve_api, resolve_requests, resolve_server) = fake_http_api(vec![
+            thread,
+            r#"{"ok":true,"channel":{"name":"general"}}"#.to_owned(),
+        ])?;
+        let source = SlackSource::with_api(resolve_api);
+        let mut resolved = Vec::new();
+        source.run(&resolve_request, &mut |message| {
+            resolved.push(message);
+            Ok(())
+        })?;
+        if let Some(value) = previous {
+            std::env::set_var("SLACK_TOKEN", value);
+        } else {
+            std::env::remove_var("SLACK_TOKEN");
+        }
+        resolve_server
+            .join()
+            .map_err(|_| anyhow!("resolve fake API server panicked"))??;
+        let resolve_request = resolve_requests
+            .lock()
+            .map_err(|error| anyhow!("locking resolve requests: {error}"))?
+            .iter()
+            .find(|request| request.contains("conversations.replies"))
+            .cloned()
+            .context("resolve called conversations.replies")?;
+        std::fs::remove_dir_all(&root)?;
+
+        assert!(resolve_request.contains(&format!("ts={parent}")));
+        assert_eq!(records(&resolved).len(), 2);
+        assert!(records(&resolved)
+            .iter()
+            .any(|record| record.pointer.ends_with(&parent)));
+        assert!(records(&resolved)
+            .iter()
+            .any(|record| record.pointer.ends_with(&reply)));
         Ok(())
     }
 }

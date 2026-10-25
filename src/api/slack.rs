@@ -96,8 +96,9 @@ impl<'a> SlackClient<'a> {
         loop {
             let mut params = vec![
                 ("channel", channel.to_owned()),
-                ("oldest", format!("{}.000000", oldest.timestamp())),
-                ("latest", format!("{}.000000", latest.timestamp())),
+                ("oldest", slack_timestamp_param(oldest)),
+                ("latest", slack_timestamp_param(latest)),
+                ("inclusive", "true".to_owned()),
                 ("limit", "200".to_owned()),
             ];
             if let Some(value) = &cursor {
@@ -114,13 +115,13 @@ impl<'a> SlackClient<'a> {
         Ok(messages)
     }
 
-    /// Fetch replies to a message, excluding the parent message.
+    /// Fetch every message in a thread, including its parent message.
     ///
     /// # Errors
     ///
     /// Returns an error when a request fails, Slack reports an error, or a cursor repeats.
-    pub fn replies(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>> {
-        let mut replies = Vec::new();
+    pub fn thread_messages(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>> {
+        let mut messages = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
         loop {
@@ -134,7 +135,7 @@ impl<'a> SlackClient<'a> {
             }
             let body = self.call("conversations.replies", &params)?;
             if let Some(Value::Array(found)) = body.get("messages") {
-                replies.extend(found.iter().cloned());
+                messages.extend(found.iter().cloned());
             }
             cursor = checked_next_cursor(&body, &mut seen_cursors, "conversations.replies")?;
             if cursor.is_none() {
@@ -142,7 +143,17 @@ impl<'a> SlackClient<'a> {
             }
             thread::sleep(Duration::from_millis(300));
         }
-        Ok(replies
+        Ok(messages)
+    }
+
+    /// Fetch replies to a message, excluding the parent message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a request fails, Slack reports an error, or a cursor repeats.
+    pub fn replies(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>> {
+        Ok(self
+            .thread_messages(channel, thread_ts)?
             .into_iter()
             .filter(|message| message.get("ts").and_then(Value::as_str) != Some(thread_ts))
             .collect())
@@ -220,6 +231,14 @@ impl<'a> SlackClient<'a> {
         }
         Ok(channels)
     }
+}
+
+fn slack_timestamp_param(timestamp: DateTime<Utc>) -> String {
+    format!(
+        "{}.{:06}",
+        timestamp.timestamp(),
+        timestamp.timestamp_subsec_micros()
+    )
 }
 
 fn next_cursor(body: &Value) -> Option<String> {
@@ -310,12 +329,15 @@ pub fn html_unescape(text: &str) -> String {
 mod tests {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
     use anyhow::Result;
 
     use super::*;
     use serde_json::json;
+
+    type RecordingApi = (String, Arc<Mutex<Vec<String>>>, JoinHandle<Result<()>>);
 
     fn fake_api(responses: Vec<String>) -> Result<(String, JoinHandle<Result<()>>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -340,6 +362,39 @@ mod tests {
             Ok(())
         });
         Ok((format!("http://{address}"), server))
+    }
+
+    fn fake_api_recording_requests(responses: Vec<String>) -> Result<RecordingApi> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let server = std::thread::spawn(move || -> Result<()> {
+            for body in responses {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = BufReader::new(stream.try_clone()?);
+                let mut first_line = String::new();
+                request.read_line(&mut first_line)?;
+                captured
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!("locking requests: {error}"))?
+                    .push(first_line);
+                loop {
+                    let mut line = String::new();
+                    let bytes_read = request.read_line(&mut line)?;
+                    if bytes_read == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes())?;
+            }
+            Ok(())
+        });
+        Ok((format!("http://{address}"), requests, server))
     }
 
     #[test]
@@ -390,6 +445,32 @@ mod tests {
             .err()
             .ok_or_else(|| anyhow::anyhow!("pagination unexpectedly succeeded"))?;
         assert!(format!("{error:#}").contains("repeated cursor \"abc\""));
+        Ok(())
+    }
+
+    #[test]
+    fn history_preserves_microsecond_bounds_and_requests_inclusive_results() -> Result<()> {
+        let (api, requests, server) =
+            fake_api_recording_requests(vec![r#"{"ok":true,"messages":[]}"#.to_owned()])?;
+        let client = SlackClient::with_api("test-token", &api);
+        let timestamp = DateTime::from_timestamp(1_792_951_800, 123_456_000)
+            .ok_or_else(|| anyhow::anyhow!("constructing test timestamp"))?;
+
+        let messages = client.history("C0EXAMPLE01", timestamp, timestamp);
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("fake API server failed"))??;
+        messages?;
+        let request = requests
+            .lock()
+            .map_err(|error| anyhow::anyhow!("locking requests: {error}"))?
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("fake API received no request"))?;
+
+        assert!(request.contains("oldest=1792951800.123456"));
+        assert!(request.contains("latest=1792951800.123456"));
+        assert!(request.contains("inclusive=true"));
         Ok(())
     }
 }
