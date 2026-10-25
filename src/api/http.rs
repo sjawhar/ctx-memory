@@ -47,18 +47,19 @@ pub fn percent_encode(value: &str) -> String {
 /// Returns an error when curl cannot run, exits unsuccessfully, times out, or returns invalid
 /// JSON.
 pub fn get_json(url: &str, bearer: &str) -> Result<Value> {
-    let authorization = format!("Authorization: Bearer {bearer}");
+    get_json_with(url, bearer, proc::run_with_stdin)
+}
+
+fn get_json_with<F>(url: &str, bearer: &str, mut run: F) -> Result<Value>
+where
+    F: FnMut(&str, &[&str], &[u8], Duration) -> Result<proc::Output>,
+{
+    let authorization = format!("Authorization: Bearer {bearer}\n");
     let max_time = HTTP_TIMEOUT_SECS.to_string();
-    let output = proc::run(
+    let output = run(
         "curl",
-        &[
-            "-sS",
-            "--max-time",
-            max_time.as_str(),
-            "-H",
-            authorization.as_str(),
-            url,
-        ],
+        &["-sS", "--max-time", max_time.as_str(), "-H", "@-", url],
+        authorization.as_bytes(),
         Duration::from_secs(HTTP_TIMEOUT_SECS + 5),
     )?;
     if !output.success() {
@@ -73,6 +74,10 @@ pub fn get_json(url: &str, bearer: &str) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -93,6 +98,36 @@ mod tests {
     fn present_token_is_returned_verbatim() -> Result<()> {
         std::env::set_var("CTX_TEST_SET_KEY_9A1", "test-token");
         assert_eq!(env_token("CTX_TEST_SET_KEY_9A1", "unused")?, "test-token");
+        Ok(())
+    }
+
+    #[test]
+    fn authorization_is_passed_on_stdin_not_in_curl_arguments() -> Result<()> {
+        let captured = RefCell::new(None);
+        let response = get_json_with(
+            "https://api.example.com/resource",
+            "test-bearer-token",
+            |program, args, stdin, _timeout| {
+                let arguments: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
+                *captured.borrow_mut() = Some((program.to_owned(), arguments, stdin.to_vec()));
+                Ok(proc::Output {
+                    code: Some(0),
+                    stdout: json!({"ok": true}).to_string(),
+                    stderr: String::new(),
+                })
+            },
+        )?;
+        let (program, arguments, stdin) = captured
+            .into_inner()
+            .ok_or_else(|| anyhow::anyhow!("runner was not called"))?;
+
+        assert_eq!(response, json!({"ok": true}));
+        assert_eq!(program, "curl");
+        assert!(arguments.iter().any(|argument| argument == "@-"));
+        assert!(arguments
+            .iter()
+            .all(|argument| !argument.contains("test-bearer-token")));
+        assert_eq!(stdin, b"Authorization: Bearer test-bearer-token\n");
         Ok(())
     }
 }
