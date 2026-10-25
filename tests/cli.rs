@@ -59,6 +59,12 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn plugin(bin: &Path, script: &str) -> Result<()> {
+    let executable = bin.join("ctx-hello");
+    std::fs::write(&executable, script)?;
+    make_executable(&executable)
+}
+
 #[test]
 fn open_works_without_home_on_a_tree_without_sources() -> Result<()> {
     let tree = fixture_tree()?;
@@ -132,6 +138,108 @@ fn unknown_command_runs_ctx_dash_name_from_path_with_context_env() -> Result<()>
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         format!("{}|1|world", tree.display())
+    );
+    Ok(())
+}
+
+#[test]
+fn external_command_rejects_invalid_user_config() -> Result<()> {
+    let bin = scratch()?;
+    plugin(&bin, "#!/bin/sh\nexit 0\n")?;
+    let config_home = scratch()?;
+    std::fs::create_dir(config_home.join("ctx"))?;
+    std::fs::write(config_home.join("ctx/config.toml"), "memory = 1\n")?;
+    let path = std::env::var("PATH").context("PATH is not set")?;
+    let output = binary()
+        .arg("hello")
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .env("XDG_CONFIG_HOME", &config_home)
+        .output()
+        .context("running external ctx command with invalid user config")?;
+    remove_scratch(&config_home)?;
+    remove_scratch(&bin)?;
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("config.toml"));
+    Ok(())
+}
+
+#[test]
+fn external_command_removes_inherited_json_without_the_flag() -> Result<()> {
+    let bin = scratch()?;
+    plugin(&bin, "#!/bin/sh\nprintf '%s\\n' \"${CTX_JSON-unset}\"\n")?;
+    let path = std::env::var("PATH").context("PATH is not set")?;
+    let output = binary()
+        .arg("hello")
+        .env_clear()
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .env("CTX_JSON", "1")
+        .output()
+        .context("running external ctx command with inherited JSON")?;
+    remove_scratch(&bin)?;
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "unset");
+    Ok(())
+}
+
+#[test]
+fn external_command_removes_inherited_state_without_a_tree() -> Result<()> {
+    let bin = scratch()?;
+    plugin(
+        &bin,
+        "#!/bin/sh\nprintf '%s\\n' \"${CTX_STATE_DIR-unset}\"\n",
+    )?;
+    let path = std::env::var("PATH").context("PATH is not set")?;
+    let output = binary()
+        .arg("hello")
+        .env_clear()
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .env("CTX_STATE_DIR", "/base")
+        .output()
+        .context("running external ctx command with inherited state")?;
+    remove_scratch(&bin)?;
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "unset");
+    Ok(())
+}
+
+#[test]
+fn external_command_passes_an_absolute_configured_state_path() -> Result<()> {
+    let bin = scratch()?;
+    plugin(
+        &bin,
+        "#!/bin/sh\nprintf '%s\\n' \"${CTX_STATE_DIR-unset}\"\n",
+    )?;
+    let tree = fixture_tree()?;
+    std::fs::write(tree.join("ctx.toml"), "version = 1\nid = \"example\"\n")?;
+    let config_home = scratch()?;
+    std::fs::create_dir(config_home.join("ctx"))?;
+    std::fs::write(
+        config_home.join("ctx/config.toml"),
+        "state_dir = \"relative-state\"\n",
+    )?;
+    let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;
+    let path = std::env::var("PATH").context("PATH is not set")?;
+    let output = binary()
+        .args(["--memory", tree_text, "hello"])
+        .env_clear()
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .env("XDG_CONFIG_HOME", &config_home)
+        .output()
+        .context("running external ctx command with relative state")?;
+    let expected = std::env::current_dir()?.join("relative-state/example");
+    remove_scratch(&config_home)?;
+    remove_scratch(&tree)?;
+    remove_scratch(&bin)?;
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        expected
+            .to_str()
+            .context("expected path is not valid UTF-8")?
     );
     Ok(())
 }

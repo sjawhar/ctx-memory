@@ -135,7 +135,7 @@ struct OpenPayload {
 /// Returns an error when tree discovery, loading, command execution, or external dispatch fails.
 pub fn run(cli: &Cli) -> Result<Outcome> {
     if let Command::External(arguments) = &cli.command {
-        let environment = plugin_environment(&GlobalArgs::from(cli));
+        let environment = plugin_environment(&GlobalArgs::from(cli))?;
         return run_external(arguments, &environment).map(|never| match never {});
     }
 
@@ -251,19 +251,29 @@ fn front_vital<'a>(document: &'a Doc, field: &str) -> Option<&'a str> {
     }
 }
 
-fn plugin_environment(global: &GlobalArgs) -> PluginEnv {
-    let user = UserConfig::load().unwrap_or_default();
+fn plugin_environment(global: &GlobalArgs) -> Result<PluginEnv> {
+    let user = UserConfig::load()?;
     let tree_root = resolve_plugin_tree(global, &user);
     let state_dir = tree_root.as_deref().and_then(|root| {
         let config = TreeConfig::load(root).ok()?;
         let id = config.id?;
-        state_base(&user).ok().map(|base| base.join(id))
+        let path = state_base(&user).ok()?.join(id);
+        absolute_path(path).ok()
     });
-    PluginEnv {
+    Ok(PluginEnv {
         tree_root,
         state_dir,
         json: global.json,
+    })
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
     }
+    Ok(std::env::current_dir()
+        .context("reading the current directory for plugin state")?
+        .join(path))
 }
 
 fn resolve_plugin_tree(global: &GlobalArgs, user: &UserConfig) -> Option<PathBuf> {
@@ -290,6 +300,10 @@ pub fn run_external(arguments: &[OsString], environment: &PluginEnv) -> Result<I
         .ok_or_else(|| anyhow!("external command name is not valid UTF-8"))?;
     let executable = format!("ctx-{name}");
     let mut command = ProcessCommand::new(&executable);
+    command
+        .env_remove("CTX_MEMORY")
+        .env_remove("CTX_STATE_DIR")
+        .env_remove("CTX_JSON");
     command.args(arguments);
     if let Some(root) = &environment.tree_root {
         command.env("CTX_MEMORY", root);
