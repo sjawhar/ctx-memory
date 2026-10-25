@@ -65,7 +65,9 @@ pub fn validate(tree: &Tree) -> Result<Vec<SchemaViolation>> {
         let schema: serde_json::Value =
             serde_saphyr::from_str_with_options(&raw, yaml_options())
                 .with_context(|| format!("parsing record schema {}", schema_path.display()))?;
-        let validator = jsonschema::validator_for(&schema)
+        let validator = jsonschema::draft202012::options()
+            .should_validate_formats(true)
+            .build(&schema)
             .with_context(|| format!("compiling record schema {}", schema_path.display()))?;
         for doc in tree
             .docs

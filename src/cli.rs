@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use chrono::Utc;
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize as _;
 use serde::Serialize;
@@ -17,6 +16,7 @@ use crate::config::{locate_tree, state_base, TreeConfig, UserConfig};
 use crate::context::Context;
 use crate::open::{open_items, OpenItem};
 use crate::output::{self, Outcome};
+use crate::schema::today_utc;
 use crate::search;
 use crate::sweep::{self, Findings};
 use crate::tree::{Doc, Resolution, Tree};
@@ -460,7 +460,7 @@ fn print_open(items: &[OpenItem]) {
         println!("nothing open");
         return;
     }
-    let today = Utc::now().date_naive();
+    let today = today_utc();
     for item in items {
         let when = item.days_overdue.map_or_else(
             || {

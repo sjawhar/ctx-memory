@@ -192,6 +192,21 @@ fn oversize_rules_page_is_structural() -> Result<()> {
 }
 
 #[test]
+fn rules_page_at_the_byte_limit_is_not_oversize() -> Result<()> {
+    let root = test_root("rules-byte-limit")?;
+    let prefix = "---\ntype: rules\n---\n";
+    let content = format!("{prefix}{}", "x".repeat(8_192 - prefix.len()));
+    write(&root, "rules.md", &content)?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    let result = result?;
+    assert_eq!(result.rules_oversize, None);
+    assert!(result.structural_clean());
+    Ok(())
+}
+
+#[test]
 fn nested_rules_page_is_still_an_orphan() -> Result<()> {
     let root = test_root("nested-rules")?;
     write(&root, "rules.md", "---\ntype: rules\n---\n# Rules\n")?;
@@ -295,6 +310,46 @@ fn schema_required_field_is_reported_when_frontmatter_omits_it() -> Result<()> {
         .context("missing required field was not reported")?;
     assert_eq!(violation.path, "decisions/x.md");
     assert!(violation.message.contains("what"));
+    assert!(!result.structural_clean());
+    Ok(())
+}
+
+#[test]
+fn schema_date_format_violation_is_structural() -> Result<()> {
+    let root = test_root("schema-date-format")?;
+    write(
+        &root,
+        "rules.md",
+        "---\ntype: rules\n---\n[[decisions/x]]\n",
+    )?;
+    write(
+        &root,
+        "schemas/decision.yaml",
+        "type: object\nproperties:\n  review_date:\n    type: string\n    format: date\n",
+    )?;
+    write(
+        &root,
+        "decisions/x.md",
+        "---\n\
+         type: decision\n\
+         status: open\n\
+         review_date: not-a-date\n\
+         tier: external\n\
+         quote: quoted\n\
+         ---\n\
+         # Example\n",
+    )?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    let result = result?;
+    assert_eq!(result.schema_violations.len(), 1);
+    let violation = result
+        .schema_violations
+        .first()
+        .context("date format violation was not reported")?;
+    assert_eq!(violation.pointer, "/review_date");
+    assert!(violation.message.contains("date"));
     assert!(!result.structural_clean());
     Ok(())
 }
