@@ -1,7 +1,7 @@
 //! Loading and modelling a markdown context tree.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -333,7 +333,192 @@ pub enum Resolution {
 pub struct Tree {
     pub root: PathBuf,
     pub docs: Vec<Doc>,
-    pub(crate) folder_notes: Vec<String>,
+    links: LinkIndex,
+}
+
+/// Link targets indexed once as a tree is loaded.
+#[derive(Default)]
+struct LinkIndex {
+    exact_paths: HashMap<PathBuf, usize>,
+    names: HashMap<String, Vec<usize>>,
+    lowercase_names: HashMap<String, Vec<usize>>,
+    basenames: HashMap<String, Vec<usize>>,
+    path_suffixes: HashMap<String, Vec<usize>>,
+}
+
+impl LinkIndex {
+    fn from_docs(docs: &[Doc], folder_notes: &[String]) -> Self {
+        let mut index = Self::default();
+        for (position, doc) in docs.iter().enumerate() {
+            index.exact_paths.insert(doc.rel.clone(), position);
+
+            let relative_path = doc.rel.to_string_lossy();
+            let stem = strip_markdown_suffix(&relative_path);
+            Self::add_name(&mut index.names, stem.to_owned(), position);
+            Self::add_name(
+                &mut index.lowercase_names,
+                relative_path.to_ascii_lowercase(),
+                position,
+            );
+            Self::add_name(
+                &mut index.lowercase_names,
+                stem.to_ascii_lowercase(),
+                position,
+            );
+
+            if doc.is_folder_note(folder_notes) {
+                if let Some(directory) = doc.rel.parent() {
+                    let directory = directory.to_string_lossy();
+                    Self::add_name(&mut index.names, directory.to_string(), position);
+                    Self::add_name(
+                        &mut index.lowercase_names,
+                        directory.to_ascii_lowercase(),
+                        position,
+                    );
+                }
+            }
+
+            if let Some(basename) = Path::new(stem).file_name().and_then(|name| name.to_str()) {
+                Self::add_name(
+                    &mut index.basenames,
+                    basename.to_ascii_lowercase(),
+                    position,
+                );
+            }
+            for start in
+                std::iter::once(0).chain(stem.match_indices('/').map(|(offset, _)| offset + 1))
+            {
+                Self::add_name(
+                    &mut index.path_suffixes,
+                    stem[start..].to_ascii_lowercase(),
+                    position,
+                );
+            }
+        }
+        index
+    }
+
+    fn add_name(candidates: &mut HashMap<String, Vec<usize>>, name: String, position: usize) {
+        let positions = candidates.entry(name).or_default();
+        if positions.last().copied() != Some(position) {
+            positions.push(position);
+        }
+    }
+
+    fn exact_path(&self, target: &Path) -> Resolution {
+        self.exact_paths
+            .get(target)
+            .copied()
+            .map_or(Resolution::Missing, Resolution::Found)
+    }
+
+    fn name(&self, target: &str) -> Resolution {
+        Self::resolve_candidates(self.names.get(target).map(Vec::as_slice))
+    }
+
+    fn exact_path_or_name(&self, path: &Path, name: &str) -> Resolution {
+        Self::resolve_position_or_candidates(
+            self.exact_paths.get(path).copied(),
+            self.names.get(name).map(Vec::as_slice),
+        )
+    }
+
+    fn case_insensitive_name(&self, path: &str, name: &str) -> Resolution {
+        let path = path.to_ascii_lowercase();
+        let name = name.to_ascii_lowercase();
+        Self::resolve_union(
+            self.lowercase_names.get(&path).map(Vec::as_slice),
+            self.lowercase_names.get(&name).map(Vec::as_slice),
+        )
+    }
+
+    fn basename_or_path_suffix(&self, target: &str) -> Resolution {
+        let target = target.to_ascii_lowercase();
+        let basename = Path::new(&target)
+            .file_name()
+            .and_then(|name| name.to_str());
+        Self::resolve_union(
+            basename.and_then(|name| self.basenames.get(name).map(Vec::as_slice)),
+            self.path_suffixes.get(&target).map(Vec::as_slice),
+        )
+    }
+
+    fn resolve_candidates(candidates: Option<&[usize]>) -> Resolution {
+        match candidates {
+            None | Some([]) => Resolution::Missing,
+            Some([position]) => Resolution::Found(*position),
+            Some(positions) => Resolution::Ambiguous(positions.to_vec()),
+        }
+    }
+
+    fn resolve_position_or_candidates(
+        position: Option<usize>,
+        candidates: Option<&[usize]>,
+    ) -> Resolution {
+        let Some(position) = position else {
+            return Self::resolve_candidates(candidates);
+        };
+        let Some(candidates) = candidates else {
+            return Resolution::Found(position);
+        };
+        Self::resolve_union(Some(std::slice::from_ref(&position)), Some(candidates))
+    }
+
+    fn resolve_union(left: Option<&[usize]>, right: Option<&[usize]>) -> Resolution {
+        let (Some(left), Some(right)) = (left, right) else {
+            return Self::resolve_candidates(left.or(right));
+        };
+
+        let mut left_index = 0;
+        let mut right_index = 0;
+        let mut first = None;
+        let mut ambiguous: Option<Vec<usize>> = None;
+        while left_index < left.len() || right_index < right.len() {
+            let position = match (left.get(left_index), right.get(right_index)) {
+                (Some(left_position), Some(right_position)) => {
+                    match left_position.cmp(right_position) {
+                        std::cmp::Ordering::Less => {
+                            left_index += 1;
+                            *left_position
+                        }
+                        std::cmp::Ordering::Greater => {
+                            right_index += 1;
+                            *right_position
+                        }
+                        std::cmp::Ordering::Equal => {
+                            left_index += 1;
+                            right_index += 1;
+                            *left_position
+                        }
+                    }
+                }
+                (Some(left_position), None) => {
+                    left_index += 1;
+                    *left_position
+                }
+                (None, Some(right_position)) => {
+                    right_index += 1;
+                    *right_position
+                }
+                (None, None) => break,
+            };
+            if let Some(candidates) = ambiguous.as_mut() {
+                candidates.push(position);
+            } else if let Some(first) = first {
+                let mut candidates = Vec::with_capacity(left.len().saturating_add(right.len()));
+                candidates.push(first);
+                candidates.push(position);
+                ambiguous = Some(candidates);
+            } else {
+                first = Some(position);
+            }
+        }
+
+        ambiguous.map_or_else(
+            || first.map_or(Resolution::Missing, Resolution::Found),
+            Resolution::Ambiguous,
+        )
+    }
 }
 
 /// Split a file into normalized YAML frontmatter and the byte offset of its Markdown body.
@@ -408,49 +593,6 @@ fn relative_target(from: &Doc, target: &str) -> Option<PathBuf> {
     Some(relative)
 }
 
-fn names_match(left: &str, right: &str, case_insensitive: bool) -> bool {
-    if case_insensitive {
-        left.eq_ignore_ascii_case(right)
-    } else {
-        left == right
-    }
-}
-
-fn document_link_name_matches(
-    doc: &Doc,
-    target: &str,
-    folder_notes: &[String],
-    case_insensitive: bool,
-) -> bool {
-    let relative_path = doc.rel.to_string_lossy();
-    let stem = relative_path
-        .strip_suffix(".md")
-        .unwrap_or(relative_path.as_ref());
-    if names_match(stem, target, case_insensitive) {
-        return true;
-    }
-    doc.is_folder_note(folder_notes)
-        && doc.rel.parent().is_some_and(|directory| {
-            names_match(
-                directory.to_string_lossy().as_ref(),
-                target,
-                case_insensitive,
-            )
-        })
-}
-fn has_path_suffix(path: &str, suffix: &str) -> bool {
-    let Some(start) = path.len().checked_sub(suffix.len()) else {
-        return false;
-    };
-    path.get(start..).is_some_and(|end| {
-        end.eq_ignore_ascii_case(suffix)
-            && (start == 0
-                || path
-                    .get(..start)
-                    .is_some_and(|prefix| prefix.ends_with('/')))
-    })
-}
-
 impl Tree {
     /// Loads all Markdown documents below `root`.
     ///
@@ -499,86 +641,44 @@ impl Tree {
                 body_start,
             });
         }
-        Ok(Self {
-            root,
-            docs,
-            folder_notes: config.folder_notes.clone(),
-        })
-    }
-
-    fn resolve_matching(&self, predicate: impl Fn(&Doc) -> bool) -> Resolution {
-        let mut positions = self
-            .docs
-            .iter()
-            .enumerate()
-            .filter_map(|(position, doc)| predicate(doc).then_some(position));
-        let Some(first) = positions.next() else {
-            return Resolution::Missing;
-        };
-        let Some(second) = positions.next() else {
-            return Resolution::Found(first);
-        };
-        let mut candidates = vec![first, second];
-        candidates.extend(positions);
-        Resolution::Ambiguous(candidates)
+        let links = LinkIndex::from_docs(&docs, &config.folder_notes);
+        Ok(Self { root, docs, links })
     }
 
     /// Resolves a target using path, relative-path, case-insensitive, and unique-shortest forms.
     #[must_use]
     pub fn resolve(&self, from: &Doc, target: &str) -> Resolution {
-        match self.resolve_matching(|doc| doc.rel == Path::new(target)) {
+        match self.links.exact_path(Path::new(target)) {
             Resolution::Missing => {}
             resolution => return resolution,
         }
 
         let target_without_suffix = strip_markdown_suffix(target);
-        match self.resolve_matching(|doc| {
-            document_link_name_matches(doc, target_without_suffix, &self.folder_notes, false)
-        }) {
+        match self.links.name(target_without_suffix) {
             Resolution::Missing => {}
             resolution => return resolution,
         }
 
         if let Some(relative) = relative_target(from, target) {
-            let relative = relative.to_string_lossy();
-            let relative_without_suffix = strip_markdown_suffix(&relative);
-            match self.resolve_matching(|doc| {
-                names_match(doc.rel.to_string_lossy().as_ref(), relative.as_ref(), false)
-                    || document_link_name_matches(
-                        doc,
-                        relative_without_suffix,
-                        &self.folder_notes,
-                        false,
-                    )
-            }) {
+            let relative_without_suffix = relative.to_string_lossy();
+            match self
+                .links
+                .exact_path_or_name(&relative, strip_markdown_suffix(&relative_without_suffix))
+            {
                 Resolution::Missing => {}
                 resolution => return resolution,
             }
         }
 
-        match self.resolve_matching(|doc| {
-            names_match(doc.rel.to_string_lossy().as_ref(), target, true)
-                || document_link_name_matches(doc, target_without_suffix, &self.folder_notes, true)
-        }) {
+        match self
+            .links
+            .case_insensitive_name(target, target_without_suffix)
+        {
             Resolution::Missing => {}
             resolution => return resolution,
         }
 
-        let target_basename = Path::new(target_without_suffix)
-            .file_name()
-            .and_then(|name| name.to_str());
-        self.resolve_matching(|doc| {
-            let relative_path = doc.rel.to_string_lossy();
-            let stem = relative_path
-                .strip_suffix(".md")
-                .unwrap_or(relative_path.as_ref());
-            target_basename.is_some_and(|basename| {
-                Path::new(stem)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| names_match(name, basename, true))
-            }) || has_path_suffix(stem, target_without_suffix)
-        })
+        self.links.basename_or_path_suffix(target_without_suffix)
     }
 
     #[must_use]
