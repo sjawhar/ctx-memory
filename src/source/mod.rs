@@ -1,7 +1,7 @@
 //! Source protocol types and validation shared by built-in and external sources.
 
-pub mod calendar;
-pub mod drive;
+mod calendar;
+mod drive;
 mod external;
 pub mod gmail;
 pub mod slack;
