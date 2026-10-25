@@ -3,12 +3,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use serde::Serialize;
 
+use crate::config::SourceConfig;
 use crate::context::Context;
 use crate::pointer::{Pointer, Schemes};
 use crate::record::render;
+use crate::source::{self, Request as SourceRequest, ResolveRequest, Session, SourceRef};
 use crate::store::Store;
 
 /// The outcome for one `ctx resolve` input.
@@ -37,24 +39,58 @@ pub struct Verification {
     pub skipped: BTreeMap<String, usize>,
 }
 
-/// Resolves `pointers` from the local store only.
+struct ResolvedText {
+    text: Option<String>,
+    verbatim: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ResolutionMode {
+    Resolve,
+    Verify { live: bool },
+}
+
+impl ResolutionMode {
+    const fn live(self) -> bool {
+        match self {
+            Self::Resolve => true,
+            Self::Verify { live } => live,
+        }
+    }
+
+    const fn needs_verbatim(self) -> bool {
+        matches!(self, Self::Verify { .. })
+    }
+}
+
+/// Resolves `pointers` from the local store, then through each owning source's `resolve` operation.
 ///
 /// # Errors
 ///
-/// Returns an error when the context has no state directory or the local store cannot be opened
-/// or read.
+/// Returns an error when the context has no state directory, a configured source cannot run, or
+/// the local store cannot be opened, updated, or read.
 pub fn resolve(context: &Context, pointers: &[String], thread: bool) -> Result<Vec<Resolved>> {
-    let schemes = context_schemes(context);
+    let schemes = source::configured_schemes(&context.config.sources)?;
     let store = Store::open(&context.state()?.store())?;
     pointers
         .iter()
         .map(|input| match schemes.parse(input) {
-            Some(pointer) => resolve_one(&store, &schemes, &pointer, thread).map(|text| Resolved {
-                input: input.clone(),
-                pointer: Some(pointer.to_string()),
-                text,
-                error: None,
-            }),
+            Some(pointer) => {
+                let resolved = resolve_with_live(
+                    context,
+                    &store,
+                    &schemes,
+                    &pointer,
+                    thread,
+                    ResolutionMode::Resolve,
+                )?;
+                Ok(Resolved {
+                    input: input.clone(),
+                    pointer: Some(pointer.to_string()),
+                    text: resolved.text,
+                    error: None,
+                })
+            }
             None => Ok(Resolved {
                 input: input.clone(),
                 pointer: None,
@@ -65,14 +101,14 @@ pub fn resolve(context: &Context, pointers: &[String], thread: bool) -> Result<V
         .collect()
 }
 
-/// Verifies local resolution and quote containment for pointers in selected tree documents.
+/// Verifies source resolution and quote containment for pointers in selected tree documents.
 ///
 /// # Errors
 ///
-/// Returns an error when the context has no state directory or the local store cannot be opened
-/// or read.
-pub fn verify(context: &Context, files: &[PathBuf], _live: bool) -> Result<Verification> {
-    let schemes = context_schemes(context);
+/// Returns an error when the context has no state directory, a requested live source cannot run,
+/// or the local store cannot be opened, updated, or read.
+pub fn verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Verification> {
+    let schemes = source::configured_schemes(&context.config.sources)?;
     let store = Store::open(&context.state()?.store())?;
     let mut verification = Verification::default();
     for document in &context.tree.docs {
@@ -80,7 +116,15 @@ pub fn verify(context: &Context, files: &[PathBuf], _live: bool) -> Result<Verif
             continue;
         }
         for found in schemes.find_all(&document.raw) {
-            if !is_verbatim(&found.pointer.scheme) {
+            let resolved = resolve_with_live(
+                context,
+                &store,
+                &schemes,
+                &found.pointer,
+                false,
+                ResolutionMode::Verify { live },
+            )?;
+            if !resolved.verbatim {
                 *verification
                     .skipped
                     .entry(found.pointer.scheme.clone())
@@ -88,8 +132,7 @@ pub fn verify(context: &Context, files: &[PathBuf], _live: bool) -> Result<Verif
                 continue;
             }
             verification.checked += 1;
-            let text = resolve_one(&store, &schemes, &found.pointer, false)?;
-            let why = match (text.as_deref(), document.front.quote.as_deref()) {
+            let why = match (resolved.text.as_deref(), document.front.quote.as_deref()) {
                 (None, _) => Some("does not resolve in the local store"),
                 (Some(text), Some(quote)) if !text.contains(quote) => {
                     Some("quote does not appear in the resolved text")
@@ -109,21 +152,108 @@ pub fn verify(context: &Context, files: &[PathBuf], _live: bool) -> Result<Verif
     Ok(verification)
 }
 
-fn context_schemes(context: &Context) -> Schemes {
-    Schemes::new(
-        context
-            .config
-            .sources
-            .iter()
-            .filter_map(|source| source.scheme.clone()),
-    )
-}
-
 fn is_verbatim(scheme: &str) -> bool {
     matches!(scheme, "slack" | "gmail")
 }
 
-fn resolve_one(
+fn is_builtin_source(source: &SourceConfig) -> bool {
+    matches!(
+        source.kind.as_str(),
+        "slack" | "gmail" | "drive" | "calendar"
+    )
+}
+
+fn source_for_scheme<'a>(context: &'a Context, scheme: &str) -> Result<Option<&'a SourceConfig>> {
+    for source in &context.config.sources {
+        if source::scheme(source)? == scheme {
+            return Ok(Some(source));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_with_live(
+    context: &Context,
+    store: &Store,
+    schemes: &Schemes,
+    pointer: &Pointer,
+    thread: bool,
+    mode: ResolutionMode,
+) -> Result<ResolvedText> {
+    let text = resolve_local(store, schemes, pointer, thread)?;
+    let live = mode.live();
+    let needs_verbatim = mode.needs_verbatim();
+    let source = (text.is_none() || needs_verbatim)
+        .then(|| source_for_scheme(context, &pointer.scheme))
+        .transpose()?
+        .flatten();
+    let source_verbatim = if needs_verbatim {
+        match source {
+            Some(source) => store.source_verbatim(&source.id)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let default_verbatim = is_verbatim(&pointer.scheme);
+    let needs_verbatim_hello = needs_verbatim
+        && live
+        && text.is_some()
+        && source.is_some_and(|source| !is_builtin_source(source))
+        && source_verbatim.is_none();
+    if (text.is_some() && !needs_verbatim_hello) || !live {
+        return Ok(ResolvedText {
+            text,
+            verbatim: source_verbatim.unwrap_or(default_verbatim),
+        });
+    }
+    let Some(source) = source else {
+        return Ok(ResolvedText {
+            text: None,
+            verbatim: default_verbatim,
+        });
+    };
+    let outcome = resolve_from_source(context, source, &pointer.scheme, pointer, schemes)?;
+    if let Some(error) = outcome.error.as_deref() {
+        return Err(anyhow!("source {} resolve failed: {error}", source.id));
+    }
+    let verbatim = outcome.verbatim.unwrap_or(default_verbatim);
+    store.set_source_verbatim(&source.id, verbatim)?;
+    store.put_all(&source.id, &outcome.records)?;
+    Ok(ResolvedText {
+        text: resolve_local(store, schemes, pointer, thread)?,
+        verbatim,
+    })
+}
+
+fn resolve_from_source(
+    context: &Context,
+    spec: &SourceConfig,
+    scheme: &str,
+    pointer: &Pointer,
+    schemes: &Schemes,
+) -> Result<crate::source::SourceOutcome> {
+    let state_dir = context.state()?.source_state(&spec.id);
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("creating {}", state_dir.display()))?;
+    let request = SourceRequest::Resolve(ResolveRequest {
+        protocol: source::PROTOCOL_VERSION,
+        source: SourceRef {
+            id: spec.id.clone(),
+            kind: spec.kind.clone(),
+            scheme: scheme.to_owned(),
+        },
+        config: source::config_json(spec)?,
+        pointers: vec![pointer.to_string()],
+        state_dir,
+    });
+    let source = source::open(spec, scheme)?;
+    let mut session = Session::new(&request, schemes);
+    let run = source.run(&request, &mut |message| session.accept(message).map(|_| ()));
+    Ok(session.finish(run))
+}
+
+fn resolve_local(
     store: &Store,
     schemes: &Schemes,
     pointer: &Pointer,

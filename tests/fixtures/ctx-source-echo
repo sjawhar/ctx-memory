@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+
+request=$(cat)
+if [ -n "${ECHO_REQUEST_OUT-}" ]; then
+    printf '%s\n' "$request" > "$ECHO_REQUEST_OUT"
+fi
+
+op=$(printf '%s' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')
+scheme=$(printf '%s' "$request" | sed -n 's/.*"scheme":"\([^"]*\)".*/\1/p' | sed -n '1p')
+streams=$(printf '%s' "$request" | sed -n 's/.*"streams":\[\([^]]*\)\].*/\1/p')
+window_end=$(printf '%s' "$request" | sed -n 's/.*"window_end":"\([^"]*\)".*/\1/p')
+
+if [ -n "${ECHO_SLEEP-}" ]; then
+    sleep "$ECHO_SLEEP"
+fi
+
+if [ "${ECHO_NO_HELLO-}" = "1" ]; then
+    exit 0
+fi
+
+printf '{"type":"hello","protocol":1,"scheme":"%s","ops":["fetch","resolve"],"verbatim":true,"streams":[%s]}\n' "$scheme" "$streams"
+
+if [ "$op" = "resolve" ]; then
+    pointers=$(printf '%s' "$request" | sed -n 's/.*"pointers":\[\([^]]*\)\].*/\1/p' | tr ',' ' ' | tr -d '"')
+    for pointer in $pointers; do
+        stream=${pointer#*:}
+        printf '{"type":"record","pointer":"%s","stream":"%s","ts":"1970-01-01T00:00:00Z","text":"echo %s","raw":null}\n' "$pointer" "$stream" "$pointer"
+    done
+    exit 0
+fi
+
+record_time=$(date -u -d "$window_end - 1 hour" +%Y-%m-%dT%H:%M:%SZ)
+if [ "${ECHO_LATE-}" = "1" ]; then
+    record_time=$(date -u -d "$window_end + 1 hour" +%Y-%m-%dT%H:%M:%SZ)
+fi
+
+for stream in $(printf '%s' "$streams" | tr ',' ' ' | tr -d '"'); do
+    pointer_scheme=$scheme
+    if [ "${ECHO_BAD_SCHEME-}" = "1" ]; then
+        pointer_scheme=other
+    fi
+    printf '{"type":"record","pointer":"%s:%s/record","stream":"%s","ts":"%s","text":"echo %s","raw":null}\n' "$pointer_scheme" "$stream" "$stream" "$record_time" "$stream"
+    if [ "${ECHO_FAIL_STREAM-}" = "$stream" ]; then
+        printf '{"type":"stream_end","stream":"%s","status":"error","error":"echo failure"}\n' "$stream"
+    elif [ "${ECHO_NO_END-}" != "$stream" ]; then
+        printf '{"type":"stream_end","stream":"%s","status":"ok","cursor":"%s"}\n' "$stream" "$window_end"
+    fi
+done

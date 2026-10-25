@@ -14,6 +14,7 @@ pub mod records_schema;
 pub mod resolve;
 pub mod schema;
 pub mod search;
+pub mod source;
 pub mod store;
 pub mod sweep;
 pub mod tree;

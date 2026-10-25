@@ -1,5 +1,6 @@
 //! Command-line parsing and dispatch for tree commands.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt as _;
@@ -7,6 +8,7 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
 use anyhow::{anyhow, bail, Context as _, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize as _;
 use serde::Serialize;
@@ -18,6 +20,9 @@ use crate::output::{self, Outcome};
 use crate::resolve::{self, Resolved, Verification};
 use crate::schema::today_utc;
 use crate::search;
+use crate::source::{
+    self, FetchRequest, Request as SourceRequest, ResolveRequest, Session, SourceRef,
+};
 use crate::sweep::{self, Findings};
 
 #[derive(Parser)]
@@ -89,6 +94,11 @@ pub enum Command {
         #[command(subcommand)]
         command: CiteCommand,
     },
+    /// Run a configured source and print its protocol stream.
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
     /// Print the active tree state paths.
     State {
         #[command(subcommand)]
@@ -106,6 +116,22 @@ pub enum CiteCommand {
         live: bool,
         files: Vec<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum SourceCommand {
+    /// Run a configured source.
+    Run {
+        id: String,
+        #[arg(long, value_enum, default_value_t = SourceOperation::Fetch)]
+        op: SourceOperation,
+    },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum SourceOperation {
+    Fetch,
+    Resolve,
 }
 
 #[derive(Subcommand)]
@@ -127,6 +153,9 @@ impl Command {
             Self::Cite {
                 command: CiteCommand::Verify { .. },
             } => "cite verify".to_owned(),
+            Self::Source {
+                command: SourceCommand::Run { .. },
+            } => "source run".to_owned(),
             Self::State {
                 command: StateCommand::Path,
             } => "state path".to_owned(),
@@ -227,11 +256,77 @@ pub fn run(cli: &Cli) -> Result<Outcome> {
         Command::Cite {
             command: CiteCommand::Verify { live, files },
         } => run_verify(&context, files, *live),
+        Command::Source {
+            command: SourceCommand::Run { id, op },
+        } => run_source(&context, id, *op),
         Command::State {
             command: StateCommand::Path,
         } => run_state_path(&context),
         Command::External(_) => Err(anyhow!("external command dispatch failed")),
     }
+}
+
+fn run_source(context: &Context, id: &str, op: SourceOperation) -> Result<Outcome> {
+    let spec = context
+        .config
+        .sources
+        .iter()
+        .find(|source| source.id == id)
+        .ok_or_else(|| anyhow!("source {id} is not configured"))?;
+    let scheme = source::scheme(spec)?;
+    let source = source::open(spec, &scheme)?;
+    let source_ref = SourceRef {
+        id: spec.id.clone(),
+        kind: spec.kind.clone(),
+        scheme: scheme.clone(),
+    };
+    let state_dir = context.state()?.source_state(id);
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("creating {}", state_dir.display()))?;
+    let request = match op {
+        SourceOperation::Fetch => SourceRequest::Fetch(FetchRequest {
+            protocol: source::PROTOCOL_VERSION,
+            source: source_ref,
+            config: source::config_json(spec)?,
+            window_end: Utc::now(),
+            backfill_hours: context.config.ingest.backfill_hours,
+            cursors: BTreeMap::new(),
+            discovered: spec
+                .discover_field
+                .as_deref()
+                .map_or_else(Vec::new, |field| {
+                    source::discover_streams(&context.tree, field)
+                }),
+            state_dir,
+        }),
+        SourceOperation::Resolve => SourceRequest::Resolve(ResolveRequest {
+            protocol: source::PROTOCOL_VERSION,
+            source: source_ref,
+            config: source::config_json(spec)?,
+            pointers: Vec::new(),
+            state_dir,
+        }),
+    };
+    let schemes = source::configured_schemes(&context.config.sources)?;
+    let mut session = Session::new(&request, &schemes);
+    let run = source.run(&request, &mut |message| {
+        println!("{}", serde_json::to_string(&message)?);
+        session.accept(message).map(|_| ())
+    });
+    let outcome = session.finish(run);
+    if let Some(error) = outcome.error.as_deref() {
+        eprintln!("source {id}: {error}");
+    }
+    for (stream, result) in &outcome.streams {
+        if let Some(error) = result.error.as_deref() {
+            eprintln!("source {id} stream {stream}: {error}");
+        }
+    }
+    Ok(if outcome.has_errors() {
+        Outcome::SourceErrors
+    } else {
+        Outcome::Pass
+    })
 }
 
 fn run_rules(context: &Context) -> Result<Outcome> {

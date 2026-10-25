@@ -43,6 +43,10 @@ impl Store {
                 json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS record_thread ON record(thread);
+            CREATE TABLE IF NOT EXISTS source_metadata (
+                source TEXT PRIMARY KEY,
+                verbatim INTEGER NOT NULL CHECK (verbatim IN (0, 1))
+            );
             PRAGMA user_version = 1;
             ",
         )
@@ -96,6 +100,38 @@ impl Store {
             .commit()
             .context("committing record store transaction")?;
         Ok(inserted)
+    }
+
+    /// Stores whether a source's records are verbatim, as declared in its protocol hello.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the source metadata.
+    pub fn set_source_verbatim(&self, source: &str, verbatim: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO source_metadata(source, verbatim) VALUES (?1, ?2)
+                 ON CONFLICT(source) DO UPDATE SET verbatim = excluded.verbatim",
+                params![source, verbatim],
+            )
+            .with_context(|| format!("storing metadata for source {source}"))?;
+        Ok(())
+    }
+
+    /// Returns the stored verbatim declaration for one source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read the source metadata.
+    pub fn source_verbatim(&self, source: &str) -> Result<Option<bool>> {
+        self.conn
+            .query_row(
+                "SELECT verbatim FROM source_metadata WHERE source = ?1",
+                [source],
+                |row| row.get(0),
+            )
+            .optional()
+            .with_context(|| format!("reading metadata for source {source}"))
     }
 
     /// Looks up one record by its canonical pointer.
