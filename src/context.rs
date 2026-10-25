@@ -35,14 +35,18 @@ impl Context {
         root: &std::path::Path,
         json: bool,
         user: UserConfig,
-        initial_state: Option<StateDir>,
+        initial_state_base: Option<PathBuf>,
     ) -> Result<Self> {
         let config = TreeConfig::load(root)?;
         let tree = Tree::load(root, &config)?;
         let state = OnceCell::new();
-        if let Some(initial_state) = initial_state {
+        if let Some(initial_state_base) = initial_state_base {
+            let id = config
+                .id
+                .as_deref()
+                .ok_or_else(|| anyhow!("ctx.toml id is required to resolve plugin state"))?;
             state
-                .set(initial_state)
+                .set(StateDir::new(initial_state_base.join(id)))
                 .map_err(|_| anyhow!("plugin state directory was not retained"))?;
         }
         Ok(Self {
@@ -89,10 +93,8 @@ impl Context {
         validate_parent_version()?;
         let user = UserConfig::load()?;
         let json = std::env::var_os("CTX_JSON").is_some_and(|value| value == "1");
-        let state = std::env::var_os("CTX_STATE_DIR")
-            .map(PathBuf::from)
-            .map(StateDir::new);
-        Self::load_at(&root, json, user, state)
+        let state_base = std::env::var_os("CTX_STATE_DIR").map(PathBuf::from);
+        Self::load_at(&root, json, user, state_base)
     }
 }
 
@@ -125,15 +127,18 @@ mod tests {
     use std::cell::OnceCell;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{LazyLock, Mutex};
 
-    use anyhow::{Context as _, Result};
+    use anyhow::{anyhow, Context as _, Result};
 
-    use crate::config::{StateDir, TreeConfig, UserConfig};
+    use crate::config::{TreeConfig, UserConfig};
     use crate::tree::Tree;
 
     use super::Context;
 
     static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    static ENVIRONMENT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn scratch() -> Result<PathBuf> {
         let suffix = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
@@ -169,18 +174,58 @@ mod tests {
     }
 
     #[test]
-    fn supplied_plugin_state_is_returned_without_appending_the_tree_identifier() -> Result<()> {
+    fn supplied_plugin_state_base_is_appended_with_the_tree_identifier() -> Result<()> {
         let root = scratch()?;
-        let state_path = PathBuf::from("/var/state/ctx/example");
+        std::fs::write(root.join("ctx.toml"), "version = 1\nid = \"example\"\n")?;
+        let state_base = PathBuf::from("/var/state/ctx");
         let context = Context::load_at(
             &root,
             false,
             UserConfig::default(),
-            Some(StateDir::new(state_path.clone())),
+            Some(state_base.clone()),
         )?;
 
-        assert_eq!(context.state()?.root(), state_path);
+        assert_eq!(context.state()?.root(), state_base.join("example"));
         std::fs::remove_dir_all(&root)?;
         Ok(())
+    }
+
+    #[test]
+    fn plugin_environment_appends_the_tree_identifier_to_the_state_base() -> Result<()> {
+        let _environment = ENVIRONMENT_LOCK
+            .lock()
+            .map_err(|error| anyhow!("locking the test environment: {error}"))?;
+        let root = scratch()?;
+        std::fs::write(root.join("ctx.toml"), "version = 1\nid = \"example\"\n")?;
+        let state_base = root.join("state-base");
+        let config_home = root.join("config-home");
+        let previous_memory = std::env::var_os("CTX_MEMORY");
+        let previous_state = std::env::var_os("CTX_STATE_DIR");
+        let previous_version = std::env::var_os("CTX_VERSION");
+        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("CTX_MEMORY", &root);
+        std::env::set_var("CTX_STATE_DIR", &state_base);
+        std::env::set_var("CTX_VERSION", env!("CARGO_PKG_VERSION"));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+
+        let state = Context::from_plugin_env()
+            .and_then(|context| context.state().map(|state| state.root().to_path_buf()));
+
+        restore_environment("CTX_MEMORY", previous_memory);
+        restore_environment("CTX_STATE_DIR", previous_state);
+        restore_environment("CTX_VERSION", previous_version);
+        restore_environment("XDG_CONFIG_HOME", previous_config_home);
+        std::fs::remove_dir_all(&root)?;
+
+        assert_eq!(state?, state_base.join("example"));
+        Ok(())
+    }
+
+    fn restore_environment(name: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
     }
 }

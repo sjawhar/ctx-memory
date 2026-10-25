@@ -93,7 +93,7 @@ impl Command {
 
 pub struct PluginEnv {
     pub tree_root: Option<PathBuf>,
-    pub state_dir: Option<PathBuf>,
+    pub state_base: Option<PathBuf>,
     pub json: bool,
 }
 
@@ -254,15 +254,14 @@ fn front_vital<'a>(document: &'a Doc, field: &str) -> Option<&'a str> {
 fn plugin_environment(global: &GlobalArgs) -> Result<PluginEnv> {
     let user = UserConfig::load()?;
     let tree_root = resolve_plugin_tree(global, &user);
-    let state_dir = tree_root.as_deref().and_then(|root| {
+    let state_base = tree_root.as_deref().and_then(|root| {
         let config = TreeConfig::load(root).ok()?;
-        let id = config.id?;
-        let path = state_base(&user).ok()?.join(id);
-        absolute_path(path).ok()
+        config.id?;
+        absolute_path(state_base(&user).ok()?).ok()
     });
     Ok(PluginEnv {
         tree_root,
-        state_dir,
+        state_base,
         json: global.json,
     })
 }
@@ -308,8 +307,8 @@ pub fn run_external(arguments: &[OsString], environment: &PluginEnv) -> Result<I
     if let Some(root) = &environment.tree_root {
         command.env("CTX_MEMORY", root);
     }
-    if let Some(state_dir) = &environment.state_dir {
-        command.env("CTX_STATE_DIR", state_dir);
+    if let Some(state_base) = &environment.state_base {
+        command.env("CTX_STATE_DIR", state_base);
     }
     if environment.json {
         command.env("CTX_JSON", "1");

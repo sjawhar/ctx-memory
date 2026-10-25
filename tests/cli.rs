@@ -230,7 +230,7 @@ fn external_command_removes_inherited_state_without_a_tree() -> Result<()> {
 }
 
 #[test]
-fn external_command_passes_an_absolute_configured_state_path() -> Result<()> {
+fn external_command_passes_an_absolute_configured_state_base() -> Result<()> {
     let bin = scratch()?;
     plugin(
         &bin,
@@ -253,7 +253,7 @@ fn external_command_passes_an_absolute_configured_state_path() -> Result<()> {
         .env("XDG_CONFIG_HOME", &config_home)
         .output()
         .context("running external ctx command with relative state")?;
-    let expected = std::env::current_dir()?.join("relative-state/example");
+    let expected = std::env::current_dir()?.join("relative-state");
     remove_scratch(&config_home)?;
     remove_scratch(&tree)?;
     remove_scratch(&bin)?;
