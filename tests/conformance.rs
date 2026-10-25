@@ -1,6 +1,9 @@
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::thread::JoinHandle;
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
@@ -60,6 +63,31 @@ fn clear_echo_environment(command: &mut std::process::Command) {
     for name in ECHO_ENV_NAMES {
         command.env_remove(name);
     }
+}
+
+fn fake_slack_api(responses: Vec<String>) -> Result<(String, JoinHandle<Result<()>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> Result<()> {
+        for body in responses {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = BufReader::new(stream.try_clone()?);
+            loop {
+                let mut line = String::new();
+                let bytes_read = request.read_line(&mut line)?;
+                if bytes_read == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes())?;
+        }
+        Ok(())
+    });
+    Ok((format!("http://{address}"), server))
 }
 
 fn source_tree(root: &Path) -> Result<PathBuf> {
@@ -138,25 +166,32 @@ fn source_run_accepts_the_resolve_operation() -> Result<()> {
 }
 
 #[test]
-fn source_run_rejects_unimplemented_builtin_kinds() -> Result<()> {
-    let root = scratch("builtin-source")?;
-    let tree = root.join("tree");
-    std::fs::create_dir(&tree)?;
-    std::fs::write(
-        tree.join("ctx.toml"),
-        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
-    )?;
-    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
-    let output = binary()
-        .args(["--memory", tree_text, "source", "run", "slack"])
-        .output()
-        .context("running unavailable built-in source")?;
-    remove_scratch(&root)?;
+fn source_opens_builtin_slack() -> Result<()> {
+    let config: ctx_memory::config::TreeConfig = toml::from_str(
+        "version = 1
+id = \"example\"
 
-    assert_eq!(output.status.code(), Some(2));
-    let error = String::from_utf8(output.stderr).context("ctx error is not UTF-8")?;
-    assert!(error.contains("slack"));
-    assert!(error.contains("not yet available"));
+[[sources]]
+id = \"slack\"
+kind = \"slack\"
+workspace = \"example\"
+channels = [\"C0EXAMPLE01\"]
+",
+    )?;
+    let spec = config
+        .sources
+        .into_iter()
+        .next()
+        .context("test configuration contains a Slack source")?;
+    let source = source::open(&spec, "slack");
+
+    assert!(
+        source.is_ok(),
+        "opening the built-in Slack source failed: {}",
+        source
+            .err()
+            .map_or_else(String::new, |error| format!("{error:#}"))
+    );
     Ok(())
 }
 
@@ -525,4 +560,52 @@ fn external_resolve_returns_records_for_requested_pointers() -> Result<()> {
         Some("echo:x")
     );
     Ok(())
+}
+
+#[test]
+fn built_in_slack_conforms_against_fake_api() -> Result<()> {
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .map_err(|error| anyhow::anyhow!("locking the test environment: {error}"))?;
+    let root = scratch("slack-conformance")?;
+    let window_end = timestamp("2026-10-25T18:00:00Z")?;
+    let request = Request::Fetch(FetchRequest {
+        protocol: source::PROTOCOL_VERSION,
+        source: SourceRef {
+            id: "slack".to_owned(),
+            kind: "slack".to_owned(),
+            scheme: "slack".to_owned(),
+        },
+        config: serde_json::json!({
+            "workspace": "acme",
+            "channels": ["C0EXAMPLE01"],
+        }),
+        window_end,
+        backfill_hours: 24,
+        cursors: std::collections::BTreeMap::new(),
+        discovered: Vec::new(),
+        state_dir: root.join("state"),
+    });
+    let (api, server) = fake_slack_api(vec![
+        r#"{"ok":true,"channel":{"name":"general"}}"#.to_owned(),
+        r#"{"ok":true,"messages":[]}"#.to_owned(),
+    ])?;
+    let previous = std::env::var_os("SLACK_TOKEN");
+    std::env::set_var("SLACK_TOKEN", "test-token");
+    let source = source::SlackSource::with_api(api);
+    let outcome = run_conformance(&source, &request);
+    restore_environment("SLACK_TOKEN", previous);
+    server
+        .join()
+        .map_err(|_| anyhow::anyhow!("fake Slack API server panicked"))??;
+    remove_scratch(&root)?;
+
+    assert!(!outcome.has_errors());
+    assert_eq!(outcome.records.len(), 0);
+    assert_stream(
+        &outcome,
+        "C0EXAMPLE01",
+        StreamStatus::Ok,
+        Some("2026-10-25T18:00:00Z"),
+    )
 }

@@ -1,6 +1,7 @@
 //! Source protocol types and validation shared by built-in and external sources.
 
 mod external;
+mod slack;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use crate::record::Record;
 use crate::tree::Tree;
 
 pub use external::External;
+pub use slack::SlackSource;
 
 /// The version of the JSONL source protocol understood by this crate.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -153,13 +155,12 @@ pub trait Source {
 ///
 /// # Errors
 ///
-/// Returns an error when a built-in source has not been implemented or an external executable is
-/// not available on `PATH`.
+/// Returns an error when a built-in source other than Slack has not been implemented or an external
+/// executable is not available on `PATH`.
 pub fn open(spec: &SourceConfig, scheme: &str) -> Result<Box<dyn Source>> {
     match spec.kind.as_str() {
-        "slack" | "gmail" | "drive" | "calendar" => {
-            bail!("source kind {} is not yet available", spec.kind)
-        }
+        "slack" => Ok::<Box<dyn Source>, anyhow::Error>(Box::new(SlackSource::new())),
+        "gmail" | "drive" | "calendar" => bail!("source kind {} is not yet available", spec.kind),
         _ => {
             let external = External::find(&spec.kind)?.with_timeout_secs(spec.timeout_secs);
             Ok::<Box<dyn Source>, anyhow::Error>(Box::new(external))
