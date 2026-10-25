@@ -9,6 +9,8 @@ use chrono::NaiveDate;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 
+use crate::config::{TreeConfig, RULES_FILE};
+
 /// How much authority a source carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
@@ -217,6 +219,7 @@ impl Doc {
 pub struct Tree {
     pub root: PathBuf,
     pub docs: Vec<Doc>,
+    pub(crate) folder_notes: Vec<String>,
 }
 
 /// Split a file into its YAML frontmatter and the byte offset of its markdown body.
@@ -240,7 +243,7 @@ impl Tree {
     ///
     /// Returns an error when the root cannot be traversed, a document cannot be read, or
     /// its frontmatter cannot be parsed.
-    pub fn load(root: &Path) -> Result<Self> {
+    pub fn load(root: &Path, config: &TreeConfig) -> Result<Self> {
         let root = root
             .canonicalize()
             .with_context(|| format!("no markdown tree at {}", root.display()))?;
@@ -269,18 +272,29 @@ impl Tree {
                 body_start,
             });
         }
-        Ok(Self { root, docs })
+        Ok(Self {
+            root,
+            docs,
+            folder_notes: config.folder_notes.clone(),
+        })
     }
 
     #[must_use]
     pub fn index_by_name(&self) -> HashMap<String, usize> {
         let mut index = HashMap::new();
         for (position, doc) in self.docs.iter().enumerate() {
-            for name in doc.link_names(&[]) {
+            for name in doc.link_names(&self.folder_notes) {
                 index.insert(name, position);
             }
         }
         index
+    }
+
+    #[must_use]
+    pub fn rules(&self) -> Option<&Doc> {
+        self.docs
+            .iter()
+            .find(|doc| doc.rel == Path::new(RULES_FILE))
     }
 }
 
@@ -290,6 +304,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anyhow::{anyhow, Context as _, Result};
+
+    use crate::config::TreeConfig;
 
     use super::{Tier, Tree};
 
@@ -314,7 +330,7 @@ mod tests {
         let root = test_root("malformed-frontmatter")?;
         std::fs::write(root.join("broken.md"), "---\ntype: [\n---\nbody\n")
             .with_context(|| format!("writing {}", root.display()))?;
-        let result = Tree::load(&root);
+        let result = Tree::load(&root, &TreeConfig::default());
         remove_test_root(&root)?;
         let error = result
             .err()
@@ -330,7 +346,7 @@ mod tests {
         let root = test_root("no-frontmatter")?;
         std::fs::write(root.join("plain.md"), "ordinary markdown\n")
             .with_context(|| format!("writing {}", root.display()))?;
-        let result = Tree::load(&root);
+        let result = Tree::load(&root, &TreeConfig::default());
         remove_test_root(&root)?;
         let tree = result?;
         let doc = tree

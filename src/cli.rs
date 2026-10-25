@@ -1,16 +1,25 @@
-//! Command-line parsing and dispatch for read-only tree commands.
+//! Command-line parsing and dispatch for tree commands.
 
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::ffi::OsString;
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize as _;
+use serde::Serialize;
 
+use crate::config::{locate_tree, state_base, TreeConfig, UserConfig};
+use crate::context::Context;
 use crate::open::{open_items, OpenItem};
+use crate::output::{self, Outcome};
 use crate::search;
 use crate::sweep::{self, Findings};
-use crate::tree::Tree;
+use crate::tree::Doc;
 
 #[derive(Parser)]
 #[command(name = "ctx", version, arg_required_else_help = true)]
@@ -27,8 +36,25 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[derive(Debug)]
+pub struct GlobalArgs {
+    pub memory: Option<PathBuf>,
+    pub json: bool,
+}
+
+impl From<&Cli> for GlobalArgs {
+    fn from(cli: &Cli) -> Self {
+        Self {
+            memory: cli.memory.clone(),
+            json: cli.json,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Command {
+    /// Print the tree rules page.
+    Rules,
     /// Report missing links, stale items, and missing provenance.
     Sweep,
     /// Search the tree, ranking direct sources ahead of summaries.
@@ -44,42 +70,81 @@ pub enum Command {
     Dossier { entity: String },
     /// List open decisions, commitments, and questions.
     Open,
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
 }
 
-pub enum Outcome {
-    Pass,
-    StructuralDefects,
-}
-
-impl Outcome {
+impl Command {
     #[must_use]
-    pub const fn exit_code(&self) -> u8 {
+    pub fn name(&self) -> String {
         match self {
-            Self::Pass => 0,
-            Self::StructuralDefects => 1,
+            Self::Rules => "rules".to_owned(),
+            Self::Sweep => "sweep".to_owned(),
+            Self::Search { .. } => "search".to_owned(),
+            Self::Dossier { .. } => "dossier".to_owned(),
+            Self::Open => "open".to_owned(),
+            Self::External(arguments) => arguments
+                .first()
+                .and_then(|argument| argument.to_str())
+                .map_or_else(|| "external".to_owned(), str::to_owned),
         }
     }
 }
 
-/// Runs the selected read command against the requested tree.
+pub struct PluginEnv {
+    pub tree_root: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
+    pub json: bool,
+}
+
+#[derive(Serialize)]
+struct RulesPayload<'a> {
+    path: String,
+    bytes: usize,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct SearchPayload<'a> {
+    query: &'a str,
+    hits: Vec<search::Hit>,
+}
+
+#[derive(Serialize)]
+struct DossierPayload<'entity, 'vitals, 'document> {
+    entity: &'entity str,
+    page: Option<DossierPage<'vitals, 'document>>,
+    hits: Vec<search::Hit>,
+}
+
+#[derive(Serialize)]
+struct DossierPage<'vitals, 'document> {
+    path: String,
+    vitals: BTreeMap<&'vitals str, &'document str>,
+}
+
+#[derive(Serialize)]
+struct OpenPayload {
+    items: Vec<OpenItem>,
+}
+
+/// Runs the selected command.
 ///
 /// # Errors
 ///
-/// Returns an error when the tree cannot be loaded or a command cannot complete.
+/// Returns an error when tree discovery, loading, command execution, or external dispatch fails.
 pub fn run(cli: &Cli) -> Result<Outcome> {
-    let tree_root = cli
-        .memory
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("memory"));
-    let tree = Tree::load(&tree_root)?;
+    if let Command::External(arguments) = &cli.command {
+        let environment = plugin_environment(&GlobalArgs::from(cli));
+        return run_external(arguments, &environment).map(|never| match never {});
+    }
+
+    let context = Context::load(&GlobalArgs::from(cli))?;
     match &cli.command {
+        Command::Rules => run_rules(&context),
         Command::Sweep => {
-            let findings = sweep::run(&tree)?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&findings)?);
-            } else {
-                print_sweep(&findings);
-            }
+            let findings = sweep::run(&context.tree)?;
+            output::emit(context.json, "sweep", &findings, print_sweep)?;
             Ok(if findings.structural_clean() {
                 Outcome::Pass
             } else {
@@ -91,33 +156,161 @@ pub fn run(cli: &Cli) -> Result<Outcome> {
             verbatim,
             limit,
         } => {
-            let hits = search::run(&tree, query, *verbatim, *limit);
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&hits)?);
-            } else {
-                search::print(&hits, query.split_whitespace().count());
-            }
+            let payload = SearchPayload {
+                query,
+                hits: search::run(&context.tree, query, *verbatim, *limit),
+            };
+            output::emit(context.json, "search", &payload, |payload| {
+                search::print(&payload.hits, payload.query.split_whitespace().count());
+            })?;
             Ok(Outcome::Pass)
         }
-        Command::Dossier { entity } => {
-            let pages = search::dossier(&tree, entity);
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&pages)?);
-            } else {
-                search::print_dossier(entity, &pages);
-            }
-            Ok(Outcome::Pass)
-        }
+        Command::Dossier { entity } => run_dossier(&context, entity),
         Command::Open => {
-            let items = open_items(&tree);
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&items)?);
-            } else {
-                print_open(&items);
+            if !context.config.sources.is_empty() {
+                context.state()?;
             }
+            let payload = OpenPayload {
+                items: open_items(&context.tree),
+            };
+            output::emit(context.json, "open", &payload, |payload| {
+                print_open(&payload.items);
+            })?;
             Ok(Outcome::Pass)
         }
+        Command::External(_) => Err(anyhow!("external command dispatch failed")),
     }
+}
+
+fn run_rules(context: &Context) -> Result<Outcome> {
+    let document = context
+        .tree
+        .rules()
+        .ok_or_else(|| anyhow!("rules.md is missing from the tree root"))?;
+    let payload = RulesPayload {
+        path: document.rel.to_string_lossy().into_owned(),
+        bytes: document.raw.len(),
+        text: &document.raw,
+    };
+    output::emit(context.json, "rules", &payload, |payload| {
+        println!("{}", payload.path);
+        print!("\n{}", payload.text);
+    })?;
+    Ok(Outcome::Pass)
+}
+
+fn run_dossier(context: &Context, entity: &str) -> Result<Outcome> {
+    if entity.trim().is_empty() {
+        bail!("dossier entity must not be empty");
+    }
+    let payload = DossierPayload {
+        entity,
+        page: dossier_page(
+            &context.tree.docs,
+            &context.tree.index_by_name(),
+            entity,
+            &context.config.dossier.vitals,
+        ),
+        hits: search::dossier(&context.tree, entity),
+    };
+    output::emit(context.json, "dossier", &payload, |payload| {
+        search::print_dossier(payload.entity, &payload.hits);
+    })?;
+    Ok(Outcome::Pass)
+}
+
+fn dossier_page<'vitals, 'document>(
+    documents: &'document [Doc],
+    index: &std::collections::HashMap<String, usize>,
+    entity: &str,
+    vital_fields: &'vitals [String],
+) -> Option<DossierPage<'vitals, 'document>> {
+    let position = *index.get(entity)?;
+    let document = documents.get(position)?;
+    let vitals = vital_fields
+        .iter()
+        .filter_map(|field| front_vital(document, field).map(|value| (field.as_str(), value)))
+        .collect();
+    Some(DossierPage {
+        path: document.rel.to_string_lossy().into_owned(),
+        vitals,
+    })
+}
+
+fn front_vital<'a>(document: &'a Doc, field: &str) -> Option<&'a str> {
+    let front = &document.front;
+    match field {
+        "type" => front.kind.as_deref(),
+        "status" => front.status.as_deref(),
+        "title" => front.title.as_deref(),
+        "name" => front.name.as_deref(),
+        "owner" => front.owner.as_deref(),
+        "what" => front.what.as_deref(),
+        "question" => front.question.as_deref(),
+        _ => front.extra_str(field),
+    }
+}
+
+fn plugin_environment(global: &GlobalArgs) -> PluginEnv {
+    let user = UserConfig::load().unwrap_or_default();
+    let tree_root = resolve_plugin_tree(global, &user);
+    let state_dir = tree_root.as_deref().and_then(|root| {
+        let config = TreeConfig::load(root).ok()?;
+        let id = config.id?;
+        state_base(&user).ok().map(|base| base.join(id))
+    });
+    PluginEnv {
+        tree_root,
+        state_dir,
+        json: global.json,
+    }
+}
+
+fn resolve_plugin_tree(global: &GlobalArgs, user: &UserConfig) -> Option<PathBuf> {
+    if let Some(root) = global.memory.as_deref() {
+        return root.canonicalize().ok();
+    }
+    let cwd = std::env::current_dir().ok()?;
+    locate_tree(None, &cwd, user)
+        .ok()
+        .and_then(|root| root.canonicalize().ok())
+}
+
+/// Executes a `ctx-<name>` command from `PATH` with the resolved ctx environment.
+///
+/// # Errors
+///
+/// Returns an error when no command name is supplied or when the executable cannot be started.
+pub fn run_external(arguments: &[OsString], environment: &PluginEnv) -> Result<Infallible> {
+    let (name, arguments) = arguments
+        .split_first()
+        .ok_or_else(|| anyhow!("external command name is missing"))?;
+    let name = name
+        .to_str()
+        .ok_or_else(|| anyhow!("external command name is not valid UTF-8"))?;
+    let executable = format!("ctx-{name}");
+    let mut command = ProcessCommand::new(&executable);
+    command.args(arguments);
+    if let Some(root) = &environment.tree_root {
+        command.env("CTX_MEMORY", root);
+    }
+    if let Some(state_dir) = &environment.state_dir {
+        command.env("CTX_STATE_DIR", state_dir);
+    }
+    if environment.json {
+        command.env("CTX_JSON", "1");
+    }
+    command.env("CTX_VERSION", env!("CARGO_PKG_VERSION"));
+    command.env(
+        "CTX_BIN",
+        std::env::current_exe().context("locating the ctx executable")?,
+    );
+
+    let error = command.exec();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        bail!("unknown command `{name}` (no {executable} on PATH)");
+    }
+    Err(error).with_context(|| format!("running {executable}"))
 }
 
 fn print_sweep(findings: &Findings) {

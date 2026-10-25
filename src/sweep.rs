@@ -155,7 +155,7 @@ pub fn run(tree: &Tree) -> Result<Findings> {
     let known: HashSet<String> = tree
         .docs
         .iter()
-        .flat_map(|doc| doc.link_names(&[]))
+        .flat_map(|doc| doc.link_names(&tree.folder_notes))
         .collect();
 
     let negative_re = negative_claim_re()?;
@@ -217,7 +217,7 @@ pub fn run(tree: &Tree) -> Result<Findings> {
         .filter(|doc| {
             doc.rel != Path::new("index.md")
                 && !doc
-                    .link_names(&[])
+                    .link_names(&tree.folder_notes)
                     .iter()
                     .any(|name| linked.contains(name.as_str()))
         })

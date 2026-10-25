@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context as _, Result};
 use chrono::NaiveDate;
-use ctx_memory::{open::open_items, tree::Tree};
+use ctx_memory::{config::TreeConfig, open::open_items, tree::Tree};
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -32,7 +32,7 @@ fn preserves_unknown_frontmatter_and_reports_open_items() -> Result<()> {
     )
     .with_context(|| format!("writing {}", decisions.display()))?;
 
-    let tree = Tree::load(&root)?;
+    let tree = Tree::load(&root, &TreeConfig::default())?;
     remove_test_root(&root)?;
 
     let doc = tree
@@ -63,7 +63,7 @@ fn folder_aliases_require_an_explicit_file_name() -> Result<()> {
     std::fs::write(decisions.join("index.md"), "# Decisions\n")
         .with_context(|| format!("writing {}", decisions.display()))?;
 
-    let tree = Tree::load(&root)?;
+    let tree = Tree::load(&root, &TreeConfig::default())?;
     remove_test_root(&root)?;
     let doc = tree
         .docs
