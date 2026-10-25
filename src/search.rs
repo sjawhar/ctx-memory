@@ -136,6 +136,11 @@ fn entity_matches(document: &Doc, entity: &str, entity_lower: &str, exact: bool)
     };
 
     matches(&document.stem())
+        || document
+            .rel
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(matches)
         || document.front.name.as_deref().is_some_and(matches)
         || document.front.title.as_deref().is_some_and(matches)
         || exact

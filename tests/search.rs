@@ -70,6 +70,16 @@ fn dossier_finds_documents_by_frontmatter_name() -> Result<()> {
         "meetings/review.md",
         "The group asked Alice Example to review the proposal. [[people/alice]]\n",
     )?;
+    write(
+        &root,
+        "records/Alice Example/archive.md",
+        "# Unrelated record\n",
+    )?;
+    write(
+        &root,
+        "records/frontmatter.md",
+        "---\nsubject: Alice Example\n---\n# Unrelated record\n",
+    )?;
 
     let response = ctx(&root, &["dossier", "Alice Example"]);
     remove_test_root(&root)?;
@@ -89,6 +99,66 @@ fn dossier_finds_documents_by_frontmatter_name() -> Result<()> {
         .collect::<Vec<_>>();
     assert!(hit_paths.contains(&"people/alice.md"));
     assert!(hit_paths.contains(&"meetings/review.md"));
+    assert!(hit_paths.contains(&"records/Alice Example/archive.md"));
+    assert!(hit_paths.contains(&"records/frontmatter.md"));
+    Ok(())
+}
+
+#[test]
+fn dossier_selects_title_and_alias_matches() -> Result<()> {
+    let root = test_root("title-alias")?;
+    write_config(&root, "")?;
+    write(
+        &root,
+        "projects/falcon.md",
+        "---\ntitle: Falcon Project\n---\n# Project\n",
+    )?;
+    write(
+        &root,
+        "people/alice.md",
+        "---\naliases: [Lead Alice]\n---\n# Profile\n",
+    )?;
+
+    let title_response = ctx(&root, &["dossier", "fAlCoN pRoJeCt"]);
+    let alias_response = ctx(&root, &["dossier", "lEaD aLiCe"]);
+    remove_test_root(&root)?;
+
+    assert_eq!(
+        title_response?
+            .get("data")
+            .and_then(|data| data.get("page"))
+            .and_then(|page| page.get("path")),
+        Some(&serde_json::json!("projects/falcon.md"))
+    );
+    assert_eq!(
+        alias_response?
+            .get("data")
+            .and_then(|data| data.get("page"))
+            .and_then(|page| page.get("path")),
+        Some(&serde_json::json!("people/alice.md"))
+    );
+    Ok(())
+}
+
+#[test]
+fn exact_entity_match_wins_over_substring_candidates() -> Result<()> {
+    let root = test_root("exact-before-substring")?;
+    write_config(&root, "")?;
+    write(&root, "people/alice.md", "# Profile\n")?;
+    write(&root, "people/alice-archive.md", "# Archive\n")?;
+
+    let response = ctx(&root, &["dossier", "alice"]);
+    remove_test_root(&root)?;
+    let data = response?
+        .get("data")
+        .cloned()
+        .context("dossier data is missing")?;
+
+    assert_eq!(
+        data.get("page").and_then(|page| page.get("path")),
+        Some(&serde_json::json!("people/alice.md"))
+    );
+    assert_eq!(data.get("candidates"), Some(&serde_json::json!([])));
     Ok(())
 }
 
@@ -143,11 +213,11 @@ fn ambiguous_entity_lists_candidates_instead_of_choosing() -> Result<()> {
 #[test]
 fn dossier_json_carries_the_page_vitals() -> Result<()> {
     let root = test_root("vitals")?;
-    write_config(&root, "\"status\"")?;
+    write_config(&root, "\"status\", \"missing\"")?;
     write(
         &root,
         "people/alice.md",
-        "---\nname: Alice Example\nstatus: active\n---\n# Profile\n",
+        "---\nname: Alice Example\nstatus: active\ndepartment: research\n---\n# Profile\n",
     )?;
 
     let response = ctx(&root, &["dossier", "Alice Example"]);
@@ -158,9 +228,8 @@ fn dossier_json_carries_the_page_vitals() -> Result<()> {
         response
             .get("data")
             .and_then(|data| data.get("page"))
-            .and_then(|page| page.get("vitals"))
-            .and_then(|vitals| vitals.get("status")),
-        Some(&serde_json::json!("active"))
+            .and_then(|page| page.get("vitals")),
+        Some(&serde_json::json!({"status": "active"}))
     );
     Ok(())
 }
