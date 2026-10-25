@@ -15,6 +15,7 @@ use crate::config::{locate_tree, state_base, TreeConfig, UserConfig};
 use crate::context::Context;
 use crate::open::{open_items_with_filters, parse_linked, LinkedFilter, OpenItemView};
 use crate::output::{self, Outcome};
+use crate::resolve::{self, Resolved, Verification};
 use crate::schema::today_utc;
 use crate::search;
 use crate::sweep::{self, Findings};
@@ -77,8 +78,40 @@ pub enum Command {
         #[arg(long, value_name = "NAME", value_delimiter = ',')]
         owner: Vec<String>,
     },
+    /// Resolve citation pointers from the local store.
+    Resolve {
+        #[arg(long)]
+        thread: bool,
+        pointers: Vec<String>,
+    },
+    /// Verify citations in tree documents.
+    Cite {
+        #[command(subcommand)]
+        command: CiteCommand,
+    },
+    /// Print the active tree state paths.
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
     #[command(external_subcommand)]
     External(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+pub enum CiteCommand {
+    /// Verify pointer resolution and quoted text.
+    Verify {
+        #[arg(long)]
+        live: bool,
+        files: Vec<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum StateCommand {
+    /// Print the state directory and SQLite store path.
+    Path,
 }
 
 impl Command {
@@ -90,6 +123,13 @@ impl Command {
             Self::Search { .. } => "search".to_owned(),
             Self::Dossier { .. } => "dossier".to_owned(),
             Self::Open { .. } => "open".to_owned(),
+            Self::Resolve { .. } => "resolve".to_owned(),
+            Self::Cite {
+                command: CiteCommand::Verify { .. },
+            } => "cite verify".to_owned(),
+            Self::State {
+                command: StateCommand::Path,
+            } => "state path".to_owned(),
             Self::External(arguments) => arguments
                 .first()
                 .and_then(|argument| argument.to_str())
@@ -120,6 +160,17 @@ struct SearchPayload<'a> {
 #[derive(Serialize)]
 struct OpenPayload {
     items: Vec<OpenItemView>,
+}
+
+#[derive(Serialize)]
+struct ResolvePayload {
+    results: Vec<Resolved>,
+}
+
+#[derive(Serialize)]
+struct StatePathPayload {
+    state_dir: String,
+    store: String,
 }
 
 /// Runs the selected command.
@@ -172,6 +223,13 @@ pub fn run(cli: &Cli) -> Result<Outcome> {
             })?;
             Ok(Outcome::Pass)
         }
+        Command::Resolve { thread, pointers } => run_resolve(&context, pointers, *thread),
+        Command::Cite {
+            command: CiteCommand::Verify { live, files },
+        } => run_verify(&context, files, *live),
+        Command::State {
+            command: StateCommand::Path,
+        } => run_state_path(&context),
         Command::External(_) => Err(anyhow!("external command dispatch failed")),
     }
 }
@@ -196,6 +254,42 @@ fn run_rules(context: &Context) -> Result<Outcome> {
 fn run_dossier(context: &Context, entity: &str) -> Result<Outcome> {
     let payload = search::dossier(&context.tree, entity, &context.config)?;
     output::emit(context.json, "dossier", &payload, search::print_dossier)?;
+    Ok(Outcome::Pass)
+}
+
+fn run_resolve(context: &Context, pointers: &[String], thread: bool) -> Result<Outcome> {
+    let payload = ResolvePayload {
+        results: resolve::resolve(context, pointers, thread)?,
+    };
+    output::emit(context.json, "resolve", &payload, print_resolved)?;
+    Ok(Outcome::Pass)
+}
+
+fn run_verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Outcome> {
+    let verification = resolve::verify(context, files, live)?;
+    output::emit(
+        context.json,
+        "cite verify",
+        &verification,
+        print_verification,
+    )?;
+    Ok(if verification.broken.is_empty() {
+        Outcome::Pass
+    } else {
+        Outcome::StructuralDefects
+    })
+}
+
+fn run_state_path(context: &Context) -> Result<Outcome> {
+    let state = context.state()?;
+    let payload = StatePathPayload {
+        state_dir: state.root().to_string_lossy().into_owned(),
+        store: state.store().to_string_lossy().into_owned(),
+    };
+    output::emit(context.json, "state path", &payload, |payload| {
+        println!("{}", payload.state_dir);
+        println!("{}", payload.store);
+    })?;
     Ok(Outcome::Pass)
 }
 
@@ -430,5 +524,32 @@ fn print_open(items: &[OpenItemView]) {
         );
         println!("     {}", item.title);
         println!("     {}\n", item.path.dimmed());
+    }
+}
+
+fn print_resolved(payload: &ResolvePayload) {
+    for result in &payload.results {
+        println!("{}", result.input);
+        if let Some(error) = result.error.as_deref() {
+            println!("  error: {error}");
+        } else if let Some(text) = result.text.as_deref() {
+            println!("{text}");
+        } else {
+            println!("  not found");
+        }
+        println!();
+    }
+}
+
+fn print_verification(verification: &Verification) {
+    println!("checked {}", verification.checked);
+    for broken in &verification.broken {
+        println!(
+            "{}:{}: {} — {}",
+            broken.file, broken.line, broken.pointer, broken.why
+        );
+    }
+    for (scheme, skipped) in &verification.skipped {
+        println!("skipped {scheme}: {skipped}");
     }
 }

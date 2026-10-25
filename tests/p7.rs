@@ -1,0 +1,308 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::TryRecvError;
+use std::thread;
+
+use anyhow::{anyhow, Context as _, Result};
+use chrono::{DateTime, TimeZone as _, Utc};
+use ctx_memory::{
+    atomic,
+    pointer::{Pointer, Schemes},
+    record::Record,
+    store::Store,
+};
+use serde_json::Value;
+
+static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+
+fn scratch(label: &str) -> Result<PathBuf> {
+    let suffix = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "ctx-memory-{label}-test-{}-{suffix}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).with_context(|| format!("creating {}", root.display()))?;
+    Ok(root)
+}
+
+fn remove_scratch(path: &Path) -> Result<()> {
+    std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))
+}
+
+fn timestamp(seconds: i64) -> Result<DateTime<Utc>> {
+    Utc.timestamp_opt(seconds, 0)
+        .single()
+        .context("constructing test timestamp")
+}
+
+fn record(pointer: &str, thread: Option<&str>, seconds: i64, text: &str) -> Result<Record> {
+    Ok(Record {
+        pointer: pointer.to_owned(),
+        stream: "C0EXAMPLE01".to_owned(),
+        ts: timestamp(seconds)?,
+        label: Some("#general".to_owned()),
+        author: Some("Alice".to_owned()),
+        author_id: Some("U0EXAMPLE9".to_owned()),
+        thread: thread.map(str::to_owned),
+        title: None,
+        url: None,
+        text: text.to_owned(),
+        aliases: Vec::new(),
+        context: false,
+        raw: Value::Null,
+    })
+}
+
+fn pointer(text: &str) -> Pointer {
+    Pointer {
+        scheme: "slack".to_owned(),
+        locator: text.to_owned(),
+    }
+}
+
+#[test]
+fn generic_scheme_is_recognised_only_when_configured() {
+    let schemes = Schemes::new(["linear".to_owned()]);
+    assert_eq!(schemes.find_all("see linear:ENG-412/c-9f2e.").len(), 1);
+    assert_eq!(schemes.find_all("note: http://x").len(), 0);
+    assert_eq!(Schemes::new([]).find_all("linear:ENG-412").len(), 0);
+}
+
+#[test]
+fn locator_does_not_swallow_trailing_punctuation() -> Result<()> {
+    let schemes = Schemes::new(["linear".to_owned()]);
+    let found = schemes
+        .find_all("(linear:ENG-412)")
+        .into_iter()
+        .next()
+        .context("finding configured pointer")?;
+    assert_eq!(found.pointer.to_string(), "linear:ENG-412");
+    Ok(())
+}
+
+#[test]
+fn slack_permalink_maps_to_pointer_and_thread() -> Result<()> {
+    let found = Schemes::new([])
+        .find_all("https://acme.slack.com/archives/C0EXAMPLE01/p1792951800000100?thread_ts=1792951700.000100")
+        .into_iter()
+        .next()
+        .context("finding Slack permalink")?;
+    assert_eq!(
+        found.pointer.to_string(),
+        "slack:C0EXAMPLE01/1792951800.000100"
+    );
+    assert_eq!(
+        found.thread.as_ref().map(ToString::to_string).as_deref(),
+        Some("slack:C0EXAMPLE01/1792951700.000100")
+    );
+    Ok(())
+}
+
+#[test]
+fn store_first_copy_wins_and_thread_orders_by_timestamp() -> Result<()> {
+    let root = scratch("store")?;
+    let store = Store::open(&root.join("store.sqlite3"))?;
+    let parent = "slack:C0EXAMPLE01/1700000000.000001";
+    let reply_early = "slack:C0EXAMPLE01/1700000001.000001";
+    let reply_late = "slack:C0EXAMPLE01/1700000002.000001";
+
+    let records = vec![
+        record(parent, None, 1_700_000_000, "first copy")?,
+        record(reply_late, Some(parent), 1_700_000_002, "late reply")?,
+        record(reply_early, Some(parent), 1_700_000_001, "early reply")?,
+        record(parent, None, 1_700_000_003, "second copy")?,
+    ];
+    assert_eq!(store.put_all("slack", &records)?, 3);
+    assert_eq!(
+        store
+            .get(&pointer("C0EXAMPLE01/1700000000.000001"))?
+            .map(|found| found.text)
+            .as_deref(),
+        Some("first copy")
+    );
+    let thread = store.thread(&pointer("C0EXAMPLE01/1700000000.000001"))?;
+    let texts: Vec<_> = thread.into_iter().map(|found| found.text).collect();
+    assert_eq!(texts, ["first copy", "early reply", "late reply"]);
+
+    remove_scratch(&root)
+}
+
+#[test]
+fn concurrent_reader_never_sees_a_partial_write() -> Result<()> {
+    let root = scratch("concurrent-store")?;
+    let store_path = root.join("store.sqlite3");
+    let writer_store = Store::open(&store_path)?;
+    let reader_store = Store::open(&store_path)?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader_pointer = pointer("C0EXAMPLE01/1700000000.000000");
+
+    let writer = thread::spawn(move || {
+        let outcome = (|| -> Result<()> {
+            for batch in 0..10 {
+                let mut records = Vec::with_capacity(100);
+                for offset in 0..100 {
+                    let ordinal = batch * 100 + offset;
+                    let pointer = format!("slack:C0EXAMPLE01/1700000000.{ordinal:06}");
+                    records.push(record(
+                        &pointer,
+                        None,
+                        1_700_000_000 + i64::from(ordinal),
+                        "stored text",
+                    )?);
+                }
+                assert_eq!(writer_store.put_all("slack", &records)?, 100);
+            }
+            Ok(())
+        })();
+        let _ = sender.send(outcome);
+    });
+
+    loop {
+        reader_store.get(&reader_pointer)?;
+        match receiver.try_recv() {
+            Ok(result) => {
+                result?;
+                break;
+            }
+            Err(TryRecvError::Empty) => thread::yield_now(),
+            Err(TryRecvError::Disconnected) => return Err(anyhow!("writer disconnected")),
+        }
+    }
+    writer
+        .join()
+        .map_err(|_| anyhow!("writer thread panicked"))?;
+    remove_scratch(&root)
+}
+
+#[test]
+fn atomic_replace_replaces_complete_file_contents() -> Result<()> {
+    let root = scratch("atomic")?;
+    let path = root.join("state.json");
+    std::fs::write(&path, b"old")?;
+    atomic::write_replace(&path, b"replacement")?;
+    assert_eq!(std::fs::read(&path)?, b"replacement");
+    remove_scratch(&root)
+}
+
+fn binary() -> std::process::Command {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ctx"))
+}
+
+fn run_ctx(tree: &Path, state_base: &Path, arguments: &[&str]) -> Result<std::process::Output> {
+    let tree = tree.to_str().context("test tree path is not valid UTF-8")?;
+    binary()
+        .args(["--json", "--memory", tree])
+        .args(arguments)
+        .env("CTX_STATE_DIR", state_base)
+        .output()
+        .context("running ctx")
+}
+
+fn response_data(output: &std::process::Output) -> Result<Value> {
+    serde_json::from_slice(&output.stdout).context("parsing ctx JSON output")
+}
+
+#[test]
+fn verify_reports_a_quote_missing_from_the_resolved_text() -> Result<()> {
+    let root = scratch("resolve-verify")?;
+    let tree = root.join("tree");
+    let state_base = root.join("state");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
+    )?;
+    let document = tree.join("decision.md");
+    std::fs::write(
+        &document,
+        "---\ntype: decision\nstatus: open\nquote: \"beta gamma\"\n---\nslack:C0EXAMPLE01/1700000000.000001\n",
+    )?;
+    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    store.put_all(
+        "slack",
+        &[record(
+            "slack:C0EXAMPLE01/1700000000.000001",
+            None,
+            1_700_000_000,
+            "alpha beta gamma delta",
+        )?],
+    )?;
+
+    let resolved = run_ctx(
+        &tree,
+        &state_base,
+        &["resolve", "--thread", "slack:C0EXAMPLE01/1700000000.000001"],
+    )?;
+    assert_eq!(resolved.status.code(), Some(0));
+    let resolve_response = response_data(&resolved)?;
+    let resolve_data = resolve_response
+        .get("data")
+        .context("resolve response has data")?;
+    let results = resolve_data
+        .get("results")
+        .and_then(Value::as_array)
+        .context("resolve response has results")?;
+    let resolved_record = results.first().context("resolve response has one result")?;
+    let resolved_text = resolved_record
+        .get("text")
+        .and_then(Value::as_str)
+        .context("resolve response has text")?;
+    assert!(resolved_text.contains("alpha beta gamma delta"));
+
+    let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
+    assert_eq!(verified.status.code(), Some(0));
+    let verification_data = response_data(&verified)?
+        .get("data")
+        .context("verification response has data")?
+        .clone();
+    assert_eq!(
+        verification_data.get("checked").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        verification_data
+            .get("broken")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    std::fs::write(
+        &document,
+        "---\ntype: decision\nstatus: open\nquote: \"omega\"\n---\nslack:C0EXAMPLE01/1700000000.000001\n",
+    )?;
+    let broken = run_ctx(&tree, &state_base, &["cite", "verify"])?;
+    assert_eq!(broken.status.code(), Some(1));
+    let broken_data = response_data(&broken)?
+        .get("data")
+        .context("broken verification response has data")?
+        .clone();
+    let broken_entries = broken_data
+        .get("broken")
+        .and_then(Value::as_array)
+        .context("broken verification response has broken records")?;
+    let entry = broken_entries
+        .first()
+        .context("broken verification reports a missing quote")?;
+    assert_eq!(
+        entry.get("why").and_then(Value::as_str),
+        Some("quote does not appear in the resolved text")
+    );
+
+    let state = run_ctx(&tree, &state_base, &["state", "path"])?;
+    assert_eq!(state.status.code(), Some(0));
+    let state_data = response_data(&state)?
+        .get("data")
+        .context("state response has data")?
+        .clone();
+    let expected_store = state_base
+        .join("example/store.sqlite3")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        state_data.get("store").and_then(Value::as_str),
+        Some(expected_store.as_str())
+    );
+
+    remove_scratch(&root)
+}

@@ -22,6 +22,7 @@ fs2 = "0.4"
 ignore = "0.4"
 jsonschema = { version = "0.60", default-features = false }
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 owo-colors = "4"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
