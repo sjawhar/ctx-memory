@@ -77,6 +77,18 @@ pub struct SourceConfig {
     pub settings: toml::Table,
 }
 
+/// Returns the pointer scheme assigned to a built-in source kind.
+#[must_use]
+pub fn default_scheme(kind: &str) -> Option<&'static str> {
+    match kind {
+        "slack" => Some("slack"),
+        "gmail" => Some("gmail"),
+        "drive" => Some("drive"),
+        "calendar" => Some("gcal"),
+        _ => None,
+    }
+}
+
 impl TreeConfig {
     /// Loads the optional configuration at the root of a tree.
     ///
@@ -116,6 +128,13 @@ impl TreeConfig {
             }
             if source.kind.is_empty() {
                 bail!("source {} kind must not be empty", source.id);
+            }
+            if source.scheme.is_none() && default_scheme(&source.kind).is_none() {
+                bail!(
+                    "source {} kind {} requires an explicit scheme",
+                    source.id,
+                    source.kind
+                );
             }
             if !source_ids.insert(source.id.as_str()) {
                 bail!("source id {} appears more than once", source.id);

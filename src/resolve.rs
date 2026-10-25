@@ -110,15 +110,13 @@ pub fn verify(context: &Context, files: &[PathBuf], _live: bool) -> Result<Verif
 }
 
 fn context_schemes(context: &Context) -> Schemes {
-    Schemes::new(context.config.sources.iter().filter_map(|source| {
-        source.scheme.clone().or_else(|| {
-            matches!(
-                source.kind.as_str(),
-                "slack" | "gmail" | "drive" | "calendar"
-            )
-            .then(|| source.kind.clone())
-        })
-    }))
+    Schemes::new(
+        context
+            .config
+            .sources
+            .iter()
+            .filter_map(|source| source.scheme.clone()),
+    )
 }
 
 fn is_verbatim(scheme: &str) -> bool {

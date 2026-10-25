@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context as _, Result};
 use chrono::{DateTime, TimeZone as _, Utc};
 use ctx_memory::{
     atomic,
+    config::TreeConfig,
     pointer::{Pointer, Schemes},
     record::Record,
     store::Store,
@@ -305,4 +306,58 @@ fn verify_reports_a_quote_missing_from_the_resolved_text() -> Result<()> {
     );
 
     remove_scratch(&root)
+}
+
+#[test]
+fn calendar_kind_uses_gcal_without_registering_calendar_as_generic() -> Result<()> {
+    let schemes = Schemes::new([]);
+    assert!(schemes.find_all("calendar:x").is_empty());
+    assert_eq!(schemes.find_all("gcal:primary/evt1").len(), 1);
+
+    let root = scratch("calendar-scheme")?;
+    let tree = root.join("tree");
+    let state_base = root.join("state");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"calendar\"\nkind = \"calendar\"\n",
+    )?;
+    std::fs::write(
+        tree.join("event.md"),
+        "---\ntype: decision\nstatus: open\nquote: \"an event\"\n---\ncalendar:x\ngcal:primary/evt1\n",
+    )?;
+
+    let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
+    assert_eq!(verified.status.code(), Some(0));
+    let data = response_data(&verified)?
+        .get("data")
+        .context("calendar verification response has data")?
+        .clone();
+    assert_eq!(data.get("checked").and_then(Value::as_u64), Some(0));
+    let skipped = data
+        .get("skipped")
+        .and_then(Value::as_object)
+        .context("calendar verification response has skipped schemes")?;
+    assert_eq!(skipped.get("calendar"), None);
+    assert_eq!(skipped.get("gcal").and_then(Value::as_u64), Some(1));
+
+    remove_scratch(&root)
+}
+
+#[test]
+fn external_source_requires_an_explicit_scheme() -> Result<()> {
+    let root = scratch("external-scheme")?;
+    std::fs::write(
+        root.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"linear\"\nkind = \"linear\"\n",
+    )?;
+
+    let result = TreeConfig::load(&root);
+    remove_scratch(&root)?;
+
+    let error = result
+        .err()
+        .context("external source without a scheme unexpectedly loaded")?;
+    assert!(format!("{error:#}").contains("scheme"));
+    Ok(())
 }
