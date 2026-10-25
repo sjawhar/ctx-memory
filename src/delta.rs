@@ -544,8 +544,15 @@ fn state_changes(
 ///
 /// # Errors
 ///
-/// Returns an error when any artifact cannot be serialized or atomically replaced.
+/// Returns an error when an artifact version is unsupported, or an artifact cannot be serialized
+/// or atomically replaced.
 pub fn write(window: &Window, snapshot: &OpenSnapshot, delta: &Delta) -> Result<()> {
+    if snapshot.version != 1 {
+        bail!("open snapshot has unsupported version {}", snapshot.version);
+    }
+    if delta.version != 1 {
+        bail!("delta has unsupported version {}", delta.version);
+    }
     let snapshot = serde_json::to_vec_pretty(snapshot).context("serializing open snapshot")?;
     write_replace(&window.dir.join("open-snapshot.json"), &snapshot)?;
     let json = serde_json::to_vec_pretty(delta).context("serializing delta")?;

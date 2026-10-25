@@ -662,3 +662,47 @@ fn ctx_fetch_writes_delta_artifacts_before_completing_the_window() -> Result<()>
     remove_scratch(&root)?;
     Ok(())
 }
+
+#[test]
+fn unsupported_artifact_versions_fail_without_replacing_existing_files() -> Result<()> {
+    let root = scratch("artifact-version")?;
+    let current = window(
+        &root.join("state/example/windows"),
+        "20261025T120000Z-0001",
+        Vec::new(),
+    )?;
+    for name in ["open-snapshot.json", "delta.json", "delta.md"] {
+        write(&current.dir.join(name), "existing artifact")?;
+    }
+    let mut snapshot = OpenSnapshot {
+        version: 0,
+        generated_at: timestamp("2026-10-25T12:00:00Z")?,
+        open: Vec::new(),
+    };
+    let mut delta = Delta {
+        version: 1,
+        window: current.id.to_string(),
+        window_end: timestamp("2026-10-25T12:00:00Z")?,
+        generated_at: timestamp("2026-10-25T12:00:00Z")?,
+        previous_window: None,
+        new_messages: Vec::new(),
+        unreviewed: Vec::new(),
+        closed_since_previous: Vec::new(),
+        opened_since_previous: Vec::new(),
+    };
+
+    let rejected = delta::write(&current, &snapshot, &delta);
+    assert!(rejected.is_err());
+    snapshot.version = 1;
+    delta.version = 2;
+    let rejected = delta::write(&current, &snapshot, &delta);
+    assert!(rejected.is_err());
+    for name in ["open-snapshot.json", "delta.json", "delta.md"] {
+        assert_eq!(
+            fs::read_to_string(current.dir.join(name))?,
+            "existing artifact"
+        );
+    }
+    remove_scratch(&root)?;
+    Ok(())
+}
