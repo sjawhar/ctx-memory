@@ -50,8 +50,6 @@ Do not convert an incomplete search into a negative claim.
 - Preserve raw sources and keep citations resolvable.
 - Run `ctx sweep` before committing. Structural findings must be fixed; stale records are a review queue.
 
-## Ingest safely
+## Ingest
 
-One writer owns a cycle. Read-only helpers may inspect material and draft recommendations, but only the writer changes records, creates links, closes items, or advances cursors.
-
-Use this order: fetch, inspect the delta, connect a new fact to an existing record before minting a duplicate, verify quotes, run `ctx sweep`, commit, then run `ctx cursor advance <window>`. A fetch proposes cursors; it does not move them. Do not send messages or other outbound communication from an ingest cycle.
+An ingest cycle follows [the ctx-memory-ingest skill](../ctx-memory-ingest/SKILL.md): one writer, fetch, read the delta, connect before minting, verify quotes, sweep, commit, then advance cursors. An ingest cycle sends no messages.

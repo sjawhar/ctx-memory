@@ -77,7 +77,7 @@ A source is declared in `ctx.toml` and may be built in or external. An external 
 
 Unknown commands use the same convention: `ctx report ...` runs `ctx-report` from `PATH` when `report` is not a built-in command. Like git and cargo plugins, external commands own their stdout and exit status; `ctx` passes the resolved tree and state paths, JSON flag, and `ctx` version through `CTX_*` environment variables. The v1 JSON envelope and `0`/`1`/`2` exit-code contract apply only to built-in commands.
 
-The agent-facing reading and writing protocol lives in [skills/ctx-memory/SKILL.md](skills/ctx-memory/SKILL.md). The reasoning behind its rules is in [docs/method.md](docs/method.md).
+Two agent skills ship with the package: [skills/ctx-memory/SKILL.md](skills/ctx-memory/SKILL.md) is the reading and writing protocol, and [skills/ctx-memory-ingest/SKILL.md](skills/ctx-memory-ingest/SKILL.md) is the ingest cycle. The reasoning behind their rules is in [docs/method.md](docs/method.md).
 
 ## License
 

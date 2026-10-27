@@ -42,4 +42,4 @@ Run the cycle in this order:
 6. Commit the tree changes.
 7. Run `ctx cursor advance <window>`.
 
-A fetch proposes a cursor; it does not advance it. Advance only after the tree commit that durably handles the window, so an interrupted cycle remains recoverable. The ingest loop records knowledge and follow-up work; it does not send outbound messages.
+A fetch proposes a cursor; it does not advance it. Advance only after the tree commit that durably handles the window, so an interrupted cycle remains recoverable. The ingest loop records knowledge and follow-up work; it does not send outbound messages. The step-by-step procedure an agent follows is [skills/ctx-memory-ingest/SKILL.md](../skills/ctx-memory-ingest/SKILL.md).
