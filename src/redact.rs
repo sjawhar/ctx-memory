@@ -19,12 +19,18 @@ const LINE_LIMIT: usize = 300;
 /// and the shape it has.
 ///
 /// The agent cycle's session can read its own model key, and an instruction it obeys could
-/// put that key, or any credential it can reach, into a record. Each shape asks for the
-/// prefix and enough of a body after it that prose naming a prefix is not refused.
+/// put that key, or any credential it can reach, into a record. That key is a model gateway key:
+/// `sk-` and 64 lower-case letters and digits, as the model gateway
+/// mints them. Each shape asks for the prefix and enough of a body after it that prose
+/// naming a prefix is not refused.
 const CREDENTIALS: &[(&str, &str)] = &[
     (
         "an Anthropic API key (sk-ant-…)",
         r"sk-ant-[A-Za-z0-9_\-]{16,}",
+    ),
+    (
+        "a model gateway key (sk-…)",
+        r"(?:^|[^A-Za-z0-9])sk-[a-z0-9]{32,}",
     ),
     (
         "a GitHub token (ghp_, gho_, ghs_, ghu_, ghr_…)",

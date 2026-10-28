@@ -104,13 +104,15 @@ impl CycleRig {
     }
 
     /// Closes the home directory, omp's configuration in it and the working directory to
-    /// writes, as the image does.
+    /// writes, as the image does. models.yml is not there: `run-cycle.sh` writes it after its
+    /// checks.
     fn lock_home(&self) -> Result<()> {
         let agent = self.home().join(".omp/agent");
-        for file in ["models.yml", "config.yml"] {
-            std::fs::write(agent.join(file), "{}\n")?;
-            std::fs::set_permissions(agent.join(file), std::fs::Permissions::from_mode(0o444))?;
-        }
+        std::fs::write(agent.join("config.yml"), "{}\n")?;
+        std::fs::set_permissions(
+            agent.join("config.yml"),
+            std::fs::Permissions::from_mode(0o444),
+        )?;
         for dir in [
             agent,
             self.home().join(".omp"),
@@ -150,6 +152,7 @@ impl CycleRig {
             .env("TMPDIR", self.root.join("tmp"))
             .env("CTX_DATA_DIR", &self.data)
             .env("CTX_SERVER", "http://127.0.0.1:9")
+            .env("CTX_MODEL_BASE_URL", "http://127.0.0.1:9")
             .env("ANTHROPIC_API_KEY", "not-a-key")
             .env("CLOUD_RUN_EXECUTION", "ctx-agent-test-1")
             .env("XDG_DATA_HOME", self.xdg("data"))
@@ -201,6 +204,82 @@ fn the_cycle_refuses_to_start_its_session_without_root_to_drop() -> Result<()> {
     let rig = CycleRig::new("not-root")?;
     let output = rig.run()?;
     let result = assert_refused(&rig, &output, "must start as root");
+    rig.remove()?;
+    result
+}
+
+/// Without the model gateway's address the session would have nowhere its calls may go; the
+/// cycle stops before anything else, rather than start one that calls Anthropic directly.
+#[test]
+fn the_cycle_refuses_to_start_without_the_model_gateway_address() -> Result<()> {
+    let rig = CycleRig::new("gateway-unset")?;
+    rig.pretend_root()?;
+    let unset = rig
+        .command()?
+        .env_remove("CTX_MODEL_BASE_URL")
+        .output()
+        .context("running run-cycle.sh")?;
+    let empty = rig
+        .command()?
+        .env("CTX_MODEL_BASE_URL", "")
+        .output()
+        .context("running run-cycle.sh")?;
+    let result = assert_refused(&rig, &unset, "CTX_MODEL_BASE_URL must")
+        .and_then(|()| assert_refused(&rig, &empty, "CTX_MODEL_BASE_URL must"));
+    rig.remove()?;
+    result
+}
+
+/// The address is written into the models.yml the session reads, so only an http or https origin
+/// is taken: a value with no scheme, another scheme, a user, a path, a query, a port that is not
+/// one run of digits, or a character that would end the YAML string or the substitution that
+/// writes it is refused before anything else. An origin, with or without a port or a final
+/// slash, goes on to the next check.
+#[test]
+fn the_cycle_takes_only_an_http_origin_as_the_model_gateway_address() -> Result<()> {
+    let rig = CycleRig::new("gateway-malformed")?;
+    let mut result = Ok(());
+    for wrong in [
+        "gateway.example.internal:4000",
+        "ftp://gateway.example.internal:4000",
+        "http://",
+        "http://:4000",
+        "http://user@gateway.example.internal:4000",
+        "http://gateway.example.internal:4000/v1",
+        "http://gateway.example.internal:4000?x=1",
+        "http://gateway.example.internal:4000\"",
+        "http://gateway.example.internal|x",
+        "http://gateway.example.internal:4000\nhttp://elsewhere",
+        "http://gateway.example.internal:",
+        "http://gateway.example.internal::4000",
+        "http://gateway.example.internal:4000:4001",
+        "http://gateway.example.internal:port",
+    ] {
+        let output = rig
+            .command()?
+            .env("CTX_MODEL_BASE_URL", wrong)
+            .output()
+            .context("running run-cycle.sh")?;
+        result = result.and_then(|()| {
+            assert_refused(&rig, &output, "CTX_MODEL_BASE_URL must be")
+                .with_context(|| format!("CTX_MODEL_BASE_URL {wrong:?}"))
+        });
+    }
+    for origin in [
+        "http://gateway.example.internal:4000",
+        "https://gateway.example.com",
+        "http://127.0.0.1:4000/",
+    ] {
+        let output = rig
+            .command()?
+            .env("CTX_MODEL_BASE_URL", origin)
+            .output()
+            .context("running run-cycle.sh")?;
+        result = result.and_then(|()| {
+            assert_refused(&rig, &output, "must start as root")
+                .with_context(|| format!("CTX_MODEL_BASE_URL {origin:?}"))
+        });
+    }
     rig.remove()?;
     result
 }
@@ -264,7 +343,7 @@ fn the_cycle_refuses_a_session_user_that_can_rewrite_omps_configuration() -> Res
     let rig = CycleRig::new("config-writable")?;
     rig.pretend_root()?;
     rig.lock_share()?;
-    std::fs::write(rig.home().join(".omp/agent/models.yml"), "providers: {}\n")?;
+    std::fs::write(rig.home().join(".omp/agent/config.yml"), "{}\n")?;
     let output = rig.run()?;
     let result = assert_refused(&rig, &output, "can rewrite");
     rig.remove()?;
@@ -273,17 +352,15 @@ fn the_cycle_refuses_a_session_user_that_can_rewrite_omps_configuration() -> Res
 
 /// omp discovers custom tools (`~/.omp/agent/tools`) and MCP servers (`~/.omp/agent/mcp.json`)
 /// beside its configuration, so a session's user that can add a file there can name a program
-/// omp starts, even when it cannot rewrite `models.yml` or `config.yml`.
+/// omp starts, even when it cannot rewrite `config.yml`.
 #[test]
 fn the_cycle_refuses_a_session_user_that_can_add_files_beside_omps_configuration() -> Result<()> {
     let rig = CycleRig::new("config-replaceable")?;
     rig.pretend_root()?;
     rig.lock_share()?;
-    for file in ["models.yml", "config.yml"] {
-        let path = rig.home().join(".omp/agent").join(file);
-        std::fs::write(&path, "{}\n")?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
-    }
+    let path = rig.home().join(".omp/agent/config.yml");
+    std::fs::write(&path, "{}\n")?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
     let output = rig.run()?;
     let agent = rig.home().join(".omp/agent");
     let result = assert_refused(&rig, &output, &format!("{} ", agent.display()))

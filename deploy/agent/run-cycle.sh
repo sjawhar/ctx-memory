@@ -24,6 +24,10 @@
 # no later cycle can rewrite it; the next cycle seals the directory of one that was killed before
 # it could.
 #
+# Every model call goes to the model gateway at CTX_MODEL_BASE_URL, never to Anthropic
+# directly: the models.yml this script writes as root before the session names one provider, the
+# gateway, with the two model ids its key is allowed, and the session holds no other model key.
+#
 # Environment (the Cloud Run job declares all of it; the session holds no source credential and no
 # clone of its own, because every read and every write goes through the server):
 #   CTX_SERVER           base URL of the ctx server. It is what makes `ctx pending` and every
@@ -31,21 +35,31 @@
 #   CTX_SERVER_AUDIENCE  the audience of the Google identity token ctx mints for that server
 #   CTX_DATA_DIR         the Filestore share's data directory; the cycle's session JSONL is
 #                        written under it, so each cycle's model cost can be measured afterwards
-#   ANTHROPIC_API_KEY    from Secret Manager (legion-anthropic-api-key), as a secret environment
-#                        variable of the job; this script moves it to a file and unsets it
+#   CTX_MODEL_BASE_URL   the model gateway's address, such as
+#                        http://gateway.example.internal:4000; written into the models.yml the session reads, so
+#                        every model call goes there. Unset, or not an http or https address,
+#                        and no session runs, rather than one that calls Anthropic directly
+#   ANTHROPIC_API_KEY    the cycle's model gateway key, from Secret Manager secret
+#                        ctx-memory-gateway-key, as a secret
+#                        environment variable of the job; this script moves it to a file and
+#                        unsets it
 #   CLOUD_RUN_EXECUTION  Cloud Run's own name for this execution, which names the session
 #                        directory and, as CTX_SESSION, every commit the session makes
 set -eu
 
 : "${CTX_DATA_DIR:?run-cycle: CTX_DATA_DIR must name the data directory on the share}"
 : "${CTX_SERVER:?run-cycle: CTX_SERVER must name the ctx server base URL}"
-: "${ANTHROPIC_API_KEY:?run-cycle: ANTHROPIC_API_KEY must hold the Anthropic API key}"
+: "${CTX_MODEL_BASE_URL:?run-cycle: CTX_MODEL_BASE_URL must name the model gateway the session calls}"
+: "${ANTHROPIC_API_KEY:?run-cycle: ANTHROPIC_API_KEY must hold the model gateway key}"
 : "${CLOUD_RUN_EXECUTION:?run-cycle: CLOUD_RUN_EXECUTION must name this job execution}"
 
-# The user the session runs as, and the file it reads the model key from. Both are the image's
-# own (deploy/agent/Dockerfile, deploy/agent/models.yml).
+# The user the session runs as, the file it reads the model key from, and the models.yml it reads
+# its one model provider from, written from the image's template. All are the image's own
+# (deploy/agent/Dockerfile, deploy/agent/models.yml).
 AGENT_USER=ctx-agent
 KEY_FILE=/run/ctx-agent/model-key
+MODELS_TEMPLATE=/opt/ctx-memory/models.yml
+MODELS_FILE="$HOME/.omp/agent/models.yml"
 # The session's time limit in minutes: omp's --max-time below. Another cycle's transcript
 # directory older than this belongs to a session that has ended.
 SESSION_MINUTES=50
@@ -54,6 +68,21 @@ refuse() {
 	echo "run-cycle: refusing to start the session: $*" >&2
 	exit 1
 }
+
+# The address goes into models.yml as it is, so it must be an http or https origin: a host of
+# letters, digits, dots and hyphens and an optional port of digits, with an optional final slash
+# and nothing else: no user, path, query or character that would end the YAML string or the
+# substitution that writes it.
+case "$CTX_MODEL_BASE_URL" in
+http://*) model_host="${CTX_MODEL_BASE_URL#http://}" ;;
+https://*) model_host="${CTX_MODEL_BASE_URL#https://}" ;;
+*) model_host= ;;
+esac
+case "${model_host%/}" in
+"" | [.:-]* | *[!A-Za-z0-9.:-]* | *: | *:*:* | *:*[!0-9]*)
+	refuse "CTX_MODEL_BASE_URL must be the model gateway's http or https address, a host and an optional port with no user, path or query: '$CTX_MODEL_BASE_URL'"
+	;;
+esac
 
 # The session is handed to ctx-agent, and only root can hand it over and take its transcript
 # back afterwards. Started as anyone else, the session would run with that user's rights, which
@@ -151,13 +180,11 @@ fi
 if [ -n "$writable" ]; then
 	refuse "$AGENT_USER can write on the share: $(printf '%s\n' "$writable" | sort -u | tr '\n' ' ')"
 fi
-# omp reads models.yml, which names the command that yields the model key, and config.yml from
-# HOME. The session can rewrite neither.
-for file in "$HOME/.omp/agent/models.yml" "$HOME/.omp/agent/config.yml"; do
-	if as_agent_user /usr/bin/test -w "$file"; then
-		refuse "$AGENT_USER can rewrite $file"
-	fi
-done
+# omp reads config.yml from HOME, and the models.yml this script writes there below, which names
+# the gateway and the command that yields the model key. The session can rewrite neither.
+if as_agent_user /usr/bin/test -w "$HOME/.omp/agent/config.yml"; then
+	refuse "$AGENT_USER can rewrite $HOME/.omp/agent/config.yml"
+fi
 # The shell's startup files. omp sources ~/.bashrc (~/.profile for a plain sh) when it builds
 # its shell snapshot (utils/shell-snapshot.ts:106-111,167 at the pinned release), and a login
 # shell reads the rest. Each is root's and is there, so the session can neither rewrite one nor
@@ -222,6 +249,24 @@ if as_agent_user /usr/bin/test -w "$snapshot_dir"; then
 	refuse "$AGENT_USER can write $snapshot_dir"
 fi
 
+# The session's one model provider: the gateway at CTX_MODEL_BASE_URL, with the two model ids its
+# key is allowed (deploy/agent/models.yml, which says why the address is written into the file).
+# root writes it from the image's template before every session, after every check above, so
+# nothing but root could have put anything in its place; it replaces the file rather than
+# writing through it, as the key file below, and leaves it root's and 0644. A file that does not
+# name the address, or that the session's user could rewrite, starts no session.
+if ! { rm -f "$MODELS_FILE" &&
+	(umask 022 && sed "/^    baseUrl: /s|@CTX_MODEL_BASE_URL@|$CTX_MODEL_BASE_URL|" "$MODELS_TEMPLATE" >"$MODELS_FILE"); }; then
+	refuse "could not write $MODELS_FILE from $MODELS_TEMPLATE"
+fi
+chown 0:0 "$MODELS_FILE"
+chmod 0644 "$MODELS_FILE"
+grep -qxF "    baseUrl: \"$CTX_MODEL_BASE_URL\"" "$MODELS_FILE" ||
+	refuse "$MODELS_FILE does not send the session's model calls to $CTX_MODEL_BASE_URL"
+if as_agent_user /usr/bin/test -w "$MODELS_FILE"; then
+	refuse "$AGENT_USER can rewrite $MODELS_FILE"
+fi
+
 # The model key leaves the environment: omp reads it from this file when a request needs it
 # (deploy/agent/models.yml), so no process the session starts inherits it and it is not in the
 # session's own /proc/<pid>/environ. The file is readable only by the user the session runs as.
@@ -266,6 +311,10 @@ wrap any window text you repeat in <untrusted-source-text-$nonce pointer=\"...\"
 # can write, and starts the program it names, outside every approval rule (lsp/writethrough.ts:428,
 # lsp/config.ts:434-476, tools/write.ts:535-548 at the pinned release). The lsp.enabled setting
 # does not reach that path; only this flag does (main.ts:1706-1707).
+# --model gateway/anthropic/claude-opus-5: models.yml's gateway provider, and the id the
+# gateway serves and this job's key is allowed, which omp sends as the request's model as it is.
+# Opus 5, not 5.5: the gateway refuses Opus 5.5 to this key, because 5.5 is kept for work where
+# the model is the point and an hourly ingest cycle is bookkeeping.
 set -- setpriv --reuid="$AGENT_USER" --regid="$agent_group" --init-groups --no-new-privs \
 	omp -p \
 	--mode json \
@@ -275,7 +324,7 @@ set -- setpriv --reuid="$AGENT_USER" --regid="$agent_group" --init-groups --no-n
 	--tools bash,read,grep,glob,todo,ctx_record_put,ctx_record_rm \
 	--trusted-extension /opt/ctx-memory/ctx-record.ts \
 	--no-lsp \
-	--model anthropic/claude-opus-5-5 \
+	--model gateway/anthropic/claude-opus-5 \
 	--session-dir "$session_dir" \
 	--max-time "${SESSION_MINUTES}m" \
 	"$prompt"

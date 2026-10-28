@@ -64,9 +64,9 @@ RUN set -eu; \
 # debian:trixie-slim
 FROM debian@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 LABEL org.opencontainers.image.source=https://github.com/sjawhar/ctx-memory
-# ca-certificates: the roots omp checks the Anthropic API against, and ctx the ctx server's own
-# Cloud Run certificate. jq: run-cycle.sh reads `ctx pending --json` with it. setpriv, which drops
-# the session to ctx-agent, is util-linux's and is already in the base image.
+# ca-certificates: the roots ctx checks the ctx server's own Cloud Run certificate against, and omp
+# a model gateway served over https. jq: run-cycle.sh reads `ctx pending --json` with it. setpriv,
+# which drops the session to ctx-agent, is util-linux's and is already in the base image.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates jq \
     && rm -rf /var/lib/apt/lists/* \
@@ -76,16 +76,23 @@ COPY --from=omp /out/omp /usr/local/bin/omp
 COPY skills /opt/ctx-memory/skills
 COPY deploy/agent/run-cycle.sh /usr/local/bin/run-cycle.sh
 COPY deploy/agent/policy.yml /opt/ctx-memory/policy.yml
+# The session's one model provider, the model gateway, as a template: run-cycle.sh writes it to
+# <HOME>/.omp/agent/models.yml as root before each session, with the job's CTX_MODEL_BASE_URL in
+# it, because omp takes a provider's address only as written in that file. The model key is never
+# built into the image: models.yml names the file run-cycle.sh writes it to from Secret Manager,
+# so the session resolves the credential without holding it in its environment.
+COPY deploy/agent/models.yml /opt/ctx-memory/models.yml
 # The two record tools, the session's only writes. root's, like the policy: omp loads this one
 # module with --trusted-extension. That flag stops extension discovery and nothing more: omp
 # still discovers custom tools (.omp/tools in its working directory, ~/.omp/agent/tools), plugin
 # tools and MCP servers (.mcp.json, ~/.omp/agent/mcp.json, other agents' files under HOME) when
 # it starts. Those are closed below, by making every place they are read from root's.
 COPY deploy/agent/ctx-record.ts /opt/ctx-memory/ctx-record.ts
-# HOME is where omp reads its settings (<HOME>/.omp/agent/config.yml), its model credential
-# (models.yml) and the configuration it discovers, and where ctx would read a user config
-# (~/.config/ctx). It is ctx-agent's home, because that is the user the session runs as, and it
-# is all root's and closed to writes, so the session can add nothing omp or ctx would read there.
+# HOME is where omp reads its settings (<HOME>/.omp/agent/config.yml), its model provider
+# (models.yml, which run-cycle.sh writes) and the configuration it discovers, and where ctx would
+# read a user config (~/.config/ctx). It is ctx-agent's home, because that is the user the session
+# runs as, and it is all root's and closed to writes, so the session can add nothing omp or ctx
+# would read there.
 # WORKDIR is an empty directory and not HOME, because omp started in the home directory moves
 # itself to a temporary one unless --allow-home is given; it is root's for the same reason.
 ENV HOME=/home/ctx-agent
@@ -104,10 +111,6 @@ skills:
   customDirectories:
     - /opt/ctx-memory/skills
 EOF
-# The model key is never built into the image: models.yml names the file run-cycle.sh writes it
-# to from Secret Manager, so the session resolves the credential without holding it in its
-# environment.
-COPY deploy/agent/models.yml /home/ctx-agent/.omp/agent/models.yml
 # HOME and the working directory are root's and 0755, every file in them root's and 0644, with
 # a .bash_profile of root's beside the shell's startup files from /etc/skel (omp sources
 # ~/.bashrc when it builds a shell snapshot, and a login shell reads the rest), so none can be
@@ -153,7 +156,7 @@ RUN chown -R root:root /var/lib/omp/data/omp/natives && chmod -R go-w /var/lib/o
 # fails here.
 RUN ! command -v gh
 # The Cloud Run job passes no arguments: one execution is one cycle. The entrypoint keeps root
-# only long enough to check what the session can touch and give it its directory on the share
-# and the model key, hands the session to ctx-agent, and takes the directory back when the
-# session ends.
+# only long enough to check what the session can touch and give it its directory on the share,
+# its models.yml and the model key, hands the session to ctx-agent, and takes the directory back
+# when the session ends.
 ENTRYPOINT ["run-cycle.sh"]

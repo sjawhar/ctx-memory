@@ -65,12 +65,18 @@ fn cycle_omp_arguments(policy: &Path, session_dir: &Path, prompt: &str) -> Resul
         .collect()
 }
 
-/// A scripted stand-in for the Anthropic Messages API. The answer to a request is the step
-/// at the index of the number of tool results the request carries, so a retry or a side
+/// The key the probe's session holds, in the file the shipped models.yml names; the fake model
+/// checks that every call carries it, and nothing else, as the model gateway's bearer token.
+const MODEL_KEY: &str = "live-probe-gateway-key";
+
+/// A scripted stand-in for the model gateway's Anthropic Messages API. The answer to a request is
+/// the step at the index of the number of tool results the request carries, so a retry or a side
 /// request (omp asks for skill summaries) never advances the script.
 struct FakeModel {
     port: u16,
     requests: Arc<Mutex<Vec<Value>>>,
+    /// The path, model, `Authorization` and `X-Api-Key` of every request, in arrival order.
+    routes: Arc<Mutex<Vec<Value>>>,
     sightings: Arc<Mutex<Vec<String>>>,
 }
 
@@ -89,22 +95,48 @@ impl FakeModel {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let routes = Arc::new(Mutex::new(Vec::new()));
         let sightings = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
+        let route_log = Arc::clone(&routes);
         let sighted = Arc::clone(&sightings);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 if let (Some(token), Ok(mut sighted)) = (&watch, sighted.lock()) {
                     sighted.extend(processes_holding(token));
                 }
-                let _ = serve_one(stream, &steps, &seen);
+                let _ = serve_one(stream, &steps, &seen, &route_log);
             }
         });
         Ok(Self {
             port,
             requests,
+            routes,
             sightings,
         })
+    }
+
+    /// Every request reached the model gateway's Messages API as the gateway serves one: the
+    /// model is `anthropic/claude-opus-5`, the id `run-cycle.sh` selects, sent as it is, and the
+    /// one credential is the key from the file models.yml names, as a bearer token.
+    fn check_gateway_route(&self) -> Result<()> {
+        let routes = self
+            .routes
+            .lock()
+            .map_err(|error| anyhow::anyhow!("reading the recorded routes: {error}"))?;
+        ensure!(!routes.is_empty(), "the session never called the model");
+        let bearer = format!("Bearer {MODEL_KEY}");
+        for route in routes.iter() {
+            ensure!(
+                route.get("path").and_then(Value::as_str) == Some("/v1/messages")
+                    && route.get("model").and_then(Value::as_str)
+                        == Some("anthropic/claude-opus-5")
+                    && route.get("authorization").and_then(Value::as_str) == Some(&bearer)
+                    && route.get("x-api-key").is_some_and(Value::is_null),
+                "a model call did not reach the gateway as it serves one: {route}"
+            );
+        }
+        Ok(())
     }
 
     fn sightings(&self) -> Result<Vec<String>> {
@@ -204,11 +236,15 @@ impl FakeModel {
     }
 }
 
-fn serve_one(stream: TcpStream, steps: &[Value], seen: &Mutex<Vec<Value>>) -> Result<()> {
+/// Reads one request from `stream`: its request line and its body. Its path, model,
+/// `Authorization` and `X-Api-Key` go to `routes`.
+fn read_request(stream: &TcpStream, routes: &Mutex<Vec<Value>>) -> Result<(String, Vec<u8>)> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
     let mut length = 0;
+    let mut authorization = Value::Null;
+    let mut api_key = Value::Null;
     loop {
         let mut header = String::new();
         reader.read_line(&mut header)?;
@@ -219,11 +255,37 @@ fn serve_one(stream: TcpStream, steps: &[Value], seen: &Mutex<Vec<Value>>) -> Re
         if let Some((name, value)) = header.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 length = value.trim().parse()?;
+            } else if name.eq_ignore_ascii_case("authorization") {
+                authorization = Value::from(value.trim());
+            } else if name.eq_ignore_ascii_case("x-api-key") {
+                api_key = Value::from(value.trim());
             }
         }
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
+    let model = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|request| request.get("model").cloned());
+    routes
+        .lock()
+        .map_err(|error| anyhow::anyhow!("recording a route: {error}"))?
+        .push(json!({
+            "path": request_line.split_whitespace().nth(1),
+            "model": model,
+            "authorization": authorization,
+            "x-api-key": api_key,
+        }));
+    Ok((request_line, body))
+}
+
+fn serve_one(
+    stream: TcpStream,
+    steps: &[Value],
+    seen: &Mutex<Vec<Value>>,
+    routes: &Mutex<Vec<Value>>,
+) -> Result<()> {
+    let (request_line, body) = read_request(&stream, routes)?;
     let mut stream = stream;
     if !request_line.starts_with("POST /v1/messages") {
         stream.write_all(
@@ -359,14 +421,16 @@ fn pinned_omp() -> Result<std::ffi::OsString> {
     Ok(omp)
 }
 
-/// Runs omp in `root/workspace` with `root/home` as its `HOME`: the image's skills, and a
-/// model credential that reaches only the fake model on `port`. `env` is added to the session's
-/// otherwise fixed environment, and `extra` after the cycle's own omp arguments, where a repeated
-/// flag wins (`cli/flag-tables.ts:209-219`), so a probe can widen what the cycle allows.
+/// Runs omp in `root/workspace` with `root/home` as its `HOME`: the image's skills, and the
+/// image's models.yml as `run-cycle.sh` writes it, with `model`'s address for the gateway's and
+/// [`MODEL_KEY`] in the file it names. `env` is added to the session's otherwise fixed
+/// environment, and `extra` after the cycle's own omp arguments, where a repeated flag wins
+/// (`cli/flag-tables.ts:209-219`), so a probe can widen what the cycle allows. Every call the
+/// session made must have reached `model` as the gateway serves one.
 fn run_session(
     omp: &std::ffi::OsStr,
     root: &Path,
-    port: u16,
+    model: &FakeModel,
     prompt: &str,
     env: &[(&str, &str)],
     extra: &[&str],
@@ -384,11 +448,26 @@ fn run_session(
             repo().join("skills").display()
         ),
     )?;
+    let key_file = root.join("model-key");
+    std::fs::write(&key_file, MODEL_KEY)?;
+    let template = deploy("models.yml")?;
+    for placeholder in [
+        "\"@CTX_MODEL_BASE_URL@\"",
+        "\"!cat /run/ctx-agent/model-key\"",
+    ] {
+        ensure!(
+            template.matches(placeholder).count() == 1,
+            "deploy/agent/models.yml does not hold {placeholder} once, which this test stands in for"
+        );
+    }
     std::fs::write(
         home.join(".omp/agent/models.yml"),
-        format!(
-            "providers:\n  anthropic:\n    baseUrl: http://127.0.0.1:{port}\n    apiKey: not-a-model-key\n"
-        ),
+        template
+            .replace(
+                "@CTX_MODEL_BASE_URL@",
+                &format!("http://127.0.0.1:{}", model.port),
+            )
+            .replace("/run/ctx-agent/model-key", &key_file.display().to_string()),
     )?;
     let mut arguments =
         cycle_omp_arguments(&repo().join("deploy/agent/policy.yml"), &sessions, prompt)?;
@@ -434,7 +513,7 @@ fn run_session(
         "omp exited with {status}: {}",
         std::fs::read_to_string(&stderr_path).unwrap_or_default()
     );
-    Ok(())
+    model.check_gateway_route()
 }
 
 /// One live session under `run-cycle.sh`'s own flags and `policy.yml`, against the omp
@@ -459,7 +538,7 @@ fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
         json!({"tool": "bash", "input": {"command": "ctx rules"}}),
     ])?;
     let root = scratch("live")?;
-    let outcome = run_session(&omp, &root, model.port, "Run the scripted probe.", &[], &[]);
+    let outcome = run_session(&omp, &root, &model, "Run the scripted probe.", &[], &[]);
     remove_scratch(&root)?;
     outcome?;
 
@@ -565,7 +644,7 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
     let outcome = run_session(
         &omp,
         &root,
-        model.port,
+        &model,
         "Run the scripted probe.",
         &[("PATH", &format!("{}:{path}", bin.display()))],
         &[],
@@ -668,7 +747,7 @@ fn a_live_session_writes_no_file() -> Result<()> {
     let outcome = run_session(
         &omp,
         &root,
-        model.port,
+        &model,
         "Run the scripted probe.",
         &[("PI_EDIT_VARIANT", "patch")],
         // The write and edit tools, offered to the session although run-cycle.sh leaves them
@@ -756,7 +835,7 @@ fn a_live_session_starts_no_mcp_server_its_directory_names() -> Result<()> {
         vec![json!({"tool": "bash", "input": {"command": "ctx rules"}})],
         token.clone(),
     )?;
-    let outcome = run_session(&omp, &root, model.port, "Run the scripted probe.", &[], &[]);
+    let outcome = run_session(&omp, &root, &model, "Run the scripted probe.", &[], &[]);
     let started = marker.exists();
     let sightings = model.sightings()?;
     remove_scratch(&root)?;

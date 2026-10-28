@@ -123,6 +123,15 @@ fn an_anthropic_key_is_refused() -> Result<()> {
     )
 }
 
+/// The agent cycle's own model key, as the model gateway mints it.
+#[test]
+fn a_model_gateway_key_is_refused() -> Result<()> {
+    refused(
+        &[format!("sk-{}", "0a1b2c3d4e5f6g7h".repeat(4))],
+        "model gateway",
+    )
+}
+
 #[test]
 fn a_github_token_is_refused() -> Result<()> {
     let body = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
