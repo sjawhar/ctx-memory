@@ -1,34 +1,38 @@
 //! Command-line parsing and dispatch for tree commands.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::ffi::OsString;
-use std::os::unix::process::CommandExt as _;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use owo_colors::OwoColorize as _;
 use serde::Serialize;
 
-use crate::config::{locate_tree, state_base, TreeConfig, UserConfig};
 use crate::context::Context;
 use crate::cursor::{self, AdvanceOutcome, Cursors};
 use crate::delta;
 use crate::fetch::{self, FetchOptions};
+use crate::git;
+use crate::lease::{self, Lease};
+use crate::marker::{self, Marker};
 use crate::open::{
-    apply_staleness, open_items_with_filters, parse_linked, LinkedFilter, OpenItemView,
+    self, apply_staleness, open_items_with_filters, parse_linked, LinkedFilter, OpenItemView,
 };
-use crate::output::{self, Outcome};
-use crate::resolve::{self, Resolved, Verification};
-use crate::schema::today_utc;
+use crate::output::{self, Outcome, Sink};
+use crate::plugin::{run_external, PluginEnv};
+use crate::redact;
+use crate::remote;
+use crate::resolve::{self, Resolved};
 use crate::search;
+use crate::server;
+use crate::slack_login;
 use crate::source::{
     self, FetchRequest, Request as SourceRequest, ResolveRequest, Session, SourceRef,
 };
-use crate::sweep::{self, Findings};
+use crate::sweep;
+use crate::tree::Doc;
 use crate::windows::{self, SourceManifest, Status, Window};
 
 #[derive(Parser)]
@@ -104,10 +108,17 @@ pub enum Command {
         write: bool,
     },
 
-    /// Inspect or advance durable source cursors.
+    /// Inspect durable source cursors.
     Cursor {
         #[command(subcommand)]
         command: CursorCommand,
+    },
+    /// List the completed windows the agent has not handled yet.
+    Pending,
+    /// Inspect or advance the agent marker.
+    Marker {
+        #[command(subcommand)]
+        command: MarkerCommand,
     },
     /// Resolve citation pointers from the local store.
     Resolve {
@@ -130,13 +141,49 @@ pub enum Command {
         #[command(subcommand)]
         command: StateCommand,
     },
+    /// Write or remove a record through the server.
+    Record {
+        #[command(subcommand)]
+        command: RecordCommand,
+    },
+    /// Sign in to Slack and save the credential for the fetch job.
+    Slack {
+        #[command(subcommand)]
+        command: SlackCommand,
+    },
+    /// Serve read commands and record writes over HTTP.
+    Serve(server::ServeArgs),
     #[command(external_subcommand)]
     External(Vec<OsString>),
 }
 
 #[derive(Subcommand)]
+pub enum SlackCommand {
+    /// Sign in through the browser and save the Slack credential.
+    Login,
+}
+
+#[derive(Subcommand)]
+pub enum RecordCommand {
+    /// Write a record, reading it from standard input or from a file.
+    Put {
+        /// Tree-relative path of the record, such as `decisions/renewal.md`.
+        path: String,
+        /// `-` reads the record from standard input; anything else names a file.
+        #[arg(default_value = "-")]
+        source: String,
+    },
+    /// Remove a record.
+    Rm {
+        /// Tree-relative path of the record.
+        path: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum CiteCommand {
-    /// Verify pointer resolution and quoted text.
+    /// Verify pointer resolution and quoted text. Exits 1 when a quote is broken or nothing
+    /// could check it.
     Verify {
         #[arg(long)]
         live: bool,
@@ -163,7 +210,7 @@ pub enum SourceOperation {
 
 #[derive(Subcommand)]
 pub enum StateCommand {
-    /// Print the state directory and SQLite store path.
+    /// Print the state directory, SQLite store path, and data directory.
     Path,
 }
 
@@ -171,7 +218,13 @@ pub enum StateCommand {
 pub enum CursorCommand {
     /// Print every stored source-stream cursor.
     Show,
-    /// Advance successful source-stream cursors from one completed window.
+}
+
+#[derive(Subcommand)]
+pub enum MarkerCommand {
+    /// Print the window the agent has handled up to.
+    Show,
+    /// Move the marker to a completed window after the commit that handled it.
     Advance { window: String },
 }
 
@@ -189,9 +242,13 @@ impl Command {
             Self::Cursor {
                 command: CursorCommand::Show,
             } => "cursor show".to_owned(),
-            Self::Cursor {
-                command: CursorCommand::Advance { .. },
-            } => "cursor advance".to_owned(),
+            Self::Pending => "pending".to_owned(),
+            Self::Marker {
+                command: MarkerCommand::Show,
+            } => "marker show".to_owned(),
+            Self::Marker {
+                command: MarkerCommand::Advance { .. },
+            } => "marker advance".to_owned(),
             Self::Resolve { .. } => "resolve".to_owned(),
             Self::Cite {
                 command: CiteCommand::Verify { .. },
@@ -202,18 +259,89 @@ impl Command {
             Self::State {
                 command: StateCommand::Path,
             } => "state path".to_owned(),
+            Self::Record {
+                command: RecordCommand::Put { .. },
+            } => "record put".to_owned(),
+            Self::Record {
+                command: RecordCommand::Rm { .. },
+            } => "record rm".to_owned(),
+            Self::Slack {
+                command: SlackCommand::Login,
+            } => "slack login".to_owned(),
+            Self::Serve(_) => "serve".to_owned(),
             Self::External(arguments) => arguments
                 .first()
                 .and_then(|argument| argument.to_str())
                 .map_or_else(|| "external".to_owned(), str::to_owned),
         }
     }
+
+    /// How this command reaches a configured server: the one place that decides it.
+    ///
+    /// The server's `/v1/command` runs reads on behalf of a caller that holds no write lease
+    /// and owns none of the files a write touches, so it runs only what answers
+    /// [`Remote::Forward`] here, and the client forwards only that. Each variant says so for
+    /// itself, and a new one has to decide: there is no catch-all arm that would let the next
+    /// writing flag through the read door the way `delta --write` did.
+    #[must_use]
+    pub fn remote(&self) -> Remote<'_> {
+        match self {
+            Self::Rules
+            | Self::Sweep
+            | Self::Search { .. }
+            | Self::Dossier { .. }
+            | Self::Open { .. }
+            | Self::Pending
+            | Self::Resolve { .. }
+            | Self::Marker {
+                command: MarkerCommand::Show,
+            }
+            | Self::Cite {
+                command: CiteCommand::Verify { .. },
+            }
+            // Without `--write` the command prints the delta and writes nothing.
+            | Self::Delta { write: false, .. } => Remote::Forward,
+            Self::Record {
+                command: RecordCommand::Put { path, source },
+            } => Remote::Put { path, source },
+            Self::Record {
+                command: RecordCommand::Rm { path },
+            } => Remote::Rm { path },
+            Self::Marker {
+                command: MarkerCommand::Advance { window },
+            } => Remote::MarkerAdvance { window },
+            // `--write` replaces the window's `delta.json`, `delta.md` and
+            // `open-snapshot.json`, which the fetch job owns.
+            Self::Delta { write: true, .. }
+            // A fetch moves cursors and publishes a window, a source run may rotate and save
+            // a credential, and the cursors and state paths are this machine's own.
+            | Self::Fetch { .. }
+            | Self::Source { .. }
+            | Self::Cursor { .. }
+            | Self::State { .. }
+            | Self::Slack { .. }
+            | Self::Serve(_)
+            // What an external subcommand does is its own business.
+            | Self::External(_) => Remote::Local,
+        }
+    }
 }
 
-pub struct PluginEnv {
-    pub tree_root: Option<PathBuf>,
-    pub state_base: Option<PathBuf>,
-    pub json: bool,
+/// Where one command runs when a server is configured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Remote<'a> {
+    /// This machine's own work, never sent to a server, and refused by one however it is
+    /// spelled.
+    Local,
+    /// A read the server runs through `/v1/command`, answering with what it printed.
+    Forward,
+    /// `record put`: the record goes to `/v1/records/put`, read from `source` (`-` is
+    /// standard input).
+    Put { path: &'a str, source: &'a str },
+    /// `record rm`: `/v1/records/delete`.
+    Rm { path: &'a str },
+    /// `marker advance`: `/v1/marker/advance`, under the server's write lease.
+    MarkerAdvance { window: &'a str },
 }
 
 #[derive(Serialize)]
@@ -221,12 +349,6 @@ struct RulesPayload<'a> {
     path: String,
     bytes: usize,
     text: &'a str,
-}
-
-#[derive(Serialize)]
-struct SearchPayload<'a> {
-    query: &'a str,
-    hits: Vec<search::Hit>,
 }
 
 #[derive(Serialize)]
@@ -243,6 +365,7 @@ struct ResolvePayload {
 struct StatePathPayload {
     state_dir: String,
     store: String,
+    data_dir: String,
 }
 
 #[derive(Serialize)]
@@ -251,6 +374,7 @@ struct FetchPayload<'a> {
     exit_status: Status,
     sources: &'a BTreeMap<String, SourceManifest>,
     delta: FetchDeltaPayload,
+    cursors: &'a AdvanceOutcome,
 }
 
 #[derive(Serialize)]
@@ -265,6 +389,11 @@ struct CursorShowPayload {
 }
 
 #[derive(Serialize)]
+struct MarkerShowPayload {
+    marker: Option<Marker>,
+}
+
+#[derive(Serialize)]
 struct SourceRunPayload<'a> {
     source: &'a str,
     op: SourceOperation,
@@ -272,23 +401,102 @@ struct SourceRunPayload<'a> {
     outcome: source::SourceOutcome,
 }
 
-/// Runs the selected command.
+/// Runs the selected command, writing its output to `sink`.
 ///
 /// # Errors
 ///
 /// Returns an error when tree discovery, loading, command execution, or external dispatch fails.
-pub fn run(cli: &Cli) -> Result<Outcome> {
+pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Outcome> {
     if let Command::External(arguments) = &cli.command {
-        let environment = plugin_environment(&GlobalArgs::from(cli))?;
+        let environment = PluginEnv::resolve(&GlobalArgs::from(cli))?;
         return run_external(arguments, &environment).map(|never| match never {});
     }
 
+    // `slack login` signs in and saves the credential; it loads no tree and reaches no server.
+    if let Command::Slack {
+        command: SlackCommand::Login,
+    } = &cli.command
+    {
+        return slack_login::run(sink, cli.json);
+    }
+
+    if let Some(outcome) = remote::run(cli, sink)? {
+        return Ok(outcome);
+    }
+
+    if let Some(root) = cli.memory.as_deref() {
+        git::clone_when_empty(root)?;
+    }
     let context = Context::load(&GlobalArgs::from(cli))?;
-    match &cli.command {
-        Command::Rules => run_rules(&context),
+    if let Command::Serve(arguments) = &cli.command {
+        return server::serve(context, arguments, sink);
+    }
+    run_loaded(cli, &context, sink)
+}
+
+/// Runs one parsed command against an already loaded tree.
+///
+/// # Errors
+///
+/// Returns an error when the command fails.
+pub fn run_loaded(cli: &Cli, context: &Context, sink: &mut Sink<'_>) -> Result<Outcome> {
+    run_loaded_with(cli, context, &[], sink)
+}
+
+/// Runs one parsed command against an already loaded tree, with drafts a remote caller sent
+/// for `cite verify` to check as text: each stands for the file the caller named by its path.
+///
+/// # Errors
+///
+/// Returns an error when the command fails.
+pub fn run_loaded_with(
+    cli: &Cli,
+    context: &Context,
+    drafts: &[Doc],
+    sink: &mut Sink<'_>,
+) -> Result<Outcome> {
+    dispatch(
+        &cli.command,
+        &mut Run {
+            context,
+            drafts,
+            json: cli.json,
+            sink,
+        },
+    )
+}
+
+/// One command's execution environment: the loaded tree, the drafts a remote caller sent, the
+/// output format, and where the output goes.
+pub struct Run<'ctx, 'sink> {
+    context: &'ctx Context,
+    drafts: &'ctx [Doc],
+    json: bool,
+    sink: &'ctx mut Sink<'sink>,
+}
+
+impl Run<'_, '_> {
+    fn emit<T: Serialize>(
+        &mut self,
+        command: &str,
+        data: &T,
+        human: impl FnOnce(&T, &mut dyn Write) -> std::io::Result<()>,
+    ) -> Result<()> {
+        output::emit(self.sink, self.json, command, data, human)
+    }
+}
+
+/// Runs one built-in command against an already loaded tree.
+///
+/// # Errors
+///
+/// Returns an error when the command fails.
+fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
+    match command {
+        Command::Rules => run_rules(run),
         Command::Sweep => {
-            let findings = sweep::run(&context.tree)?;
-            output::emit(context.json, "sweep", &findings, print_sweep)?;
+            let findings = sweep::run(&run.context.tree)?;
+            run.emit("sweep", &findings, sweep::print)?;
             Ok(if findings.structural_clean() {
                 Outcome::Pass
             } else {
@@ -300,54 +508,138 @@ pub fn run(cli: &Cli) -> Result<Outcome> {
             verbatim,
             limit,
         } => {
-            let payload = SearchPayload {
+            let found = search::run(
+                run.context.index()?,
+                &run.context.tree,
                 query,
-                hits: search::run(&context.tree, query, *verbatim, *limit),
-            };
-            output::emit(context.json, "search", &payload, |payload| {
-                search::print(&payload.hits, payload.query.split_whitespace().count());
-            })?;
+                *verbatim,
+                *limit,
+            )?;
+            run.emit("search", &found, search::print)?;
             Ok(Outcome::Pass)
         }
-        Command::Dossier { entity } => run_dossier(&context, entity),
+        Command::Dossier { entity } => run_dossier(run, entity),
         Command::Open { linked, owner } => {
-            let stale = if context.config.sources.is_empty() {
+            let stale = if run.context.config.sources.is_empty() {
                 BTreeMap::new()
             } else {
-                delta::staleness(&context.state()?.windows(), &context.tree)?
+                delta::staleness(&run.context.data()?.windows(), &run.context.tree)?
             };
-            let mut items = open_items_with_filters(&context.tree, linked, owner)?;
+            let mut items = open_items_with_filters(&run.context.tree, linked, owner)?;
             apply_staleness(&mut items, &stale);
             let payload = OpenPayload { items };
-            output::emit(context.json, "open", &payload, |payload| {
-                print_open(&payload.items);
+            run.emit("open", &payload, |payload, out| {
+                open::print(&payload.items, out)
             })?;
             Ok(Outcome::Pass)
         }
         Command::Fetch { window_end, source } => run_fetch(
-            &context,
+            run,
             &FetchOptions {
                 window_end: window_end.unwrap_or_else(Utc::now),
                 only: source.clone(),
             },
         ),
-        Command::Delta { window, write } => run_delta(&context, window.as_deref(), *write),
-        Command::Cursor { command } => run_cursor(&context, command),
-        Command::Resolve { thread, pointers } => run_resolve(&context, pointers, *thread),
+        Command::Delta { window, write } => run_delta(run, window.as_deref(), *write),
+        Command::Cursor { command } => run_cursor(run, command),
+        Command::Pending => run_pending(run),
+        Command::Marker { command } => run_marker(run, command),
+        Command::Resolve { thread, pointers } => run_resolve(run, pointers, *thread),
         Command::Cite {
             command: CiteCommand::Verify { live, files },
-        } => run_verify(&context, files, *live),
+        } => run_verify(run, files, *live),
         Command::Source {
             command: SourceCommand::Run { id, op },
-        } => run_source(&context, id, *op),
+        } => run_source(run, id, *op),
         Command::State {
             command: StateCommand::Path,
-        } => run_state_path(&context),
+        } => run_state_path(run),
+        Command::Record { .. } => Err(anyhow!(
+            "ctx record writes through the server; set CTX_SERVER or server in the user config"
+        )),
+        Command::Slack { .. } => Err(anyhow!(
+            "slack login is dispatched before the tree commands"
+        )),
+        Command::Serve(_) => Err(anyhow!("serve is dispatched before the tree commands")),
         Command::External(_) => Err(anyhow!("external command dispatch failed")),
     }
 }
 
-fn run_source(context: &Context, id: &str, op: SourceOperation) -> Result<Outcome> {
+/// Parses a command line that does not carry the program name.
+///
+/// # Errors
+///
+/// Returns clap's error, which carries the message a local run would print.
+pub fn parse_argv(argv: &[String]) -> std::result::Result<Cli, clap::Error> {
+    Cli::try_parse_from(std::iter::once("ctx".to_owned()).chain(argv.iter().cloned()))
+}
+
+/// Parses a command line, program name first, runs it, and reports the result the one way
+/// `ctx` reports anything; returns the exit code.
+///
+/// - Help and version text are clap's answer, not an error: stdout, exit 0.
+/// - A command line clap refuses: with `--json`, an error envelope on stdout; otherwise
+///   clap's message on stderr. Exit 2.
+/// - A command that fails: the same two forms, with the error chain. Exit 2.
+///
+/// The binary and the server's `/v1/command` both report through this, so a remote caller
+/// cannot be answered differently from a local one.
+pub fn run_reported<I, T>(
+    argv: I,
+    sink: &mut Sink<'_>,
+    run: impl FnOnce(&Cli, &mut Sink<'_>) -> Result<Outcome>,
+) -> u8
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let argv: Vec<OsString> = argv.into_iter().map(Into::into).collect();
+    let cli = match Cli::try_parse_from(&argv) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let message = error.to_string();
+            if !error.use_stderr() {
+                let _ = write!(sink.out, "{message}");
+                return u8::try_from(error.exit_code()).unwrap_or(2);
+            }
+            if argv.iter().any(|argument| argument == "--json") {
+                report_error(sink, "ctx", message);
+            } else {
+                let _ = write!(sink.err, "{message}");
+            }
+            return 2;
+        }
+    };
+    match run(&cli, sink) {
+        Ok(outcome) => outcome.exit_code(),
+        Err(error) => {
+            let message = format!("{error:#}");
+            if cli.json {
+                report_error(sink, &cli.command.name(), message);
+            } else if matches!(cli.command, Command::Serve(_) | Command::Fetch { .. }) {
+                // The server and the fetch job run on Cloud Run, where each line of standard
+                // error is its own log entry, and every other line they write there is one
+                // line: so is the error that stops them, though it carries git's words or a
+                // list of a tree's files.
+                let _ = writeln!(sink.err, "{}", redact::flattened(&message));
+            } else {
+                // An error can carry a server's or a source's own words.
+                let _ = writeln!(sink.err, "{}", output::printable(&message));
+            }
+            2
+        }
+    }
+}
+
+/// Writes an error envelope to stdout, or the reason it could not be written to stderr.
+fn report_error(sink: &mut Sink<'_>, command: &str, message: String) {
+    if let Err(error) = output::emit_error(&mut *sink.out, command, message) {
+        let _ = writeln!(sink.err, "{error:#}");
+    }
+}
+
+fn run_source(run: &mut Run<'_, '_>, id: &str, op: SourceOperation) -> Result<Outcome> {
+    let context = run.context;
     let spec = context
         .config
         .sources
@@ -391,9 +683,12 @@ fn run_source(context: &Context, id: &str, op: SourceOperation) -> Result<Outcom
     let schemes = source::configured_schemes(&context.config.sources)?;
     let mut session = Session::new(&request, &schemes);
     let mut messages = Vec::new();
-    let run = source.run(&request, &mut |message| {
-        if !context.json {
-            println!("{}", serde_json::to_string(&message)?);
+    let json = run.json;
+    let stream = &mut *run.sink.out;
+    let outcome = source.run(&request, &mut |message| {
+        if !json {
+            output::write_json(&mut *stream, &message)?;
+            writeln!(stream)?;
         }
         session.accept(message.clone()).map(|_| {
             messages.push(message);
@@ -403,17 +698,22 @@ fn run_source(context: &Context, id: &str, op: SourceOperation) -> Result<Outcom
         source: id,
         op,
         messages,
-        outcome: session.finish(run),
+        outcome: session.finish(outcome),
     };
     if let Some(error) = payload.outcome.error.as_deref() {
-        eprintln!("source {id}: {error}");
+        writeln!(run.sink.err, "source {id}: {}", output::printable(error))?;
     }
     for (stream, result) in &payload.outcome.streams {
         if let Some(error) = result.error.as_deref() {
-            eprintln!("source {id} stream {stream}: {error}");
+            writeln!(
+                run.sink.err,
+                "source {id} stream {}: {}",
+                output::printable(stream),
+                output::printable(error)
+            )?;
         }
     }
-    output::emit(context.json, "source run", &payload, |_| {})?;
+    run.emit("source run", &payload, |_, _| Ok(()))?;
     Ok(if payload.outcome.has_errors() {
         Outcome::SourceErrors
     } else {
@@ -421,8 +721,8 @@ fn run_source(context: &Context, id: &str, op: SourceOperation) -> Result<Outcom
     })
 }
 
-fn run_fetch(context: &Context, options: &FetchOptions) -> Result<Outcome> {
-    let outcome = fetch::fetch(context, options)?;
+fn run_fetch(run: &mut Run<'_, '_>, options: &FetchOptions) -> Result<Outcome> {
+    let outcome = fetch::fetch(run.context, options)?;
     let payload = FetchPayload {
         window: outcome.window.id.as_str(),
         exit_status: outcome.manifest.exit_status,
@@ -431,8 +731,9 @@ fn run_fetch(context: &Context, options: &FetchOptions) -> Result<Outcome> {
             summary: delta::summary(&outcome.delta),
             new_messages: outcome.delta.new_messages.len(),
         },
+        cursors: &outcome.cursors,
     };
-    output::emit(context.json, "fetch", &payload, print_fetch)?;
+    run.emit("fetch", &payload, print_fetch)?;
     Ok(if outcome.errored.is_empty() {
         Outcome::Pass
     } else {
@@ -440,11 +741,22 @@ fn run_fetch(context: &Context, options: &FetchOptions) -> Result<Outcome> {
     })
 }
 
-fn run_delta(context: &Context, requested: Option<&str>, write: bool) -> Result<Outcome> {
-    let state = context.state()?;
-    let directory = windows::resolve_arg(requested.unwrap_or("newest"), &state.windows())?;
+fn run_delta(run: &mut Run<'_, '_>, requested: Option<&str>, write: bool) -> Result<Outcome> {
+    // `--write` replaces the window's `delta.json`, `delta.md` and `open-snapshot.json`, which
+    // the fetch writes under its lease, on the share every machine reads. So a write takes the
+    // fetch lease first, and computes nothing while another copy holds it.
+    let lease = if write {
+        lease::for_role("fetch").context(
+            "ctx delta --write replaces files the fetch writes, so it takes the fetch lease",
+        )?
+    } else {
+        None
+    };
+    let context = run.context;
+    let data = context.data()?;
+    let directory = windows::resolve_arg(requested.unwrap_or("newest"), &data.windows())?;
     let window = Window::open(directory)?;
-    let previous = windows::previous(&state.windows(), &window.id)?;
+    let previous = windows::previous(&data.windows(), &window.id)?;
     let schemes = source::configured_schemes(&context.config.sources)?;
     let owners = delta::Owners::discover(&context.tree, &context.config.sources);
     let snapshot = delta::open_snapshot(&context.tree, Utc::now());
@@ -455,37 +767,91 @@ fn run_delta(context: &Context, requested: Option<&str>, write: bool) -> Result<
         &window,
         previous.as_ref(),
         snapshot.generated_at,
+        context.embedding()?.embedder(),
     )?;
     if write {
+        // The compute can wait on Vertex AI for longer than the lease survives unrenewed.
+        lease
+            .as_ref()
+            .map_or(Ok(()), Lease::check)
+            .context("before writing the delta")?;
         delta::write(&window, &snapshot, &computed)?;
+        give_back(lease, run.sink.err);
     }
-    output::emit(context.json, "delta", &computed, |delta| {
-        println!("{}", delta::render(delta));
+    // A delta quotes each new message, which is a source's text.
+    run.emit("delta", &computed, |delta, out| {
+        writeln!(out, "{}", output::printable(&delta::render(delta)))
     })?;
     Ok(Outcome::Pass)
 }
 
-fn run_cursor(context: &Context, command: &CursorCommand) -> Result<Outcome> {
+/// Gives up a lease a local command took for its write, so the role's own copy can take it
+/// at once. A failure costs that copy the takeover wait and nothing else.
+fn give_back(lease: Option<Lease>, err: &mut dyn Write) {
+    if let Some(lease) = lease {
+        if let Err(error) = lease.release() {
+            let _ = writeln!(
+                err,
+                "releasing the lease: {}",
+                redact::one_line(&format!("{error:#}"))
+            );
+        }
+    }
+}
+
+fn run_cursor(run: &mut Run<'_, '_>, command: &CursorCommand) -> Result<Outcome> {
     match command {
         CursorCommand::Show => {
             let payload = CursorShowPayload {
-                cursors: cursor::show(context)?,
+                cursors: cursor::show(run.context)?,
             };
-            output::emit(context.json, "cursor show", &payload, print_cursors)?;
-        }
-        CursorCommand::Advance { window } => {
-            let state = context.state()?;
-            let directory = windows::resolve_arg(window, &state.windows())?;
-            let window = Window::open(directory)?;
-            let payload = cursor::advance(context, &window)?;
-            output::emit(context.json, "cursor advance", &payload, print_advance)?;
+            run.emit("cursor show", &payload, |payload, out| {
+                cursor::print_cursors(&payload.cursors, out)
+            })?;
         }
     }
     Ok(Outcome::Pass)
 }
 
-fn run_rules(context: &Context) -> Result<Outcome> {
-    let document = context
+fn run_pending(run: &mut Run<'_, '_>) -> Result<Outcome> {
+    let payload = marker::pending(run.context)?;
+    run.emit("pending", &payload, marker::print_pending)?;
+    Ok(Outcome::Pass)
+}
+
+fn run_marker(run: &mut Run<'_, '_>, command: &MarkerCommand) -> Result<Outcome> {
+    match command {
+        MarkerCommand::Show => {
+            let payload = MarkerShowPayload {
+                marker: marker::show(run.context)?,
+            };
+            run.emit("marker show", &payload, |payload, out| {
+                marker::print(payload.marker.as_ref(), out)
+            })?;
+        }
+        MarkerCommand::Advance { window } => {
+            // The marker is on the share, and the server moves it under its write lease. A
+            // move made here takes that lease while it writes, and moves nothing while another
+            // copy, such as a running server, holds it.
+            let lease = lease::for_role("server").context(
+                "ctx marker advance moves the marker the server moves, so it takes the server lease",
+            )?;
+            let moved = marker::advance(run.context, window, &marker::caller());
+            give_back(lease, run.sink.err);
+            let payload = MarkerShowPayload {
+                marker: Some(moved?),
+            };
+            run.emit("marker advance", &payload, |payload, out| {
+                marker::print(payload.marker.as_ref(), out)
+            })?;
+        }
+    }
+    Ok(Outcome::Pass)
+}
+
+fn run_rules(run: &mut Run<'_, '_>) -> Result<Outcome> {
+    let document = run
+        .context
         .tree
         .rules()
         .ok_or_else(|| anyhow!("rules.md is missing from the tree root"))?;
@@ -494,25 +860,28 @@ fn run_rules(context: &Context) -> Result<Outcome> {
         bytes: document.raw.len(),
         text: &document.raw,
     };
-    output::emit(context.json, "rules", &payload, |payload| {
-        println!("{}", payload.path);
-        print!("\n{}", payload.text);
+    // The rules page is the tree's text, printed without its control characters.
+    run.emit("rules", &payload, |payload, out| {
+        writeln!(out, "{}", output::printable(&payload.path))?;
+        write!(out, "\n{}", output::printable(payload.text))
     })?;
     Ok(Outcome::Pass)
 }
 
-fn run_dossier(context: &Context, entity: &str) -> Result<Outcome> {
-    let payload = search::dossier(&context.tree, entity, &context.config)?;
-    output::emit(context.json, "dossier", &payload, search::print_dossier)?;
+fn run_dossier(run: &mut Run<'_, '_>, entity: &str) -> Result<Outcome> {
+    let payload = search::dossier(&run.context.tree, entity, &run.context.config)?;
+    run.emit("dossier", &payload, search::print_dossier)?;
     Ok(Outcome::Pass)
 }
 
-fn run_resolve(context: &Context, pointers: &[String], thread: bool) -> Result<Outcome> {
+fn run_resolve(run: &mut Run<'_, '_>, pointers: &[String], thread: bool) -> Result<Outcome> {
     let payload = ResolvePayload {
-        results: resolve::resolve(context, pointers, thread)?,
+        results: resolve::resolve(run.context, pointers, thread)?,
     };
     let source_errors = payload.results.iter().any(|result| result.source_error);
-    output::emit(context.json, "resolve", &payload, print_resolved)?;
+    run.emit("resolve", &payload, |payload, out| {
+        resolve::print_resolved(&payload.results, out)
+    })?;
     Ok(if source_errors {
         Outcome::SourceErrors
     } else {
@@ -520,109 +889,33 @@ fn run_resolve(context: &Context, pointers: &[String], thread: bool) -> Result<O
     })
 }
 
-fn run_verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Outcome> {
-    let verification = resolve::verify(context, files, live)?;
-    output::emit(
-        context.json,
-        "cite verify",
-        &verification,
-        print_verification,
-    )?;
+fn run_verify(run: &mut Run<'_, '_>, files: &[PathBuf], live: bool) -> Result<Outcome> {
+    let verification = resolve::verify(run.context, files, run.drafts, live)?;
+    run.emit("cite verify", &verification, resolve::print_verification)?;
+    // A quote nothing could check is not a checked one, and the writer refuses it as it
+    // refuses a broken one: the exit code says so to a cycle that reads only the code.
     Ok(if verification.source_errors {
         Outcome::SourceErrors
-    } else if verification.broken.is_empty() {
+    } else if verification.broken.is_empty() && verification.unchecked.is_empty() {
         Outcome::Pass
     } else {
         Outcome::StructuralDefects
     })
 }
 
-fn run_state_path(context: &Context) -> Result<Outcome> {
-    let state = context.state()?;
+fn run_state_path(run: &mut Run<'_, '_>) -> Result<Outcome> {
+    let state = run.context.state()?;
     let payload = StatePathPayload {
         state_dir: state.root().to_string_lossy().into_owned(),
         store: state.store().to_string_lossy().into_owned(),
+        data_dir: run.context.data()?.root().to_string_lossy().into_owned(),
     };
-    output::emit(context.json, "state path", &payload, |payload| {
-        println!("{}", payload.state_dir);
-        println!("{}", payload.store);
+    run.emit("state path", &payload, |payload, out| {
+        writeln!(out, "{}", payload.state_dir)?;
+        writeln!(out, "{}", payload.store)?;
+        writeln!(out, "{}", payload.data_dir)
     })?;
     Ok(Outcome::Pass)
-}
-
-fn plugin_environment(global: &GlobalArgs) -> Result<PluginEnv> {
-    let user = UserConfig::load()?;
-    let tree_root = resolve_plugin_tree(global, &user);
-    let state_base = tree_root.as_deref().and_then(|root| {
-        let config = TreeConfig::load(root).ok()?;
-        config.id?;
-        absolute_path(state_base(&user).ok()?).ok()
-    });
-    Ok(PluginEnv {
-        tree_root,
-        state_base,
-        json: global.json,
-    })
-}
-
-fn absolute_path(path: PathBuf) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path);
-    }
-    Ok(std::env::current_dir()
-        .context("reading the current directory for plugin state")?
-        .join(path))
-}
-
-fn resolve_plugin_tree(global: &GlobalArgs, user: &UserConfig) -> Option<PathBuf> {
-    if let Some(root) = global.memory.as_deref() {
-        return root.canonicalize().ok();
-    }
-    let cwd = std::env::current_dir().ok()?;
-    locate_tree(None, &cwd, user)
-        .ok()
-        .and_then(|root| root.canonicalize().ok())
-}
-
-/// Executes a `ctx-<name>` command from `PATH` with the resolved ctx environment.
-///
-/// # Errors
-///
-/// Returns an error when no command name is supplied or when the executable cannot be started.
-pub fn run_external(arguments: &[OsString], environment: &PluginEnv) -> Result<Infallible> {
-    let (name, arguments) = arguments
-        .split_first()
-        .ok_or_else(|| anyhow!("external command name is missing"))?;
-    let name = name
-        .to_str()
-        .ok_or_else(|| anyhow!("external command name is not valid UTF-8"))?;
-    let executable = format!("ctx-{name}");
-    let mut command = ProcessCommand::new(&executable);
-    command
-        .env_remove("CTX_MEMORY")
-        .env_remove("CTX_STATE_DIR")
-        .env_remove("CTX_JSON");
-    command.args(arguments);
-    if let Some(root) = &environment.tree_root {
-        command.env("CTX_MEMORY", root);
-    }
-    if let Some(state_base) = &environment.state_base {
-        command.env("CTX_STATE_DIR", state_base);
-    }
-    if environment.json {
-        command.env("CTX_JSON", "1");
-    }
-    command.env("CTX_VERSION", env!("CARGO_PKG_VERSION"));
-    command.env(
-        "CTX_BIN",
-        std::env::current_exe().context("locating the ctx executable")?,
-    );
-
-    let error = command.exec();
-    if error.kind() == std::io::ErrorKind::NotFound {
-        bail!("unknown command `{name}` (no {executable} on PATH)");
-    }
-    Err(error).with_context(|| format!("running {executable}"))
 }
 
 fn parse_window_end(value: &str) -> std::result::Result<DateTime<Utc>, String> {
@@ -631,235 +924,15 @@ fn parse_window_end(value: &str) -> std::result::Result<DateTime<Utc>, String> {
         .map_err(|error| format!("window end must be RFC 3339: {error}"))
 }
 
-fn print_fetch(payload: &FetchPayload<'_>) {
-    println!("{}", payload.window);
+fn print_fetch(payload: &FetchPayload<'_>, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(out, "{}", payload.window)?;
     for (source, manifest) in payload.sources {
-        println!("{source}: {}", status_label(manifest.status));
+        writeln!(
+            out,
+            "{}: {}",
+            output::printable(source),
+            manifest.status.label()
+        )?;
     }
-}
-
-fn print_cursors(payload: &CursorShowPayload) {
-    for (source, streams) in &payload.cursors.sources {
-        for (stream, cursor) in streams {
-            println!("{source} {stream} {} {}", cursor.cursor, cursor.window);
-        }
-    }
-}
-
-fn print_advance(payload: &AdvanceOutcome) {
-    for advanced in &payload.advanced {
-        println!(
-            "advanced {} {} {}",
-            advanced.source, advanced.stream, advanced.cursor
-        );
-    }
-    for skipped in &payload.skipped {
-        println!(
-            "skipped {} {} {}",
-            skipped.source, skipped.stream, skipped.why
-        );
-    }
-}
-
-const fn status_label(status: Status) -> &'static str {
-    match status {
-        Status::Ok => "ok",
-        Status::Error => "error",
-    }
-}
-
-fn print_rules_findings(findings: &Findings) {
-    if findings.rules_missing {
-        println!("{}", "RULES — missing root rules.md".bold());
-        println!();
-    }
-    if findings.rules_wrong_type {
-        println!("{}", "RULES — rules.md must have type: rules".bold());
-        println!();
-    }
-    if let Some(bytes) = findings.rules_oversize {
-        println!(
-            "{}",
-            format!("RULES — rules.md exceeds 8192 bytes ({bytes})").bold()
-        );
-        println!();
-    }
-    if !findings.schema_violations.is_empty() {
-        println!(
-            "{}",
-            format!(
-                "SCHEMAS — records that do not match their type ({})",
-                findings.schema_violations.len()
-            )
-            .bold()
-        );
-        for violation in &findings.schema_violations {
-            println!(
-                "  {}{} — {}",
-                violation.path, violation.pointer, violation.message
-            );
-        }
-        println!();
-    }
-}
-
-fn print_sweep(findings: &Findings) {
-    println!("{} files\n", findings.files);
-
-    if !findings.gaps.is_empty() {
-        println!(
-            "{}",
-            format!("GAPS — links with no file ({})", findings.gaps.len()).bold()
-        );
-        for gap in &findings.gaps {
-            println!("  {}  <- {}", gap.target.yellow(), gap.from.dimmed());
-        }
-        println!();
-    }
-
-    if !findings.ambiguous.is_empty() {
-        println!(
-            "{}",
-            format!(
-                "AMBIGUOUS — links with multiple files ({})",
-                findings.ambiguous.len()
-            )
-            .bold()
-        );
-        for ambiguous in &findings.ambiguous {
-            println!(
-                "  {}  <- {}  candidates={}",
-                ambiguous.target.yellow(),
-                ambiguous.from.dimmed(),
-                ambiguous.candidates.join(", ")
-            );
-        }
-        println!();
-    }
-
-    let (overdue, undated): (Vec<_>, Vec<_>) = findings
-        .stale
-        .iter()
-        .partition(|stale| stale.overdue_days.is_some());
-    for (title, items) in [
-        ("STALE — open past its date", &overdue),
-        ("UNDATED — open with no revisit_by/due date", &undated),
-    ] {
-        if items.is_empty() {
-            continue;
-        }
-        println!("{}", format!("{title} ({})", items.len()).bold());
-        for item in items {
-            let owner = item.owner.as_deref().unwrap_or("unassigned");
-            println!(
-                "  {}  [{}] {}  owner={}",
-                item.path.red(),
-                item.status,
-                item.why.yellow(),
-                owner.dimmed()
-            );
-        }
-        println!();
-    }
-
-    for (title, items) in [
-        ("UNTIERED — no authority tier", &findings.untiered),
-        ("UNQUOTED — no verbatim quote", &findings.unquoted),
-        (
-            "NEGATIVES — direct source not identified",
-            &findings.negatives,
-        ),
-        ("ORPHANS — no document links here", &findings.orphans),
-    ] {
-        if items.is_empty() {
-            continue;
-        }
-        println!("{}", format!("{title} ({})", items.len()).bold());
-        for item in items {
-            println!("  {item}");
-        }
-        println!();
-    }
-
-    print_rules_findings(findings);
-
-    if findings.clean() {
-        println!("{}", "no findings".green());
-    } else if findings.structural_clean() {
-        println!(
-            "{}",
-            format!(
-                "structure clean — {} stale item(s) need review",
-                findings.stale.len()
-            )
-            .green()
-        );
-    }
-}
-
-fn print_open(items: &[OpenItemView]) {
-    if items.is_empty() {
-        println!("nothing open");
-        return;
-    }
-    let today = today_utc();
-    for item in items {
-        let when = item.days_overdue.map_or_else(
-            || {
-                item.deadline.map_or_else(
-                    || match item.opened.map(|opened| (today - opened).num_days()) {
-                        Some(age) => format!("no date (opened {age}d ago)"),
-                        None => "no date".to_owned(),
-                    },
-                    |deadline| deadline.format("%a %Y-%m-%d").to_string(),
-                )
-            },
-            |days| format!("overdue {days}d"),
-        );
-        println!(
-            "[{}] {}  {}",
-            item.kind.bold(),
-            when.red(),
-            item.owner.as_deref().unwrap_or("unassigned").dimmed()
-        );
-        println!("     {}", item.title);
-        println!("     {}", item.path.dimmed());
-        if let Some(unreviewed) = item.unreviewed.as_deref() {
-            for reply in unreviewed {
-                let same_day = if reply.same_day { " (same day)" } else { "" };
-                println!(
-                    "     unreviewed {} {} ({}){}",
-                    reply.ts, reply.pointer, reply.how, same_day
-                );
-            }
-        }
-        println!();
-    }
-}
-
-fn print_resolved(payload: &ResolvePayload) {
-    for result in &payload.results {
-        println!("{}", result.input);
-        if let Some(error) = result.error.as_deref() {
-            println!("  error: {error}");
-        } else if let Some(text) = result.text.as_deref() {
-            println!("{text}");
-        } else {
-            println!("  not found");
-        }
-        println!();
-    }
-}
-
-fn print_verification(verification: &Verification) {
-    println!("checked {}", verification.checked);
-    for broken in &verification.broken {
-        println!(
-            "{}:{}: {} — {}",
-            broken.file, broken.line, broken.pointer, broken.why
-        );
-    }
-    for (scheme, skipped) in &verification.skipped {
-        println!("skipped {scheme}: {skipped}");
-    }
+    cursor::print_advance(payload.cursors, out)
 }

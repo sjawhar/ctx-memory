@@ -3,6 +3,7 @@
 mod calendar;
 mod drive;
 mod external;
+pub mod github;
 pub mod gmail;
 pub mod slack;
 
@@ -10,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{default_scheme, SourceConfig};
@@ -21,6 +22,7 @@ use crate::tree::Tree;
 pub use calendar::CalendarSource;
 pub use drive::DriveSource;
 pub use external::External;
+pub use github::GithubSource;
 pub use gmail::GmailSource;
 pub use slack::SlackSource;
 
@@ -68,6 +70,8 @@ pub struct FetchRequest {
     pub backfill_hours: u32,
     pub cursors: BTreeMap<String, String>,
     pub discovered: Vec<DiscoveredStream>,
+    /// `<data_dir>/sources/<id>`: what the source keeps between fetches, shared by every
+    /// machine that fetches this tree, so a fetch elsewhere still reaches it.
     pub state_dir: PathBuf,
 }
 
@@ -79,6 +83,8 @@ pub struct ResolveRequest {
     pub source: SourceRef,
     pub config: serde_json::Value,
     pub pointers: Vec<String>,
+    /// `<state_dir>/sources/<id>`: scratch space on this machine. A resolve is a read, and a
+    /// read never writes the shared data directory.
     pub state_dir: PathBuf,
 }
 
@@ -168,6 +174,7 @@ pub fn open(spec: &SourceConfig, scheme: &str) -> Result<Box<dyn Source>> {
         "gmail" => Ok::<Box<dyn Source>, anyhow::Error>(Box::new(GmailSource::new())),
         "drive" => Ok::<Box<dyn Source>, anyhow::Error>(Box::new(DriveSource::new())),
         "calendar" => Ok::<Box<dyn Source>, anyhow::Error>(Box::new(CalendarSource::new())),
+        "github" => Ok::<Box<dyn Source>, anyhow::Error>(Box::new(GithubSource::new())),
         _ => {
             let external = External::find(&spec.kind)?.with_timeout_secs(spec.timeout_secs);
             Ok::<Box<dyn Source>, anyhow::Error>(Box::new(external))
@@ -242,6 +249,185 @@ pub fn window_start(
             .map(|timestamp| timestamp.with_timezone(&Utc))
             .with_context(|| format!("parsing source cursor {cursor}")),
         None => Ok(window_end - Duration::hours(i64::from(backfill_hours))),
+    }
+}
+
+/// The longest stretch of time one run lists for a stream that lists by time.
+///
+/// A stream whose position is far behind its window end — after an outage, or on a first fetch
+/// with a long backfill — reads the gap a slice at a time, oldest first, and names the slice's
+/// end as its cursor, so one run's requests stay bounded and every run moves the stream on.
+/// Seven days is about what the Gmail history path reads in one run, since Gmail keeps a
+/// mailbox's history for about a week.
+pub const MAX_SLICE_DAYS: i64 = 7;
+
+/// Where the slice a run lists from `start` ends: `MAX_SLICE_DAYS` after `start`, or the window
+/// end when that comes first.
+#[must_use]
+pub fn slice_end(start: DateTime<Utc>, window_end: DateTime<Utc>) -> DateTime<Utc> {
+    (start + Duration::days(MAX_SLICE_DAYS)).min(window_end)
+}
+
+/// What separates a token from the time beside it in a cursor.
+const STORED_THROUGH: char = '@';
+
+/// What a cursor names when a stream's position is a token its API issued.
+///
+/// A token — a Gmail history ID, a Calendar sync token — says nothing about time, so a run
+/// whose token the API no longer holds cannot tell what the stream already stored, and listing
+/// the backfill window instead would step over everything older than it. Writing the time
+/// beside the token, as `<token>@<rfc3339>`, lets that run list from what is stored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenCursor<'a> {
+    /// A token, with the time through which the stream is stored when the cursor carries one.
+    Token {
+        token: &'a str,
+        stored_through: Option<DateTime<Utc>>,
+    },
+    /// A time, which a stream names when it holds no token to follow.
+    Time(DateTime<Utc>),
+}
+
+impl<'a> TokenCursor<'a> {
+    /// Reads a stored cursor. A cursor an earlier build wrote names no time.
+    #[must_use]
+    pub fn parse(cursor: &'a str) -> Self {
+        if let Some((token, time)) = cursor.rsplit_once(STORED_THROUGH) {
+            if let Some(stored_through) = timestamp(time) {
+                return Self::Token {
+                    token,
+                    stored_through: Some(stored_through),
+                };
+            }
+        }
+        timestamp(cursor).map_or(
+            Self::Token {
+                token: cursor,
+                stored_through: None,
+            },
+            Self::Time,
+        )
+    }
+}
+
+/// Writes the cursor of a stream that holds `token` and is stored through `stored_through`.
+#[must_use]
+pub fn token_cursor(token: &str, stored_through: DateTime<Utc>) -> String {
+    format!(
+        "{token}{STORED_THROUGH}{}",
+        stored_through.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )
+}
+
+/// What separates the times a sliced listing covers from the token taken before its first slice.
+const TAKEN_FIRST: char = '#';
+/// What separates the time a catch-up began from the time its slices reach, as an ISO 8601
+/// interval does.
+const BEGAN: char = '/';
+
+/// Where a stream that lists a long gap a slice at a time stands, once the token that follows
+/// the listing has been taken: the time its slices reach, that token, and, for a stream whose
+/// token can expire, the time the catch-up began.
+///
+/// The token is taken before the first slice and adopted after the last. A token taken only
+/// when the last slice is listed opens a feed that never names what changed during the
+/// catch-up with a time behind the slices — a file uploaded with an old modified time, mail
+/// imported with an old date — and no later slice lists it either. A stream whose token expires
+/// before the last slice lists again from where the catch-up began, under a new token.
+///
+/// Written `<rfc3339>#<token>`, or `<began>/<rfc3339>#<token>` when it carries the start. A
+/// bare time, which an earlier build wrote, names no token, and the run that reads it takes one
+/// before it lists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SliceCursor<'a> {
+    /// The time the catch-up began, when the stream keeps it.
+    pub began: Option<DateTime<Utc>>,
+    /// The time the slices listed so far reach.
+    pub through: DateTime<Utc>,
+    /// The token taken before the first slice.
+    pub token: &'a str,
+}
+
+impl<'a> SliceCursor<'a> {
+    /// Reads a cursor written by [`slice_cursor`], or `None` for any other cursor.
+    #[must_use]
+    pub fn parse(cursor: &'a str) -> Option<Self> {
+        let (times, token) = cursor.split_once(TAKEN_FIRST)?;
+        if token.is_empty() {
+            return None;
+        }
+        let (began, through) = match times.split_once(BEGAN) {
+            Some((began, through)) => (Some(timestamp(began)?), timestamp(through)?),
+            None => (None, timestamp(times)?),
+        };
+        Some(Self {
+            began,
+            through,
+            token,
+        })
+    }
+}
+
+/// Writes the cursor of a listing whose slices reach `through`, holding `token` for the run
+/// whose slice reaches the window end, and the time the catch-up `began` when the stream keeps
+/// it.
+#[must_use]
+pub fn slice_cursor(began: Option<DateTime<Utc>>, through: DateTime<Utc>, token: &str) -> String {
+    let through = through.to_rfc3339_opts(SecondsFormat::Secs, true);
+    began.map_or_else(
+        || format!("{through}{TAKEN_FIRST}{token}"),
+        |began| {
+            format!(
+                "{}{BEGAN}{through}{TAKEN_FIRST}{token}",
+                began.to_rfc3339_opts(SecondsFormat::Secs, true)
+            )
+        },
+    )
+}
+
+fn timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+/// Emits a fetch stream's warnings, then its records, then its terminal `StreamEnd`.
+///
+/// On success the stream ends `Ok` at `cursor`; on failure it ends `Error` with the cause and
+/// no cursor, so a failing stream does not advance its position.
+///
+/// # Errors
+///
+/// Returns an error when the sink cannot accept a message.
+pub fn emit_stream(
+    stream: &str,
+    collected: Result<(Vec<String>, Vec<Record>, String)>,
+    sink: &mut dyn FnMut(Message) -> Result<()>,
+) -> Result<()> {
+    match collected {
+        Ok((warnings, records, cursor)) => {
+            for warning in warnings {
+                sink(Message::Warning {
+                    stream: Some(stream.to_owned()),
+                    message: warning,
+                })?;
+            }
+            for record in records {
+                sink(Message::Record(Box::new(record)))?;
+            }
+            sink(Message::StreamEnd {
+                stream: stream.to_owned(),
+                status: StreamStatus::Ok,
+                cursor: Some(cursor),
+                error: None,
+            })
+        }
+        Err(error) => sink(Message::StreamEnd {
+            stream: stream.to_owned(),
+            status: StreamStatus::Error,
+            cursor: None,
+            error: Some(format!("{error:#}")),
+        }),
     }
 }
 

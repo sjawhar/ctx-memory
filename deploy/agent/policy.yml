@@ -1,0 +1,101 @@
+# What the ingest cycle's session may do. run-cycle.sh loads this file with --config, and
+# the image copies it to /opt/ctx-memory/policy.yml. A --config overlay outranks the
+# global and project settings for every key it sets.
+#
+# The session reads the verbatim text of every message a source delivered: a GitHub issue
+# or comment any GitHub user can open on a public repository, mail from outside the organization, a
+# message in a channel. None of that text can be trusted, so the session must not be able
+# to do what it says. What the cycle needs is named here; everything else has no approval
+# it can get, because a headless session cannot answer a prompt and a call that needs one
+# fails instead of running.
+tools:
+  # read and write tier calls run unattended; the exec tier — bash, and anything else that
+  # executes code — prompts, which ends the call. The bash rules below lower the ctx
+  # subcommands the cycle runs to the write tier, so they are the only programs the session
+  # can start.
+  approvalMode: write
+  approval:
+    # A user deny is absolute: it holds over the mode, over a pattern that would allow, and
+    # inside a subagent, which omp would otherwise run in yolo. run-cycle.sh also leaves
+    # these tools out of --tools; this is what holds if that list is ever widened.
+    eval: deny
+    task: deny
+    browser: deny
+    computer: deny
+    web_search: deny
+    # Every tool that writes a file. omp's own state under HOME (agent.db, whose stored keys
+    # may be `!commands` omp runs) belongs to the session's user, and an approval rule cannot
+    # keep a write tool to one directory, so the session writes no file at all.
+    write: deny
+    edit: deny
+    ast_edit: deny
+    manage_skill: deny
+    memory_edit: deny
+    learn: deny
+    retain: deny
+    checkpoint: deny
+    rewind: deny
+    github: deny
+    # The cycle's only writes: the two tools deploy/agent/ctx-record.ts adds, which hand a record
+    # to `ctx record put` on standard input, or a path to `ctx record rm`, with no shell.
+    ctx_record_put: allow
+    ctx_record_rm: allow
+# `read` and `grep` fetch any http(s) path they are given, and a URL read needs only the
+# read tier, which the mode above approves. With fetch on, one instruction in a window could
+# send the model key or any window's text out in a URL. This switch is the one omp has for
+# it: every URL read and search fails with "URL reads are disabled by settings".
+fetch:
+  enabled: false
+# The bash tool's service mode hands commands to a launch broker, which keeps the program each
+# service runs in daemon records under omp's state directory, where the session can write
+# (launch/paths.ts, launch/broker.ts:893,918 at the pinned release). The cycle runs no service,
+# so the mode is off: the tool offers no service fields and starts no broker.
+launch:
+  enabled: false
+# omp starts every MCP server a configuration file it discovers names, before the session's first
+# turn: an .mcp.json (or mcp.json, .omp/mcp.json, …) in its working directory, and the user's own
+# under HOME. This switch drops the project files (mcp/settings.ts, sdk.ts:2621 at the pinned
+# release); omp has none for the user's, which the image keeps out of the session's reach by
+# making HOME root's. The cycle uses no MCP server.
+mcp:
+  enableProjectConfig: false
+bash:
+  # direnv would load an .envrc the session can write in its working directory into every
+  # shell (exec/direnv.ts). The image has no direnv, and this keeps it so if one is added.
+  direnv: "off"
+  patterns:
+    # `ctx <name>` runs any `ctx-<name>` program it finds, so a rule naming only `ctx` would
+    # admit every program a name can spell. Each rule here names one built-in subcommand the
+    # server answers — what the ingest skill runs — and a wildcard stands only for that
+    # subcommand's arguments. An allow lowers a simple call to the write tier, which the mode
+    # above approves. Compound commands are not evaluated per segment
+    # (bash.allowCompoundCommands stays off), so `ctx rules && curl …` keeps the exec tier and
+    # is refused with everything else. `ctx record put` and `ctx record rm` have no rule: the
+    # session writes only through the record tools above, and at the shell `ctx record put
+    # <path> <file>` would read any file the session's user can read into a record.
+    - match: "ctx rules"
+      approval: allow
+    - match: "ctx pending"
+      approval: allow
+    - match: "ctx pending *"
+      approval: allow
+    - match: "ctx search *"
+      approval: allow
+    - match: "ctx dossier *"
+      approval: allow
+    - match: "ctx open"
+      approval: allow
+    - match: "ctx open *"
+      approval: allow
+    - match: "ctx resolve"
+      approval: allow
+    - match: "ctx resolve *"
+      approval: allow
+    - match: "ctx cite verify"
+      approval: allow
+    - match: "ctx cite verify *"
+      approval: allow
+    - match: "ctx sweep"
+      approval: allow
+    - match: "ctx marker advance *"
+      approval: allow

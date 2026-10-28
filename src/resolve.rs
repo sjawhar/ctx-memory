@@ -1,19 +1,27 @@
 //! Local record resolution and citation verification.
 
+mod evidence;
+mod lookup;
+mod provenance;
+mod quotes;
+
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{bail, Result};
 use serde::Serialize;
-use serde_json::Value;
 
-use crate::config::SourceConfig;
 use crate::context::Context;
-use crate::pointer::{Pointer, Schemes};
-use crate::record::render;
-use crate::source::{self, Request as SourceRequest, ResolveRequest, Session, SourceRef};
+use crate::output::printable;
+use crate::pointer::Pointer;
+use crate::source;
 use crate::store::Store;
-use crate::tree::Doc;
+use crate::tree::{Doc, Tree};
+
+use lookup::{resolve_with_live, Lookup, ResolutionMode};
+use provenance::verify_pointers;
+use quotes::{quote_claims, refresh_quote_sources, verify_quotes};
 
 /// The outcome for one `ctx resolve` input.
 #[derive(Debug, Serialize)]
@@ -42,43 +50,18 @@ pub struct Verification {
     pub broken: Vec<Broken>,
     pub skipped: BTreeMap<String, usize>,
     pub quotes_unchecked: usize,
+    /// Quotes the verification could not check, with the reason each one defeated it: the
+    /// cited source has never declared whether its records are its own words, it stores
+    /// renderings rather than the words themselves, no configured source owns the scheme the
+    /// claim names, or a claim at tier 1 or 2 names no resolvable pointer at all. A record
+    /// that ranks at tier 1 or 2 with no quote at those tiers checked against its source is
+    /// listed here too, as `tier 1` or `tier 2`, and so is a record whose frontmatter does not
+    /// parse, whose quotes nothing could read, as `frontmatter`. `cite verify` exits 1 on any of
+    /// these, and the single writer refuses them, since it cannot tell whether the quote it is
+    /// about to commit should have been checked.
+    pub unchecked: Vec<Broken>,
     #[serde(skip)]
     pub source_errors: bool,
-}
-
-struct ResolvedText {
-    text: Option<String>,
-    verbatim: bool,
-    source_error: Option<String>,
-}
-
-struct QuoteSource {
-    pointer: Pointer,
-    start: usize,
-    text: String,
-}
-
-#[derive(Clone, Copy)]
-enum ResolutionMode {
-    Resolve,
-    Verify { live: bool, refresh: bool },
-}
-
-impl ResolutionMode {
-    const fn live(self) -> bool {
-        match self {
-            Self::Resolve => true,
-            Self::Verify { live, .. } => live,
-        }
-    }
-
-    const fn needs_verbatim(self) -> bool {
-        matches!(self, Self::Verify { .. })
-    }
-
-    const fn force_live(self) -> bool {
-        matches!(self, Self::Verify { refresh: true, .. })
-    }
 }
 
 /// Resolves `pointers` from the local store, then through each owning source's `resolve` operation.
@@ -89,19 +72,18 @@ impl ResolutionMode {
 /// the local store cannot be opened, updated, or read.
 pub fn resolve(context: &Context, pointers: &[String], thread: bool) -> Result<Vec<Resolved>> {
     let schemes = source::configured_schemes(&context.config.sources)?;
-    let store = Store::open(&context.state()?.store())?;
+    let store = Store::load(context.data()?, context.state()?)?;
+    let lookup = Lookup {
+        context,
+        store: &store,
+        schemes: &schemes,
+    };
     pointers
         .iter()
         .map(|input| match schemes.parse(input) {
             Some(pointer) => {
-                let resolved = resolve_with_live(
-                    context,
-                    &store,
-                    &schemes,
-                    &pointer,
-                    thread,
-                    ResolutionMode::Resolve,
-                )?;
+                let resolved =
+                    resolve_with_live(lookup, &pointer, thread, ResolutionMode::Resolve)?;
                 let source_error = resolved.source_error;
                 Ok(Resolved {
                     input: input.clone(),
@@ -124,539 +106,200 @@ pub fn resolve(context: &Context, pointers: &[String], thread: bool) -> Result<V
 
 /// Verifies source resolution and quote containment for pointers in selected tree documents.
 ///
+/// With no file named, every document of the tree is checked. A named file is checked however
+/// the caller writes its path: relative to the working directory or to the tree's root, or
+/// absolute. One the caller sent as a draft (`drafts`, by the path the caller named) is checked
+/// as that text. A path that names no record of the tree is an error, never `checked 0`: the
+/// caller asked for that file to be checked, and nothing was.
+///
 /// # Errors
 ///
-/// Returns an error when the context has no state directory, a requested live source cannot run,
-/// or the local store cannot be opened, updated, or read.
-pub fn verify(context: &Context, files: &[PathBuf], live: bool) -> Result<Verification> {
-    let schemes = source::configured_schemes(&context.config.sources)?;
-    let store = Store::open(&context.state()?.store())?;
-    let mut verification = Verification::default();
-    for document in &context.tree.docs {
-        if files.is_empty() || files.contains(&document.rel) {
-            verify_document(context, &store, &schemes, document, live, &mut verification)?;
+/// Returns an error when a named file is no record of the tree, the context has no state
+/// directory, a requested live source cannot run, or the local store cannot be opened,
+/// updated, or read.
+pub fn verify(
+    context: &Context,
+    files: &[PathBuf],
+    drafts: &[Doc],
+    live: bool,
+) -> Result<Verification> {
+    let mut documents: Vec<&Doc> = Vec::new();
+    if files.is_empty() {
+        documents.extend(&context.tree.docs);
+    }
+    for file in files {
+        let document = match drafts.iter().find(|draft| draft.rel == *file) {
+            Some(draft) => draft,
+            None => named_document(&context.tree, file)?,
+        };
+        if !documents
+            .iter()
+            .any(|chosen| std::ptr::eq(*chosen, document))
+        {
+            documents.push(document);
         }
+    }
+    verify_documents(context, &documents, live)
+}
+
+/// Verifies source resolution and quote containment in `documents`.
+///
+/// # Errors
+///
+/// Returns an error when the context has no state directory, a requested live source cannot
+/// run, or the local store cannot be opened, updated, or read.
+pub fn verify_documents(context: &Context, documents: &[&Doc], live: bool) -> Result<Verification> {
+    let schemes = source::configured_schemes(&context.config.sources)?;
+    let store = Store::load(context.data()?, context.state()?)?;
+    let mut verification = Verification::default();
+    let lookup = Lookup {
+        context,
+        store: &store,
+        schemes: &schemes,
+    };
+    for document in documents {
+        verify_document(lookup, document, live, &mut verification)?;
     }
     Ok(verification)
 }
 
-fn verify_document(
-    context: &Context,
-    store: &Store,
-    schemes: &Schemes,
-    document: &Doc,
-    live: bool,
-    verification: &mut Verification,
-) -> Result<()> {
-    let source_pointers = source_pointers(document, schemes)?;
-    let mut has_verbatim_source = false;
-    let mut quote_sources = Vec::new();
-    for found in schemes.find_all(&document.raw) {
-        let is_source_pointer = source_pointers.contains(&found.pointer);
-        let resolved = resolve_with_live(
-            context,
-            store,
-            schemes,
-            &found.pointer,
-            false,
-            ResolutionMode::Verify {
-                live,
-                refresh: false,
-            },
-        )?;
-        if is_source_pointer && resolved.verbatim {
-            has_verbatim_source = true;
+/// The record of `tree` that `named` names: a path relative to the working directory, or to
+/// the tree's root, or an absolute one.
+fn named_document<'t>(tree: &'t Tree, named: &Path) -> Result<&'t Doc> {
+    let mut candidates = Vec::with_capacity(2);
+    if named.is_absolute() {
+        candidates.push(named.to_path_buf());
+    } else {
+        if let Ok(directory) = std::env::current_dir() {
+            candidates.push(directory.join(named));
         }
-        if let Some(error) = resolved.source_error {
-            verification.source_errors = true;
-            verification.broken.push(Broken {
-                file: document.rel.to_string_lossy().into_owned(),
-                line: line_number(&document.raw, found.start),
-                pointer: found.pointer.to_string(),
-                why: error,
-            });
+        candidates.push(tree.root.join(named));
+    }
+    for candidate in candidates {
+        let Ok(real) = candidate.canonicalize() else {
             continue;
-        }
-        if !resolved.verbatim {
-            *verification
-                .skipped
-                .entry(found.pointer.scheme.clone())
-                .or_default() += 1;
+        };
+        let Ok(relative) = real.strip_prefix(&tree.root) else {
             continue;
-        }
-        verification.checked += 1;
-        if resolved.text.is_none() {
-            verification.broken.push(Broken {
-                file: document.rel.to_string_lossy().into_owned(),
-                line: line_number(&document.raw, found.start),
-                pointer: found.pointer.to_string(),
-                why: "does not resolve in the local store".to_owned(),
-            });
-            continue;
-        }
-        if is_source_pointer {
-            let thread_resolved = resolve_with_live(
-                context,
-                store,
-                schemes,
-                &found.pointer,
-                true,
-                ResolutionMode::Verify {
-                    live,
-                    refresh: false,
-                },
-            )?;
-            if let Some(error) = thread_resolved.source_error {
-                verification.source_errors = true;
-                verification.broken.push(Broken {
-                    file: document.rel.to_string_lossy().into_owned(),
-                    line: line_number(&document.raw, found.start),
-                    pointer: found.pointer.to_string(),
-                    why: error,
-                });
-                continue;
-            }
-            if !quote_sources
-                .iter()
-                .any(|source: &QuoteSource| source.pointer == found.pointer)
-            {
-                let text = local_records(store, schemes, &found.pointer, true)?
-                    .into_iter()
-                    .map(|record| record.text)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                quote_sources.push(QuoteSource {
-                    pointer: found.pointer,
-                    start: found.start,
-                    text,
-                });
-            }
+        };
+        if let Some(document) = tree.docs.iter().find(|document| document.rel == relative) {
+            return Ok(document);
         }
     }
-    refresh_quote_sources(
-        context,
-        store,
-        schemes,
-        document,
-        live,
-        &mut quote_sources,
-        verification,
-    )?;
-    verify_quote(document, &quote_sources, has_verbatim_source, verification);
-    Ok(())
-}
-
-fn refresh_quote_sources(
-    context: &Context,
-    store: &Store,
-    schemes: &Schemes,
-    document: &Doc,
-    live: bool,
-    quote_sources: &mut [QuoteSource],
-    verification: &mut Verification,
-) -> Result<()> {
-    let Some(quote) = document.front.quote.as_deref() else {
-        return Ok(());
-    };
-    if !live
-        || quote_sources
-            .iter()
-            .any(|source| quote_matches(&source.text, quote))
-    {
-        return Ok(());
-    }
-    for source in quote_sources {
-        let pointer = thread_refresh_pointer(store, schemes, &source.pointer)?;
-        let resolved = resolve_with_live(
-            context,
-            store,
-            schemes,
-            &pointer,
-            true,
-            ResolutionMode::Verify {
-                live,
-                refresh: true,
-            },
-        )?;
-        if let Some(error) = resolved.source_error {
-            verification.source_errors = true;
-            verification.broken.push(Broken {
-                file: document.rel.to_string_lossy().into_owned(),
-                line: line_number(&document.raw, source.start),
-                pointer: source.pointer.to_string(),
-                why: error,
-            });
-            continue;
-        }
-        source.text = local_records(store, schemes, &source.pointer, true)?
-            .into_iter()
-            .map(|record| record.text)
-            .collect::<Vec<_>>()
-            .join("\n");
-    }
-    Ok(())
-}
-
-fn thread_refresh_pointer(store: &Store, schemes: &Schemes, pointer: &Pointer) -> Result<Pointer> {
-    let thread = store.get(pointer)?.and_then(|record| record.thread);
-    Ok(thread
-        .as_deref()
-        .and_then(|thread| schemes.parse(thread))
-        .unwrap_or_else(|| pointer.clone()))
-}
-
-fn verify_quote(
-    document: &Doc,
-    quote_sources: &[QuoteSource],
-    has_verbatim_source: bool,
-    verification: &mut Verification,
-) {
-    let Some(quote) = document.front.quote.as_deref() else {
-        return;
-    };
-    if !has_verbatim_source {
-        verification.quotes_unchecked += 1;
-        return;
-    }
-    if quote_sources.is_empty()
-        || quote_sources
-            .iter()
-            .any(|source| quote_matches(&source.text, quote))
-    {
-        return;
-    }
-    let Some(source) = quote_sources.first() else {
-        return;
-    };
-    verification.broken.push(Broken {
-        file: document.rel.to_string_lossy().into_owned(),
-        line: line_number(&document.raw, source.start),
-        pointer: source.pointer.to_string(),
-        why: "quote does not appear in the resolved text".to_owned(),
-    });
-}
-
-fn default_verbatim(source: Option<&SourceConfig>, scheme: &str) -> bool {
-    source.map_or(matches!(scheme, "slack" | "gmail"), |source| {
-        matches!(source.kind.as_str(), "slack" | "gmail")
-    })
-}
-
-fn is_builtin_source(source: &SourceConfig) -> bool {
-    matches!(
-        source.kind.as_str(),
-        "slack" | "gmail" | "drive" | "calendar"
+    bail!(
+        "{} names no record of this tree, so nothing checked it",
+        printable(&named.to_string_lossy())
     )
 }
 
-fn source_for_scheme<'a>(context: &'a Context, scheme: &str) -> Result<Option<&'a SourceConfig>> {
-    for source in &context.config.sources {
-        if source::scheme(source)? == scheme {
-            return Ok(Some(source));
-        }
-    }
-    Ok(None)
-}
-
-fn resolve_with_live(
-    context: &Context,
-    store: &Store,
-    schemes: &Schemes,
-    pointer: &Pointer,
-    thread: bool,
-    mode: ResolutionMode,
-) -> Result<ResolvedText> {
-    let text = resolve_local(store, schemes, pointer, thread)?;
-    let live = mode.live();
-    let needs_verbatim = mode.needs_verbatim();
-    let force_live = mode.force_live();
-    let source = (text.is_none() || needs_verbatim || force_live)
-        .then(|| source_for_scheme(context, &pointer.scheme))
-        .transpose()?
-        .flatten();
-    let source_verbatim = if needs_verbatim {
-        match source {
-            Some(source) => store.source_verbatim(&source.id)?,
-            None => None,
-        }
-    } else {
-        None
-    };
-    let default_verbatim = default_verbatim(source, &pointer.scheme);
-    let needs_verbatim_hello = needs_verbatim
-        && live
-        && text.is_some()
-        && source.is_some_and(|source| !is_builtin_source(source))
-        && source_verbatim.is_none();
-    if (text.is_some() && !needs_verbatim_hello && !force_live) || !live {
-        return Ok(ResolvedText {
-            text,
-            verbatim: source_verbatim.unwrap_or(default_verbatim),
-            source_error: None,
-        });
-    }
-    let Some(source) = source else {
-        return Ok(ResolvedText {
-            text: None,
-            verbatim: default_verbatim,
-            source_error: None,
-        });
-    };
-    let outcome = resolve_from_source(context, source, &pointer.scheme, pointer, schemes)?;
-    if let Some(error) = outcome.error.as_deref() {
-        return Ok(ResolvedText {
-            text: None,
-            verbatim: source_verbatim.unwrap_or(default_verbatim),
-            source_error: Some(format!("source {} resolve failed: {error}", source.id)),
-        });
-    }
-    let verbatim = outcome.verbatim.unwrap_or(default_verbatim);
-    store.set_source_verbatim(&source.id, verbatim)?;
-    store.put_all(&source.id, &outcome.records)?;
-    Ok(ResolvedText {
-        text: resolve_local(store, schemes, pointer, thread)?,
-        verbatim,
-        source_error: None,
-    })
-}
-
-fn resolve_from_source(
-    context: &Context,
-    spec: &SourceConfig,
-    scheme: &str,
-    pointer: &Pointer,
-    schemes: &Schemes,
-) -> Result<crate::source::SourceOutcome> {
-    let state_dir = context.state()?.source_state(&spec.id);
-    std::fs::create_dir_all(&state_dir)
-        .with_context(|| format!("creating {}", state_dir.display()))?;
-    let request = SourceRequest::Resolve(ResolveRequest {
-        protocol: source::PROTOCOL_VERSION,
-        source: SourceRef {
-            id: spec.id.clone(),
-            kind: spec.kind.clone(),
-            scheme: scheme.to_owned(),
-        },
-        config: source::config_json(spec)?,
-        pointers: vec![pointer.to_string()],
-        state_dir,
-    });
-    let source = source::open(spec, scheme)?;
-    let mut session = Session::new(&request, schemes);
-    let run = source.run(&request, &mut |message| session.accept(message).map(|_| ()));
-    Ok(session.finish(run))
-}
-
-fn resolve_local(
-    store: &Store,
-    schemes: &Schemes,
-    pointer: &Pointer,
-    thread: bool,
-) -> Result<Option<String>> {
-    let records = local_records(store, schemes, pointer, thread)?;
-    (!records.is_empty())
-        .then(|| records.iter().map(render).collect::<Vec<_>>().join("\n\n"))
-        .map_or(Ok(None), |text| Ok(Some(text)))
-}
-
-fn local_records(
-    store: &Store,
-    schemes: &Schemes,
-    pointer: &Pointer,
-    thread: bool,
-) -> Result<Vec<crate::record::Record>> {
-    let is_gmail_thread = pointer.scheme == "gmail" && pointer.locator.starts_with("thread/");
-    if !thread && !is_gmail_thread {
-        return store
-            .get(pointer)
-            .map(|record| record.into_iter().collect());
-    }
-    let mut records = store.thread(pointer)?;
-    let pointer_text = pointer.to_string();
-    let nested_thread = records
-        .iter()
-        .find(|record| record.pointer == pointer_text)
-        .and_then(|record| record.thread.as_deref())
-        .map(str::to_owned);
-    if let Some(nested_thread) = nested_thread {
-        let thread_pointer = schemes.parse(&nested_thread).ok_or_else(|| {
-            anyhow!("stored thread pointer {nested_thread} is invalid for its configured scheme")
-        })?;
-        records = store.thread(&thread_pointer)?;
-    }
-    Ok(records)
-}
-
-fn source_pointers(document: &Doc, schemes: &Schemes) -> Result<Vec<Pointer>> {
-    let frontmatter = document.frontmatter_json()?;
-    let mut pointers = Vec::new();
-    let Some(fields) = frontmatter.as_object() else {
-        return Ok(pointers);
-    };
-    for field in ["source", "sources"] {
-        if let Some(value) = fields.get(field) {
-            collect_source_pointers(value, schemes, &mut pointers);
-        }
-    }
-    Ok(pointers)
-}
-
-fn collect_source_pointers(value: &Value, schemes: &Schemes, pointers: &mut Vec<Pointer>) {
-    match value {
-        Value::String(text) => {
-            for found in schemes.find_all(text) {
-                if !pointers.contains(&found.pointer) {
-                    pointers.push(found.pointer);
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_source_pointers(value, schemes, pointers);
-            }
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                collect_source_pointers(value, schemes, pointers);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+/// A citation that cannot be verified, at the line where the document writes it.
+fn finding(document: &Doc, start: usize, pointer: String, why: String) -> Broken {
+    Broken {
+        file: document.rel.to_string_lossy().into_owned(),
+        line: document.line_at(start),
+        pointer,
+        why,
     }
 }
 
-fn quote_matches(text: &str, quote: &str) -> bool {
-    let text = normalise_quote_text(text);
-    let quote = normalise_quote_text(quote);
-    let mut cursor = 0;
-    let mut matched_fragment = false;
-    for fragment in quote
-        .split("...")
-        .map(str::trim)
-        .filter(|fragment| !fragment.is_empty())
-    {
-        let Some(relative) = text
-            .get(cursor..)
-            .and_then(|remaining| remaining.find(fragment))
-        else {
-            return false;
-        };
-        matched_fragment = true;
-        cursor += relative + fragment.len();
-    }
-    matched_fragment
+/// A cited pointer that cannot be verified, at the line where the document cites it.
+fn broken(document: &Doc, start: usize, pointer: &Pointer, why: String) -> Broken {
+    finding(document, start, pointer.to_string(), why)
 }
 
-fn normalise_quote_text(text: &str) -> String {
-    let text = strip_mentions(&unwrap_slack_links(text));
-    let mut normalised = String::new();
-    let mut whitespace = false;
-    for character in text.chars() {
-        if character.is_whitespace() {
-            whitespace = !normalised.is_empty();
-            continue;
-        }
-        if matches!(character, '*' | '_' | '~' | '`') {
-            continue;
-        }
-        if whitespace {
-            normalised.push(' ');
-            whitespace = false;
-        }
-        match character {
-            '‘' | '’' | 'ʼ' => normalised.push('\''),
-            '“' | '”' => normalised.push('"'),
-            '–' | '—' | '−' => normalised.push('-'),
-            '…' => normalised.push_str("..."),
-            character => normalised.extend(character.to_lowercase()),
-        }
-    }
-    normalised
+/// Where the record writes `text`, for the line a finding names.
+fn text_start(document: &Doc, text: &str) -> usize {
+    document.raw.find(text).unwrap_or(0)
 }
 
-fn unwrap_slack_links(text: &str) -> String {
-    let mut unwrapped = String::new();
-    let mut remaining = text;
-    while let Some(open) = remaining.find('<') {
-        let Some(before) = remaining.get(..open) else {
-            break;
-        };
-        unwrapped.push_str(before);
-        let Some(after_open) = remaining.get(open + '<'.len_utf8()..) else {
-            break;
-        };
-        let Some(close) = after_open.find('>') else {
-            unwrapped.push('<');
-            unwrapped.push_str(after_open);
-            return unwrapped;
-        };
-        let Some(content) = after_open.get(..close) else {
-            break;
-        };
-        let Some(after_close) = after_open.get(close + '>'.len_utf8()..) else {
-            break;
-        };
-        if content.starts_with("http://") || content.starts_with("https://") {
-            unwrapped.push_str(content.split_once('|').map_or(content, |(_, label)| label));
+fn verify_document(
+    lookup: Lookup<'_>,
+    document: &Doc,
+    live: bool,
+    verification: &mut Verification,
+) -> Result<()> {
+    // A record whose frontmatter does not parse has no claims this check can read: its quotes,
+    // tiers and sources are in text nothing parsed. Its pointers are still resolved below, but
+    // passing it would tell a cycle that verifies before it writes that the writer will take
+    // it, and the writer refuses it as frontmatter-invalid.
+    if let Some(error) = &document.front_error {
+        verification.unchecked.push(finding(
+            document,
+            0,
+            "frontmatter".to_owned(),
+            format!(
+                "the frontmatter does not parse, so no quote of this record was checked: {error}"
+            ),
+        ));
+    }
+    let claims = quote_claims(document);
+    let mut evidence = verify_pointers(lookup, document, live, verification)?;
+    refresh_quote_sources(lookup, document, live, &claims, &mut evidence, verification)?;
+    verify_quotes(document, lookup.schemes, &claims, &evidence, verification);
+    Ok(())
+}
+
+/// Prints each resolved pointer and the text it resolved to.
+///
+/// # Errors
+///
+/// Returns an error when the output cannot be written.
+pub fn print_resolved(results: &[Resolved], out: &mut dyn Write) -> std::io::Result<()> {
+    // The resolved text is a source's, and an error may quote one: each is printed without
+    // its control characters.
+    for result in results {
+        writeln!(out, "{}", printable(&result.input))?;
+        if let Some(error) = result.error.as_deref() {
+            writeln!(out, "  error: {}", printable(error))?;
+        } else if let Some(text) = result.text.as_deref() {
+            writeln!(out, "{}", printable(text))?;
         } else {
-            unwrapped.push('<');
-            unwrapped.push_str(content);
-            unwrapped.push('>');
+            writeln!(out, "  not found")?;
         }
-        remaining = after_close;
+        writeln!(out)?;
     }
-    unwrapped.push_str(remaining);
-    unwrapped
+    Ok(())
 }
 
-fn strip_mentions(text: &str) -> String {
-    let mut stripped = String::new();
-    let mut remaining = text;
-    while let Some(character) = remaining.chars().next() {
-        if let Some(after) = remaining.strip_prefix("<@") {
-            if let Some(close) = after.find('>') {
-                let identifier = after.get(..close);
-                if identifier.is_some_and(|identifier| identifier.starts_with('U')) {
-                    let Some(after_mention) = after.get(close + '>'.len_utf8()..) else {
-                        break;
-                    };
-                    remaining = after_mention;
-                    continue;
-                }
-            }
-        }
-        let mention_boundary = stripped.chars().next_back().is_none_or(|previous| {
-            !previous.is_alphanumeric() && previous != '_' && previous != '-'
-        });
-        if character == '@' && mention_boundary {
-            let Some(after) = remaining.get(character.len_utf8()..) else {
-                break;
-            };
-            let name_end = after
-                .char_indices()
-                .find_map(|(offset, character)| {
-                    (!character.is_alphanumeric() && character != '_' && character != '-')
-                        .then_some(offset)
-                })
-                .unwrap_or(after.len());
-            if name_end > 0 {
-                let Some(after_mention) = after.get(name_end..) else {
-                    break;
-                };
-                remaining = after_mention;
-                continue;
-            }
-        }
-        stripped.push(character);
-        let Some(after_character) = remaining.get(character.len_utf8()..) else {
-            break;
-        };
-        remaining = after_character;
+/// Prints a verification, including the quotes nothing checked.
+///
+/// A reader that sees only `checked` and the broken list would read "checked 0" as success
+/// for a record whose quote nothing compared to a source — which the single writer refuses.
+///
+/// # Errors
+///
+/// Returns an error when the output cannot be written.
+pub fn print_verification(verification: &Verification, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(out, "checked {}", verification.checked)?;
+    if verification.quotes_unchecked > 0 {
+        writeln!(
+            out,
+            "quotes nothing checked {}",
+            verification.quotes_unchecked
+        )?;
     }
-    stripped
-}
-
-fn line_number(text: &str, offset: usize) -> usize {
-    text.get(..offset).map_or(1, |prefix| {
-        prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
-    })
+    for broken in &verification.broken {
+        writeln!(
+            out,
+            "{}:{}: {} — {}",
+            printable(&broken.file),
+            broken.line,
+            printable(&broken.pointer),
+            printable(&broken.why)
+        )?;
+    }
+    for unchecked in &verification.unchecked {
+        writeln!(
+            out,
+            "unchecked {}:{}: {} — {}",
+            printable(&unchecked.file),
+            unchecked.line,
+            printable(&unchecked.pointer),
+            printable(&unchecked.why)
+        )?;
+    }
+    for (scheme, skipped) in &verification.skipped {
+        writeln!(out, "skipped {}: {skipped}", printable(scheme))?;
+    }
+    Ok(())
 }

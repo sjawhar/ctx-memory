@@ -1,35 +1,16 @@
 use std::process::ExitCode;
 
-use clap::Parser as _;
-use ctx_memory::cli::{self, Cli};
-use ctx_memory::output;
+use ctx_memory::cli;
+use ctx_memory::output::{colour_wanted, Sink};
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(error) => {
-            if std::env::args_os().any(|argument| argument == "--json") {
-                if let Err(emit_error) = output::emit_error("ctx", error.to_string()) {
-                    eprintln!("{emit_error:#}");
-                }
-                return ExitCode::from(2);
-            }
-            error.exit();
-        }
-    };
-    match cli::run(&cli) {
-        Ok(outcome) => ExitCode::from(outcome.exit_code()),
-        Err(error) => {
-            if cli.json {
-                if let Err(emit_error) =
-                    output::emit_error(&cli.command.name(), format!("{error:#}"))
-                {
-                    eprintln!("{emit_error:#}");
-                }
-            } else {
-                eprintln!("{error:#}");
-            }
-            ExitCode::from(2)
-        }
-    }
+    // The streams are locked per write, not for the life of the process. The server and the
+    // fetch print from threads of their own — the follow loop, the lease renewal, a write
+    // whose rollback failed — and a stream this thread held locked stopped each of them, for
+    // good, at the first line it printed.
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    let colour = colour_wanted(&out);
+    let mut sink = Sink::new(&mut out, &mut err).coloured(colour);
+    ExitCode::from(cli::run_reported(std::env::args_os(), &mut sink, cli::run))
 }

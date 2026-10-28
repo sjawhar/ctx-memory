@@ -195,3 +195,36 @@ fn owner_linked_matches_the_filtered_target() -> Result<()> {
     );
     Ok(())
 }
+
+/// An open item's title is the record's text, which can quote anyone. `ctx open` prints it
+/// without its control characters (`CSI 2J`, `BEL`, the C1 `CSI`); what followed each stays.
+#[test]
+fn piped_open_output_carries_none_of_the_tree_s_controls() -> Result<()> {
+    let root = test_root("no-control")?;
+    write(&root, "ctx.toml", "version = 1\n")?;
+    write(
+        &root,
+        "decisions/renew.md",
+        "---\ntype: decision\nstatus: open\ntitle: \"Renew \\e[2J\\a the \\u009b31mcontract\"\n---\nOpen.\n",
+    )?;
+    let tree = root.to_str().context("test tree path is not valid UTF-8")?;
+    let output = binary()
+        .args(["--memory", tree, "open"])
+        .output()
+        .context("running ctx open");
+    remove_test_root(&root)?;
+    let output = output?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("Renew [2J the 31mcontract"),
+        "the open item is missing: {stdout:?}"
+    );
+    let controls: Vec<char> = stdout
+        .chars()
+        .filter(|character| character.is_control() && !matches!(character, '\t' | '\n'))
+        .collect();
+    assert_eq!(controls, Vec::<char>::new(), "{stdout:?}");
+    Ok(())
+}

@@ -1,0 +1,11 @@
+# Where the session's model credential comes from. The image copies this file to
+# <HOME>/.omp/agent/models.yml.
+#
+# run-cycle.sh writes the key from Secret Manager into the file named here and removes
+# ANTHROPIC_API_KEY from the environment before it starts the session, so the key is not
+# inherited by `ctx` or any other process the session starts and is not in the session's
+# own /proc/<pid>/environ. omp runs this command when a request needs the credential, not
+# when it loads the catalog.
+providers:
+  anthropic:
+    apiKey: "!cat /run/ctx-agent/model-key"

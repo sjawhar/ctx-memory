@@ -1,14 +1,17 @@
 //! Structural checks for a markdown context tree.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
+use owo_colors::OwoColorize as _;
 use regex::Regex;
 use serde::Serialize;
 
 use crate::config::RULES_FILE;
+use crate::output::printable;
 use crate::records_schema::{self, SchemaViolation};
 use crate::schema::{today_utc, NEEDS_QUOTE, NEEDS_TIER, OPEN_KINDS, OPEN_STATES};
 use crate::tree::{wikilinks, Doc, Resolution, Tree};
@@ -36,6 +39,40 @@ pub struct Stale {
     pub overdue_days: Option<i64>,
 }
 
+/// A document whose frontmatter did not parse. Its body and links are still checked.
+#[derive(Debug, Serialize)]
+pub struct InvalidFront {
+    /// The finding kind, for callers that read the JSON envelope.
+    pub kind: &'static str,
+    pub path: String,
+    pub error: String,
+}
+
+/// A universal negative a record states without naming the source it checked, at the line
+/// that states it.
+///
+/// The single writer refuses one record at a time, so the finding names its record: a line of
+/// prose the writer cannot attribute to a path is a finding that never fires at the gate.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct Negative {
+    pub path: String,
+    pub line: usize,
+    pub snippet: String,
+}
+
+impl Negative {
+    /// The finding as one line of report text.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "{}:{} — \"{}\" (source it directly or identify the searched surface)",
+            self.path, self.line, self.snippet
+        )
+    }
+}
+
+pub const FRONTMATTER_INVALID: &str = "frontmatter-invalid";
+
 #[derive(Debug, Default, Serialize)]
 pub struct Findings {
     pub files: usize,
@@ -44,12 +81,13 @@ pub struct Findings {
     pub stale: Vec<Stale>,
     pub untiered: Vec<String>,
     pub unquoted: Vec<String>,
-    pub negatives: Vec<String>,
+    pub negatives: Vec<Negative>,
     pub orphans: Vec<String>,
     pub rules_missing: bool,
     pub rules_wrong_type: bool,
     pub rules_oversize: Option<usize>,
     pub schema_violations: Vec<SchemaViolation>,
+    pub frontmatter_invalid: Vec<InvalidFront>,
 }
 
 impl Findings {
@@ -67,6 +105,7 @@ impl Findings {
             && !self.rules_wrong_type
             && self.rules_oversize.is_none()
             && self.schema_violations.is_empty()
+            && self.frontmatter_invalid.is_empty()
     }
 
     /// Nothing to report at all: structure is clean and no record is stale.
@@ -133,47 +172,128 @@ fn is_closeable(doc: &Doc) -> bool {
 }
 
 /// Scan a document for universal negatives that do not name a direct source.
+///
+/// The frontmatter is not prose: the fields that state the record's claim are checked one by
+/// one, and the rest of it (a question, a name, the quotes and sources that are the evidence)
+/// claims no absence. The body is checked paragraph by paragraph, apart from the frontmatter,
+/// so a body that opens on the line after the closing `---` is a paragraph of its own. Every
+/// kind of record is scanned: a meeting's notes state absences in the record's own voice as
+/// readily as any other record's prose.
 fn scan_negatives(
     doc: &Doc,
     negative_re: &Regex,
     paragraph_re: &Regex,
-    negatives: &mut Vec<String>,
+    negatives: &mut Vec<Negative>,
 ) -> Result<()> {
-    if doc.rel.starts_with("raw") || doc.front.kind.as_deref() == Some("meeting") {
+    if doc.rel.starts_with("raw") {
         return Ok(());
     }
-    let mut line_number = 1usize;
-    for paragraph in paragraph_re.split(&doc.raw) {
-        if !has_tier1_marker(paragraph) {
-            if let Some(match_) = negative_re.find_iter(paragraph).find(|match_| {
-                paragraph
-                    .get(..match_.start())
-                    .is_some_and(|before| before.matches('"').count() % 2 == 0)
-            }) {
-                let snippet: String = paragraph
-                    .get(match_.start()..)
-                    .ok_or_else(|| anyhow!("negative-claim match was not a paragraph boundary"))?
-                    .chars()
-                    .take(80)
-                    .map(|character| {
-                        if matches!(character, '\r' | '\n') {
-                            ' '
-                        } else {
-                            character
-                        }
-                    })
-                    .collect();
-                negatives.push(format!(
-                    "{}:{} — \"{}\" (source it directly or identify the searched surface)",
-                    doc.rel.to_string_lossy(),
-                    line_number,
-                    snippet
-                ));
-            }
+    scan_claim_fields(doc, negative_re, negatives)?;
+    let body = doc.body();
+    let body_start = doc.frontmatter_block().len();
+    let breaks = paragraph_re
+        .find_iter(body)
+        .map(|separator| (separator.start(), separator.end()))
+        .chain(std::iter::once((body.len(), body.len())));
+    let mut paragraph_start = 0;
+    for (paragraph_end, next_start) in breaks {
+        let paragraph = body
+            .get(paragraph_start..paragraph_end)
+            .ok_or_else(|| anyhow!("a paragraph break was not a character boundary"))?;
+        if let Some(start) = unsourced_negative(paragraph, negative_re) {
+            negatives.push(Negative {
+                path: doc.rel.to_string_lossy().into_owned(),
+                line: doc.line_at(body_start + paragraph_start + start),
+                snippet: snippet(paragraph, start)?,
+            });
         }
-        line_number += paragraph.matches('\n').count() + 2;
+        paragraph_start = next_start;
     }
     Ok(())
+}
+
+/// Checks each frontmatter field in which the record states its claim, on its own value.
+///
+/// A negative there is excused by a marker the body accepts, written in that value; by a
+/// non-empty `searched:` field, which names the search as the method prescribes for a
+/// `not_found` record; or by a quote the record makes at tier 1 or 2, which is then the
+/// evidence for it. The words `quote:` or `tier: 1` elsewhere in the frontmatter excuse
+/// nothing. The sweep does not check quotes: `ctx cite verify` does, and the single writer
+/// refuses a record whose tier 1 or 2 quote did not hold, so a quote excuses the absence only
+/// where it was checked against its source.
+fn scan_claim_fields(doc: &Doc, negative_re: &Regex, negatives: &mut Vec<Negative>) -> Result<()> {
+    let front = &doc.front;
+    if front.makes_verbatim_quote() || front.extra.get("searched").is_some_and(names_something) {
+        return Ok(());
+    }
+    for (field, value) in [
+        ("title", front.title.as_deref()),
+        ("what", front.what.as_deref()),
+        ("statement", front.extra_str("statement")),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let Some(start) = unsourced_negative(value, negative_re) else {
+            continue;
+        };
+        let field_start = doc
+            .frontmatter_line_start(|line| {
+                line.strip_prefix(field)
+                    .is_some_and(|rest| rest.starts_with(':'))
+            })
+            .unwrap_or(0);
+        negatives.push(Negative {
+            path: doc.rel.to_string_lossy().into_owned(),
+            line: doc.line_at(field_start),
+            snippet: snippet(value, start)?,
+        });
+    }
+    Ok(())
+}
+
+/// Whether a `searched:` value names any search at all.
+fn names_something(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        serde_json::Value::Array(values) => values.iter().any(names_something),
+        serde_json::Value::Object(values) => values.values().any(names_something),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+/// Where a text states a universal negative outside a quotation, unless the text identifies a
+/// direct source or the surface it searched.
+fn unsourced_negative(text: &str, negative_re: &Regex) -> Option<usize> {
+    if has_tier1_marker(text) {
+        return None;
+    }
+    negative_re
+        .find_iter(text)
+        .find(|match_| {
+            text.get(..match_.start())
+                .is_some_and(|before| before.matches('"').count() % 2 == 0)
+        })
+        .map(|match_| match_.start())
+}
+
+/// Up to 80 characters of `text` from `start`, on one line.
+fn snippet(text: &str, start: usize) -> Result<String> {
+    Ok(text
+        .get(start..)
+        .ok_or_else(|| anyhow!("a negative-claim match was not a character boundary"))?
+        .chars()
+        .take(80)
+        .map(|character| {
+            if matches!(character, '\r' | '\n') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect())
 }
 
 /// Runs the structural sweep for a loaded tree.
@@ -275,6 +395,17 @@ pub fn run(tree: &Tree) -> Result<Findings> {
         .map(|(_, doc)| doc.rel.to_string_lossy().into_owned())
         .collect();
     let schema_violations = records_schema::validate(tree)?;
+    let frontmatter_invalid = tree
+        .docs
+        .iter()
+        .filter_map(|doc| {
+            doc.front_error.as_ref().map(|error| InvalidFront {
+                kind: FRONTMATTER_INVALID,
+                path: doc.rel.to_string_lossy().into_owned(),
+                error: error.clone(),
+            })
+        })
+        .collect();
 
     Ok(Findings {
         files: tree.docs.len(),
@@ -289,7 +420,180 @@ pub fn run(tree: &Tree) -> Result<Findings> {
         rules_wrong_type,
         rules_oversize,
         schema_violations,
+        frontmatter_invalid,
     })
+}
+
+/// Prints a sweep the way a person reads it: each kind of finding under its own heading.
+///
+/// # Errors
+///
+/// Returns an error when the output cannot be written.
+pub fn print(findings: &Findings, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(out, "{} files\n", findings.files)?;
+
+    if !findings.gaps.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            format!("GAPS — links with no file ({})", findings.gaps.len()).bold()
+        )?;
+        // Link targets, paths, titles and the lines a finding quotes are the tree's text, and
+        // so the sources' text: each is printed without its control characters.
+        for gap in &findings.gaps {
+            writeln!(
+                out,
+                "  {}  <- {}",
+                printable(&gap.target).yellow(),
+                printable(&gap.from).dimmed()
+            )?;
+        }
+        writeln!(out)?;
+    }
+
+    if !findings.ambiguous.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            format!(
+                "AMBIGUOUS — links with multiple files ({})",
+                findings.ambiguous.len()
+            )
+            .bold()
+        )?;
+        for ambiguous in &findings.ambiguous {
+            writeln!(
+                out,
+                "  {}  <- {}  candidates={}",
+                printable(&ambiguous.target).yellow(),
+                printable(&ambiguous.from).dimmed(),
+                printable(&ambiguous.candidates.join(", "))
+            )?;
+        }
+        writeln!(out)?;
+    }
+
+    let (overdue, undated): (Vec<_>, Vec<_>) = findings
+        .stale
+        .iter()
+        .partition(|stale| stale.overdue_days.is_some());
+    for (title, items) in [
+        ("STALE — open past its date", &overdue),
+        ("UNDATED — open with no revisit_by/due date", &undated),
+    ] {
+        if items.is_empty() {
+            continue;
+        }
+        writeln!(out, "{}", format!("{title} ({})", items.len()).bold())?;
+        for item in items {
+            let owner = item.owner.as_deref().unwrap_or("unassigned");
+            writeln!(
+                out,
+                "  {}  [{}] {}  owner={}",
+                printable(&item.path).red(),
+                printable(&item.status),
+                printable(&item.why).yellow(),
+                printable(owner).dimmed()
+            )?;
+        }
+        writeln!(out)?;
+    }
+
+    let negatives: Vec<String> = findings.negatives.iter().map(Negative::describe).collect();
+    for (title, items) in [
+        ("UNTIERED — no authority tier", &findings.untiered),
+        ("UNQUOTED — no verbatim quote", &findings.unquoted),
+        ("NEGATIVES — direct source not identified", &negatives),
+        ("ORPHANS — no document links here", &findings.orphans),
+    ] {
+        if items.is_empty() {
+            continue;
+        }
+        writeln!(out, "{}", format!("{title} ({})", items.len()).bold())?;
+        for item in items {
+            writeln!(out, "  {}", printable(item))?;
+        }
+        writeln!(out)?;
+    }
+
+    print_rules_findings(findings, out)?;
+
+    if findings.clean() {
+        writeln!(out, "{}", "no findings".green())?;
+    } else if findings.structural_clean() {
+        writeln!(
+            out,
+            "{}",
+            format!(
+                "structure clean — {} stale item(s) need review",
+                findings.stale.len()
+            )
+            .green()
+        )?;
+    }
+    Ok(())
+}
+
+fn print_rules_findings(findings: &Findings, out: &mut dyn Write) -> std::io::Result<()> {
+    if findings.rules_missing {
+        writeln!(out, "{}", "RULES — missing root rules.md".bold())?;
+        writeln!(out)?;
+    }
+    if findings.rules_wrong_type {
+        writeln!(out, "{}", "RULES — rules.md must have type: rules".bold())?;
+        writeln!(out)?;
+    }
+    if let Some(bytes) = findings.rules_oversize {
+        writeln!(
+            out,
+            "{}",
+            format!("RULES — rules.md exceeds 8192 bytes ({bytes})").bold()
+        )?;
+        writeln!(out)?;
+    }
+    if !findings.schema_violations.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            format!(
+                "SCHEMAS — records that do not match their type ({})",
+                findings.schema_violations.len()
+            )
+            .bold()
+        )?;
+        for violation in &findings.schema_violations {
+            writeln!(
+                out,
+                "  {}{} — {}",
+                printable(&violation.path),
+                printable(&violation.pointer),
+                printable(&violation.message)
+            )?;
+        }
+        writeln!(out)?;
+    }
+    if !findings.frontmatter_invalid.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            format!(
+                "FRONTMATTER — records whose frontmatter does not parse ({})",
+                findings.frontmatter_invalid.len()
+            )
+            .bold()
+        )?;
+        for invalid in &findings.frontmatter_invalid {
+            let summary = invalid.error.lines().next().unwrap_or(&invalid.error);
+            writeln!(
+                out,
+                "  {} — {}",
+                printable(&invalid.path).yellow(),
+                printable(summary)
+            )?;
+        }
+        writeln!(out)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

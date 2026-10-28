@@ -61,6 +61,9 @@ impl std::fmt::Display for WindowId {
     }
 }
 
+/// Records grouped by the id of the source that emitted them, each source's in window order.
+pub type RecordsBySource = BTreeMap<String, Vec<Record>>;
+
 /// A completed or staged fetch window.
 #[derive(Clone, Debug)]
 pub struct Window {
@@ -108,6 +111,26 @@ impl Window {
         Ok(records)
     }
 
+    /// Loads this window's records grouped by the source that emitted them, each source's in
+    /// the order the window holds them, beside the time the fetch generated the window, which
+    /// is when every one of them was fetched. This is what replaying the window into the store
+    /// reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest or the records cannot be read.
+    pub fn records_by_source(&self) -> Result<(DateTime<Utc>, RecordsBySource)> {
+        let fetched_at = self.manifest()?.generated_at;
+        let mut by_source = RecordsBySource::new();
+        for sourced in self.records()? {
+            by_source
+                .entry(sourced.source)
+                .or_default()
+                .push(sourced.record);
+        }
+        Ok((fetched_at, by_source))
+    }
+
     /// Loads the optional open-item snapshot written by the delta engine.
     ///
     /// # Errors
@@ -153,6 +176,17 @@ impl Window {
 pub enum Status {
     Ok,
     Error,
+}
+
+impl Status {
+    /// The word a person reads for this status.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
 }
 
 /// One source record with the source configuration that emitted it.
@@ -223,6 +257,23 @@ pub fn previous(windows: &Path, before: &WindowId) -> Result<Option<Window>> {
         .max_by(|left, right| left.id.cmp(&right.id)))
 }
 
+/// Returns the completed windows after `marker`, oldest first.
+///
+/// A tree with no window directory yet has nothing pending, which is not an error.
+///
+/// # Errors
+///
+/// Returns an error when the window directory cannot be inspected.
+pub fn after(windows: &Path, marker: Option<&WindowId>) -> Result<Vec<Window>> {
+    if !windows.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut found = completed(windows)?;
+    found.retain(|window| marker.is_none_or(|marker| window.id > *marker));
+    found.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(found)
+}
+
 /// Resolves `newest` or a completed window identifier into its directory.
 ///
 /// # Errors
@@ -233,7 +284,13 @@ pub fn resolve_arg(value: &str, windows: &Path) -> Result<PathBuf> {
         return newest(windows).map(|window| window.dir);
     }
     let id = WindowId::parse(value)?;
-    Window::open(windows.join(id.as_str())).map(|window| window.dir)
+    // The caller named the window by its id, which is all the answer repeats: the directory
+    // is this machine's, and a remote caller has no use for where the server keeps it.
+    let dir = windows.join(id.as_str());
+    if !dir.is_dir() {
+        bail!("window {id} does not exist");
+    }
+    Window::open(dir).map(|window| window.dir)
 }
 
 pub(crate) fn stage(windows: &Path, window_end: DateTime<Utc>) -> Result<Window> {
@@ -312,4 +369,124 @@ fn completed(windows: &Path) -> Result<Vec<Window>> {
         }
     }
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use anyhow::{Context as _, Result};
+    use chrono::{DateTime, TimeZone as _, Utc};
+
+    use super::{Manifest, SourcedRecord, Status, Window, WindowId};
+    use crate::record::Record;
+
+    fn at(hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 25, hour, 0, 0)
+            .single()
+            .unwrap_or(DateTime::UNIX_EPOCH)
+    }
+
+    fn sourced(source: &str, pointer: &str) -> SourcedRecord {
+        SourcedRecord {
+            source: source.to_owned(),
+            record: Record {
+                pointer: pointer.to_owned(),
+                stream: "C0EXAMPLE01".to_owned(),
+                ts: at(11),
+                label: None,
+                author: None,
+                author_id: None,
+                thread: None,
+                title: None,
+                url: None,
+                text: format!("the text of {pointer}"),
+                aliases: Vec::new(),
+                context: false,
+                raw: serde_json::Value::Null,
+            },
+        }
+    }
+
+    /// Writes a window holding `records` in this order, generated at `generated_at`.
+    fn write_window(
+        dir: &std::path::Path,
+        generated_at: DateTime<Utc>,
+        records: &[SourcedRecord],
+    ) -> Result<()> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let manifest = Manifest {
+            version: 1,
+            window: "20261025T120000Z-0000".to_owned(),
+            generated_at,
+            window_end: at(12),
+            sources: BTreeMap::new(),
+            warnings: Vec::new(),
+            exit_status: Status::Ok,
+        };
+        std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
+        let mut jsonl = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut jsonl, record)?;
+            jsonl.push(b'\n');
+        }
+        std::fs::write(dir.join("records.jsonl"), jsonl)?;
+        Ok(())
+    }
+
+    #[test]
+    fn records_by_source_groups_a_window_in_order_at_its_fetch_time() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-memory-windows-by-source-test-{}",
+            std::process::id()
+        ));
+        write_window(
+            &dir,
+            at(13),
+            &[
+                sourced("slack", "slack:C0EXAMPLE01/1"),
+                sourced("github", "github:other-org/memory/issues/1"),
+                sourced("slack", "slack:C0EXAMPLE01/2"),
+            ],
+        )?;
+        let window = Window {
+            id: WindowId::parse("20261025T120000Z-0000")?,
+            dir: dir.clone(),
+        };
+
+        let replay = window.records_by_source();
+        std::fs::remove_dir_all(&dir)?;
+        let (fetched_at, by_source) = replay?;
+
+        assert_eq!(
+            fetched_at,
+            at(13),
+            "a window's records were fetched when it was generated"
+        );
+        let pointers = by_source
+            .iter()
+            .map(|(source, records)| {
+                let pointers = records
+                    .iter()
+                    .map(|record| record.pointer.as_str())
+                    .collect::<Vec<_>>();
+                (source.as_str(), pointers)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            pointers,
+            BTreeMap::from([
+                ("github", vec!["github:other-org/memory/issues/1"]),
+                ("slack", vec!["slack:C0EXAMPLE01/1", "slack:C0EXAMPLE01/2"]),
+            ]),
+            "each source keeps its records in the order the window holds them"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_status_reads_as_its_word() {
+        assert_eq!(Status::Ok.label(), "ok");
+        assert_eq!(Status::Error.label(), "error");
+    }
 }

@@ -296,6 +296,52 @@ fn json_errors_use_the_error_envelope() -> Result<()> {
     Ok(())
 }
 
+/// The writer refuses a record whose quote nothing could check, and `cite verify` is the
+/// check a writer runs first. It used to pass such a record with exit 0, so a cycle that
+/// read the exit code took it for a checked one.
+#[test]
+fn cite_verify_fails_on_a_quote_nothing_could_check() -> Result<()> {
+    let tree = fixture_tree()?;
+    let state = scratch()?;
+    // A tree resolves its state directory by its id.
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"cite-unchecked\"\n",
+    )?;
+    std::fs::write(
+        tree.join("decisions/overheard.md"),
+        "---\ntype: decision\nstatus: open\ntitle: Overheard\ntier: 1\nquote: \"invented words\"\nsource: \"overheard in standup\"\n---\nA claim nothing checked.\n",
+    )?;
+    let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;
+    let output = binary()
+        .args(["--memory", tree_text, "--json", "cite", "verify"])
+        .env("CTX_STATE_DIR", &state)
+        .output()
+        .context("running ctx cite verify")?;
+    let help = binary()
+        .args(["cite", "verify", "--help"])
+        .output()
+        .context("running ctx cite verify --help")?;
+    remove_scratch(&tree)?;
+    remove_scratch(&state)?;
+
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    assert!(
+        value
+            .pointer("/data/unchecked")
+            .and_then(Value::as_array)
+            .is_some_and(|unchecked| !unchecked.is_empty()),
+        "the quote was not reported unchecked: {value}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{value}");
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("nothing could check"),
+        "the help does not say an unchecked quote fails: {}",
+        String::from_utf8_lossy(&help.stdout)
+    );
+    Ok(())
+}
+
 #[test]
 fn rules_without_a_rules_page_exits_two() -> Result<()> {
     let tree = scratch()?;
@@ -309,5 +355,75 @@ fn rules_without_a_rules_page_exits_two() -> Result<()> {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("rules.md"));
+    Ok(())
+}
+
+/// Every control character in `text` but a tab or a newline.
+fn controls(text: &str) -> Vec<char> {
+    text.chars()
+        .filter(|character| character.is_control() && !matches!(character, '\t' | '\n'))
+        .collect()
+}
+
+/// The rules page is the tree's text: `ctx rules` prints it without the controls that would
+/// drive a terminal (an `OSC` title ended by `BEL`, a C1 `CSI`), and what followed each stays.
+#[test]
+fn rules_are_printed_without_control_characters() -> Result<()> {
+    let tree = scratch()?;
+    std::fs::write(tree.join("ctx.toml"), "version = 1\n")?;
+    std::fs::write(
+        tree.join("rules.md"),
+        "---\ntype: rules\n---\n# Rules\n\nCite \u{1b}]0;owned\u{7}every \u{9b}31mclaim.\n",
+    )?;
+    let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;
+    let output = binary()
+        .args(["--memory", tree_text, "rules"])
+        .output()
+        .context("running ctx rules");
+    remove_scratch(&tree)?;
+    let output = output?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains("Cite ]0;ownedevery 31mclaim."),
+        "the rules text is missing: {stdout:?}"
+    );
+    assert_eq!(controls(&stdout), Vec::<char>::new(), "{stdout:?}");
+    Ok(())
+}
+
+/// A cursor is what a source answered, and `ctx cursor show` prints it without its controls.
+#[test]
+fn cursors_are_printed_without_control_characters() -> Result<()> {
+    let tree = fixture_tree()?;
+    let data = tree.join("data");
+    std::fs::create_dir(&data)?;
+    std::fs::write(
+        data.join("cursors.json"),
+        "{\"version\":1,\"sources\":{\"echo\":{\"C0EXAMPLE01\":{\"cursor\":\"1700000000.1\\u001b]0;owned\\u0007\\u009b2J\",\"window\":\"20261025T120000Z-0000\"}}}}",
+    )?;
+    let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;
+    let output = binary()
+        .args(["--memory", tree_text, "cursor", "show"])
+        .env("CTX_DATA_DIR", &data)
+        .env("CTX_STATE_DIR", tree.join("state"))
+        .output()
+        .context("running ctx cursor show");
+    remove_scratch(&tree)?;
+    let output = output?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("echo C0EXAMPLE01 1700000000.1]0;owned2J 20261025T120000Z-0000"),
+        "the cursor is missing: {stdout:?}"
+    );
+    assert_eq!(controls(&stdout), Vec::<char>::new(), "{stdout:?}");
     Ok(())
 }

@@ -1,5 +1,7 @@
 name: ci
-on: { push: { branches: [main] }, pull_request: {} }
+# A push to main runs this workflow through images.yml, which calls it and publishes the images
+# only once it passes; a pull request runs it on its own.
+on: { pull_request: {}, workflow_call: {} }
 permissions:
   contents: read
 
@@ -14,4 +16,24 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The agent cycle's live probe drives the omp release the agent image pins: the same URL
+      # and SHA-256 as deploy/agent/Dockerfile, read from it, and a digest that does not match
+      # fails the step. The probe is #[ignore]d in the plain run above, which has no omp.
+      - name: agent cycle live probe (pinned omp)
+        run: |
+          release="$(sed -n 's/^ARG OMP_RELEASE=//p' deploy/agent/Dockerfile)"
+          digest="$(sed -n 's/^ARG OMP_SHA256=//p' deploy/agent/Dockerfile)"
+          test -n "$release" && test -n "$digest"
+          curl -fsSLo "$RUNNER_TEMP/omp.tar.gz" \
+            "https://github.com/sjawhar/oh-my-pi/releases/download/${release}/omp-${release}-linux-x64.tar.gz"
+          printf '%s  %s\n' "$digest" "$RUNNER_TEMP/omp.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/omp"
+          tar -xzf "$RUNNER_TEMP/omp.tar.gz" -C "$RUNNER_TEMP/omp" --strip-components=2 --no-same-owner
+          CTX_TEST_OMP="$RUNNER_TEMP/omp/omp" cargo test --test agent_cycle -- --ignored
+      # The starter tree is what a new tree is copied from, so it must pass both checks its own
+      # rules page asks for: the sweep, and cite verify, which exits 1 on a claim it cannot check.
       - run: cargo run -- --memory starter sweep
+      - run: cargo run -- --memory starter cite verify
+      # The agent cycle ships a shell script, and what it does with the model key and the
+      # session's privileges is security-relevant, so it is checked like the Rust is.
+      - run: shellcheck deploy/agent/run-cycle.sh

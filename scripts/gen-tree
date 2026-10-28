@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Generate a large synthetic memory tree, for measuring ctx at scale.
+#
+# Usage: scripts/gen-tree <directory> [record-count]
+#
+# The tree is structurally clean: rules.md links the index, the index links one shard page
+# per 1,000 records, and each shard links its records, so `ctx sweep` reports no findings.
+# Every record carries a distinctive quote and title, so `ctx search` can be measured
+# against text that appears only in frontmatter.
+set -euo pipefail
+
+root=${1:?usage: gen-tree <directory> [record-count]}
+count=${2:-20000}
+shard_size=1000
+
+if [[ -e $root && -n $(ls -A -- "$root" 2>/dev/null) ]]; then
+	echo "gen-tree: $root exists and is not empty" >&2
+	exit 1
+fi
+
+revisit=$(date -u -d '+1 year' +%F)
+mkdir -p -- "$root/decisions" "$root/shards"
+
+cat >"$root/ctx.toml" <<'TOML'
+version = 1
+id = "gen-tree"
+TOML
+
+cat >"$root/rules.md" <<'RULES'
+---
+type: rules
+---
+
+# Rules
+
+- Every durable claim carries a source, a verbatim quote, and an authority tier.
+- [[index]] lists every generated record.
+RULES
+
+{
+	printf -- '---\ntype: index\ntitle: Generated tree\n---\n\n# Generated tree\n\n'
+	for ((shard = 0; shard * shard_size < count; shard++)); do
+		printf -- '- [[shards/shard-%04d]]\n' "$shard"
+	done
+} >"$root/index.md"
+
+shard_file=""
+for ((n = 0; n < count; n++)); do
+	shard=$((n / shard_size))
+	if ((n % shard_size == 0)); then
+		shard_file="$root/shards/shard-$(printf '%04d' "$shard").md"
+		printf -- '---\ntype: index\ntitle: Shard %04d\n---\n\n# Shard %04d\n\n' "$shard" "$shard" >"$shard_file"
+	fi
+	printf -- '- [[decisions/record-%06d]]\n' "$n" >>"$shard_file"
+
+	tier=$((n % 4 + 1))
+	price=$((100 + n % 900))
+	printf -- '---
+type: decision
+status: open
+title: Vendor%d renewal
+statement: Renew the vendor%d contract at the agreed rate.
+owner: Alice
+revisit_by: %s
+tier: %d
+quote: "The vendor%d renewal was agreed at %d dollars per seat."
+source: "example:note-%06d"
+---
+
+Renewal terms for vendor%d are unchanged from the previous period. The account team
+confirmed the seat count, the billing contact, and the renewal window in the planning
+review, and recorded the agreed rate in the contract index.
+' "$n" "$n" "$revisit" "$tier" "$n" "$price" "$n" "$n" >"$root/decisions/record-$(printf '%06d' "$n").md"
+done
+
+echo "gen-tree: wrote $count records to $root"

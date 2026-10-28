@@ -43,6 +43,17 @@ impl Tier {
         matches!(self, Self::External | Self::Internal)
     }
 
+    /// The canonical numeric tier, 1–4.
+    #[must_use]
+    pub const fn number(self) -> u8 {
+        match self {
+            Self::External => 1,
+            Self::Internal => 2,
+            Self::Summary => 3,
+            Self::Recollection => 4,
+        }
+    }
+
     const fn from_numeric(n: u64) -> Option<Self> {
         match n {
             1 => Some(Self::External),
@@ -102,6 +113,30 @@ impl fmt::Display for Tier {
     }
 }
 
+/// One verbatim claim: the quote, the source it came from, and how direct that source is.
+/// A record may carry several, beside or instead of the single `quote`/`source`/`tier`.
+#[derive(Debug, Deserialize)]
+pub struct QuoteEntry {
+    pub quote: String,
+    pub source: Option<String>,
+    tier: Option<TierValue>,
+}
+
+impl QuoteEntry {
+    /// The authority tier this claim declares.
+    #[must_use]
+    pub fn tier(&self) -> Option<Tier> {
+        self.tier.as_ref().and_then(Tier::from_value)
+    }
+
+    /// The tier this claim is judged at in a record whose strongest tier is `record`: its own
+    /// when it declares one, else the record's.
+    #[must_use]
+    pub fn tier_in(&self, record: Option<Tier>) -> Option<Tier> {
+        self.tier().or(record)
+    }
+}
+
 /// Frontmatter fields the library reasons about. Other frontmatter remains available in
 /// [`Self::extra`].
 #[derive(Debug, Default, Deserialize)]
@@ -126,6 +161,8 @@ pub struct Front {
     source_tier: Option<TierValue>,
     #[serde(default)]
     sources: Vec<BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub quotes: Vec<QuoteEntry>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -142,6 +179,7 @@ impl Front {
             .sources
             .iter()
             .filter_map(|source| source.get("tier").and_then(Tier::from_json_value))
+            .chain(self.quotes.iter().filter_map(QuoteEntry::tier))
             .min();
         match (direct, nested) {
             (Some(first), Some(second)) => Some(first.min(second)),
@@ -152,6 +190,19 @@ impl Front {
     #[must_use]
     pub fn has_any_tier(&self) -> bool {
         self.best_tier().is_some()
+    }
+
+    /// Whether the record makes a quote at tier 1 or 2: its single `quote` at the record's
+    /// strongest tier, or a `quotes` entry at the tier [`QuoteEntry::tier_in`] judges it at.
+    #[must_use]
+    pub fn makes_verbatim_quote(&self) -> bool {
+        let record = self.best_tier();
+        let verbatim = |tier: Option<Tier>| tier.is_some_and(Tier::is_verbatim);
+        (self.quote.is_some() && verbatim(record))
+            || self
+                .quotes
+                .iter()
+                .any(|entry| verbatim(entry.tier_in(record)))
     }
 
     /// The date an open item is due to be revisited, if any.
@@ -169,6 +220,23 @@ impl Front {
             .or(self.question.as_deref())
     }
 
+    /// Every verbatim quote this record carries, from `quote` and from `quotes`.
+    #[must_use]
+    pub fn quote_texts(&self) -> Vec<&str> {
+        self.quote
+            .as_deref()
+            .into_iter()
+            .chain(self.quotes.iter().map(|entry| entry.quote.as_str()))
+            .collect()
+    }
+
+    /// The structured `sources:` entries, which `extra` does not carry because `sources` is
+    /// a field of its own. The search index reads their pointers.
+    #[must_use]
+    pub fn source_entries(&self) -> &[BTreeMap<String, serde_json::Value>] {
+        &self.sources
+    }
+
     /// Returns a string-valued frontmatter field that is not part of the generic schema.
     pub fn extra_str(&self, key: &str) -> Option<&str> {
         self.extra.get(key).and_then(serde_json::Value::as_str)
@@ -180,19 +248,85 @@ pub struct Doc {
     /// Path relative to the tree root — the form used in wikilinks and output.
     pub rel: PathBuf,
     pub front: Front,
+    /// Why this document's frontmatter did not parse, if it did not. Such a document keeps
+    /// its body and links; every typed field is empty.
+    pub front_error: Option<String>,
     /// The original markdown text, including YAML frontmatter.
     pub raw: String,
     body_start: usize,
 }
 
 impl Doc {
+    /// A document at the tree-relative path `rel` whose markdown, frontmatter included, is
+    /// `raw`. Frontmatter that does not parse leaves every typed field empty and says why in
+    /// [`Self::front_error`].
+    #[must_use]
+    pub fn from_text(rel: PathBuf, raw: String) -> Self {
+        let (frontmatter, body_start) = split_front(&raw);
+        let (front, front_error) = match frontmatter {
+            Some(frontmatter) => match parse_front(frontmatter.as_ref()) {
+                Ok(front) => (front, None),
+                Err(error) => (Front::default(), Some(format!("{error:#}"))),
+            },
+            None => (Front::default(), None),
+        };
+        Self {
+            rel,
+            front,
+            front_error,
+            raw,
+            body_start,
+        }
+    }
+
     #[must_use]
     pub fn body(&self) -> &str {
         let (_, body) = self.raw.split_at(self.body_start);
         body
     }
 
+    /// The frontmatter block exactly as the file writes it, both `---` lines included, so an
+    /// offset into it is an offset into [`Self::raw`]. Empty when the document has none.
+    #[must_use]
+    pub fn frontmatter_block(&self) -> &str {
+        let (frontmatter, _) = self.raw.split_at(self.body_start);
+        frontmatter
+    }
+
+    /// The line of the file that a byte offset into [`Self::raw`] falls on, counting from 1.
+    #[must_use]
+    pub fn line_at(&self, offset: usize) -> usize {
+        self.raw.get(..offset).map_or(1, |before| {
+            before.bytes().filter(|byte| *byte == b'\n').count() + 1
+        })
+    }
+
+    /// The offset into [`Self::raw`] of the first frontmatter line, as written, that `accepts`
+    /// returns true for. `None` when no frontmatter line is accepted; the body is never
+    /// searched.
+    pub fn frontmatter_line_start(&self, accepts: impl Fn(&str) -> bool) -> Option<usize> {
+        let mut start = 0;
+        for line in self.frontmatter_block().split_inclusive('\n') {
+            if accepts(line) {
+                return Some(start);
+            }
+            start += line.len();
+        }
+        None
+    }
+
+    /// The document's YAML frontmatter as written, before typed parsing. Empty when the
+    /// document has none. A reader of a document whose frontmatter did not parse has this
+    /// text and nothing else.
+    #[must_use]
+    pub fn frontmatter_text(&self) -> Cow<'_, str> {
+        split_front(&self.raw).0.unwrap_or(Cow::Borrowed(""))
+    }
+
     pub(crate) fn frontmatter_json(&self) -> Result<serde_json::Value> {
+        if self.front_error.is_some() {
+            return Ok(serde_json::Value::Object(serde_json::Map::new()));
+        }
         let (frontmatter, _) = split_front(&self.raw);
         frontmatter.map_or_else(
             || Ok(serde_json::Value::Object(serde_json::Map::new())),
@@ -239,10 +373,11 @@ impl Doc {
             .map_or_else(|| self.rel.to_string_lossy().into_owned(), str::to_owned)
     }
 
-    /// Quotes are provenance anchors: frontmatter `quote:` or a markdown blockquote.
+    /// Quotes are provenance anchors: frontmatter `quote:`, a `quotes:` entry, or a
+    /// markdown blockquote.
     #[must_use]
     pub fn has_quote(&self) -> bool {
-        self.front.quote.is_some()
+        !self.front.quote_texts().is_empty()
             || self
                 .body()
                 .lines()
@@ -562,9 +697,10 @@ pub(crate) fn yaml_options() -> Options {
     options
 }
 
-fn parse_front(raw: &str, path: &Path) -> Result<Front> {
-    serde_saphyr::from_str_with_options(raw, yaml_options())
-        .with_context(|| format!("parsing frontmatter in {}", path.display()))
+/// Parses typed frontmatter fields. The error describes the offending value; the caller
+/// names the document.
+fn parse_front(raw: &str) -> Result<Front> {
+    serde_saphyr::from_str_with_options(raw, yaml_options()).map_err(Into::into)
 }
 
 fn strip_markdown_suffix(target: &str) -> &str {
@@ -625,21 +761,11 @@ impl Tree {
             }
             let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            let (frontmatter, body_start) = split_front(&raw);
-            let front = frontmatter.map_or_else(
-                || Ok(Front::default()),
-                |frontmatter| parse_front(frontmatter.as_ref(), path),
-            )?;
             let rel = path
                 .strip_prefix(&root)
                 .with_context(|| format!("deriving a tree-relative path for {}", path.display()))?
                 .to_path_buf();
-            docs.push(Doc {
-                rel,
-                front,
-                raw,
-                body_start,
-            });
+            docs.push(Doc::from_text(rel, raw));
         }
         let links = LinkIndex::from_docs(&docs, &config.folder_notes);
         Ok(Self { root, docs, links })
@@ -724,7 +850,8 @@ mod tests {
         )
     }
 
-    fn parse_front(text: &str, path: &Path) -> Result<Front> {
+    /// Loads one document and returns its typed frontmatter with the parse error, if any.
+    fn load_front(text: &str, path: &Path) -> Result<(Front, Option<String>)> {
         let root = test_root("parse-front")?;
         let document = root.join(path);
         let parent = document
@@ -738,26 +865,73 @@ mod tests {
             tree.docs
                 .into_iter()
                 .next()
-                .map(|doc| doc.front)
+                .map(|doc| (doc.front, doc.front_error))
                 .ok_or_else(|| anyhow!("frontmatter document was not loaded"))
         });
         remove_test_root(&root)?;
         result
     }
 
+    fn parse_front(text: &str, path: &Path) -> Result<Front> {
+        let (front, error) = load_front(text, path)?;
+        match error {
+            Some(error) => Err(anyhow!(error)),
+            None => Ok(front),
+        }
+    }
+
     #[test]
-    fn load_rejects_malformed_frontmatter_with_file_context() -> Result<()> {
+    fn malformed_frontmatter_keeps_the_document_and_records_the_error() -> Result<()> {
         let root = test_root("malformed-frontmatter")?;
-        std::fs::write(root.join("broken.md"), "---\ntype: [\n---\nbody\n")
+        std::fs::write(root.join("broken.md"), "---\ntype: [\n---\nbody text\n")
             .with_context(|| format!("writing {}", root.display()))?;
         let result = Tree::load(&root, &TreeConfig::default());
         remove_test_root(&root)?;
-        let error = result
-            .err()
-            .ok_or_else(|| anyhow!("malformed frontmatter unexpectedly loaded"))?;
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("parsing frontmatter"));
-        assert!(rendered.contains("broken.md"));
+        let tree = result?;
+        let doc = tree
+            .docs
+            .first()
+            .ok_or_else(|| anyhow!("malformed document was not loaded"))?;
+        assert_eq!(doc.rel, Path::new("broken.md"));
+        assert!(doc.front.kind.is_none());
+        assert!(doc.front_error.is_some());
+        assert_eq!(doc.body().trim(), "body text");
+        Ok(())
+    }
+
+    /// The frontmatter block and the body are the file, split once: offsets into either one
+    /// land on the same line of the file, and a document without frontmatter has an empty
+    /// block and all of its text as body.
+    #[test]
+    fn frontmatter_block_and_body_split_the_file_as_written() -> Result<()> {
+        let root = test_root("frontmatter-block")?;
+        let with = "\u{feff}---\r\ntype: decision\r\n---\r\nbody\r\n";
+        std::fs::write(root.join("with.md"), with)
+            .with_context(|| format!("writing {}", root.display()))?;
+        std::fs::write(root.join("without.md"), "plain body\n")
+            .with_context(|| format!("writing {}", root.display()))?;
+        let result = Tree::load(&root, &TreeConfig::default());
+        remove_test_root(&root)?;
+        let tree = result?;
+        let [with_doc, without_doc] = tree.docs.as_slice() else {
+            return Err(anyhow!(
+                "expected two documents, loaded {}",
+                tree.docs.len()
+            ));
+        };
+        assert_eq!(
+            with_doc.frontmatter_block(),
+            "\u{feff}---\r\ntype: decision\r\n---\r\n"
+        );
+        assert_eq!(
+            format!("{}{}", with_doc.frontmatter_block(), with_doc.body()),
+            with
+        );
+        assert_eq!(with_doc.line_at(0), 1);
+        assert_eq!(with_doc.line_at(with_doc.frontmatter_block().len()), 4);
+        assert_eq!(with_doc.line_at(with.len() + 1), 1);
+        assert_eq!(without_doc.frontmatter_block(), "");
+        assert_eq!(without_doc.body(), "plain body\n");
         Ok(())
     }
 
@@ -774,6 +948,54 @@ mod tests {
             .first()
             .ok_or_else(|| anyhow!("plain document was not loaded"))?;
         assert!(doc.front.kind.is_none());
+        Ok(())
+    }
+
+    /// A quote is judged at its `quotes` entry's own tier, else at the record's strongest, so
+    /// a record's `tier: 1` makes no tier 1 quote of an entry that declares tier 3.
+    #[test]
+    fn a_verbatim_quote_is_judged_at_each_quote_s_own_tier() -> Result<()> {
+        let single = |tier: &str| format!("tier: {tier}\nquote: \"q\"\n");
+        let entry = |record: &str, own: &str| {
+            format!("tier: {record}\nquotes:\n  - quote: \"q\"\n    source: \"s\"\n{own}")
+        };
+        for (text, expected) in [
+            (single("1"), true),
+            (single("3"), false),
+            (entry("1", "    tier: 3\n"), false),
+            (entry("3", "    tier: 2\n"), true),
+            (entry("2", ""), true),
+            ("tier: 1\n".to_owned(), false),
+        ] {
+            let front = parse_front(&text, Path::new("x.md"))?;
+            assert_eq!(front.makes_verbatim_quote(), expected, "{text}");
+        }
+        Ok(())
+    }
+
+    /// The first frontmatter line a predicate accepts, as an offset into the file; the body is
+    /// never searched.
+    #[test]
+    fn frontmatter_line_start_searches_the_frontmatter_alone() -> Result<()> {
+        let root = test_root("frontmatter-line")?;
+        std::fs::write(
+            root.join("doc.md"),
+            "---\ntype: decision\nstatement: s\n---\nstatement: in the body\n",
+        )
+        .with_context(|| format!("writing {}", root.display()))?;
+        let result = Tree::load(&root, &TreeConfig::default());
+        remove_test_root(&root)?;
+        let tree = result?;
+        let doc = tree
+            .docs
+            .first()
+            .ok_or_else(|| anyhow!("document was not loaded"))?;
+        let statement = doc.frontmatter_line_start(|line| line.starts_with("statement:"));
+        assert_eq!(statement.map(|start| doc.line_at(start)), Some(3));
+        assert_eq!(
+            doc.frontmatter_line_start(|line| line.starts_with("owner:")),
+            None
+        );
         Ok(())
     }
 
@@ -826,11 +1048,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_keys_are_an_error_naming_the_file() -> Result<()> {
-        let error = parse_front("type: a\ntype: b\n", Path::new("dup.md"))
-            .err()
-            .ok_or_else(|| anyhow!("duplicate frontmatter keys unexpectedly loaded"))?;
-        assert!(format!("{error:#}").contains("dup.md"));
+    fn duplicate_keys_are_a_frontmatter_error() -> Result<()> {
+        let (front, error) = load_front("type: a\ntype: b\n", Path::new("dup.md"))?;
+        assert!(front.kind.is_none());
+        let error = error.ok_or_else(|| anyhow!("duplicate frontmatter keys were accepted"))?;
+        assert!(error.contains("duplicate"), "{error}");
         Ok(())
     }
 

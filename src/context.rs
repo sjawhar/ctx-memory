@@ -2,11 +2,14 @@
 
 use std::cell::OnceCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 
 use crate::cli::GlobalArgs;
-use crate::config::{locate_tree, state_base, StateDir, TreeConfig, UserConfig};
+use crate::config::{data_dir, locate_tree, state_base, DataDir, StateDir, TreeConfig, UserConfig};
+use crate::embed::{CachedEmbedder, Embedder, Embedding};
+use crate::index::Index;
 use crate::tree::Tree;
 
 pub struct Context {
@@ -15,6 +18,9 @@ pub struct Context {
     pub json: bool,
     user: UserConfig,
     state: OnceCell<StateDir>,
+    data: OnceCell<DataDir>,
+    index: OnceCell<Index>,
+    embedding: OnceCell<Embedding>,
 }
 
 impl Context {
@@ -29,6 +35,17 @@ impl Context {
         let cwd = std::env::current_dir().context("reading the current directory")?;
         let root = locate_tree(global.memory.as_deref(), &cwd, &user)?;
         Self::load_at(&root, global.json, user, None)
+    }
+
+    /// Loads a tree from an explicit root, as `ctx serve` does for the clone it answers from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when user configuration, tree configuration, or the tree cannot be
+    /// loaded.
+    pub fn open(root: &std::path::Path) -> Result<Self> {
+        let user = UserConfig::load()?;
+        Self::load_at(root, false, user, None)
     }
 
     fn load_at(
@@ -55,7 +72,72 @@ impl Context {
             json,
             user,
             state,
+            data: OnceCell::new(),
+            index: OnceCell::new(),
+            embedding: OnceCell::new(),
         })
+    }
+
+    /// Returns this tree's full-text index, building it on first use.
+    ///
+    /// One process keeps one index: `ctx serve` answers every search from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index cannot be built.
+    pub fn index(&self) -> Result<&Index> {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let index = Index::build(&self.tree, self.embedding()?)?;
+        self.index
+            .set(index)
+            .map_err(|_| anyhow!("index was initialized concurrently"))?;
+        self.index
+            .get()
+            .ok_or_else(|| anyhow!("index was not retained"))
+    }
+
+    /// Returns this tree's embedder for meaning search, building it on first use.
+    ///
+    /// Meaning search is on when `CTX_EMBED_MODEL`, `GOOGLE_CLOUD_PROJECT` and
+    /// `GOOGLE_CLOUD_LOCATION` are all set; otherwise `ctx` matches by text alone. The vectors
+    /// are cached under the data directory, so one process embeds each record once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the data directory cannot be resolved.
+    pub fn embedding(&self) -> Result<&Embedding> {
+        if let Some(embedding) = self.embedding.get() {
+            return Ok(embedding);
+        }
+        let resolved = self.resolve_embedding()?;
+        self.embedding
+            .set(resolved)
+            .map_err(|_| anyhow!("embedding was initialized concurrently"))?;
+        self.embedding
+            .get()
+            .ok_or_else(|| anyhow!("embedding was not retained"))
+    }
+
+    fn resolve_embedding(&self) -> Result<Embedding> {
+        let Some(model) = std::env::var_os("CTX_EMBED_MODEL") else {
+            return Ok(Embedding::Off);
+        };
+        let model = model
+            .to_str()
+            .ok_or_else(|| anyhow!("CTX_EMBED_MODEL is not valid UTF-8"))?;
+        if model.is_empty() {
+            return Ok(Embedding::Off);
+        }
+        // A configured model with no project or region is a misconfiguration, not meaning
+        // search; `ctx` keeps matching by text rather than refusing to answer.
+        let Ok(vertex) = Embedder::vertex(model) else {
+            return Ok(Embedding::Off);
+        };
+        let cache = self.data()?.embeddings();
+        let embedder = CachedEmbedder::new(Arc::new(vertex), cache);
+        Ok(Embedding::Ready(Arc::new(embedder)))
     }
 
     /// Resolves the state directory for this tree.
@@ -79,6 +161,31 @@ impl Context {
         self.state
             .get()
             .ok_or_else(|| anyhow!("state directory was not retained"))
+    }
+
+    /// Resolves the directory holding this tree's fetch windows and cursors.
+    ///
+    /// It is the configured `data_dir` when one is set, and otherwise the state directory, so a
+    /// tree with no configuration keeps every file in one place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no `data_dir` is configured and the state directory cannot be
+    /// resolved.
+    pub fn data(&self) -> Result<&DataDir> {
+        if let Some(data) = self.data.get() {
+            return Ok(data);
+        }
+        let root = match data_dir(&self.config) {
+            Some(root) => root,
+            None => self.state()?.root().to_path_buf(),
+        };
+        self.data
+            .set(DataDir::new(root))
+            .map_err(|_| anyhow!("data directory was initialized concurrently"))?;
+        self.data
+            .get()
+            .ok_or_else(|| anyhow!("data directory was not retained"))
     }
 
     /// Loads a context passed from a `ctx` external subcommand invocation.
@@ -161,6 +268,9 @@ mod tests {
             json: false,
             user: UserConfig::default(),
             state: OnceCell::new(),
+            data: OnceCell::new(),
+            index: OnceCell::new(),
+            embedding: OnceCell::new(),
         };
 
         let result = context.state();

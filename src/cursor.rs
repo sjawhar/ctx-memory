@@ -1,7 +1,8 @@
-//! Cursor persistence and explicit advancement from completed windows.
+//! Cursor persistence and advancement from a completed window.
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{bail, Context as _, Result};
@@ -9,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic::write_replace;
 use crate::context::Context;
-use crate::fetch::acquire_lock;
-use crate::windows::{Status, Window};
+use crate::output::printable;
+use crate::windows::{Manifest, Status, WindowId};
 
 /// The complete versioned cursor file.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -66,20 +67,26 @@ pub struct AdvanceOutcome {
 ///
 /// Returns an error when the cursor file exists but cannot be decoded or uses another version.
 pub fn show(context: &Context) -> Result<Cursors> {
-    load(&context.state()?.cursors())
+    load(&context.data()?.cursors())
 }
 
-/// Applies successful stream cursors from `window` while holding the fetch lock.
+/// Applies the successful stream cursors of a completed window.
+///
+/// The caller holds the fetch lock. `ctx fetch` moves a stream's cursor itself once that
+/// stream's messages are stored, so an interrupted fetch re-reads the same material. A stream
+/// that errored, proposed no cursor, or was already advanced by a newer window is skipped, and
+/// skipping one stream never holds back another.
 ///
 /// # Errors
 ///
-/// Returns an error when the state lock is busy, the window is stale for a stream, or cursor state
-/// cannot be read or persisted.
-pub fn advance(context: &Context, window: &Window) -> Result<AdvanceOutcome> {
-    let state = context.state()?;
-    let _lock = acquire_lock(state)?;
-    let manifest = window.manifest()?;
-    let mut cursors = load(&state.cursors())?;
+/// Returns an error when cursor state cannot be read or persisted, or when a stored cursor names
+/// a window identifier that is not canonical.
+pub(crate) fn advance(
+    path: &Path,
+    window: &WindowId,
+    manifest: &Manifest,
+) -> Result<AdvanceOutcome> {
+    let mut cursors = load(path)?;
     let mut updates = Vec::new();
     let mut skipped = Vec::new();
 
@@ -105,15 +112,18 @@ pub fn advance(context: &Context, window: &Window) -> Result<AdvanceOutcome> {
                 .sources
                 .get(source)
                 .and_then(|streams| streams.get(stream))
-                .filter(|existing| existing.window.as_str() > window.id.as_str())
             {
-                bail!(
-                    "window {} is older than {} for source {} stream {}",
-                    window.id,
-                    existing.window,
-                    source,
-                    stream
-                );
+                let existing_window = WindowId::parse(&existing.window).with_context(|| {
+                    format!("reading the stored cursor for source {source} stream {stream}")
+                })?;
+                if existing_window > *window {
+                    skipped.push(Skipped {
+                        source: source.clone(),
+                        stream: stream.clone(),
+                        why: format!("a newer window {existing_window} already advanced it"),
+                    });
+                    continue;
+                }
             }
             updates.push((source.clone(), stream.clone(), next.to_owned()));
         }
@@ -125,7 +135,7 @@ pub fn advance(context: &Context, window: &Window) -> Result<AdvanceOutcome> {
             stream.clone(),
             Cursor {
                 cursor: cursor.clone(),
-                window: window.id.to_string(),
+                window: window.to_string(),
             },
         );
         advanced.push(Advanced {
@@ -135,7 +145,7 @@ pub fn advance(context: &Context, window: &Window) -> Result<AdvanceOutcome> {
         });
     }
     if !advanced.is_empty() {
-        write(&state.cursors(), &cursors)?;
+        write(path, &cursors)?;
     }
     Ok(AdvanceOutcome { advanced, skipped })
 }
@@ -162,4 +172,55 @@ pub(crate) fn load(path: &Path) -> Result<Cursors> {
 fn write(path: &Path, cursors: &Cursors) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(cursors).context("serializing cursor state")?;
     write_replace(path, &bytes)
+}
+
+/// Prints every stored cursor, one stream per line.
+///
+/// A stream name can come from a record (a discovered stream) and a cursor from a source's
+/// answer, so each is printed without its control characters.
+///
+/// # Errors
+///
+/// Returns an error when the output cannot be written.
+pub fn print_cursors(cursors: &Cursors, out: &mut dyn Write) -> std::io::Result<()> {
+    for (source, streams) in &cursors.sources {
+        for (stream, cursor) in streams {
+            writeln!(
+                out,
+                "{} {} {} {}",
+                printable(source),
+                printable(stream),
+                printable(&cursor.cursor),
+                printable(&cursor.window)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Prints which cursors one window moved and which it left, and why.
+///
+/// # Errors
+///
+/// Returns an error when the output cannot be written.
+pub fn print_advance(outcome: &AdvanceOutcome, out: &mut dyn Write) -> std::io::Result<()> {
+    for advanced in &outcome.advanced {
+        writeln!(
+            out,
+            "advanced {} {} {}",
+            printable(&advanced.source),
+            printable(&advanced.stream),
+            printable(&advanced.cursor)
+        )?;
+    }
+    for skipped in &outcome.skipped {
+        writeln!(
+            out,
+            "skipped {} {} {}",
+            printable(&skipped.source),
+            printable(&skipped.stream),
+            printable(&skipped.why)
+        )?;
+    }
+    Ok(())
 }

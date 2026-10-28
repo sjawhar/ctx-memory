@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic::write_replace;
 use crate::config::SourceConfig;
+use crate::embed::{cosine, Embed, MEANING_THRESHOLD};
+use crate::index;
 use crate::pointer::Schemes;
 use crate::record::Record;
 use crate::schema::{OPEN_KINDS, OPEN_STATES};
@@ -55,7 +57,7 @@ impl Owners {
 #[serde(deny_unknown_fields)]
 pub struct Match {
     pub record: String,
-    /// `pointer`, `alias`, `quote`, `owner`, or `stream`.
+    /// `pointer`, `alias`, `quote`, `owner`, `stream`, or `meaning`.
     pub how: String,
 }
 
@@ -201,6 +203,7 @@ pub fn compute(
     window: &Window,
     previous: Option<&Window>,
     generated_at: DateTime<Utc>,
+    embedder: Option<&dyn Embed>,
 ) -> Result<Delta> {
     let manifest = window.manifest()?;
     let sourced_records = window.records()?;
@@ -214,8 +217,12 @@ pub fn compute(
         .iter()
         .map(|document| (document.rel.to_string_lossy().into_owned(), document))
         .collect::<BTreeMap<_, _>>();
+    let arrivals = arrivals(&sourced_records);
+    // Meaning matching is best-effort: a window still yields its text matches when the
+    // embedder cannot be reached, rather than failing the fetch.
+    let meaning = embedder.and_then(|embedder| meaning_vectors(embedder, &arrivals, &docs).ok());
     let (new_messages, flagged) =
-        match_arrivals(arrivals(&sourced_records), &cited_records, owners, &docs);
+        match_arrivals(arrivals, &cited_records, owners, &docs, meaning.as_ref());
     let (previous_window, closed_since_previous, opened_since_previous) =
         state_changes(tree, &docs, previous)?;
 
@@ -273,15 +280,19 @@ fn match_arrivals(
     cited_records: &[Cited],
     owners: &Owners,
     docs: &BTreeMap<String, &Doc>,
+    meaning: Option<&MeaningVectors>,
 ) -> (Vec<NewMessage>, BTreeMap<String, Vec<ReplyRef>>) {
     let mut new_messages = Vec::with_capacity(arrivals.len());
     let mut flagged = BTreeMap::<String, Vec<ReplyRef>>::new();
-    for arrival in arrivals {
+    for (index, arrival) in arrivals.into_iter().enumerate() {
         let owner = owners.get(arrival.source, &arrival.record.stream);
         let mut matches = cited_records
             .iter()
             .filter_map(|cited| match_one(&arrival, cited, owner))
             .collect::<Vec<_>>();
+        if let Some(meaning) = meaning {
+            append_meaning_matches(index, meaning, &mut matches);
+        }
         matches.sort_by(|left, right| left.record.cmp(&right.record));
         flag_matches(&arrival, &matches, docs, &mut flagged);
         new_messages.push(NewMessage {
@@ -296,6 +307,58 @@ fn match_arrivals(
         });
     }
     (new_messages, flagged)
+}
+
+/// The embeddings a window's meaning matching needs: one vector per arrival, in arrival order,
+/// and one vector per tree record, keyed by its path.
+struct MeaningVectors {
+    arrivals: Vec<Vec<f32>>,
+    records: Vec<(String, Vec<f32>)>,
+}
+
+/// Embeds every arrival and every record, so an arrival can be matched to the record it means
+/// even when the two share no word. Both sets are embedded in one batch each, and the embedder
+/// caches by content hash, so a record embedded for the index is not embedded again here.
+fn meaning_vectors(
+    embedder: &dyn Embed,
+    arrivals: &[Arrival<'_>],
+    docs: &BTreeMap<String, &Doc>,
+) -> Result<MeaningVectors> {
+    let record_texts = docs
+        .values()
+        .map(|document| index::document_text(document))
+        .collect::<Vec<_>>();
+    let record_refs = record_texts.iter().map(String::as_str).collect::<Vec<_>>();
+    let record_vectors = embedder.embed(&record_refs)?;
+    let arrival_refs = arrivals
+        .iter()
+        .map(|arrival| arrival.record.text.as_str())
+        .collect::<Vec<_>>();
+    let arrival_vectors = embedder.embed(&arrival_refs)?;
+    let records = docs.keys().cloned().zip(record_vectors).collect::<Vec<_>>();
+    Ok(MeaningVectors {
+        arrivals: arrival_vectors,
+        records,
+    })
+}
+
+/// Adds a `meaning` match for every record whose vector is close to this arrival's and that no
+/// text rule has already matched, so a paraphrase is never listed twice.
+fn append_meaning_matches(index: usize, meaning: &MeaningVectors, matches: &mut Vec<Match>) {
+    let Some(arrival_vector) = meaning.arrivals.get(index) else {
+        return;
+    };
+    for (record, record_vector) in &meaning.records {
+        if matches.iter().any(|matched| &matched.record == record) {
+            continue;
+        }
+        if cosine(arrival_vector, record_vector) >= MEANING_THRESHOLD {
+            matches.push(Match {
+                record: record.clone(),
+                how: "meaning".to_owned(),
+            });
+        }
+    }
 }
 
 fn flag_matches(
@@ -711,6 +774,95 @@ fn render_messages(lines: &mut Vec<String>, messages: &[NewMessage]) {
     lines.push(String::new());
 }
 
+/// Reads one window's durable delta, if it has been written.
+///
+/// # Errors
+///
+/// Returns an error when the delta cannot be read, decoded, or uses another format version.
+pub fn read(window: &Window) -> Result<Option<Delta>> {
+    let path = window.dir.join("delta.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let delta: Delta =
+        serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))?;
+    if delta.version != 1 {
+        bail!(
+            "{} has unsupported delta version {}",
+            path.display(),
+            delta.version
+        );
+    }
+    Ok(Some(delta))
+}
+
+/// Combines the deltas of consecutive windows, oldest first, into one delta.
+///
+/// A message, open flag, or status change that several windows carry appears once, as the
+/// newest window saw it, so an agent handling a backlog of windows reads one list.
+#[must_use]
+pub fn combine(deltas: &[Delta], generated_at: DateTime<Utc>) -> Option<Delta> {
+    let newest = deltas.last()?;
+    let oldest = deltas.first()?;
+    let mut new_messages = BTreeMap::new();
+    let mut unreviewed: BTreeMap<String, OpenFlag> = BTreeMap::new();
+    let mut closed = BTreeMap::new();
+    let mut opened = BTreeSet::new();
+    for delta in deltas {
+        for message in &delta.new_messages {
+            new_messages.insert(message.pointer.clone(), message.clone());
+        }
+        for flag in &delta.unreviewed {
+            match unreviewed.get_mut(&flag.record) {
+                Some(existing) => {
+                    for reply in &flag.replies {
+                        if !existing
+                            .replies
+                            .iter()
+                            .any(|kept| kept.pointer == reply.pointer)
+                        {
+                            existing.replies.push(reply.clone());
+                        }
+                    }
+                    existing.replies.sort_by(|left, right| {
+                        left.ts
+                            .cmp(&right.ts)
+                            .then_with(|| left.pointer.cmp(&right.pointer))
+                    });
+                    existing.last_reviewed = flag.last_reviewed;
+                    existing.status.clone_from(&flag.status);
+                }
+                None => {
+                    unreviewed.insert(flag.record.clone(), flag.clone());
+                }
+            }
+        }
+        for change in &delta.closed_since_previous {
+            closed.insert(change.record.clone(), change.clone());
+        }
+        opened.extend(delta.opened_since_previous.iter().cloned());
+    }
+    let mut new_messages = new_messages.into_values().collect::<Vec<_>>();
+    new_messages.sort_by(|left, right| {
+        left.ts
+            .cmp(&right.ts)
+            .then_with(|| left.pointer.cmp(&right.pointer))
+    });
+    Some(Delta {
+        version: 1,
+        window: newest.window.clone(),
+        window_end: newest.window_end,
+        generated_at,
+        previous_window: oldest.previous_window.clone(),
+        new_messages,
+        unreviewed: unreviewed.into_values().collect(),
+        closed_since_previous: closed.into_values().collect(),
+        opened_since_previous: opened.into_iter().collect(),
+    })
+}
+
 /// Reads all durable deltas and returns replies still unreviewed by record path.
 ///
 /// # Errors
@@ -746,17 +898,9 @@ pub fn staleness(windows: &Path, tree: &Tree) -> Result<BTreeMap<String, Vec<Sta
 
     let mut seen = BTreeSet::new();
     for window in completed {
-        let path = window.dir.join("delta.json");
-        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let delta: Delta = serde_json::from_slice(&bytes)
-            .with_context(|| format!("decoding {}", path.display()))?;
-        if delta.version != 1 {
-            bail!(
-                "{} has unsupported delta version {}",
-                path.display(),
-                delta.version
-            );
-        }
+        let Some(delta) = read(&window)? else {
+            continue;
+        };
         for flag in delta.unreviewed {
             let Some(last_reviewed) = reviewed.get(&flag.record) else {
                 continue;

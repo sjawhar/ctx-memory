@@ -1,12 +1,15 @@
 //! Retrieval over a markdown context tree.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 
 use anyhow::{anyhow, bail, Result};
 use owo_colors::OwoColorize as _;
 use serde::Serialize;
 
 use crate::config::TreeConfig;
+use crate::index::{self, Index};
+use crate::output::printable;
 use crate::tree::{wikilinks, Doc, Resolution, Tier, Tree};
 
 #[derive(Debug, Serialize)]
@@ -18,6 +21,9 @@ pub struct Hit {
     /// How many query terms appear anywhere in this document.
     pub matched_terms: usize,
     pub total_terms: usize,
+    /// This document was found because its meaning is close, not because it holds a query word.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_meaning: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,59 +51,93 @@ fn tier_rank(tier: Option<Tier>) -> u8 {
     tier.map_or(9, |tier| tier as u8)
 }
 
-/// Rank by term coverage, then authority tier. Partial matches are returned and labeled.
-pub fn run(tree: &Tree, query: &str, verbatim_only: bool, limit: usize) -> Vec<Hit> {
-    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    let mut hits: Vec<(usize, u8, Hit)> = Vec::new();
+/// What one `ctx search` found.
+#[derive(Debug, Serialize)]
+pub struct Search {
+    pub query: String,
+    pub hits: Vec<Hit>,
+    pub total_terms: usize,
+    /// Documents that matched the query but were dropped by `--verbatim`.
+    pub dropped_by_verbatim: usize,
+    /// Set when meaning search was asked for but is unavailable, so the result is text alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
+}
 
-    for doc in &tree.docs {
+/// Searches every frontmatter value — title, quotes, statement, aliases, owner, dates,
+/// source pointers and whatever else a record declares — and the markdown body, ranking by
+/// text relevance and then by authority tier, so a direct source precedes an equally
+/// relevant summary.
+///
+/// `limit` of 0 returns every match, the meaning [`Index::search`] gives it.
+///
+/// The index is passed in, so one server process keeps a single index for every query.
+///
+/// # Errors
+///
+/// Returns an error when the index cannot be queried.
+pub fn run(
+    index: &Index,
+    tree: &Tree,
+    query: &str,
+    verbatim_only: bool,
+    limit: usize,
+) -> Result<Search> {
+    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    // Without a filter the index applies the limit; with one it cannot, because the
+    // dropped documents must still be counted to tell a filtered result from an absence.
+    let found = index.search(query, if verbatim_only { 0 } else { limit })?;
+    let matches = found.hits;
+    // 0 is the index's "every match"; the hit loop must read it the same way, or a limit of
+    // zero would drop every hit and print an absence the tree does not support.
+    let keep = if limit == 0 { usize::MAX } else { limit };
+
+    let mut hits = Vec::new();
+    let mut dropped_by_verbatim = 0;
+    for found in matches {
+        let doc = tree
+            .docs
+            .get(found.position)
+            .ok_or_else(|| anyhow!("search hit {} is not in the tree", found.path))?;
+        // `--verbatim` keeps or drops the whole record by its strongest tier, never one quote:
+        // a tier 3 `quotes` entry in a record that a tier 1 quote ranks at tier 1 is shown at
+        // tier 1, beside it. The writer refuses a tier 1 or 2 record unless one of its tier 1
+        // or 2 quotes was checked against its source, so the rank rests on that quote.
         let tier = doc.front.best_tier();
         if verbatim_only && !tier.is_some_and(Tier::is_verbatim) {
+            dropped_by_verbatim += 1;
             continue;
         }
-        let body = doc.body().to_lowercase();
-        let matched = terms
-            .iter()
-            .filter(|term| body.contains(term.as_str()))
-            .count();
-        if matched == 0 {
+        if hits.len() >= keep {
             continue;
         }
-        let mut best: Option<(usize, &str)> = None;
-        for line in doc.body().lines() {
-            let trimmed = line.trim();
-            if trimmed.len() < 12 {
-                continue;
-            }
-            let lower = trimmed.to_lowercase();
-            let matched_in_line = terms
+        let haystack = index::document_text(doc).to_lowercase();
+        hits.push(Hit {
+            path: found.path,
+            tier: tier.map(|tier| tier.label().to_owned()),
+            title: doc.label(),
+            line: one_line(&found.snippet),
+            matched_terms: terms
                 .iter()
-                .filter(|term| lower.contains(term.as_str()))
-                .count();
-            if matched_in_line > 0 && best.is_none_or(|(count, _)| matched_in_line > count) {
-                best = Some((matched_in_line, trimmed));
-            }
-        }
-        let Some((_, line)) = best else { continue };
-        hits.push((
-            terms.len() - matched,
-            tier_rank(tier),
-            Hit {
-                path: doc.rel.to_string_lossy().into_owned(),
-                tier: tier.map(|tier| tier.label().to_owned()),
-                title: doc.label(),
-                line: line.to_owned(),
-                matched_terms: matched,
-                total_terms: terms.len(),
-            },
-        ));
+                .filter(|term| haystack.contains(term.as_str()))
+                .count(),
+            total_terms: terms.len(),
+            by_meaning: found.by_meaning,
+        });
     }
 
-    hits.sort_by_key(|(missed, rank, _)| (*missed, *rank));
-    hits.into_iter()
-        .take(limit)
-        .map(|(_, _, hit)| hit)
-        .collect()
+    Ok(Search {
+        query: query.to_owned(),
+        hits,
+        total_terms: terms.len(),
+        dropped_by_verbatim,
+        notice: found.notice,
+    })
+}
+
+/// Collapses a snippet to one line so a hit stays one entry.
+fn one_line(snippet: &str) -> String {
+    snippet.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Finds a page by its canonical name before accepting an unambiguous partial match.
@@ -229,6 +269,7 @@ pub fn dossier(tree: &Tree, entity: &str, config: &TreeConfig) -> Result<Dossier
                     line: first_meaningful_line(document),
                     matched_terms: 1,
                     total_terms: 1,
+                    by_meaning: false,
                 },
             ))
         })
@@ -281,60 +322,102 @@ fn first_meaningful_line(doc: &Doc) -> String {
         .to_owned()
 }
 
-pub fn print(hits: &[Hit], total_terms: usize) {
-    if hits.is_empty() {
-        if total_terms > 1 {
-            println!("no hits — none of the {total_terms} query terms appear anywhere in the tree");
-        } else {
-            println!("no hits");
-        }
-        return;
+/// Prints a search result, keeping an absence claim honest: the tree is only said to lack
+/// every term when nothing matched at all.
+///
+/// # Errors
+///
+/// Returns an error when the output cannot be written.
+pub fn print(search: &Search, out: &mut dyn Write) -> std::io::Result<()> {
+    if let Some(notice) = &search.notice {
+        writeln!(out, "{}\n", printable(notice).yellow())?;
     }
+    if search.hits.is_empty() {
+        if search.dropped_by_verbatim > 0 {
+            return writeln!(
+                out,
+                "no direct-source hits — {} document(s) match in lower tiers; drop --verbatim to see them",
+                search.dropped_by_verbatim
+            );
+        } else if search.total_terms > 1 {
+            return writeln!(
+                out,
+                "no hits — none of the {} query terms appear anywhere in the tree",
+                search.total_terms
+            );
+        }
+        return writeln!(out, "no hits");
+    }
+    print_hits(&search.hits, out)
+}
+
+fn print_hits(hits: &[Hit], out: &mut dyn Write) -> std::io::Result<()> {
     if hits
         .first()
-        .is_some_and(|hit| hit.matched_terms < hit.total_terms)
+        .is_some_and(|hit| !hit.by_meaning && hit.matched_terms < hit.total_terms)
     {
         let (matched, total) = hits
             .first()
             .map_or((0, 0), |hit| (hit.matched_terms, hit.total_terms));
-        println!(
+        writeln!(
+            out,
             "{}",
             format!(
                 "no document matches all {total} terms — best match covers {matched}; narrow the query before relying on absence"
             )
             .yellow()
-        );
-        println!();
+        )?;
+        writeln!(out)?;
     }
+    // Titles, lines and paths are the tree's text, and so the sources' text: each is printed
+    // without its control characters.
     for hit in hits {
-        let tier = hit.tier.as_deref().unwrap_or("--");
-        if hit.matched_terms < hit.total_terms {
-            println!(
-                "[{}] {}  {}",
+        let tier = printable(hit.tier.as_deref().unwrap_or("--"));
+        let title = printable(&hit.title);
+        if hit.by_meaning {
+            writeln!(
+                out,
+                "[{}] {title}  {}",
                 tier.bold(),
-                hit.title,
+                "(by meaning)".yellow()
+            )?;
+        } else if hit.matched_terms < hit.total_terms {
+            writeln!(
+                out,
+                "[{}] {title}  {}",
+                tier.bold(),
                 format!("({}/{} terms)", hit.matched_terms, hit.total_terms).yellow()
-            );
+            )?;
         } else {
-            println!("[{}] {}", tier.bold(), hit.title);
+            writeln!(out, "[{}] {title}", tier.bold())?;
         }
-        println!("     {}", hit.line);
-        println!("     {}\n", hit.path.dimmed());
+        writeln!(out, "     {}", printable(&hit.line))?;
+        writeln!(out, "     {}\n", printable(&hit.path).dimmed())?;
     }
+    Ok(())
 }
 
-pub fn print_dossier(dossier: &Dossier) {
-    println!(
+/// Prints a dossier.
+///
+/// # Errors
+///
+/// Returns an error when the output cannot be written.
+pub fn print_dossier(dossier: &Dossier, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(
+        out,
         "{} — {} documents\n",
-        dossier.entity.bold(),
+        printable(&dossier.entity).bold(),
         dossier.hits.len()
-    );
+    )?;
     if !dossier.candidates.is_empty() {
-        println!("ambiguous entity page; candidates:");
+        writeln!(out, "ambiguous entity page; candidates:")?;
         for candidate in &dossier.candidates {
-            println!("  {candidate}");
+            writeln!(out, "  {}", printable(candidate))?;
         }
-        println!();
+        writeln!(out)?;
     }
-    print(&dossier.hits, 1);
+    if dossier.hits.is_empty() {
+        return writeln!(out, "no hits");
+    }
+    print_hits(&dossier.hits, out)
 }

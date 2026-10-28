@@ -1,13 +1,16 @@
 //! Open-item retrieval.
 
 use std::collections::{hash_map::Entry, BTreeMap, HashMap};
+use std::io::Write;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::NaiveDate;
+use owo_colors::OwoColorize as _;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::delta::Staleness;
+use crate::output::printable;
 use crate::schema::{today_utc, OPEN_KINDS, OPEN_STATES};
 use crate::tree::{wikilinks, Doc, Resolution, Tree};
 
@@ -270,4 +273,56 @@ fn owner_name_matches(
     Ok(owner.stem().eq_ignore_ascii_case(name)
         || target.eq_ignore_ascii_case(name)
         || matches!(tree.resolve(document, name), Resolution::Found(position) if position == owner_position))
+}
+
+/// Prints open items the way a person reads them: kind, when, owner, title and path.
+///
+/// # Errors
+///
+/// Returns an error when the output cannot be written.
+pub fn print(items: &[OpenItemView], out: &mut dyn Write) -> std::io::Result<()> {
+    if items.is_empty() {
+        return writeln!(out, "nothing open");
+    }
+    let today = today_utc();
+    for item in items {
+        let when = item.days_overdue.map_or_else(
+            || {
+                item.deadline.map_or_else(
+                    || match item.opened.map(|opened| (today - opened).num_days()) {
+                        Some(age) => format!("no date (opened {age}d ago)"),
+                        None => "no date".to_owned(),
+                    },
+                    |deadline| deadline.format("%a %Y-%m-%d").to_string(),
+                )
+            },
+            |days| format!("overdue {days}d"),
+        );
+        // Titles, owners, paths and pointers are the tree's text, and so the sources' text:
+        // each is printed without its control characters.
+        writeln!(
+            out,
+            "[{}] {}  {}",
+            printable(&item.kind).bold(),
+            when.red(),
+            printable(item.owner.as_deref().unwrap_or("unassigned")).dimmed()
+        )?;
+        writeln!(out, "     {}", printable(&item.title))?;
+        writeln!(out, "     {}", printable(&item.path).dimmed())?;
+        if let Some(unreviewed) = item.unreviewed.as_deref() {
+            for reply in unreviewed {
+                let same_day = if reply.same_day { " (same day)" } else { "" };
+                writeln!(
+                    out,
+                    "     unreviewed {} {} ({}){}",
+                    reply.ts,
+                    printable(&reply.pointer),
+                    reply.how,
+                    same_day
+                )?;
+            }
+        }
+        writeln!(out)?;
+    }
+    Ok(())
 }

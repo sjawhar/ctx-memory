@@ -16,19 +16,33 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.23.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+encoding_rs = "0.8"
 fs2 = "0.4"
 ignore = "0.4"
 jsonschema = { version = "0.60", default-features = false }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 libc = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 owo-colors = "4"
 regex = "1"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "form", "json", "query", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-saphyr = "2"
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "signal", "time", "sync", "macros"] }
 toml = "0.8"
+
+[dev-dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "query", "rustls"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+
 [lints.rust]
 unused_must_use = "deny"
 elided_lifetimes_in_paths = "warn"

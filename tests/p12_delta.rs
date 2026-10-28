@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -145,6 +147,7 @@ fn delta_matches_thread_alias_quote_owner_and_owned_streams() -> Result<()> {
         &current,
         None,
         timestamp("2026-10-25T12:01:00Z")?,
+        None,
     )?;
     remove_scratch(&root)?;
 
@@ -336,6 +339,7 @@ fn delta_matches_normalised_quote_fragments_in_replies_and_parents() -> Result<(
         &current,
         None,
         timestamp("2026-10-25T12:01:00Z")?,
+        None,
     )?;
     remove_scratch(&root)?;
 
@@ -415,6 +419,7 @@ fn delta_diffs_open_items_from_the_previous_snapshot() -> Result<()> {
         &current,
         Some(&previous),
         timestamp("2026-10-25T12:00:00Z")?,
+        None,
     )?;
     remove_scratch(&root)?;
 
@@ -704,5 +709,82 @@ fn unsupported_artifact_versions_fail_without_replacing_existing_files() -> Resu
         );
     }
     remove_scratch(&root)?;
+    Ok(())
+}
+
+#[test]
+fn delta_suggests_semantic_match() -> Result<()> {
+    let root = scratch("meaning")?;
+    write(
+        &root.join("questions/renewal.md"),
+        "---\ntype: question\nstatus: open\n---\nThe Acme contract renewal is due in March.\n",
+    )?;
+    write(
+        &root.join("questions/hiring.md"),
+        "---\ntype: question\nstatus: open\n---\nInterview the hiring candidate on Tuesday.\n",
+    )?;
+    let (tree, config) = configured_tree(&root)?;
+    let owners = Owners::discover(&tree, &config.sources);
+    let schemes = source::configured_schemes(&config.sources)?;
+    let current = window(
+        &root.join("state/example/windows"),
+        "20261025T120000Z-0001",
+        vec![SourcedRecord {
+            source: "echo".to_owned(),
+            record: record(
+                "echo:C0EXAMPLE01/paraphrase",
+                "C0EXAMPLE01",
+                "2026-10-25T10:00:00Z",
+                "Does the supplier agreement extend into spring?",
+                RecordOptions {
+                    label: Some("#general"),
+                    thread: None,
+                    aliases: &[],
+                    context: false,
+                },
+            )?,
+        }],
+    )?;
+    let embedder = support::fake_embed::ConceptEmbedder::new("fake-embedding-1");
+    let delta = delta::compute(
+        &tree,
+        &schemes,
+        &owners,
+        &current,
+        None,
+        timestamp("2026-10-25T12:01:00Z")?,
+        Some(&embedder),
+    )?;
+    let without = delta::compute(
+        &tree,
+        &schemes,
+        &owners,
+        &current,
+        None,
+        timestamp("2026-10-25T12:01:00Z")?,
+        None,
+    )?;
+    remove_scratch(&root)?;
+
+    let paraphrase = match_for(&delta, "echo:C0EXAMPLE01/paraphrase")?;
+    assert_eq!(
+        paraphrase.matches,
+        vec![Match {
+            record: "questions/renewal.md".to_owned(),
+            how: "meaning".to_owned(),
+        }],
+        "the message shares no word with the record it paraphrases"
+    );
+    let flagged = delta
+        .unreviewed
+        .iter()
+        .map(|flag| flag.record.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(flagged, ["questions/renewal.md"]);
+    assert_eq!(
+        match_for(&without, "echo:C0EXAMPLE01/paraphrase")?.matches,
+        [] as [Match; 0],
+        "without an embedder the message matches nothing"
+    );
     Ok(())
 }

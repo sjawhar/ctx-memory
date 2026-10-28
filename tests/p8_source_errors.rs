@@ -53,6 +53,7 @@ fn clear_echo_environment(command: &mut std::process::Command) {
         "ECHO_LATE",
         "ECHO_NO_HELLO",
         "ECHO_SLEEP",
+        "ECHO_WAIT_FOR",
         "ECHO_REQUEST_OUT",
         "ECHO_EXIT",
     ] {
@@ -139,7 +140,11 @@ fn store_only_verify_does_not_assume_external_builtin_named_schemes_are_verbatim
         "---\ntype: decision\nquote: \"stored text\"\n---\nslack:C0EXAMPLE01/1700000000.000001\n",
     )?;
     let timestamp = DateTime::parse_from_rfc3339("2023-11-14T22:13:20Z")?.with_timezone(&Utc);
-    let store = Store::open(&root.join("state/example/store.sqlite3"))?;
+    let store = Store::open(
+        &root.join("state/example/store.sqlite3"),
+        &root.join("state/example/sources.json"),
+        &root.join("state/example/resolved"),
+    )?;
     store.put_all(
         "echo",
         &[Record {
@@ -157,6 +162,7 @@ fn store_only_verify_does_not_assume_external_builtin_named_schemes_are_verbatim
             context: false,
             raw: Value::Null,
         }],
+        timestamp,
     )?;
     let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
     let output = binary()
@@ -166,7 +172,8 @@ fn store_only_verify_does_not_assume_external_builtin_named_schemes_are_verbatim
         .context("running store-only citation verification")?;
     remove_scratch(&root)?;
 
-    assert_eq!(output.status.code(), Some(0));
+    // A quote nothing could check fails `cite verify`, as it fails the writer.
+    assert_eq!(output.status.code(), Some(1));
     let value: Value = serde_json::from_slice(&output.stdout)?;
     let data = value
         .get("data")

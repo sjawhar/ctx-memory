@@ -165,24 +165,41 @@ fn kill_process_group(child: &std::process::Child, program: &str, timeout: Durat
     Ok(())
 }
 
-fn timeout_error(program: &str, timeout: Duration) -> anyhow::Error {
-    anyhow!("{program}: timed out after {}s", timeout.as_secs())
+/// A run stopped because it went past its wall-clock limit.
+///
+/// Typed, so a caller can tell "the program was stopped part-way through" — after which what
+/// it did is unknown — from "the program said no".
+#[derive(Debug)]
+pub struct TimedOut {
+    program: String,
+    timeout: Duration,
 }
 
-/// Run `program args…` with stdin closed and a wall-clock limit.
-///
-/// A missing binary errors as `<program>: not found`; a run past `timeout` terminates its
-/// process group and errors as `<program>: timed out after <N>s`.
-///
-/// # Errors
-///
-/// Returns an error when the program cannot start, a pipe cannot be read, or either the process
-/// group or reader threads exceed the deadline.
-pub fn run(program: &str, args: &[&str], timeout: Duration) -> Result<Output> {
-    run_with_stdin(program, args, &[], timeout)
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: timed out after {}s",
+            self.program,
+            self.timeout.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+fn timeout_error(program: &str, timeout: Duration) -> anyhow::Error {
+    anyhow::Error::new(TimedOut {
+        program: program.to_owned(),
+        timeout,
+    })
 }
 
 /// Run `program args…` with `stdin` and a wall-clock limit.
+///
+/// An empty `stdin` closes the child's standard input. A missing binary errors as
+/// `<program>: not found`; a run past `timeout` terminates its process group and errors as
+/// `<program>: timed out after <N>s`.
 ///
 /// # Errors
 ///
@@ -194,13 +211,33 @@ pub fn run_with_stdin(
     stdin: &[u8],
     timeout: Duration,
 ) -> Result<Output> {
+    let mut command = Command::new(program);
+    command.args(args);
+    run_command(command, program, stdin, timeout)
+}
+
+/// Run a prepared command with `stdin` and a wall-clock limit, as [`run_with_stdin`] does.
+///
+/// The caller sets the program, arguments, environment and directory; this sets the three
+/// standard streams and puts the child in a process group of its own, so a run past
+/// `timeout` stops every process it started. `program` names it in errors.
+///
+/// # Errors
+///
+/// Returns an error when the program cannot start, stdin cannot be written, a pipe cannot be
+/// read, or the process group exceeds the deadline.
+pub fn run_command(
+    mut command: Command,
+    program: &str,
+    stdin: &[u8],
+    timeout: Duration,
+) -> Result<Output> {
     let child_stdin = if stdin.is_empty() {
         Stdio::null()
     } else {
         Stdio::piped()
     };
-    let mut child = Command::new(program)
-        .args(args)
+    let mut child = command
         .stdin(child_stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -278,6 +315,11 @@ pub fn run_with_stdin(
 mod tests {
     use super::*;
 
+    /// Every test runs with standard input closed.
+    fn run(program: &str, args: &[&str], timeout: Duration) -> Result<Output> {
+        run_with_stdin(program, args, &[], timeout)
+    }
+
     #[test]
     fn captures_stdout_and_exit_code() -> Result<()> {
         let output = run(
@@ -326,13 +368,14 @@ mod tests {
     #[test]
     fn injected_reader_error_rejects_partial_stdout() -> Result<()> {
         let error = checked_reader_output(
-            "gws",
+            "ctx-source-example",
             "stdout",
             Err(std::io::Error::other("injected pipe failure")),
         )
         .err()
         .ok_or_else(|| anyhow!("injected reader error unexpectedly succeeded"))?;
-        assert!(format!("{error:#}").contains("gws: reading stdout: injected pipe failure"));
+        assert!(format!("{error:#}")
+            .contains("ctx-source-example: reading stdout: injected pipe failure"));
         Ok(())
     }
 

@@ -1,0 +1,8 @@
+# The image builds (deploy/*/Dockerfile) copy named paths only; everything else is context the
+# daemon transfers for nothing. `target` is the big one: a developer box's build directory is
+# gigabytes, and sending it makes a local image build slower than the compile inside it.
+.git
+.github
+target
+docs
+tests

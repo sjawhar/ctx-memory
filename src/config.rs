@@ -17,6 +17,8 @@ pub type TreeId = String;
 pub struct TreeConfig {
     pub version: u32,
     pub id: Option<TreeId>,
+    /// Directory holding the files shared between machines; see `data_dir`.
+    pub data_dir: Option<PathBuf>,
     #[serde(default)]
     pub folder_notes: Vec<String>,
     #[serde(default)]
@@ -25,6 +27,9 @@ pub struct TreeConfig {
     pub ingest: IngestConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
+    /// Where a credential comes from on a machine without Secret Manager.
+    #[serde(default)]
+    pub credentials: crate::credentials::Config,
 }
 
 impl Default for TreeConfig {
@@ -32,10 +37,12 @@ impl Default for TreeConfig {
         Self {
             version: 1,
             id: None,
+            data_dir: None,
             folder_notes: Vec::new(),
             dossier: DossierConfig::default(),
             ingest: IngestConfig::default(),
             sources: Vec::new(),
+            credentials: crate::credentials::Config::new(),
         }
     }
 }
@@ -85,6 +92,7 @@ pub fn default_scheme(kind: &str) -> Option<&'static str> {
         "gmail" => Some("gmail"),
         "drive" => Some("drive"),
         "calendar" => Some("gcal"),
+        "github" => Some("github"),
         _ => None,
     }
 }
@@ -193,6 +201,8 @@ fn validate_source_id(id: &str) -> Result<()> {
 pub struct UserConfig {
     pub memory: Option<String>,
     pub state_dir: Option<PathBuf>,
+    /// The ctx server this machine reads and writes through, when it has one.
+    pub server: Option<String>,
 }
 
 impl UserConfig {
@@ -333,8 +343,52 @@ impl StateDir {
     }
 
     #[must_use]
-    pub fn cursors(&self) -> PathBuf {
-        self.root.join("cursors.json")
+    pub fn fetch_lock(&self) -> PathBuf {
+        self.root.join("fetch.lock")
+    }
+
+    /// The records live resolution obtained on this machine, which a rebuild replays.
+    #[must_use]
+    pub fn resolved(&self) -> PathBuf {
+        self.root.join("resolved")
+    }
+
+    #[must_use]
+    pub fn source_state(&self, source_id: &str) -> PathBuf {
+        self.root.join("sources").join(source_id)
+    }
+}
+
+/// Returns the configured directory for the files shared between machines.
+///
+/// `CTX_DATA_DIR` wins over `data_dir` in `ctx.toml`. When neither is set the caller keeps its
+/// own default, which is the tree's state directory.
+#[must_use]
+pub fn data_dir(config: &TreeConfig) -> Option<PathBuf> {
+    data_dir_from(std::env::var_os("CTX_DATA_DIR").map(PathBuf::from), config)
+}
+
+/// Pure data-directory resolution over an explicit `CTX_DATA_DIR` value.
+#[must_use]
+pub fn data_dir_from(environment: Option<PathBuf>, config: &TreeConfig) -> Option<PathBuf> {
+    environment.or_else(|| config.data_dir.clone())
+}
+
+/// The directory holding fetch windows, cursors, and the other files shared between machines.
+#[derive(Debug)]
+pub struct DataDir {
+    root: PathBuf,
+}
+
+impl DataDir {
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     #[must_use]
@@ -343,10 +397,29 @@ impl StateDir {
     }
 
     #[must_use]
-    pub fn fetch_lock(&self) -> PathBuf {
-        self.root.join("fetch.lock")
+    pub fn cursors(&self) -> PathBuf {
+        self.root.join("cursors.json")
     }
 
+    #[must_use]
+    pub fn marker(&self) -> PathBuf {
+        self.root.join("marker.json")
+    }
+
+    /// The directory holding cached embedding vectors, one file per content hash (C1).
+    #[must_use]
+    pub fn embeddings(&self) -> PathBuf {
+        self.root.join("embeddings")
+    }
+
+    #[must_use]
+    pub fn sources(&self) -> PathBuf {
+        self.root.join("sources.json")
+    }
+
+    /// What a source must keep between fetches, such as the Slack threads whose parent is older
+    /// than the window being fetched. A fetch reaches that material only through this file, so
+    /// it travels with the windows instead of staying on the machine that fetched last.
     #[must_use]
     pub fn source_state(&self, source_id: &str) -> PathBuf {
         self.root.join("sources").join(source_id)
@@ -360,7 +433,9 @@ mod tests {
 
     use anyhow::{Context as _, Result};
 
-    use super::{locate_tree, state_base_from, StateDir, TreeConfig, UserConfig};
+    use super::{
+        data_dir_from, locate_tree, state_base_from, DataDir, StateDir, TreeConfig, UserConfig,
+    };
 
     static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -472,20 +547,46 @@ mod tests {
             PathBuf::from("/var/state/ctx/example/store.sqlite3")
         );
         assert_eq!(
-            state.cursors(),
-            PathBuf::from("/var/state/ctx/example/cursors.json")
-        );
-        assert_eq!(
-            state.windows(),
-            PathBuf::from("/var/state/ctx/example/windows")
-        );
-        assert_eq!(
             state.fetch_lock(),
             PathBuf::from("/var/state/ctx/example/fetch.lock")
         );
         assert_eq!(
             state.source_state("source"),
             PathBuf::from("/var/state/ctx/example/sources/source")
+        );
+    }
+
+    #[test]
+    fn data_dir_holds_the_files_shared_between_machines() {
+        let data = DataDir::new(PathBuf::from("/mnt/share/memory"));
+        assert_eq!(data.windows(), PathBuf::from("/mnt/share/memory/windows"));
+        assert_eq!(
+            data.cursors(),
+            PathBuf::from("/mnt/share/memory/cursors.json")
+        );
+        assert_eq!(
+            data.marker(),
+            PathBuf::from("/mnt/share/memory/marker.json")
+        );
+        assert_eq!(
+            data.source_state("slack"),
+            PathBuf::from("/mnt/share/memory/sources/slack")
+        );
+    }
+
+    #[test]
+    fn the_environment_data_dir_wins_over_tree_configuration() {
+        let mut config = TreeConfig::default();
+        assert_eq!(data_dir_from(None, &config), None);
+
+        config.data_dir = Some(PathBuf::from("/mnt/share/memory"));
+        assert_eq!(
+            data_dir_from(None, &config),
+            Some(PathBuf::from("/mnt/share/memory"))
+        );
+        assert_eq!(
+            data_dir_from(Some(PathBuf::from("/mnt/other")), &config),
+            Some(PathBuf::from("/mnt/other"))
         );
     }
 }

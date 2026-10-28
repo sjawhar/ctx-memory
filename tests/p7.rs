@@ -1,4 +1,5 @@
-use std::os::unix::fs::PermissionsExt as _;
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -14,6 +15,7 @@ use ctx_memory::{
     store::Store,
 };
 use serde_json::Value;
+use support::fake_google::FakeGoogle;
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -62,6 +64,15 @@ fn pointer(text: &str) -> Pointer {
     }
 }
 
+/// The store of a tree whose state lives under `state_base`.
+fn tree_store(state_base: &Path) -> Result<Store> {
+    Store::open(
+        &state_base.join("example/store.sqlite3"),
+        &state_base.join("example/sources.json"),
+        &state_base.join("example/resolved"),
+    )
+}
+
 #[test]
 fn generic_scheme_is_recognised_only_when_configured() {
     let schemes = Schemes::new(["linear".to_owned()]);
@@ -101,9 +112,14 @@ fn slack_permalink_maps_to_pointer_and_thread() -> Result<()> {
 }
 
 #[test]
-fn store_first_copy_wins_and_thread_orders_by_timestamp() -> Result<()> {
+fn store_keeps_every_version_and_thread_orders_by_timestamp() -> Result<()> {
     let root = scratch("store")?;
-    let store = Store::open(&root.join("store.sqlite3"))?;
+    let store = Store::open(
+        &root.join("store.sqlite3"),
+        &root.join("sources.json"),
+        &root.join("resolved"),
+    )?;
+    let fetched_at = DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?;
     let parent = "slack:C0EXAMPLE01/1700000000.000001";
     let reply_early = "slack:C0EXAMPLE01/1700000001.000001";
     let reply_late = "slack:C0EXAMPLE01/1700000002.000001";
@@ -114,17 +130,26 @@ fn store_first_copy_wins_and_thread_orders_by_timestamp() -> Result<()> {
         record(reply_early, Some(parent), 1_700_000_001, "early reply")?,
         record(parent, None, 1_700_000_003, "second copy")?,
     ];
-    assert_eq!(store.put_all("slack", &records)?, 3);
+    assert_eq!(store.put_all("slack", &records, fetched_at)?, 4);
+    assert_eq!(store.put_all("slack", &records, fetched_at)?, 0);
     assert_eq!(
         store
             .get(&pointer("C0EXAMPLE01/1700000000.000001"))?
             .map(|found| found.text)
             .as_deref(),
-        Some("first copy")
+        Some("second copy")
+    );
+    assert_eq!(
+        store
+            .versions(&pointer("C0EXAMPLE01/1700000000.000001"))?
+            .into_iter()
+            .map(|(_, found)| found.text)
+            .collect::<Vec<_>>(),
+        ["first copy", "second copy"]
     );
     let thread = store.thread(&pointer("C0EXAMPLE01/1700000000.000001"))?;
     let texts: Vec<_> = thread.into_iter().map(|found| found.text).collect();
-    assert_eq!(texts, ["first copy", "early reply", "late reply"]);
+    assert_eq!(texts, ["early reply", "late reply", "second copy"]);
 
     remove_scratch(&root)
 }
@@ -133,8 +158,11 @@ fn store_first_copy_wins_and_thread_orders_by_timestamp() -> Result<()> {
 fn concurrent_reader_never_sees_a_partial_write() -> Result<()> {
     let root = scratch("concurrent-store")?;
     let store_path = root.join("store.sqlite3");
-    let writer_store = Store::open(&store_path)?;
-    let reader_store = Store::open(&store_path)?;
+    let sources_path = root.join("sources.json");
+    let resolved_path = root.join("resolved");
+    let writer_store = Store::open(&store_path, &sources_path, &resolved_path)?;
+    let reader_store = Store::open(&store_path, &sources_path, &resolved_path)?;
+    let fetched_at = DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?;
     let (sender, receiver) = std::sync::mpsc::channel();
     let reader_pointer = pointer("C0EXAMPLE01/1700000000.000000");
 
@@ -152,7 +180,7 @@ fn concurrent_reader_never_sees_a_partial_write() -> Result<()> {
                         "stored text",
                     )?);
                 }
-                assert_eq!(writer_store.put_all("slack", &records)?, 100);
+                assert_eq!(writer_store.put_all("slack", &records, fetched_at)?, 100);
             }
             Ok(())
         })();
@@ -216,33 +244,6 @@ fn echo_fixture_path() -> Result<std::ffi::OsString> {
     path_with(&fixture)
 }
 
-fn fake_gws(root: &Path) -> Result<PathBuf> {
-    let bin = root.join("bin");
-    std::fs::create_dir(&bin).with_context(|| format!("creating {}", bin.display()))?;
-    let program = bin.join("gws");
-    std::fs::write(
-        &program,
-        r#"#!/bin/sh
-set -eu
-
-case "$1:$2:$3" in
-    gmail:users:threads)
-        printf '%s\n' '{"messages":[{"id":"aaaaaaaaaaaaaaaa","threadId":"cccccccccccccccc","internalDate":"1792944000000","payload":{"headers":[{"name":"Subject","value":"First message"}],"mimeType":"text/plain","body":{"data":"bG9jYWwgcGFyZW50"}}},{"id":"bbbbbbbbbbbbbbbb","threadId":"cccccccccccccccc","internalDate":"1792947600000","payload":{"headers":[{"name":"Subject","value":"Second message"}],"mimeType":"text/plain","body":{"data":"bGl2ZSBHbWFpbCBzaWJsaW5n"}}}]}'
-        ;;
-    *)
-        exit 1
-        ;;
-esac
-"#,
-    )
-    .with_context(|| format!("writing {}", program.display()))?;
-    let mut permissions = std::fs::metadata(&program)?.permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&program, permissions)
-        .with_context(|| format!("marking {} executable", program.display()))?;
-    Ok(bin)
-}
-
 #[test]
 fn verify_reports_a_quote_missing_from_the_resolved_text() -> Result<()> {
     let root = scratch("resolve-verify")?;
@@ -258,7 +259,7 @@ fn verify_reports_a_quote_missing_from_the_resolved_text() -> Result<()> {
         &document,
         "---\ntype: decision\nstatus: open\nquote: \"beta gamma\"\nsource: \"slack:C0EXAMPLE01/1700000000.000001\"\n---\nEvidence.\n",
     )?;
-    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    let store = tree_store(&state_base)?;
     store.put_all(
         "slack",
         &[record(
@@ -267,6 +268,7 @@ fn verify_reports_a_quote_missing_from_the_resolved_text() -> Result<()> {
             1_700_000_000,
             "alpha beta gamma delta",
         )?],
+        DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?,
     )?;
 
     let resolved = run_ctx(
@@ -370,7 +372,8 @@ fn calendar_kind_uses_gcal_without_registering_calendar_as_generic() -> Result<(
     )?;
 
     let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
-    assert_eq!(verified.status.code(), Some(0));
+    // A quote nothing could check fails `cite verify`, as it fails the writer.
+    assert_eq!(verified.status.code(), Some(1));
     let data = response_data(&verified)?
         .get("data")
         .context("calendar verification response has data")?
@@ -438,7 +441,7 @@ fn quote_in_a_sibling_reply_of_the_source_pointer_verifies() -> Result<()> {
         tree.join("decision.md"),
         "---\ntype: decision\nstatus: open\nquote: \"the sibling contains the evidence\"\nsource: \"slack:C0EXAMPLE01/1700000000.000002\"\n---\n",
     )?;
-    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    let store = tree_store(&state_base)?;
     store.put_all(
         "slack",
         &[
@@ -461,6 +464,7 @@ fn quote_in_a_sibling_reply_of_the_source_pointer_verifies() -> Result<()> {
                 "the sibling contains the evidence",
             )?,
         ],
+        DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?,
     )?;
 
     let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
@@ -495,7 +499,7 @@ fn quote_matching_only_a_body_pointer_is_unchecked() -> Result<()> {
         tree.join("decision.md"),
         "---\ntype: decision\nstatus: open\nquote: \"body-only evidence\"\nsource: \"meetings/example/transcript.txt:12\"\n---\nContext: slack:C0EXAMPLE01/1700000000.000004\n",
     )?;
-    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    let store = tree_store(&state_base)?;
     store.put_all(
         "slack",
         &[record(
@@ -504,10 +508,12 @@ fn quote_matching_only_a_body_pointer_is_unchecked() -> Result<()> {
             1_700_000_000,
             "body-only evidence",
         )?],
+        DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?,
     )?;
 
     let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
-    assert_eq!(verified.status.code(), Some(0));
+    // A quote nothing could check fails `cite verify`, as it fails the writer.
+    assert_eq!(verified.status.code(), Some(1));
     let data = response_data(&verified)?
         .get("data")
         .context("body-only verification response has data")?
@@ -538,7 +544,7 @@ fn normalized_source_quote_matches_markup_mentions_and_ellipsis() -> Result<()> 
         tree.join("decision.md"),
         "---\ntype: decision\nstatus: open\nquote: \"portal hello \\\"world\\\" - @Alice ... later\"\nsource: \"slack:C0EXAMPLE01/1700000000.000005\"\n---\n",
     )?;
-    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    let store = tree_store(&state_base)?;
     store.put_all(
         "slack",
         &[record(
@@ -547,6 +553,7 @@ fn normalized_source_quote_matches_markup_mentions_and_ellipsis() -> Result<()> 
             1_700_000_000,
             "<https://example.com|Portal>  *HELLO*\n“WORLD” — <@U0EXAMPLE9> after later",
         )?],
+        DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?,
     )?;
 
     let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
@@ -577,11 +584,12 @@ fn live_verification_fills_a_partially_stored_source_thread() -> Result<()> {
         tree.join("decision.md"),
         "---\ntype: decision\nstatus: open\nquote: \"live sibling evidence\"\nsource: \"echo:parent\"\n---\n",
     )?;
-    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    let store = tree_store(&state_base)?;
     store.set_source_verbatim("echo", true)?;
     store.put_all(
         "echo",
         &[record("echo:parent", None, 1_700_000_000, "local parent")?],
+        DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?,
     )?;
     let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;
 
@@ -622,21 +630,23 @@ fn quote_mismatch_names_the_verbatim_source_that_was_checked() -> Result<()> {
     std::fs::create_dir(&tree)?;
     std::fs::write(
         tree.join("ctx.toml"),
-        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"drive\"\nkind = \"drive\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"calendar\"\nkind = \"calendar\"\ncalendars = [\"primary\"]\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
     )?;
     std::fs::write(
         tree.join("decision.md"),
-        "---\ntype: decision\nstatus: open\nquote: \"a different quote\"\nsource: \"drive:abcdefghijklmnopqrst; slack:C0EXAMPLE01/1700000000.000006\"\n---\n",
+        "---\ntype: decision\nstatus: open\nquote: \"a different quote\"\nsource: \"gcal:primary/EVENT-EXAMPLE; slack:C0EXAMPLE01/1700000000.000006\"\n---\n",
     )?;
-    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    let store = tree_store(&state_base)?;
+    let fetched_at = DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?;
     store.put_all(
-        "drive",
+        "calendar",
         &[record(
-            "drive:abcdefghijklmnopqrst",
+            "gcal:primary/EVENT-EXAMPLE",
             None,
             1_700_000_000,
-            "file contents",
+            "When: 2023-11-14T22:13:20Z",
         )?],
+        fetched_at,
     )?;
     store.put_all(
         "slack",
@@ -646,6 +656,7 @@ fn quote_mismatch_names_the_verbatim_source_that_was_checked() -> Result<()> {
             1_700_000_000,
             "actual Slack text",
         )?],
+        fetched_at,
     )?;
 
     let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
@@ -672,7 +683,31 @@ fn live_verification_fills_a_partially_stored_gmail_thread() -> Result<()> {
     let root = scratch("quote-live-gmail-thread")?;
     let tree = root.join("tree");
     let state_base = root.join("state");
-    let gws = fake_gws(&root)?;
+    let server = FakeGoogle::start(vec![(
+        "/gmail/v1/users/me/threads/cccccccccccccccc",
+        serde_json::json!({"messages": [
+            {
+                "id": "aaaaaaaaaaaaaaaa",
+                "threadId": "cccccccccccccccc",
+                "internalDate": "1792944000000",
+                "payload": {
+                    "headers": [{"name": "Subject", "value": "First message"}],
+                    "mimeType": "text/plain",
+                    "body": {"data": "bG9jYWwgcGFyZW50"}
+                }
+            },
+            {
+                "id": "bbbbbbbbbbbbbbbb",
+                "threadId": "cccccccccccccccc",
+                "internalDate": "1792947600000",
+                "payload": {
+                    "headers": [{"name": "Subject", "value": "Second message"}],
+                    "mimeType": "text/plain",
+                    "body": {"data": "bGl2ZSBHbWFpbCBzaWJsaW5n"}
+                }
+            }
+        ]}),
+    )])?;
     std::fs::create_dir(&tree)?;
     std::fs::write(
         tree.join("ctx.toml"),
@@ -682,7 +717,7 @@ fn live_verification_fills_a_partially_stored_gmail_thread() -> Result<()> {
         tree.join("decision.md"),
         "---\ntype: decision\nstatus: open\nquote: \"live Gmail sibling\"\nsource: \"gmail:aaaaaaaaaaaaaaaa\"\n---\n",
     )?;
-    let store = Store::open(&state_base.join("example/store.sqlite3"))?;
+    let store = tree_store(&state_base)?;
     store.put_all(
         "gmail",
         &[record(
@@ -691,13 +726,15 @@ fn live_verification_fills_a_partially_stored_gmail_thread() -> Result<()> {
             1_700_000_000,
             "local parent",
         )?],
+        DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?,
     )?;
     let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;
 
     let local = binary()
         .args(["--json", "--memory", tree_text, "cite", "verify"])
         .env("CTX_STATE_DIR", &state_base)
-        .env("PATH", path_with(&gws)?)
+        .env("CTX_GOOGLE_API_BASE", server.base())
+        .env("CTX_CREDENTIAL_GOOGLE", "ya29.p7-gmail")
         .output()
         .context("running local Gmail citation verification")?;
     assert_eq!(local.status.code(), Some(1));
@@ -705,7 +742,8 @@ fn live_verification_fills_a_partially_stored_gmail_thread() -> Result<()> {
     let live = binary()
         .args(["--json", "--memory", tree_text, "cite", "verify", "--live"])
         .env("CTX_STATE_DIR", &state_base)
-        .env("PATH", path_with(&gws)?)
+        .env("CTX_GOOGLE_API_BASE", server.base())
+        .env("CTX_CREDENTIAL_GOOGLE", "ya29.p7-gmail")
         .output()
         .context("running live Gmail citation verification")?;
     remove_scratch(&root)?;

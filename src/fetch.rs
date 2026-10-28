@@ -8,11 +8,13 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt as _;
 
 use crate::atomic::write_replace;
-use crate::config::{SourceConfig, StateDir};
+use crate::config::{DataDir, SourceConfig, StateDir};
 use crate::context::Context;
-use crate::cursor::{self, Cursors};
+use crate::cursor::{self, AdvanceOutcome, Cursors};
 use crate::delta::{self, Delta};
+use crate::lease::{self, Lease};
 use crate::record::Record;
+use crate::redact::one_line;
 use crate::render;
 use crate::source::{
     self, FetchRequest, Request as SourceRequest, Session, SourceOutcome, SourceRef, StreamResult,
@@ -30,36 +32,50 @@ pub struct FetchOptions {
     pub only: Vec<String>,
 }
 
-/// The completed window and source results from a fetch execution.
+/// The completed window, source results, and cursor movement from a fetch execution.
 #[derive(Debug)]
 pub struct FetchOutcome {
     pub window: Window,
     pub manifest: Manifest,
     pub delta: Delta,
     pub errored: Vec<(String, String)>,
+    pub cursors: AdvanceOutcome,
 }
 
-/// Runs every selected configured source into one complete staged window.
+/// Runs every selected configured source into one complete staged window, then moves the cursor
+/// of every stream that stored its messages.
 ///
 /// # Errors
 ///
-/// Returns an error when another fetch or cursor advance holds the state lock, state artifacts
-/// cannot be persisted, or an invalid selected source is requested. Source failures are retained
-/// in the returned outcome and its manifest.
+/// Returns an error when the fetch runs as a Cloud Run job with no lease bucket, another fetch
+/// holds the state lock, state artifacts cannot be persisted, or an invalid selected source is
+/// requested. Source failures are retained in the returned outcome and its manifest.
 pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> {
+    // Cloud Scheduler can start the fetch job while its last execution still runs, and the two
+    // executions share the data directory but not the `flock` below, which is per machine. With
+    // no lease bucket neither would take a lease, so a fetch that runs as a Cloud Run job does
+    // not start, and writes nothing. Cloud Run names the job it runs in `CLOUD_RUN_JOB`.
+    if lease::bucket().is_none() && std::env::var_os("CLOUD_RUN_JOB").is_some() {
+        bail!(
+            "ctx fetch as a Cloud Run job needs CTX_LEASE_BUCKET: two executions can run at \
+             once, and the fetch lease is what keeps one of them the only writer"
+        );
+    }
     let state = context.state()?;
+    let data = context.data()?;
     let _lock = acquire_lock(state)?;
+    // The flock keeps one machine single; the share has no locks, so the lease is what keeps
+    // the fetch job single across machines. It is taken before anything is staged, so a run
+    // that may not write writes nothing at all.
+    let lease = lease::for_role("fetch")?;
     validate_selection(&context.config.sources, &options.only)?;
 
-    let cursors = cursor::load(&state.cursors())?;
-    let staged = windows::stage(&state.windows(), options.window_end)?;
-    let store = Store::open(&state.store())?;
+    let cursors = cursor::load(&data.cursors())?;
+    let staged = windows::stage(&data.windows(), options.window_end)?;
+    let store = Store::load(data, state)?;
     let schemes = source::configured_schemes(&context.config.sources)?;
     let generated_at = Utc::now();
-    let mut records = Vec::new();
-    let mut sources = BTreeMap::new();
-    let mut warnings = Vec::new();
-    let mut errored = Vec::new();
+    let mut collected = Collected::default();
 
     for spec in context
         .config
@@ -67,18 +83,20 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
         .iter()
         .filter(|spec| options.only.is_empty() || options.only.contains(&spec.id))
     {
-        let result = run_source(context, state, spec, options, &cursors, &schemes)?;
-        collect_source_result(
-            spec,
-            result,
-            &mut records,
-            &mut sources,
-            &mut warnings,
-            &mut errored,
-            &store,
-        )?;
+        lease
+            .as_ref()
+            .map_or(Ok(()), Lease::check)
+            .with_context(|| format!("before fetching {}", spec.id))?;
+        let result = run_source(context, data, spec, options, &cursors, &schemes)?;
+        collect_source_result(spec, result, &mut collected, &store, generated_at)?;
     }
 
+    let Collected {
+        records,
+        sources,
+        warnings,
+        errored,
+    } = collected;
     let exit_status = if errored.is_empty() {
         Status::Ok
     } else {
@@ -93,8 +111,12 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
         warnings,
         exit_status,
     };
+    lease
+        .as_ref()
+        .map_or(Ok(()), Lease::check)
+        .context("before writing the window")?;
     write_window(&staged, &records, &manifest)?;
-    let previous = windows::previous(&state.windows(), &staged.id)?;
+    let previous = windows::previous(&data.windows(), &staged.id)?;
     let owners = delta::Owners::discover(&context.tree, &context.config.sources);
     let snapshot = delta::open_snapshot(&context.tree, generated_at);
     let delta = delta::compute(
@@ -104,15 +126,40 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
         &staged,
         previous.as_ref(),
         generated_at,
+        context.embedding()?.embedder(),
     )?;
     // Write delta.json, delta.md, and open-snapshot.json before completing the staged window.
     delta::write(&staged, &snapshot, &delta)?;
-    let window = windows::complete(staged, &state.windows())?;
+    // The compute can wait on Vertex AI for a long time, long enough for this copy to lose the
+    // lease; a copy that lost it publishes nothing, so the window stays staged.
+    lease
+        .as_ref()
+        .map_or(Ok(()), Lease::check)
+        .context("before publishing the window")?;
+    let window = windows::complete(staged, &data.windows())?;
+    // The streams that stored their messages move their own cursors; a failed stream holds only
+    // its own, so the next fetch re-reads only what this one did not store.
+    lease
+        .as_ref()
+        .map_or(Ok(()), Lease::check)
+        .context("before moving the cursors")?;
+    let cursors = cursor::advance(&data.cursors(), &window.id, &manifest)?;
+    if let Some(lease) = lease {
+        // The next run starts at once rather than waiting out the takeover window; a failure
+        // here costs that run the wait and nothing else.
+        if let Err(error) = lease.release() {
+            eprintln!(
+                "releasing the fetch lease: {}",
+                one_line(&format!("{error:#}"))
+            );
+        }
+    }
     Ok(FetchOutcome {
         window,
         manifest,
         delta,
         errored,
+        cursors,
     })
 }
 
@@ -146,7 +193,7 @@ fn validate_selection(sources: &[SourceConfig], only: &[String]) -> Result<()> {
 
 fn run_source(
     context: &Context,
-    state: &StateDir,
+    data: &DataDir,
     spec: &SourceConfig,
     options: &FetchOptions,
     cursors: &Cursors,
@@ -168,7 +215,7 @@ fn run_source(
                 .map(|(stream, entry)| (stream.clone(), entry.cursor.clone()))
                 .collect()
         });
-    let state_dir = state.source_state(&spec.id);
+    let state_dir = data.source_state(&spec.id);
     fs::create_dir_all(&state_dir).with_context(|| format!("creating {}", state_dir.display()))?;
     let request = SourceRequest::Fetch(FetchRequest {
         protocol: source::PROTOCOL_VERSION,
@@ -199,31 +246,40 @@ fn run_source(
     })
 }
 
+/// What one fetch execution accumulates across its sources.
+#[derive(Default)]
+struct Collected {
+    records: Vec<SourcedRecord>,
+    sources: BTreeMap<String, SourceManifest>,
+    warnings: Vec<String>,
+    errored: Vec<(String, String)>,
+}
+
 fn collect_source_result(
     spec: &SourceConfig,
     result: SourceRun,
-    records: &mut Vec<SourcedRecord>,
-    sources: &mut BTreeMap<String, SourceManifest>,
-    warnings: &mut Vec<String>,
-    errored: &mut Vec<(String, String)>,
+    collected: &mut Collected,
     store: &Store,
+    fetched_at: DateTime<Utc>,
 ) -> Result<()> {
     if let Some(verbatim) = result.outcome.verbatim {
         store.set_source_verbatim(&spec.id, verbatim)?;
     }
-    store.put_all(&spec.id, &result.outcome.records)?;
+    store.put_all(&spec.id, &result.outcome.records, fetched_at)?;
     for warning in &result.outcome.warnings {
         let stream = warning
             .stream
             .as_deref()
             .map_or_else(String::new, |stream| format!(" stream {stream}"));
-        warnings.push(format!("source {}{stream}: {}", spec.id, warning.message));
+        collected
+            .warnings
+            .push(format!("source {}{stream}: {}", spec.id, warning.message));
     }
 
     let mut streams = BTreeMap::new();
     for (stream, outcome) in &result.outcome.streams {
         if outcome.status == StreamStatus::Error {
-            errored.push((
+            collected.errored.push((
                 spec.id.clone(),
                 outcome
                     .error
@@ -243,14 +299,14 @@ fn collect_source_result(
         );
     }
     if let Some(error) = result.outcome.error.as_deref() {
-        errored.push((spec.id.clone(), error.to_owned()));
+        collected.errored.push((spec.id.clone(), error.to_owned()));
     }
     let status = if result.outcome.has_errors() {
         Status::Error
     } else {
         Status::Ok
     };
-    sources.insert(
+    collected.sources.insert(
         spec.id.clone(),
         SourceManifest {
             kind: spec.kind.clone(),
@@ -259,7 +315,7 @@ fn collect_source_result(
             streams,
         },
     );
-    records.extend(
+    collected.records.extend(
         result
             .outcome
             .records

@@ -34,7 +34,7 @@ impl Schemes {
     /// Creates a parser registry containing every built-in scheme and valid configured schemes.
     #[must_use]
     pub fn new(configured: impl IntoIterator<Item = String>) -> Self {
-        let mut schemes = ["slack", "gmail", "drive", "gcal"]
+        let mut schemes = ["slack", "gmail", "drive", "gcal", "github"]
             .into_iter()
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
@@ -101,10 +101,24 @@ impl Schemes {
                     "gmail" => gmail_pointer_at(text, start),
                     "drive" => drive_pointer_at(text, start),
                     "gcal" => gcal_pointer_at(text, start),
+                    "github" => github_pointer_at(text, start),
                     _ => generic_pointer_at(text, start, scheme),
                 })
         })
     }
+}
+
+/// Whether `text` claims a pointer: a scheme, a colon, and a locator with no space in it.
+///
+/// A text of this shape claims provenance at a source, whether or not any source is
+/// configured for its scheme. Free text ("overheard in standup") claims none.
+#[must_use]
+pub fn is_pointer_shaped(text: &str) -> bool {
+    text.trim()
+        .split_once(':')
+        .is_some_and(|(scheme, locator)| {
+            is_scheme(scheme) && !locator.is_empty() && !locator.contains(char::is_whitespace)
+        })
 }
 
 fn is_scheme(scheme: &str) -> bool {
@@ -307,6 +321,81 @@ fn gcal_pointer_at(text: &str, start: usize) -> Option<(Pointer, usize)> {
     ))
 }
 
+/// A byte an owner name may hold: GitHub owners are alphanumeric and hyphen.
+fn is_github_owner_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
+}
+
+/// A byte a repository name may hold: alphanumeric, hyphen, underscore, or dot.
+fn is_github_repo_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+
+/// Parses a GitHub pointer (contract C7):
+///
+/// `github:<owner>/<repo>#<n>` and its `/comment/<id>`, `/review/<id>` and
+/// `/review-comment/<id>` forms, or `github:<owner>/<repo>@<sha>` for a commit message.
+fn github_pointer_at(text: &str, start: usize) -> Option<(Pointer, usize)> {
+    let locator_start = start.checked_add("github:".len())?;
+    let owner_end = scan_while(text, locator_start, is_github_owner_byte);
+    if owner_end == locator_start || byte_at(text, owner_end) != Some(b'/') {
+        return None;
+    }
+    let repo_start = owner_end.checked_add(1)?;
+    let repo_end = scan_while(text, repo_start, is_github_repo_byte);
+    if repo_end == repo_start {
+        return None;
+    }
+    let end = match byte_at(text, repo_end) {
+        Some(b'#') => github_item_end(text, repo_end.checked_add(1)?)?,
+        Some(b'@') => github_commit_end(text, repo_end.checked_add(1)?)?,
+        _ => return None,
+    };
+    if has_strict_continuation(text, end) {
+        return None;
+    }
+    Some((
+        Pointer {
+            scheme: "github".to_owned(),
+            locator: text.get(locator_start..end)?.to_owned(),
+        },
+        end,
+    ))
+}
+
+/// The end of an issue or pull-request item: `<n>` and an optional sub-thread form.
+fn github_item_end(text: &str, number_start: usize) -> Option<usize> {
+    let number_end = scan_while(text, number_start, |byte| byte.is_ascii_digit());
+    if number_end == number_start {
+        return None;
+    }
+    if byte_at(text, number_end) != Some(b'/') {
+        return Some(number_end);
+    }
+    let kind_start = number_end.checked_add(1)?;
+    let kind_end = scan_while(text, kind_start, |byte| {
+        byte.is_ascii_lowercase() || byte == b'-'
+    });
+    let kind = text.get(kind_start..kind_end)?;
+    if !matches!(kind, "comment" | "review" | "review-comment")
+        || byte_at(text, kind_end) != Some(b'/')
+    {
+        return None;
+    }
+    let id_start = kind_end.checked_add(1)?;
+    let id_end = scan_while(text, id_start, |byte| byte.is_ascii_digit());
+    (id_end != id_start).then_some(id_end)
+}
+
+/// The end of a commit locator: a lower-hex SHA of seven to forty digits.
+fn github_commit_end(text: &str, sha_start: usize) -> Option<usize> {
+    let sha_end = scan_while(text, sha_start, |byte| {
+        byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+    });
+    let length = sha_end.checked_sub(sha_start)?;
+    (7..=40).contains(&length).then_some(sha_end)
+}
+
 fn slack_permalink_at(text: &str, start: usize) -> Option<Found> {
     let protocol_length = if text.get(start..)?.starts_with("https://") {
         "https://".len()
@@ -391,4 +480,68 @@ fn permalink_timestamp(digits: &str) -> Option<String> {
     let seconds = digits.get(..10)?;
     let micros = digits.get(10..)?;
     Some(format!("{seconds}.{micros}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Schemes;
+
+    fn parsed(text: &str) -> Option<String> {
+        Schemes::new([])
+            .parse(text)
+            .map(|pointer| pointer.to_string())
+    }
+
+    #[test]
+    fn parses_every_github_pointer_form() {
+        for text in [
+            "github:sjawhar/ctx-memory#12",
+            "github:sjawhar/ctx-memory#12/comment/3894201101",
+            "github:example-org/infra#7/review/2210047",
+            "github:example-org/infra#7/review-comment/998877",
+            "github:sjawhar/ctx-memory@d56570d",
+            "github:sjawhar/ctx-memory@41481dbb1f0f0ad1f6cf9e83d3a6ad1d0ec4a0f1",
+            "github:other-org/memory#1",
+            "github:sjawhar/ctx.memory#3",
+        ] {
+            assert_eq!(parsed(text).as_deref(), Some(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_github_pointer_without_an_item_or_a_commit_is_not_a_pointer() {
+        for text in [
+            "github:sjawhar",
+            "github:sjawhar/ctx-memory",
+            "github:sjawhar/ctx-memory#",
+            "github:sjawhar/ctx-memory#abc",
+            "github:/ctx-memory#1",
+            "github:sjawhar/ctx-memory#12/comment/",
+            "github:sjawhar/ctx-memory#12/comment/xyz",
+            "github:sjawhar/ctx-memory#12/reaction/4",
+            "github:sjawhar/ctx-memory@zzzzzzz",
+            "github:sjawhar/ctx-memory@d565",
+        ] {
+            assert_eq!(parsed(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_github_pointer_ends_before_the_prose_around_it() {
+        let schemes = Schemes::new([]);
+        let found = schemes.find_all(
+            "see (github:sjawhar/ctx-memory#12), and github:sjawhar/ctx-memory#12/review/88. Done.",
+        );
+        let pointers: Vec<String> = found
+            .iter()
+            .map(|entry| entry.pointer.to_string())
+            .collect();
+        assert_eq!(
+            pointers,
+            [
+                "github:sjawhar/ctx-memory#12",
+                "github:sjawhar/ctx-memory#12/review/88"
+            ]
+        );
+    }
 }

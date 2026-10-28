@@ -7,11 +7,38 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::api::http::{get_json, percent_encode};
+use crate::api::client;
+use crate::credentials::Secret;
 
 const SLACK_API: &str = "https://slack.com/api";
+
+/// The public OAuth client id of the Claude Code Slack app, which `ctx` reuses, the same app
+/// omp signs in with (`docs/sources.md`, "Slack source").
+pub const SLACK_CLIENT_ID: &str = "1601185624273.8899143856786";
+/// Where the browser authorizes the sign-in.
+pub const SLACK_AUTHORIZE_URL: &str = "https://slack.com/oauth/v2_user/authorize";
+/// Where an authorization code or a refresh token is exchanged for an access token.
+pub const SLACK_TOKEN_URL: &str = "https://slack.com/api/oauth.v2.user.access";
+/// The resource this app's tokens are scoped to.
+pub const SLACK_RESOURCE: &str = "https://mcp.slack.com";
+/// The only redirect URI this public client accepts.
+pub const SLACK_REDIRECT_URI: &str = "http://localhost:3118/callback";
+/// The read scopes `ctx` needs: public and private channel listing and history, and user
+/// names. Scopes are additive per user, so the issued token may carry more.
+pub const SLACK_SCOPES: [&str; 5] = [
+    "channels:history",
+    "channels:read",
+    "groups:history",
+    "groups:read",
+    "users:read",
+];
+/// A token is refreshed once it is within this long of expiring (omp's skew).
+const REFRESH_SKEW_SECONDS: i64 = 300;
+/// Slack's token lifetime, used when a refresh response omits `expires_in`.
+const DEFAULT_EXPIRES_IN_SECONDS: i64 = 43_200;
 
 pub struct SlackClient<'a> {
     token: &'a str,
@@ -44,23 +71,17 @@ impl<'a> SlackClient<'a> {
     /// The response body whether or not Slack said `ok`, retrying up to twice on
     /// `ratelimited` five seconds apart.
     fn call_raw(&self, method: &str, params: &[(&str, String)]) -> Result<Value> {
-        let query = params
-            .iter()
-            .map(|(key, value)| format!("{key}={}", percent_encode(value)))
-            .collect::<Vec<_>>()
-            .join("&");
-        let url = if query.is_empty() {
-            format!("{}/{method}", self.api)
-        } else {
-            format!("{}/{method}?{query}", self.api)
-        };
-        let mut body = get_json(&url, self.token).with_context(|| format!("slack {method}"))?;
+        let url = format!("{}/{method}", self.api);
+        let (_, _, mut body) = client::get_json(&url, self.token, params)
+            .with_context(|| format!("slack {method}"))?;
         for _ in 0..2 {
             if slack_error(&body) != Some("ratelimited") {
                 break;
             }
             thread::sleep(Duration::from_secs(5));
-            body = get_json(&url, self.token).with_context(|| format!("slack {method}"))?;
+            let (_, _, retried) = client::get_json(&url, self.token, params)
+                .with_context(|| format!("slack {method}"))?;
+            body = retried;
         }
         Ok(body)
     }
@@ -146,19 +167,6 @@ impl<'a> SlackClient<'a> {
         Ok(messages)
     }
 
-    /// Fetch replies to a message, excluding the parent message.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a request fails, Slack reports an error, or a cursor repeats.
-    pub fn replies(&self, channel: &str, thread_ts: &str) -> Result<Vec<Value>> {
-        Ok(self
-            .thread_messages(channel, thread_ts)?
-            .into_iter()
-            .filter(|message| message.get("ts").and_then(Value::as_str) != Some(thread_ts))
-            .collect())
-    }
-
     /// Fetch metadata for a conversation.
     ///
     /// # Errors
@@ -170,36 +178,6 @@ impl<'a> SlackClient<'a> {
         body.get("channel")
             .cloned()
             .ok_or_else(|| anyhow!("slack conversations.info: missing 'channel' in response"))
-    }
-
-    /// Member user IDs of a conversation, following the cursor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a request fails, Slack reports an error, or a cursor repeats.
-    pub fn members(&self, channel: &str) -> Result<Vec<String>> {
-        let mut members = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = HashSet::new();
-        loop {
-            let mut params = vec![
-                ("channel", channel.to_owned()),
-                ("limit", "1000".to_owned()),
-            ];
-            if let Some(value) = &cursor {
-                params.push(("cursor", value.clone()));
-            }
-            let body = self.call("conversations.members", &params)?;
-            if let Some(Value::Array(found)) = body.get("members") {
-                members.extend(found.iter().filter_map(Value::as_str).map(str::to_owned));
-            }
-            cursor = checked_next_cursor(&body, &mut seen_cursors, "conversations.members")?;
-            if cursor.is_none() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(300));
-        }
-        Ok(members)
     }
 
     /// Every conversation of the given `types`, following the cursor.
@@ -323,6 +301,103 @@ pub fn html_unescape(text: &str) -> String {
         output.push_str(tail);
     }
     output
+}
+
+/// The Slack user OAuth credential (contract C6): everything needed to call the Web API and
+/// to refresh the token without a browser.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SlackCredential {
+    /// The bearer token every Web API call presents.
+    pub access: String,
+    /// The refresh token, redeemed for a new pair; it stops working once redeemed.
+    pub refresh: String,
+    /// When `access` expires.
+    pub expires: DateTime<Utc>,
+    /// The public client id a refresh presents.
+    pub client_id: String,
+    /// The token endpoint a refresh posts to.
+    pub token_url: String,
+    /// The resource the token is scoped to.
+    pub resource: String,
+}
+
+impl SlackCredential {
+    /// Reads the credential from its stored JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the JSON is not a Slack credential.
+    pub fn from_secret(secret: &Secret) -> Result<Self> {
+        secret.parse().context("parsing the Slack credential")
+    }
+
+    /// Serializes the credential for storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the credential cannot be serialized.
+    pub fn to_secret(&self) -> Result<Secret> {
+        Ok(Secret::new(
+            serde_json::to_string(self).context("serializing the Slack credential")?,
+        ))
+    }
+
+    /// Whether `access` is within the refresh skew of expiring at `now`.
+    #[must_use]
+    pub fn near_expiry(&self, now: DateTime<Utc>) -> bool {
+        self.expires - now <= chrono::Duration::seconds(REFRESH_SKEW_SECONDS)
+    }
+}
+
+/// Exchanges the refresh token for a renewed credential, keeping the fields the response does
+/// not carry. `post` performs the form POST to `token_url` and returns the parsed body.
+///
+/// Slack answers `200` even for a failure, with `{"ok":false,"error":...}`, so this inspects
+/// the body rather than the status.
+///
+/// # Errors
+///
+/// Returns an error when the POST fails, Slack reports an error, or the response has no access
+/// token. A Slack error is fatal for the refresh: the caller must sign in again rather than
+/// loop.
+pub fn refresh_credential(
+    credential: &SlackCredential,
+    now: DateTime<Utc>,
+    post: impl Fn(&str, &[(&str, String)]) -> Result<Value>,
+) -> Result<SlackCredential> {
+    let form = vec![
+        ("grant_type", "refresh_token".to_owned()),
+        ("refresh_token", credential.refresh.clone()),
+        ("client_id", credential.client_id.clone()),
+        ("resource", credential.resource.clone()),
+    ];
+    let body = post(&credential.token_url, &form)?;
+    if body.get("ok").and_then(Value::as_bool) == Some(false) {
+        let error = slack_error(&body).unwrap_or("unknown");
+        bail!("Slack refused the token refresh: {error:?}; run `ctx slack login` to sign in again");
+    }
+    let access = body
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| anyhow!("the Slack refresh response has no access_token"))?;
+    let refresh = body
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .unwrap_or(&credential.refresh);
+    let expires_in = body
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_EXPIRES_IN_SECONDS);
+    Ok(SlackCredential {
+        access: access.to_owned(),
+        refresh: refresh.to_owned(),
+        expires: now + chrono::Duration::seconds(expires_in),
+        client_id: credential.client_id.clone(),
+        token_url: credential.token_url.clone(),
+        resource: credential.resource.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -471,6 +546,90 @@ mod tests {
         assert!(request.contains("oldest=1792951800.123456"));
         assert!(request.contains("latest=1792951800.123456"));
         assert!(request.contains("inclusive=true"));
+        Ok(())
+    }
+
+    fn credential(expires: DateTime<Utc>) -> SlackCredential {
+        SlackCredential {
+            access: "old-access".to_owned(),
+            refresh: "old-refresh".to_owned(),
+            expires,
+            client_id: SLACK_CLIENT_ID.to_owned(),
+            token_url: SLACK_TOKEN_URL.to_owned(),
+            resource: SLACK_RESOURCE.to_owned(),
+        }
+    }
+
+    #[test]
+    fn near_expiry_uses_the_skew() -> Result<()> {
+        let now = DateTime::from_timestamp(1_700_000_000, 0)
+            .ok_or_else(|| anyhow::anyhow!("constructing test time"))?;
+        assert!(credential(now + chrono::Duration::seconds(60)).near_expiry(now));
+        assert!(credential(now + chrono::Duration::seconds(299)).near_expiry(now));
+        assert!(!credential(now + chrono::Duration::seconds(600)).near_expiry(now));
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_posts_the_rotation_form_and_keeps_unreturned_fields() -> Result<()> {
+        let now = DateTime::from_timestamp(1_700_000_000, 0)
+            .ok_or_else(|| anyhow::anyhow!("constructing test time"))?;
+        let seen = std::cell::RefCell::new(Vec::new());
+        let renewed = refresh_credential(&credential(now), now, |url, form| {
+            let owned: Vec<(String, String)> = form
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect();
+            seen.borrow_mut().push((url.to_owned(), owned));
+            Ok(json!({
+                "ok": true,
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 43_200,
+            }))
+        })?;
+        let calls = seen.into_inner();
+        assert_eq!(calls.len(), 1);
+        let (url, form) = calls.first().ok_or_else(|| anyhow::anyhow!("no call"))?;
+        assert_eq!(url, SLACK_TOKEN_URL);
+        assert!(form.contains(&("grant_type".to_owned(), "refresh_token".to_owned())));
+        assert!(form.contains(&("refresh_token".to_owned(), "old-refresh".to_owned())));
+        assert!(form.contains(&("client_id".to_owned(), SLACK_CLIENT_ID.to_owned())));
+        assert!(form.contains(&("resource".to_owned(), SLACK_RESOURCE.to_owned())));
+        assert!(!form.iter().any(|(key, _)| key == "client_secret"));
+        assert_eq!(renewed.access, "new-access");
+        assert_eq!(renewed.refresh, "new-refresh");
+        assert_eq!(renewed.expires, now + chrono::Duration::seconds(43_200));
+        assert_eq!(renewed.client_id, SLACK_CLIENT_ID);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_keeps_the_old_refresh_token_when_none_is_returned() -> Result<()> {
+        let now = DateTime::from_timestamp(1_700_000_000, 0)
+            .ok_or_else(|| anyhow::anyhow!("constructing test time"))?;
+        let renewed = refresh_credential(&credential(now), now, |_url, _form| {
+            Ok(json!({ "ok": true, "access_token": "new-access", "expires_in": 43_200 }))
+        })?;
+        assert_eq!(renewed.refresh, "old-refresh");
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_rejects_a_slack_error_without_looping() -> Result<()> {
+        let now = DateTime::from_timestamp(1_700_000_000, 0)
+            .ok_or_else(|| anyhow::anyhow!("constructing test time"))?;
+        let calls = std::cell::Cell::new(0_u32);
+        let error = refresh_credential(&credential(now), now, |_url, _form| {
+            calls.set(calls.get() + 1);
+            Ok(json!({ "ok": false, "error": "invalid_refresh_token" }))
+        })
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a Slack error must fail the refresh"))?;
+        assert_eq!(calls.get(), 1);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("invalid_refresh_token"));
+        assert!(rendered.contains("ctx slack login"));
         Ok(())
     }
 }

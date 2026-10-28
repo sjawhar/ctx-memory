@@ -10,9 +10,18 @@ op=$(printf '%s' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')
 scheme=$(printf '%s' "$request" | sed -n 's/.*"scheme":"\([^"]*\)".*/\1/p' | sed -n '1p')
 streams=$(printf '%s' "$request" | sed -n 's/.*"streams":\[\([^]]*\)\].*/\1/p')
 window_end=$(printf '%s' "$request" | sed -n 's/.*"window_end":"\([^"]*\)".*/\1/p')
+state_dir=$(printf '%s' "$request" | sed -n 's/.*"state_dir":"\([^"]*\)".*/\1/p')
 
 if [ -n "${ECHO_SLEEP-}" ]; then
     sleep "$ECHO_SLEEP"
+fi
+
+# With ECHO_WAIT_FOR the source goes on only once that file exists, so a test holds a fetch
+# here for as long as it needs, however slow the machine is.
+if [ -n "${ECHO_WAIT_FOR-}" ]; then
+    while [ ! -e "$ECHO_WAIT_FOR" ]; do
+        sleep 0.1
+    done
 fi
 
 if [ "${ECHO_EXIT-}" = "1" ]; then
@@ -48,6 +57,15 @@ for stream in $(printf '%s' "$streams" | tr ',' ' ' | tr -d '"'); do
         pointer_scheme=other
     fi
     printf '{"type":"record","pointer":"%s:%s/record","stream":"%s","ts":"%s","text":"echo %s","raw":null}\n' "$pointer_scheme" "$stream" "$stream" "$record_time" "$stream"
+    # With ECHO_THREAD_STATE the source behaves like Slack: a reply whose parent is older than
+    # the window is reachable only through the file the previous fetch left in state_dir.
+    if [ "${ECHO_THREAD_STATE-}" = "1" ]; then
+        tracked="$state_dir/threads-$stream.json"
+        if [ -f "$tracked" ]; then
+            printf '{"type":"record","pointer":"%s:%s/reply","stream":"%s","thread":"%s:%s/record","ts":"%s","text":"echo thread reply","raw":null}\n' "$pointer_scheme" "$stream" "$stream" "$pointer_scheme" "$stream" "$record_time"
+        fi
+        printf '{"parent":"%s:%s/record"}\n' "$pointer_scheme" "$stream" > "$tracked"
+    fi
     if [ "${ECHO_ERROR_CURSOR-}" = "$stream" ]; then
         printf '{"type":"stream_end","stream":"%s","status":"error","cursor":"%s","error":"echo failure"}\n' "$stream" "$window_end"
     elif [ "${ECHO_FAIL_STREAM-}" = "$stream" ]; then

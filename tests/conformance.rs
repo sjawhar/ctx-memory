@@ -1,9 +1,8 @@
-use std::io::{BufRead as _, BufReader, Write as _};
-use std::net::TcpListener;
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::thread::JoinHandle;
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
@@ -17,12 +16,13 @@ use ctx_memory::{
     store::Store,
 };
 use serde_json::Value;
+use support::fake_http::FakeHttp;
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 static ENVIRONMENT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const STREAMS: [&str; 2] = ["C0EXAMPLE01", "C0EXAMPLE02"];
-const ECHO_ENV_NAMES: [&str; 8] = [
+const ECHO_ENV_NAMES: [&str; 9] = [
     "ECHO_FAIL_STREAM",
     "ECHO_BAD_SCHEME",
     "ECHO_DUPLICATE_END",
@@ -30,6 +30,7 @@ const ECHO_ENV_NAMES: [&str; 8] = [
     "ECHO_LATE",
     "ECHO_NO_HELLO",
     "ECHO_SLEEP",
+    "ECHO_WAIT_FOR",
     "ECHO_REQUEST_OUT",
 ];
 
@@ -64,31 +65,6 @@ fn clear_echo_environment(command: &mut std::process::Command) {
     for name in ECHO_ENV_NAMES {
         command.env_remove(name);
     }
-}
-
-fn fake_slack_api(responses: Vec<String>) -> Result<(String, JoinHandle<Result<()>>)> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let address = listener.local_addr()?;
-    let server = std::thread::spawn(move || -> Result<()> {
-        for body in responses {
-            let (mut stream, _) = listener.accept()?;
-            let mut request = BufReader::new(stream.try_clone()?);
-            loop {
-                let mut line = String::new();
-                let bytes_read = request.read_line(&mut line)?;
-                if bytes_read == 0 || line == "\r\n" {
-                    break;
-                }
-            }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes())?;
-        }
-        Ok(())
-    });
-    Ok((format!("http://{address}"), server))
 }
 
 fn source_tree(root: &Path) -> Result<PathBuf> {
@@ -343,7 +319,11 @@ fn resolve_live_fallback_stores_and_returns_external_records() -> Result<()> {
     clear_echo_environment(&mut command);
     let output = command.output().context("running ctx resolve")?;
     let stored = (|| {
-        let store = Store::open(&root.join("state/example/store.sqlite3"))?;
+        let store = Store::open(
+            &root.join("state/example/store.sqlite3"),
+            &root.join("state/example/sources.json"),
+            &root.join("state/example/resolved"),
+        )?;
         store.get(&Pointer {
             scheme: "echo".to_owned(),
             locator: "x".to_owned(),
@@ -378,7 +358,7 @@ fn cite_verify_live_checks_verbatim_external_records() -> Result<()> {
     let tree = source_tree(&root)?;
     std::fs::write(
         tree.join("decision.md"),
-        "---\ntype: decision\nquote: \"echo\"\n---\necho:x\n",
+        "---\ntype: decision\nquote: \"echo\"\nsource: \"echo:x\"\n---\nThe decision.\n",
     )?;
     let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
     let mut first = binary();
@@ -470,6 +450,52 @@ fn source_run_discovers_streams_from_the_selected_tree() -> Result<()> {
         .and_then(Value::as_str)
         .context("source request has discovered stream")?;
     assert_eq!(stream, "C0EXAMPLEBB");
+    Ok(())
+}
+
+#[test]
+fn source_run_keeps_its_state_on_the_machine() -> Result<()> {
+    // `ctx fetch` hands a source `<data_dir>/sources/<id>`, so the material it can reach only
+    // through what it wrote last time survives a machine that has never fetched. `ctx source
+    // run` is a diagnostic: it stores no record and moves no cursor, so it keeps the machine's
+    // own directory and cannot change what the next fetch reads.
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .map_err(|error| anyhow::anyhow!("locking the test environment: {error}"))?;
+    let root = scratch("source-run-state")?;
+    let tree = source_tree(&root)?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let state = root.join("state");
+    let data = root.join("data");
+    let request_path = root.join("request.json");
+    let mut command = binary();
+    command
+        .args(["--memory", tree_text, "source", "run", "echo"])
+        .env("CTX_STATE_DIR", &state)
+        .env("CTX_DATA_DIR", &data)
+        .env("PATH", fixture_path()?);
+    clear_echo_environment(&mut command);
+    command.env("ECHO_REQUEST_OUT", &request_path);
+    let output = command.output().context("running ctx source run")?;
+    let request = std::fs::read(&request_path).context("reading echo request")?;
+    let shared = data.join("sources").exists();
+    remove_scratch(&root)?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request: Value = serde_json::from_slice(&request)?;
+    let state_dir = request
+        .get("state_dir")
+        .and_then(Value::as_str)
+        .context("source request names the source state directory")?;
+    assert_eq!(Path::new(state_dir), state.join("example/sources/echo"));
+    assert!(
+        !shared,
+        "a diagnostic run writes nothing under the data directory"
+    );
     Ok(())
 }
 
@@ -718,19 +744,49 @@ fn built_in_slack_conforms_against_fake_api() -> Result<()> {
         discovered: Vec::new(),
         state_dir: root.join("state"),
     });
-    let (api, server) = fake_slack_api(vec![
-        r#"{"ok":true,"channel":{"name":"general"}}"#.to_owned(),
-        r#"{"ok":true,"messages":[]}"#.to_owned(),
-    ])?;
-    let previous = std::env::var_os("SLACK_TOKEN");
-    std::env::set_var("SLACK_TOKEN", "test-token");
-    let source = source::SlackSource::with_api(api);
+    // The shared transport routes each Slack method by its path, so the test asserts what each
+    // call asked for rather than the order the calls came in.
+    let api = FakeHttp::start()?;
+    api.json(
+        "/conversations.list",
+        200,
+        r#"{"ok":true,"channels":[{"id":"C0EXAMPLE01","is_private":false,"is_member":true}]}"#,
+    )?;
+    api.json(
+        "/conversations.info",
+        200,
+        r#"{"ok":true,"channel":{"name":"general"}}"#,
+    )?;
+    api.json(
+        "/conversations.history",
+        200,
+        r#"{"ok":true,"messages":[]}"#,
+    )?;
+    let credential = r#"{"access":"test-token","refresh":"r","expires":"2099-01-01T00:00:00Z","client_id":"cid","token_url":"https://unused.example/token","resource":"https://mcp.slack.com"}"#;
+    let previous_credential = std::env::var_os("CTX_CREDENTIAL_SLACK");
+    let previous_secret = std::env::var_os("CTX_SECRET_SLACK");
+    std::env::remove_var("CTX_SECRET_SLACK");
+    std::env::set_var("CTX_CREDENTIAL_SLACK", credential);
+    let source = source::SlackSource::with_api(api.url(""));
     let outcome = run_conformance(&source, &request);
-    restore_environment("SLACK_TOKEN", previous);
-    server
-        .join()
-        .map_err(|_| anyhow::anyhow!("fake Slack API server panicked"))??;
+    restore_environment("CTX_CREDENTIAL_SLACK", previous_credential);
+    restore_environment("CTX_SECRET_SLACK", previous_secret);
     remove_scratch(&root)?;
+
+    // A message nobody has answered is read again for 48 hours, not for the 30 days a thread
+    // with replies is followed: the history is asked for back to 2026-10-23T18:00:00Z.
+    let history: Vec<_> = api
+        .requests()?
+        .into_iter()
+        .filter(|request| request.path == "/conversations.history")
+        .collect();
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert!(
+        history
+            .iter()
+            .all(|request| request.target.contains("oldest=1792778400")),
+        "{history:?}"
+    );
 
     assert!(!outcome.has_errors());
     assert_eq!(outcome.records.len(), 0);

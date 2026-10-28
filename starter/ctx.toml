@@ -15,4 +15,4 @@ vitals = ["status", "last_reviewed"]
 # [[sources]]
 # id = "gmail"
 # kind = "gmail"
-# query = ""
+# query = "-category:promotions -category:social"
