@@ -274,6 +274,39 @@ fn source_run_accepts_the_resolve_operation() -> Result<()> {
 }
 
 #[test]
+fn source_run_fetch_refuses_slack_to_keep_token_rotation_to_ctx_fetch() -> Result<()> {
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .map_err(|error| anyhow::anyhow!("locking test environment: {error}"))?;
+    let root = scratch("source-run-slack-fetch")?;
+    let tree = root.join("tree");
+    std::fs::create_dir(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\nworkspace = \"example\"\n",
+    )?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let output = binary()
+        .args(["--memory", tree_text, "source", "run", "slack"])
+        .env("CTX_STATE_DIR", root.join("state"))
+        .env_remove("CTX_CREDENTIAL_SLACK")
+        .env_remove("CTX_CREDENTIAL_SLACK_FILE")
+        .env_remove("CTX_SECRET_SLACK")
+        .output()
+        .context("running ctx source run slack")?;
+    remove_scratch(&root)?;
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("only ctx fetch may rotate the Slack credential"),
+        "unexpected source-run failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn source_opens_builtin_slack() -> Result<()> {
     let config: ctx_memory::config::TreeConfig = toml::from_str(
         "version = 1

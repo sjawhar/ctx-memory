@@ -35,8 +35,9 @@ pub const SLACK_SCOPES: [&str; 5] = [
     "groups:read",
     "users:read",
 ];
-/// A token is refreshed once it is within this long of expiring (omp's skew).
-const REFRESH_SKEW_SECONDS: i64 = 300;
+/// Longest permitted `ctx-fetch` run. The deployment's fetch job timeout must not be
+/// longer than this, so a token cannot expire during a fetch.
+const FETCH_JOB_MAX_RUNTIME_SECONDS: i64 = 3_600;
 /// Slack's token lifetime, used when a refresh response omits `expires_in`.
 const DEFAULT_EXPIRES_IN_SECONDS: i64 = 43_200;
 
@@ -342,10 +343,10 @@ impl SlackCredential {
         ))
     }
 
-    /// Whether `access` is within the refresh skew of expiring at `now`.
+    /// Whether `access` expires before a `ctx-fetch` run can finish.
     #[must_use]
     pub fn near_expiry(&self, now: DateTime<Utc>) -> bool {
-        self.expires - now <= chrono::Duration::seconds(REFRESH_SKEW_SECONDS)
+        self.expires - now <= chrono::Duration::seconds(FETCH_JOB_MAX_RUNTIME_SECONDS)
     }
 }
 
@@ -561,12 +562,15 @@ mod tests {
     }
 
     #[test]
-    fn near_expiry_uses_the_skew() -> Result<()> {
+    fn near_expiry_covers_the_full_fetch_timeout() -> Result<()> {
         let now = DateTime::from_timestamp(1_700_000_000, 0)
             .ok_or_else(|| anyhow::anyhow!("constructing test time"))?;
-        assert!(credential(now + chrono::Duration::seconds(60)).near_expiry(now));
-        assert!(credential(now + chrono::Duration::seconds(299)).near_expiry(now));
-        assert!(!credential(now + chrono::Duration::seconds(600)).near_expiry(now));
+        assert!(credential(now + chrono::Duration::minutes(30)).near_expiry(now));
+        assert!(credential(now + chrono::Duration::hours(1)).near_expiry(now));
+        assert!(
+            !credential(now + chrono::Duration::hours(1) + chrono::Duration::seconds(1))
+                .near_expiry(now)
+        );
         Ok(())
     }
 

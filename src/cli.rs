@@ -313,8 +313,8 @@ impl Command {
             // `--write` replaces the window's `delta.json`, `delta.md` and
             // `open-snapshot.json`, which the fetch job owns.
             Self::Delta { write: true, .. }
-            // A fetch moves cursors and publishes a window, a source run may rotate and save
-            // a credential, and the cursors and state paths are this machine's own.
+            // A fetch moves cursors and publishes a window, and a source run's scratch state,
+            // the cursors and the state paths are this machine's own.
             | Self::Fetch { .. }
             | Self::Source { .. }
             | Self::Cursor { .. }
@@ -646,6 +646,11 @@ fn run_source(run: &mut Run<'_, '_>, id: &str, op: SourceOperation) -> Result<Ou
         .iter()
         .find(|source| source.id == id)
         .ok_or_else(|| anyhow!("source {id} is not configured"))?;
+    if matches!(op, SourceOperation::Fetch) && spec.kind == "slack" {
+        return Err(anyhow!(
+            "ctx source run {id} --op fetch is refused: only ctx fetch may rotate the Slack credential"
+        ));
+    }
     let scheme = source::scheme(spec)?;
     let source = source::open(spec, &scheme)?;
     let source_ref = SourceRef {
