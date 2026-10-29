@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 
 use crate::config::RULES_FILE;
 use crate::context::Context;
@@ -16,10 +16,11 @@ use super::Change;
 
 /// The absolute path a write touches, refused when any part of it is a symbolic link.
 ///
-/// [`record_path`] keeps a path inside the tree by its text. That is not enough on its own: a
-/// symbolic link committed to `main` under a `.md` name would send the write wherever it
-/// points, and the server runs as root in its container. Every existing component is checked,
-/// so neither the file nor a directory on the way to it can redirect the write.
+/// [`record_path`](crate::tree::record_path) keeps a path inside the tree by its text. That is
+/// not enough on its own: a symbolic link committed to `main` under a `.md` name would send the
+/// write wherever it points, and the server runs as root in its container. Every existing
+/// component is checked, so neither the file nor a directory on the way to it can redirect the
+/// write.
 pub(super) fn inside_the_tree(root: &Path, path: &str) -> Result<PathBuf> {
     let mut absolute = root.to_path_buf();
     for part in Path::new(path).components() {
@@ -267,63 +268,6 @@ fn rules_findings(sweep: &sweep::Findings) -> Vec<Finding> {
         ));
     }
     findings
-}
-
-/// Checks the path names a record this tree loads, and returns it in the one spelling the
-/// tree uses.
-///
-/// The rule is the tree's own: a record is a `.md` file under the tree root, named by its
-/// components, none of them hidden. `Tree::load` walks the tree with `hidden(true)`, so a
-/// component starting with `.` is never loaded and nothing would check such a file. The
-/// components are joined with `/` so that `decisions//renewal.md` and `decisions/renewal.md`
-/// are one path: every check in [`check`] matches findings by this string, and two spellings
-/// of one file would let a write past all of them.
-///
-/// A record path is also plain text, because git and a commit message both read it. git's
-/// pathspec magic is off for every call `ctx` makes, and a path still carries no `*`, `?`,
-/// `[` or `]`, which git would otherwise read as a pattern, and no component starting with
-/// `-` or `:`, which git reads as an option or as magic. No control character either: the
-/// path goes into the commit's subject line, and a line break would start a line of its own.
-///
-/// This covers what a path can say about itself. Whether this tree in fact loads the written
-/// file — `.gitignore` decides that too — is settled in [`check`], against the loaded tree.
-pub(super) fn record_path(path: &str) -> Result<String> {
-    let candidate = Path::new(path);
-    if path.is_empty() || candidate.is_absolute() {
-        bail!("a record path is relative to the tree root");
-    }
-    let mut parts = Vec::new();
-    for part in candidate.components() {
-        let std::path::Component::Normal(name) = part else {
-            bail!("{path} is not a record path");
-        };
-        let name = name
-            .to_str()
-            .ok_or_else(|| anyhow!("{path} is not valid UTF-8"))?;
-        if name.starts_with('.') {
-            bail!("{path} is not a record path: a tree loads no hidden file as a record");
-        }
-        if name.starts_with(['-', ':']) {
-            bail!("{path} is not a record path: git reads a name starting with - or : as an option or as magic");
-        }
-        if let Some(letter) = name
-            .chars()
-            .find(|letter| letter.is_control() || matches!(letter, '*' | '?' | '[' | ']'))
-        {
-            bail!(
-                "{path} is not a record path: a record path is plain text, and holds no {letter:?}"
-            );
-        }
-        parts.push(name);
-    }
-    let normalised = parts.join("/");
-    if Path::new(&normalised)
-        .extension()
-        .is_none_or(|suffix| suffix != "md")
-    {
-        bail!("{path} is not a markdown record");
-    }
-    Ok(normalised)
 }
 
 /// The file names an agent reads as its instructions, from anywhere in the tree it runs in.

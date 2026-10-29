@@ -246,14 +246,15 @@ pub fn server_url(user: &UserConfig) -> Option<String> {
 ///
 /// # Errors
 ///
-/// Returns an error when `ctx record` runs with no server configured, or when the server
-/// cannot be reached or fails the request.
+/// Returns an error when `ctx record put` or `ctx record rm` runs with no server configured,
+/// or when the server cannot be reached or fails the request.
 pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
     let route = cli.command.remote();
     let user = UserConfig::load()?;
     let Some(base) = server_url(&user) else {
-        // Only `ctx record` has no local meaning at all: a tree on one machine still moves
-        // its own marker, and routes it to the server when one is configured.
+        // Only a record write has no local meaning at all: a tree on one machine still moves
+        // its own marker and shows its own records, and routes both to the server when one is
+        // configured.
         if matches!(route, Remote::Put { .. } | Remote::Rm { .. }) {
             bail!("no ctx server is configured; set CTX_SERVER or server in the user config");
         }

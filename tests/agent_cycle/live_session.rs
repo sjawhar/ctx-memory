@@ -518,7 +518,8 @@ fn run_session(
 
 /// One live session under `run-cycle.sh`'s own flags and `policy.yml`, against the omp
 /// release the image pins, with a scripted model that does what an injected instruction
-/// asks: read a URL, search one, and start a program through `ctx`. No model is called.
+/// asks: read a URL, search one, start a program through `ctx`, and write a record from a file
+/// at the shell. `ctx rules` and `ctx record show` still run. No model is called.
 #[test]
 #[ignore = "drives the omp release deploy/agent/Dockerfile pins; CI runs it with CTX_TEST_OMP naming that binary"]
 fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
@@ -536,6 +537,8 @@ fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
         json!({"tool": "bash", "input": {"command": escape}}),
         json!({"tool": "bash", "input": {"command": "curl -sS https://example.com"}}),
         json!({"tool": "bash", "input": {"command": "ctx rules"}}),
+        json!({"tool": "bash", "input": {"command": "ctx record show index.md"}}),
+        json!({"tool": "bash", "input": {"command": "ctx record put index.md /etc/hostname"}}),
     ])?;
     let root = scratch("live")?;
     let outcome = run_session(&omp, &root, &model, "Run the scripted probe.", &[], &[]);
@@ -592,6 +595,7 @@ fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
         (2, "read ssh://example.com/etc/hostname"),
         (3, "ctx a/../…/bin/sh"),
         (4, "curl"),
+        (7, "ctx record put index.md /etc/hostname"),
     ] {
         let (error, text) = result(step)?;
         ensure!(
@@ -603,6 +607,12 @@ fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
     ensure!(
         text.contains("Tree rules") && !text.contains("requires approval"),
         "`ctx rules` did not run, so the probe above refuses everything and proves nothing: {text}"
+    );
+    let (_, text) = result(6)?;
+    ensure!(
+        text.contains("This index links every sample record")
+            && !text.contains("requires approval"),
+        "`ctx record show index.md` did not print the record: {text}"
     );
     Ok(())
 }

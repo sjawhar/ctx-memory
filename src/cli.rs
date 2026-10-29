@@ -141,7 +141,7 @@ pub enum Command {
         #[command(subcommand)]
         command: StateCommand,
     },
-    /// Write or remove a record through the server.
+    /// Show a record, or write or remove one through the server.
     Record {
         #[command(subcommand)]
         command: RecordCommand,
@@ -165,6 +165,11 @@ pub enum SlackCommand {
 
 #[derive(Subcommand)]
 pub enum RecordCommand {
+    /// Print a record's whole text, frontmatter and body, as the tree holds it.
+    Show {
+        /// Tree-relative path of the record, such as `decisions/renewal.md`.
+        path: String,
+    },
     /// Write a record, reading it from standard input or from a file.
     Put {
         /// Tree-relative path of the record, such as `decisions/renewal.md`.
@@ -260,6 +265,9 @@ impl Command {
                 command: StateCommand::Path,
             } => "state path".to_owned(),
             Self::Record {
+                command: RecordCommand::Show { .. },
+            } => "record show".to_owned(),
+            Self::Record {
                 command: RecordCommand::Put { .. },
             } => "record put".to_owned(),
             Self::Record {
@@ -298,6 +306,9 @@ impl Command {
             }
             | Self::Cite {
                 command: CiteCommand::Verify { .. },
+            }
+            | Self::Record {
+                command: RecordCommand::Show { .. },
             }
             // Without `--write` the command prints the delta and writes nothing.
             | Self::Delta { write: false, .. } => Remote::Forward,
@@ -348,6 +359,12 @@ pub enum Remote<'a> {
 struct RulesPayload<'a> {
     path: String,
     bytes: usize,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct RecordShowPayload<'a> {
+    path: String,
     text: &'a str,
 }
 
@@ -554,8 +571,12 @@ fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
         Command::State {
             command: StateCommand::Path,
         } => run_state_path(run),
+        Command::Record {
+            command: RecordCommand::Show { path },
+        } => run_record_show(run, path),
         Command::Record { .. } => Err(anyhow!(
-            "ctx record writes through the server; set CTX_SERVER or server in the user config"
+            "ctx record put and ctx record rm write through the server; set CTX_SERVER or \
+             server in the user config"
         )),
         Command::Slack { .. } => Err(anyhow!(
             "slack login is dispatched before the tree commands"
@@ -869,6 +890,19 @@ fn run_rules(run: &mut Run<'_, '_>) -> Result<Outcome> {
     run.emit("rules", &payload, |payload, out| {
         writeln!(out, "{}", output::printable(&payload.path))?;
         write!(out, "\n{}", output::printable(payload.text))
+    })?;
+    Ok(Outcome::Pass)
+}
+
+fn run_record_show(run: &mut Run<'_, '_>, path: &str) -> Result<Outcome> {
+    let document = run.context.tree.record(path)?;
+    let payload = RecordShowPayload {
+        path: document.rel.to_string_lossy().into_owned(),
+        text: &document.raw,
+    };
+    // The record is the tree's text, printed whole without its control characters.
+    run.emit("record show", &payload, |payload, out| {
+        write!(out, "{}", output::printable(payload.text))
     })?;
     Ok(Outcome::Pass)
 }

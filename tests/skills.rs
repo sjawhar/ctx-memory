@@ -82,7 +82,12 @@ fn the_ingest_skill_names_only_commands_the_server_answers() -> Result<()> {
 #[test]
 fn the_ingest_skill_writes_through_the_server() -> Result<()> {
     let text = skill("ctx-memory-ingest")?;
-    for expected in ["ctx record put", "ctx pending", "ctx marker advance"] {
+    for expected in [
+        "ctx record put",
+        "ctx record show",
+        "ctx pending",
+        "ctx marker advance",
+    ] {
         assert!(
             text.contains(expected),
             "the ingest skill never mentions {expected}"

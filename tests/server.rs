@@ -517,6 +517,182 @@ fn record_put_reads_stdin() -> Result<()> {
     Ok(())
 }
 
+/// `ctx record show` through the server prints what a local run prints, from the server's own
+/// committed tree, and changes nothing: no commit, no marker, no cursor. A path that names no
+/// record, or one outside the tree, fails as it does locally, and the file outside is never sent.
+#[test]
+fn remote_record_show_answers_as_local_does_and_moves_nothing() -> Result<()> {
+    let tree = support::fixture_clone("remote-record-show")?;
+    support::fetch_window(&tree)?;
+    let root = tree
+        .parent()
+        .context("the fixture has a root")?
+        .to_path_buf();
+    std::fs::write(
+        root.join("outside.md"),
+        "---\ntype: decision\n---\nOUTSIDE THE TREE\n",
+    )?;
+    let bare = support::remote_of(&tree)?;
+    let head = support::git(&bare, &["rev-parse", "main"])?;
+    let cursors = std::fs::read(root.join("data/cursors.json"))?;
+    let local = ctx_local(&tree, &["record", "show", "index.md"])?;
+    let local_missing = ctx_local(&tree, &["record", "show", "decisions/missing.md"])?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let server = ingress_server(&tree, &keys)?;
+    let metadata = metadata_identity("ctx-agent@example-project.iam.gserviceaccount.com")?;
+    let environment = cloud_env(&server, &metadata)?;
+    let elsewhere = support::scratch("remote-record-show-cwd")?;
+    let outcome = (|| -> Result<_> {
+        let run = |arguments: &[&str]| {
+            support::ctx_remote(&elsewhere, &borrowed(&environment), arguments, None)
+        };
+        Ok((
+            run(&["record", "show", "index.md"])?,
+            run(&["--json", "record", "show", "index.md"])?,
+            run(&["record", "show", "decisions/missing.md"])?,
+            run(&["record", "show", "../outside.md"])?,
+        ))
+    })();
+    drop(server);
+    let head_after = support::git(&bare, &["rev-parse", "main"])?;
+    let cursors_after = std::fs::read(root.join("data/cursors.json"))?;
+    let marker = root.join("data/marker.json").exists();
+    support::remove_scratch(&elsewhere)?;
+    remove_fixture(&tree)?;
+    let (text, json, missing, outside) = outcome?;
+
+    let record = "---\ntype: index\n---\n# Index\n\nRecords live under decisions/.\n";
+    assert_eq!(local.exit_code, 0, "{}", local.stderr);
+    assert_eq!(local.stdout, record);
+    assert_eq!(text.exit_code, 0, "{}{}", text.stdout, text.stderr);
+    assert_eq!(text.stdout, local.stdout);
+    let envelope: Value = serde_json::from_str(json.stdout.trim())
+        .with_context(|| format!("decoding {}{}", json.stdout, json.stderr))?;
+    assert_eq!(envelope.pointer("/data/path"), Some(&json!("index.md")));
+    assert_eq!(envelope.pointer("/data/text"), Some(&json!(record)));
+    assert_eq!(missing.exit_code, 2, "{}{}", missing.stdout, missing.stderr);
+    assert_eq!(missing.stdout, "");
+    assert_eq!(missing.stderr, local_missing.stderr);
+    assert_eq!(outside.exit_code, 2, "{}{}", outside.stdout, outside.stderr);
+    assert!(
+        !outside.stdout.contains("OUTSIDE") && !outside.stderr.contains("OUTSIDE"),
+        "the server sent a file outside its tree: {}{}",
+        outside.stdout,
+        outside.stderr
+    );
+    assert!(
+        outside.stderr.contains("../outside.md"),
+        "the refusal does not name the path: {}",
+        outside.stderr
+    );
+    assert_eq!(head_after, head, "a read made a commit");
+    assert_eq!(cursors_after, cursors, "a read moved a cursor");
+    assert!(!marker, "a read moved the marker");
+    Ok(())
+}
+
+/// A cycle writes back the whole record `record show` printed, so the server sends a record
+/// as its tree holds it. The server names its own directories by placeholders in what a
+/// command prints, and doing that to a record's text would change the words a write puts back
+/// whenever a record quotes one of those paths.
+#[test]
+fn remote_record_show_sends_the_record_unchanged() -> Result<()> {
+    let tree = fixture_tree("remote-record-show-paths")?;
+    let root = tree
+        .parent()
+        .context("the fixture has a root")?
+        .canonicalize()?;
+    let record = format!(
+        "---\ntype: note\n---\nThe tree is at {}, its data at {} and its state at {}.\n",
+        tree.canonicalize()?.display(),
+        root.join("data").display(),
+        root.join("state").display()
+    );
+    std::fs::write(tree.join("decisions/paths.md"), &record)?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let server = ingress_server(&tree, &keys)?;
+    let metadata = metadata_identity("ctx-agent@example-project.iam.gserviceaccount.com")?;
+    let environment = cloud_env(&server, &metadata)?;
+    let elsewhere = support::scratch("remote-record-show-paths-cwd")?;
+    let outcome = (|| -> Result<_> {
+        let run = |arguments: &[&str]| {
+            support::ctx_remote(&elsewhere, &borrowed(&environment), arguments, None)
+        };
+        Ok((
+            run(&["--json", "record", "show", "decisions/paths.md"])?,
+            run(&["record", "show", "decisions/paths.md"])?,
+        ))
+    })();
+    drop(server);
+    support::remove_scratch(&elsewhere)?;
+    remove_fixture(&tree)?;
+    let (json, text) = outcome?;
+
+    assert_eq!(json.exit_code, 0, "{}{}", json.stdout, json.stderr);
+    let envelope: Value = serde_json::from_str(json.stdout.trim())
+        .with_context(|| format!("decoding {}{}", json.stdout, json.stderr))?;
+    assert_eq!(envelope.pointer("/data/text"), Some(&json!(record)));
+    assert_eq!(text.exit_code, 0, "{}{}", text.stdout, text.stderr);
+    assert_eq!(text.stdout, record);
+    Ok(())
+}
+
+/// `record` is a first word `/v1/command` answers for `record show` alone: a record write
+/// has its own endpoint, which holds the write lease, and is refused at the read door.
+#[test]
+fn record_writes_are_not_read_commands() -> Result<()> {
+    let tree = fixture_tree("server-record-write-door")?;
+    let server = Server::start(&tree, &[])?;
+    let put = server.command(&["record", "put", "decisions/renewal.md", "-"])?;
+    let rm = server.command(&["record", "rm", "decisions/renewal.md"])?;
+    let show = server.command(&["record", "show", "decisions/renewal.md"])?;
+    drop(server);
+    let still_there = tree.join("decisions/renewal.md").exists();
+    remove_fixture(&tree)?;
+
+    for reply in [&put, &rm] {
+        assert_eq!(reply.status, 400, "unexpected body: {}", reply.body);
+        assert!(
+            reply.text("error")?.contains("own endpoint"),
+            "unexpected body: {}",
+            reply.body
+        );
+    }
+    assert!(still_there, "a refused remove removed the record");
+    assert_eq!(show.status, 200, "unexpected body: {}", show.body);
+    assert!(
+        show.text("stdout")?.contains("quarterly cadence"),
+        "unexpected body: {}",
+        show.body
+    );
+    Ok(())
+}
+
+/// `record show` is answered to the principals every read is answered to, and to no one else.
+#[test]
+fn record_show_refuses_a_principal_outside_the_allow_list() -> Result<()> {
+    let tree = fixture_tree("server-record-show-principal")?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let server = ingress_server(&tree, &keys)?;
+    let token = support::google_token(AUDIENCE, "someone@example.net")?;
+    let reply = server.post(
+        server.ingress_address()?,
+        "/v1/command",
+        &json!({ "argv": ["record", "show", "decisions/renewal.md"] }),
+        &[("Authorization", &format!("Bearer {token}"))],
+    )?;
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert_eq!(reply.status, 401, "unexpected body: {}", reply.body);
+    assert!(
+        reply.body.get("stdout").is_none(),
+        "the refusal carries output: {}",
+        reply.body
+    );
+    Ok(())
+}
+
 /// In remote mode `ctx cite verify <file>` names a draft on the caller's machine, which the
 /// server's tree does not hold. Forwarded as a path, it matched nothing on the server and
 /// answered `checked 0` with exit 0 (round-4 acceptance at d5655fc, R4-D1). The client sends

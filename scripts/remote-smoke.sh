@@ -1,6 +1,6 @@
 #!/bin/sh
 # Drives a running ctx server through the surface an agent uses: the health endpoint, a read
-# command in remote mode, and - with --write - one record written and removed again.
+# command in remote mode, and - with --write - one record written, read back and removed again.
 #
 # Usage:
 #   CTX_SERVER='http://ctx-memory.<tailnet>.ts.net' scripts/remote-smoke.sh [--write] [query]
@@ -51,6 +51,9 @@ title: Remote smoke $stamp
 ---
 Written by scripts/remote-smoke.sh to prove the write path, and removed again.
 EOF
+
+echo "--- ctx record show $path"
+"$ctx" record show "$path"
 
 echo "--- ctx record rm $path"
 "$ctx" record rm "$path"

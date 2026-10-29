@@ -6,8 +6,9 @@ use anyhow::Result;
 use axum::http::StatusCode;
 
 use super::response::failure_line;
-use super::validation::{credential_findings, inside_the_tree, is_rules_page, record_path};
+use super::validation::{credential_findings, inside_the_tree, is_rules_page};
 use super::Change;
+use crate::tree::record_path;
 
 /// A token's shape began with `\b`, and `_` is a word character, so a token written after
 /// one, as in `decisions/x_ghp_…`, passed every check and reached the graph's file names

@@ -24,9 +24,11 @@ use crate::tree::Doc;
 ///
 /// Whether one of them runs is [`cli::Command::remote`]'s answer for the parsed command; this
 /// list is what turns a first word no remote caller may use into a refusal before clap is
-/// asked, rather than clap's usage error.
+/// asked, rather than clap's usage error. `record` is here for `record show`: `record put` and
+/// `record rm` parse as writes and are refused.
 const ALLOWED: &[&str] = &[
     "rules", "sweep", "search", "dossier", "open", "resolve", "cite", "delta", "marker", "pending",
+    "record",
 ];
 
 /// Runs one command against a loaded tree and captures what it would have printed.
@@ -76,6 +78,7 @@ pub async fn command(
     if let Err(message) = allowed(&request.argv) {
         return error_response(shared, StatusCode::BAD_REQUEST, &message);
     }
+    let record_text = shows_a_record(&request.argv);
     let running = Arc::clone(shared);
     let captured = tokio::task::spawn_blocking(move || {
         let context = running.tree()?;
@@ -84,11 +87,18 @@ pub async fn command(
     .await;
     match captured {
         // What the command printed can quote the server's own paths, in an error or in its
-        // output alike, so both streams go out with those named by their placeholders.
+        // output alike, so both streams go out with those named by their placeholders. The one
+        // exception is what a `record show` that succeeded printed: that is a record of the
+        // tree, which a cycle writes back whole, so a placeholder in it would change the
+        // record. It names nothing the tree does not already hold.
         Ok(Ok(captured)) => (
             StatusCode::OK,
             Json(Captured {
-                stdout: shared.hide_paths(&captured.stdout),
+                stdout: if record_text && captured.exit_code == 0 {
+                    captured.stdout
+                } else {
+                    shared.hide_paths(&captured.stdout)
+                },
                 stderr: shared.hide_paths(&captured.stderr),
                 exit_code: captured.exit_code,
             }),
@@ -105,6 +115,18 @@ pub async fn command(
             &format!("running the command failed: {error}"),
         ),
     }
+}
+
+/// Whether `argv` is a `record show`, whose output, when it succeeds, is a record of the tree.
+fn shows_a_record(argv: &[String]) -> bool {
+    cli::parse_argv(argv).is_ok_and(|parsed| {
+        matches!(
+            parsed.command,
+            cli::Command::Record {
+                command: cli::RecordCommand::Show { .. }
+            }
+        )
+    })
 }
 
 /// What `/healthz` answers with.

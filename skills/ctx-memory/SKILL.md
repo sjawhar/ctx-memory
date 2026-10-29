@@ -60,7 +60,7 @@ Do not convert an incomplete search into a negative claim.
 - Link each new record from a parent or index so the graph remains reachable.
 - Preserve raw sources and keep citations resolvable.
 - Run `ctx sweep` after writing. Structural findings must be fixed; stale records are a review queue.
-- Write a record with `ctx record put <path>`, which reads it from standard input or from a file you name, and remove one with `ctx record rm <path>`. The server checks the record, commits it under your name and pushes it; a refused write prints its findings and changes nothing. Never edit a tree file by hand while a server holds it. A session with no tool that writes a file, such as the scheduled ingest cycle, writes through the record tools its own skill names instead.
+- Write a record with `ctx record put <path>`, which reads it from standard input or from a file you name, and remove one with `ctx record rm <path>`. A put replaces the whole file, so an update starts from `ctx record show <path>`, which prints the record as the tree holds it, and puts back all of it. The server checks the record, commits it under your name and pushes it; a refused write prints its findings and changes nothing. Never edit a tree file by hand while a server holds it. A session with no tool that writes a file, such as the scheduled ingest cycle, writes through the record tools its own skill names instead.
 
 ## Ingest
 

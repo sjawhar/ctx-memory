@@ -427,3 +427,125 @@ fn cursors_are_printed_without_control_characters() -> Result<()> {
     assert_eq!(controls(&stdout), Vec::<char>::new(), "{stdout:?}");
     Ok(())
 }
+
+/// Runs `ctx` on a tree, whatever its exit code, with no server configured.
+fn ctx_output(tree: &Path, arguments: &[&str]) -> Result<std::process::Output> {
+    let tree = tree.to_str().context("test tree path is not valid UTF-8")?;
+    binary()
+        .args(["--memory", tree])
+        .args(arguments)
+        .env_remove("CTX_SERVER")
+        .output()
+        .context("running ctx")
+}
+
+/// An update to a record starts from what the record holds now, so `ctx record show` prints it
+/// whole, frontmatter and body, as the tree holds it, and names it in the tree's own spelling.
+#[test]
+fn record_show_prints_the_whole_record() -> Result<()> {
+    let tree = fixture_tree()?;
+    let text = ctx_output(&tree, &["record", "show", "decisions/open.md"]);
+    let json = ctx_output(&tree, &["--json", "record", "show", "decisions//open.md"]);
+    remove_scratch(&tree)?;
+    let (text, json) = (text?, json?);
+
+    let record =
+        "---\ntype: decision\nstatus: open\ntitle: Example decision\n---\nOpen decision.\n";
+    assert_eq!(
+        text.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&text.stdout), record);
+    assert_eq!(
+        json.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let value: Value = serde_json::from_slice(&json.stdout)?;
+    assert_eq!(
+        value.get("command"),
+        Some(&serde_json::json!("record show"))
+    );
+    assert_eq!(
+        value.pointer("/data/path"),
+        Some(&serde_json::json!("decisions/open.md"))
+    );
+    assert_eq!(
+        value.pointer("/data/text"),
+        Some(&serde_json::json!(record))
+    );
+    Ok(())
+}
+
+/// A path that names no record of the tree is an error, never empty text: a cycle that read
+/// nothing must not take it for an empty record.
+#[test]
+fn record_show_refuses_a_path_that_names_no_record() -> Result<()> {
+    let tree = fixture_tree()?;
+    let missing = ctx_output(&tree, &["record", "show", "decisions/missing.md"]);
+    let not_markdown = ctx_output(&tree, &["record", "show", "ctx.toml"]);
+    remove_scratch(&tree)?;
+
+    for (path, output) in [
+        ("decisions/missing.md", missing?),
+        ("ctx.toml", not_markdown?),
+    ] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{path}: {stderr}");
+        assert!(output.stdout.is_empty(), "{path}: {:?}", output.stdout);
+        assert!(
+            stderr.contains(path),
+            "the refusal does not name {path}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// `ctx record show` reads the tree and nothing else: a path that climbs out of it, an absolute
+/// path, and a symbolic link in the tree that points out of it are each refused, and the file
+/// outside is never printed.
+#[test]
+fn record_show_refuses_a_path_outside_the_tree() -> Result<()> {
+    let tree = fixture_tree()?;
+    let outside = scratch()?;
+    let outcome = (|| -> Result<Vec<(String, std::process::Output)>> {
+        let secret = outside.join("secret.md");
+        std::fs::write(&secret, "---\ntype: decision\n---\nOUTSIDE THE TREE\n")?;
+        std::os::unix::fs::symlink(&secret, tree.join("decisions/linked.md"))?;
+        let name = outside
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("scratch name is not valid UTF-8")?;
+        let climbing = format!("../{name}/secret.md");
+        let absolute = secret
+            .to_str()
+            .context("scratch path is not valid UTF-8")?
+            .to_owned();
+        let mut outputs = Vec::new();
+        for path in [climbing, absolute, "decisions/linked.md".to_owned()] {
+            let output = ctx_output(&tree, &["record", "show", &path])?;
+            outputs.push((path, output));
+        }
+        Ok(outputs)
+    })();
+    remove_scratch(&tree)?;
+    remove_scratch(&outside)?;
+
+    for (path, output) in outcome? {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{path}: {stdout}{stderr}");
+        assert!(
+            !stdout.contains("OUTSIDE") && !stderr.contains("OUTSIDE"),
+            "{path} printed the file outside the tree: {stdout}{stderr}"
+        );
+        assert!(
+            stderr.contains(&path),
+            "the refusal does not name {path}: {stderr}"
+        );
+    }
+    Ok(())
+}

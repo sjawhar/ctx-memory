@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::NaiveDate;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
@@ -813,6 +813,88 @@ impl Tree {
             .iter()
             .find(|doc| doc.rel == Path::new(RULES_FILE))
     }
+
+    /// The record `path` names: a [`record_path`] this tree loaded.
+    ///
+    /// The tree loads only regular `.md` files under its root and follows no symbolic link, so
+    /// a record this returns is a file inside the tree, whatever the path's text says.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` is not a record path, or when this tree loaded no record
+    /// at it.
+    pub fn record(&self, path: &str) -> Result<&Doc> {
+        let normalised = record_path(path)?;
+        self.docs
+            .iter()
+            .find(|doc| doc.rel == Path::new(&normalised))
+            .ok_or_else(|| anyhow!("{path} names no record of this tree"))
+    }
+}
+
+/// Checks the path names a record this tree loads, and returns it in the one spelling the
+/// tree uses.
+///
+/// The rule is the tree's own: a record is a `.md` file under the tree root, named by its
+/// components, none of them hidden. `Tree::load` walks the tree with `hidden(true)`, so a
+/// component starting with `.` is never loaded and nothing would check such a file. The
+/// components are joined with `/` so that `decisions//renewal.md` and `decisions/renewal.md`
+/// are one path: the writer matches every finding by this string, and two spellings of one
+/// file would let a write past all of them.
+///
+/// A record path is also plain text, because git and a commit message both read it. git's
+/// pathspec magic is off for every call `ctx` makes, and a path still carries no `*`, `?`,
+/// `[` or `]`, which git would otherwise read as a pattern, and no component starting with
+/// `-` or `:`, which git reads as an option or as magic. No control character either: the
+/// path goes into the commit's subject line, and a line break would start a line of its own.
+///
+/// This covers what a path can say about itself. Whether this tree in fact loads the file —
+/// `.gitignore` decides that too — is settled against the loaded tree: by [`Tree::record`] for
+/// a read, and by the writer's own checks for a write.
+///
+/// # Errors
+///
+/// Returns an error when `path` is not a record path.
+pub fn record_path(path: &str) -> Result<String> {
+    let candidate = Path::new(path);
+    if path.is_empty() {
+        bail!("a record path names a file under the tree root, and this one is empty");
+    }
+    if candidate.is_absolute() {
+        bail!("{path} is not a record path: a record path is relative to the tree root");
+    }
+    let mut parts = Vec::new();
+    for part in candidate.components() {
+        let Component::Normal(name) = part else {
+            bail!("{path} is not a record path");
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow!("{path} is not valid UTF-8"))?;
+        if name.starts_with('.') {
+            bail!("{path} is not a record path: a tree loads no hidden file as a record");
+        }
+        if name.starts_with(['-', ':']) {
+            bail!("{path} is not a record path: git reads a name starting with - or : as an option or as magic");
+        }
+        if let Some(letter) = name
+            .chars()
+            .find(|letter| letter.is_control() || matches!(letter, '*' | '?' | '[' | ']'))
+        {
+            bail!(
+                "{path} is not a record path: a record path is plain text, and holds no {letter:?}"
+            );
+        }
+        parts.push(name);
+    }
+    let normalised = parts.join("/");
+    if Path::new(&normalised)
+        .extension()
+        .is_none_or(|suffix| suffix != "md")
+    {
+        bail!("{path} is not a markdown record");
+    }
+    Ok(normalised)
 }
 
 #[cfg(test)]

@@ -176,6 +176,7 @@ fn the_shell_admits_only_the_ctx_subcommands_the_cycle_needs() -> Result<()> {
         "marker advance",
         "open",
         "pending",
+        "record show",
         "resolve",
         "rules",
         "search",

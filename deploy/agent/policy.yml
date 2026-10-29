@@ -70,9 +70,10 @@ bash:
     # subcommand's arguments. An allow lowers a simple call to the write tier, which the mode
     # above approves. Compound commands are not evaluated per segment
     # (bash.allowCompoundCommands stays off), so `ctx rules && curl …` keeps the exec tier and
-    # is refused with everything else. `ctx record put` and `ctx record rm` have no rule: the
-    # session writes only through the record tools above, and at the shell `ctx record put
-    # <path> <file>` would read any file the session's user can read into a record.
+    # is refused with everything else. `ctx record show` reads one record of the server's tree;
+    # `ctx record put` and `ctx record rm` have no rule: the session writes only through the
+    # record tools above, and at the shell `ctx record put <path> <file>` would read any file
+    # the session's user can read into a record.
     - match: "ctx rules"
       approval: allow
     - match: "ctx pending"
@@ -90,6 +91,8 @@ bash:
     - match: "ctx resolve"
       approval: allow
     - match: "ctx resolve *"
+      approval: allow
+    - match: "ctx record show *"
       approval: allow
     - match: "ctx cite verify"
       approval: allow

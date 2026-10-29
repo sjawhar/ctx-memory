@@ -8,11 +8,12 @@ use crate::config::RULES_FILE;
 use crate::context::Context;
 use crate::git::{Access, Author, Push, Repo};
 use crate::redact::one_line;
+use crate::tree::record_path;
 
 use super::super::identity::Caller;
 use super::validation::{
     check, credential_findings, in_the_way, inside_the_tree, instruction_file, is_rules_page,
-    record_path, too_long, unloaded,
+    too_long, unloaded,
 };
 use super::{Applied, Change, Shared};
 
