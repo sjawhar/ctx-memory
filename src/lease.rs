@@ -196,6 +196,9 @@ impl Lease {
             .name(format!("ctx-lease-{object}"))
             .spawn(move || renew_until_stopped(&renewing))
             .with_context(|| format!("starting the renewal of the {object} lease"))?;
+        if let Ok(mut holding) = HOLDING.lock() {
+            holding.push(Arc::clone(&held));
+        }
         Ok(Self {
             held,
             renewal: Some(renewal),
@@ -307,6 +310,9 @@ impl Lease {
         if let Some(renewal) = self.renewal.take() {
             let _ = renewal.join();
         }
+        if let Ok(mut holding) = HOLDING.lock() {
+            holding.retain(|other| !Arc::ptr_eq(other, &self.held));
+        }
     }
 }
 
@@ -340,6 +346,28 @@ pub fn for_role(role: &str) -> Result<Option<Lease>> {
         return Ok(None);
     };
     Lease::acquire(&bucket, role, &holder_name(role)).map(Some)
+}
+
+/// The leases this process holds, from the moment each is taken until it is stopped, so code
+/// that may act only as a role's holder can ask ([`holds`]).
+static HOLDING: Mutex<Vec<Arc<Held>>> = Mutex::new(Vec::new());
+
+/// Whether this process holds `role`'s lease now: it took it, has not given it up, has not lost
+/// it to a takeover, and renewed it recently enough that no other copy may take it over yet (the
+/// rule [`Lease::check`] applies). Without `CTX_LEASE_BUCKET` no process holds any lease. This
+/// answers from what this copy knows; [`Lease::check`] also asks Cloud Storage.
+#[must_use]
+pub fn holds(role: &str) -> bool {
+    HOLDING.lock().is_ok_and(|holding| {
+        holding.iter().any(|held| {
+            held.object == role
+                && held.state().is_ok_and(|state| {
+                    state.lost.is_none()
+                        && !state.released
+                        && held.clock.now() - state.renewed_at < Duration::seconds(TAKEOVER - RENEW)
+                })
+        })
+    })
 }
 
 /// The bucket this deployment keeps its leases in, when it leases at all.

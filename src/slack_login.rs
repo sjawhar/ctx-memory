@@ -1,51 +1,48 @@
 //! `ctx slack login`: the browser sign-in that seeds the Slack credential.
 //!
-//! This reproduces omp's own sign-in (`docs/sources.md`, "Slack source"): an OAuth
-//! authorization-code flow with PKCE against the Claude Code Slack app, a public client that
-//! needs no secret. The code is exchanged for a user token at Slack's token endpoint and
-//! saved as the `slack` credential. Only the fetch job ever refreshes it afterwards.
+//! It signs in with the ctx-memory Slack app, an internal app of the workspace that only
+//! ctx uses (`deploy/slack/ctx-memory-manifest.yaml`; `docs/sources.md`, "Slack source"). The
+//! flow is Slack's OAuth v2 flow for a user token: the browser authorizes with `user_scope`, and
+//! the code is exchanged at `oauth.v2.access` with the app's client id and secret, which come from
+//! the `slack_app` credential. The app has token rotation on, so the token expires in 12 hours
+//! and comes with a refresh token, which the fetch job redeems. It is saved as the `slack`
+//! credential.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpListener;
 use std::sync::mpsc;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
-use crate::api::client;
 use crate::api::slack::{
-    SlackCredential, SLACK_AUTHORIZE_URL, SLACK_CLIENT_ID, SLACK_REDIRECT_URI, SLACK_RESOURCE,
-    SLACK_SCOPES, SLACK_TOKEN_URL,
+    AppCredential, AppKind, SlackApp, SLACK_ACCESS_URL, SLACK_AUTHORIZE_URL, SLACK_REDIRECT_URI,
+    SLACK_SCOPES,
 };
-use crate::credentials;
+use crate::credentials::{self, Secret};
 use crate::output::{self, Outcome, Sink};
 
-/// Slack's token lifetime, used only when a token response omits `expires_in`.
-const DEFAULT_EXPIRES_IN_SECONDS: i64 = 43_200;
-/// The loopback address the Slack app redirects to; the only one this client accepts.
+/// The loopback address the Slack app redirects to; the only one its manifest registers.
 const CALLBACK_ADDRESS: &str = "127.0.0.1:3118";
 
 /// Runs the browser sign-in and saves the Slack credential.
 ///
 /// # Errors
 ///
-/// Returns an error when the callback port cannot be bound, the sign-in is refused, or the
-/// credential cannot be saved. The credential is saved before this returns success, so the
-/// fetch job never redeems a refresh token that was not stored.
+/// Returns an error when the app's credential cannot be read, the callback port cannot be
+/// bound, the sign-in is refused, or the credential cannot be saved. The credential is saved
+/// before this returns success.
 pub fn run(sink: &mut Sink<'_>, json: bool) -> Result<Outcome> {
-    let (verifier, challenge) = pkce()?;
+    let app = SlackApp::load()?;
     let state = random_state()?;
     let listener = TcpListener::bind(CALLBACK_ADDRESS).with_context(|| {
         format!("binding {CALLBACK_ADDRESS} for the Slack callback; is another sign-in running?")
     })?;
-    let authorize = authorize_url(&state, &challenge)?;
+    let authorize = authorize_url(&app.client_id, &state)?;
     writeln!(
         sink.err,
-        "Open this URL in a browser to sign in to Slack:\n\n{authorize}\n"
+        "Open this URL in a browser to sign in to Slack with the ctx-memory app:\n\n{authorize}\n"
     )?;
     writeln!(
         sink.err,
@@ -53,90 +50,126 @@ pub fn run(sink: &mut Sink<'_>, json: bool) -> Result<Outcome> {
     )?;
     let _ = open_browser(&authorize);
     let code = await_code(listener, &state)?;
-    let credential = exchange(&code, &verifier, Utc::now(), |url, form| {
-        let (status, _headers, body) = client::post_form(url, form)?;
-        if !status.is_success() {
-            bail!("the Slack token endpoint returned {status}");
-        }
-        Ok(body)
-    })?;
-    // Saved before anything uses it: a token that is not stored is lost the moment it is used.
-    credentials::save("slack", &credential.to_secret()?).context("saving the Slack credential")?;
+    finish(
+        sink,
+        json,
+        &app,
+        &code,
+        SLACK_ACCESS_URL,
+        Utc::now(),
+        |credential| credentials::save("slack", credential),
+    )
+}
+
+/// Exchanges the code at `access_url`, saves the credential with `save`, and then reports who
+/// signed in. Nothing it prints, and nothing it saves, carries the client secret.
+fn finish(
+    sink: &mut Sink<'_>,
+    json: bool,
+    app: &SlackApp,
+    code: &str,
+    access_url: &str,
+    now: DateTime<Utc>,
+    save: impl FnOnce(&Secret) -> Result<()>,
+) -> Result<Outcome> {
+    let credential = exchange(app, code, access_url, now)?;
+    // Saved before success is reported: the fetch job reads only what is stored.
+    save(&credential.to_secret()?).context("saving the Slack credential")?;
     output::emit(
         sink,
         json,
         "slack login",
-        &serde_json::json!({ "saved": true }),
-        |_, out| writeln!(out, "Signed in to Slack. The credential is saved."),
+        &serde_json::json!({
+            "saved": true,
+            "team_id": credential.team_id,
+            "user_id": credential.user_id,
+        }),
+        |_, out| {
+            writeln!(
+                out,
+                "Signed in to Slack as {} in workspace {}. The credential is saved.",
+                credential.user_id, credential.team_id
+            )
+        },
     )?;
     Ok(Outcome::Pass)
 }
 
-/// Builds the authorization URL omp builds, with the same parameters in the same order.
-fn authorize_url(state: &str, challenge: &str) -> Result<String> {
-    let scope = SLACK_SCOPES.join(" ");
+/// Builds the authorization URL: the app's client id, its user scopes, the registered redirect,
+/// and the `state` the callback must return. It asks for no bot scope.
+fn authorize_url(client_id: &str, state: &str) -> Result<String> {
+    let user_scope = SLACK_SCOPES.join(",");
     let url = reqwest::Url::parse_with_params(
         SLACK_AUTHORIZE_URL,
         &[
-            ("response_type", "code"),
-            ("client_id", SLACK_CLIENT_ID),
-            ("scope", scope.as_str()),
-            ("resource", SLACK_RESOURCE),
+            ("client_id", client_id),
+            ("user_scope", user_scope.as_str()),
             ("redirect_uri", SLACK_REDIRECT_URI),
             ("state", state),
-            ("code_challenge", challenge),
-            ("code_challenge_method", "S256"),
         ],
     )
     .context("building the Slack authorize URL")?;
     Ok(url.to_string())
 }
 
-/// Exchanges the authorization code for a user token, with PKCE and no client secret.
+/// Exchanges the authorization code for the user token at `access_url`, presenting the app's
+/// client id and secret with HTTP Basic, as Slack recommends for `oauth.v2.access`.
+///
+/// Slack answers `200` even for a failure, with `{"ok":false,"error":...}`, so the body is read
+/// before the status. The app has token rotation on, so its token comes with an expiry and a
+/// refresh token; a token without them means rotation is off, and the fetch could not renew the
+/// sign-in the way it renews every other, so it is refused rather than stored.
 fn exchange(
+    app: &SlackApp,
     code: &str,
-    verifier: &str,
+    access_url: &str,
     now: DateTime<Utc>,
-    post: impl Fn(&str, &[(&str, String)]) -> Result<Value>,
-) -> Result<SlackCredential> {
-    let form = vec![
+) -> Result<AppCredential> {
+    let form = [
         ("grant_type", "authorization_code".to_owned()),
         ("code", code.to_owned()),
         ("redirect_uri", SLACK_REDIRECT_URI.to_owned()),
-        ("client_id", SLACK_CLIENT_ID.to_owned()),
-        ("code_verifier", verifier.to_owned()),
-        ("resource", SLACK_RESOURCE.to_owned()),
     ];
-    let body = post(SLACK_TOKEN_URL, &form)?;
-    if body.get("ok").and_then(Value::as_bool) == Some(false) {
+    let body = app.post(access_url, &form)?;
+    if body.get("ok").and_then(Value::as_bool) != Some(true) {
         let error = body
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        bail!("Slack rejected the sign-in: {error:?}");
+        bail!("Slack refused the sign-in: {error:?}");
     }
-    let access = body
-        .get("access_token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| anyhow!("the Slack token response has no access_token"))?;
-    let refresh = body
+    let user = body
+        .get("authed_user")
+        .ok_or_else(|| anyhow!("the Slack token response has no authed_user"))?;
+    let expires_in = user.get("expires_in").and_then(Value::as_i64);
+    let refresh = user
         .get("refresh_token")
         .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| anyhow!("the Slack token response has no refresh_token"))?;
-    let expires_in = body
-        .get("expires_in")
-        .and_then(Value::as_i64)
-        .unwrap_or(DEFAULT_EXPIRES_IN_SECONDS);
-    Ok(SlackCredential {
-        access: access.to_owned(),
+        .filter(|token| !token.is_empty());
+    let (Some(expires_in), Some(refresh)) = (expires_in, refresh) else {
+        bail!(
+            "Slack issued a token that does not expire, so this Slack app has token rotation off; ctx needs the ctx-memory app with token rotation on (deploy/slack/ctx-memory-manifest.yaml). Turn it on under OAuth & Permissions (it cannot be turned off again) and sign in again. Nothing was saved"
+        );
+    };
+    Ok(AppCredential {
+        kind: AppKind::App,
+        access: text(user.get("access_token"), "authed_user.access_token")?,
         refresh: refresh.to_owned(),
         expires: now + chrono::Duration::seconds(expires_in),
-        client_id: SLACK_CLIENT_ID.to_owned(),
-        token_url: SLACK_TOKEN_URL.to_owned(),
-        resource: SLACK_RESOURCE.to_owned(),
+        client_id: app.client_id.clone(),
+        token_url: access_url.to_owned(),
+        team_id: text(body.get("team").and_then(|team| team.get("id")), "team.id")?,
+        user_id: text(user.get("id"), "authed_user.id")?,
     })
+}
+
+/// A non-empty string field of the token response, or an error naming the field.
+fn text(value: Option<&Value>, field: &str) -> Result<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("the Slack token response has no {field}"))
 }
 
 /// Reads the authorization code from the first of two paths to complete: the local HTTP
@@ -195,7 +228,8 @@ fn accept_callback(listener: &TcpListener) -> Result<String> {
         .nth(1)
         .ok_or_else(|| anyhow!("the callback request carried no target"))?
         .to_owned();
-    let body = "You are signed in to Slack for ctx. You may close this tab.";
+    let body =
+        "ctx received the Slack sign-in. Return to the terminal to see whether it was saved.";
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -239,18 +273,6 @@ fn open_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// A PKCE verifier and its S256 challenge.
-fn pkce() -> Result<(String, String)> {
-    let verifier = URL_SAFE_NO_PAD.encode(random_bytes(32)?);
-    let challenge = challenge_of(&verifier);
-    Ok((verifier, challenge))
-}
-
-/// The S256 challenge for a verifier: base64url(SHA-256(verifier)), without padding.
-fn challenge_of(verifier: &str) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
-}
-
 /// A random `state`: 16 bytes as hex.
 fn random_state() -> Result<String> {
     use std::fmt::Write as _;
@@ -271,143 +293,4 @@ fn random_bytes(count: usize) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn challenge_matches_the_rfc7636_example() {
-        // RFC 7636 appendix B.
-        assert_eq!(
-            challenge_of("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
-    }
-
-    #[test]
-    fn authorize_url_carries_omps_parameters_in_order() -> Result<()> {
-        let url = authorize_url("STATE", "CHALLENGE")?;
-        let parsed = reqwest::Url::parse(&url).context("parsing the authorize URL")?;
-        assert_eq!(parsed.scheme(), "https");
-        assert_eq!(parsed.host_str(), Some("slack.com"));
-        assert_eq!(parsed.path(), "/oauth/v2_user/authorize");
-        let query = parsed.query().context("authorize URL has a query")?;
-        assert!(
-            query.starts_with("response_type=code&client_id="),
-            "unexpected order: {query}"
-        );
-        let pairs: std::collections::BTreeMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(
-            pairs.get("client_id").map(String::as_str),
-            Some(SLACK_CLIENT_ID)
-        );
-        assert_eq!(
-            pairs.get("resource").map(String::as_str),
-            Some(SLACK_RESOURCE)
-        );
-        assert_eq!(
-            pairs.get("redirect_uri").map(String::as_str),
-            Some(SLACK_REDIRECT_URI)
-        );
-        assert_eq!(
-            pairs.get("code_challenge").map(String::as_str),
-            Some("CHALLENGE")
-        );
-        assert_eq!(
-            pairs.get("code_challenge_method").map(String::as_str),
-            Some("S256")
-        );
-        assert_eq!(pairs.get("state").map(String::as_str), Some("STATE"));
-        assert_eq!(
-            pairs.get("scope").map(String::as_str),
-            Some("channels:history channels:read groups:history groups:read users:read")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn parse_callback_extracts_the_code() -> Result<()> {
-        let code = parse_callback("/callback?code=abc123&state=xyz", "xyz")?;
-        assert_eq!(code, "abc123");
-        Ok(())
-    }
-
-    #[test]
-    fn parse_callback_accepts_a_full_url() -> Result<()> {
-        let code = parse_callback("http://localhost:3118/callback?code=abc&state=s", "s")?;
-        assert_eq!(code, "abc");
-        Ok(())
-    }
-
-    #[test]
-    fn parse_callback_rejects_a_mismatched_state() {
-        let error = parse_callback("/callback?code=abc&state=other", "expected")
-            .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
-        assert!(
-            error.contains("state did not match"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_callback_reports_a_slack_error() {
-        let error = parse_callback("/callback?error=access_denied&state=s", "s")
-            .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
-        assert!(error.contains("access_denied"), "unexpected error: {error}");
-    }
-
-    #[test]
-    fn exchange_sends_pkce_without_a_secret_and_parses_the_token() -> Result<()> {
-        let now = DateTime::from_timestamp(1_700_000_000, 0)
-            .ok_or_else(|| anyhow!("constructing test time"))?;
-        let seen = std::cell::RefCell::new(Vec::new());
-        let credential = exchange("the-code", "the-verifier", now, |url, form| {
-            let owned: Vec<(String, String)> = form
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), value.clone()))
-                .collect();
-            seen.borrow_mut().push((url.to_owned(), owned));
-            Ok(json!({
-                "ok": true,
-                "access_token": "xoxe.xoxp-token",
-                "refresh_token": "xoxe-refresh",
-                "expires_in": 43_200,
-            }))
-        })?;
-        let calls = seen.into_inner();
-        assert_eq!(calls.len(), 1);
-        let (url, form) = calls.first().ok_or_else(|| anyhow!("no call"))?;
-        assert_eq!(url, SLACK_TOKEN_URL);
-        assert!(form.contains(&("grant_type".to_owned(), "authorization_code".to_owned())));
-        assert!(form.contains(&("code".to_owned(), "the-code".to_owned())));
-        assert!(form.contains(&("code_verifier".to_owned(), "the-verifier".to_owned())));
-        assert!(form.contains(&("redirect_uri".to_owned(), SLACK_REDIRECT_URI.to_owned())));
-        assert!(form.contains(&("client_id".to_owned(), SLACK_CLIENT_ID.to_owned())));
-        assert!(form.contains(&("resource".to_owned(), SLACK_RESOURCE.to_owned())));
-        assert!(!form.iter().any(|(key, _)| key == "client_secret"));
-        assert_eq!(credential.access, "xoxe.xoxp-token");
-        assert_eq!(credential.refresh, "xoxe-refresh");
-        assert_eq!(credential.expires, now + chrono::Duration::seconds(43_200));
-        assert_eq!(credential.client_id, SLACK_CLIENT_ID);
-        assert_eq!(credential.token_url, SLACK_TOKEN_URL);
-        Ok(())
-    }
-
-    #[test]
-    fn exchange_rejects_a_slack_error() -> Result<()> {
-        let now = DateTime::from_timestamp(1_700_000_000, 0)
-            .ok_or_else(|| anyhow!("constructing test time"))?;
-        let error = exchange("bad", "verifier", now, |_url, _form| {
-            Ok(json!({ "ok": false, "error": "invalid_code" }))
-        })
-        .err()
-        .map(|error| format!("{error:#}"))
-        .unwrap_or_default();
-        assert!(error.contains("invalid_code"), "unexpected error: {error}");
-        Ok(())
-    }
-}
+mod tests;

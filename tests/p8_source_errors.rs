@@ -187,3 +187,45 @@ fn store_only_verify_does_not_assume_external_builtin_named_schemes_are_verbatim
     );
     Ok(())
 }
+
+/// A fetch's text output, which is what the fetch job's log holds, says why a source failed on
+/// that source's line, and says the same as the JSON envelope does.
+#[test]
+fn fetch_text_output_says_why_a_source_failed() -> Result<()> {
+    let root = scratch("fetch-source-error-text")?;
+    let tree = tree(&root, None)?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let run = |json: bool| -> Result<std::process::Output> {
+        let mut command = binary();
+        clear_echo_environment(&mut command);
+        if json {
+            command.arg("--json");
+        }
+        command
+            .args(["--memory", tree_text, "fetch"])
+            .env("CTX_STATE_DIR", root.join("state"))
+            .env("CTX_DATA_DIR", root.join("data"))
+            .env("PATH", fixture_path()?)
+            .env("ECHO_EXIT", "1")
+            .output()
+            .context("running a fetch whose source fails")
+    };
+    let text = run(false)?;
+    let json = run(true)?;
+    remove_scratch(&root)?;
+
+    assert_eq!(text.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&json.stdout)?;
+    let why = value
+        .pointer("/data/sources/echo/error")
+        .and_then(Value::as_str)
+        .context("the JSON envelope names why the source failed")?;
+    let stdout = String::from_utf8(text.stdout)?;
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == format!("echo: error: {why}")),
+        "no line says why the source failed: {stdout:?}"
+    );
+    Ok(())
+}

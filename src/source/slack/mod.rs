@@ -60,12 +60,13 @@ impl Source for SlackSource {
                 emit_resolve_hello(request, sink)?;
                 // A live resolve never rotates the token: only the fetch job renews the Slack
                 // credential (contract C6), so another holder is not raced here.
-                let token = load_credential()?.access;
+                let credential = load_credential()?;
+                let token = credential.access();
                 if let Some(api) = &self.api {
-                    let client = SlackClient::with_api(&token, api);
+                    let client = SlackClient::with_api(token, api);
                     resolve_with_api(request, &config, &client, sink)
                 } else {
-                    let client = SlackClient::new(&token);
+                    let client = SlackClient::new(token);
                     resolve_with_api(request, &config, &client, sink)
                 }
             }

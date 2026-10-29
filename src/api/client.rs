@@ -87,6 +87,26 @@ pub fn post_form(url: &str, form: &[(&str, String)]) -> Result<JsonReply> {
     json_reply(send(request, "POST", url)?)
 }
 
+/// `POST url` with a form-encoded body, authenticated as an OAuth client with HTTP Basic
+/// (RFC 6749 section 2.3.1), parsed as JSON. The client secret travels only in the
+/// `Authorization` header, never in the body or the URL.
+///
+/// # Errors
+///
+/// Returns an error when the request cannot be sent or the body is not JSON.
+pub fn post_form_basic(
+    url: &str,
+    client_id: &str,
+    client_secret: &str,
+    form: &[(&str, String)],
+) -> Result<JsonReply> {
+    let request = client()?
+        .post(url)
+        .basic_auth(client_id, Some(client_secret))
+        .form(form);
+    json_reply(send(request, "POST", url)?)
+}
+
 /// `POST url` with a JSON body and `Authorization: Bearer <bearer>`, parsed as JSON.
 ///
 /// # Errors

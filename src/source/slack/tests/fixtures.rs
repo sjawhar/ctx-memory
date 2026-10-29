@@ -13,7 +13,7 @@ pub(super) use anyhow::{anyhow, bail, Context as _, Result};
 pub(super) use chrono::{DateTime, Duration, SecondsFormat, Utc};
 pub(super) use serde_json::{json, Value};
 
-pub(super) use crate::api::slack::SlackCredential;
+pub(super) use crate::api::slack::{AppCredential, AppKind, ClaudeCodeCredential, SlackCredential};
 pub(super) use crate::record::Record;
 
 pub(super) use super::super::super::{

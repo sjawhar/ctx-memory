@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{anyhow, Context as _, Result};
 use chrono::{DateTime, Duration, Utc};
-use ctx_memory::lease::{Clock, Lease};
+use ctx_memory::lease::{self, Clock, Lease};
 use serde_json::{json, Value};
 
 use crate::fixtures::{frozen, reads, Cloud, BUCKET};
@@ -240,5 +240,41 @@ fn a_released_lease_is_free_at_once() -> Result<()> {
         1,
         "the release did not delete the lease object"
     );
+    Ok(())
+}
+
+/// What the fetch's Slack source asks before it rotates a credential: whether this process
+/// holds the fetch lease now. It does from the moment the lease is taken until it is released
+/// or dropped, and holding one role's lease is not holding another's.
+#[test]
+fn this_process_holds_a_lease_only_while_it_has_it() -> Result<()> {
+    let _cloud = Cloud::start()?;
+
+    assert!(!lease::holds("fetch"), "no lease is taken yet");
+    let first = Lease::acquire(BUCKET, "fetch", "fetch@one")?;
+    assert!(lease::holds("fetch"));
+    assert!(
+        !lease::holds("server"),
+        "the fetch lease is not the server's"
+    );
+    first.release()?;
+    assert!(!lease::holds("fetch"), "a released lease is not held");
+    let second = Lease::acquire(BUCKET, "fetch", "fetch@two")?;
+    assert!(lease::holds("fetch"));
+    drop(second);
+    assert!(!lease::holds("fetch"), "a dropped lease is not held");
+
+    // A lease not renewed for as long as `check` refuses is not held either, though nothing
+    // has marked it lost: another copy may take it over soon.
+    let start = at("2026-10-27T12:00:00Z")?;
+    let (clock, now) = movable(start);
+    let stale = Lease::acquire_with(BUCKET, "fetch", "fetch@three", clock)?;
+    assert!(lease::holds("fetch"));
+    *now.lock().unwrap_or_else(PoisonError::into_inner) = start + Duration::seconds(95);
+    assert!(
+        !lease::holds("fetch"),
+        "a lease 95 seconds unrenewed is held"
+    );
+    drop(stale);
     Ok(())
 }

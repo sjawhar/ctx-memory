@@ -932,12 +932,19 @@ fn parse_window_end(value: &str) -> std::result::Result<DateTime<Utc>, String> {
 fn print_fetch(payload: &FetchPayload<'_>, out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(out, "{}", payload.window)?;
     for (source, manifest) in payload.sources {
-        writeln!(
+        write!(
             out,
             "{}: {}",
             output::printable(source),
             manifest.status.label()
         )?;
+        // Why the source failed, on the same line with any credential taken out, so the fetch
+        // job's log says what to do and not only that it failed (a revoked Slack token names
+        // `ctx slack login`). Each stream's own error stays in the window's manifest.
+        if let Some(error) = &manifest.error {
+            write!(out, ": {}", crate::redact::one_line(error))?;
+        }
+        writeln!(out)?;
     }
     cursor::print_advance(payload.cursors, out)
 }

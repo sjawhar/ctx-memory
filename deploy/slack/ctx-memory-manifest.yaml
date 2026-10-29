@@ -1,0 +1,40 @@
+# The Slack app `ctx slack login` signs in with: "ctx-memory", an internal app of the
+# workspace that only ctx uses, so no other client's tokens count against its token
+# limit (docs/sources.md, "Slack source"). Create it at
+# https://api.slack.com/apps: Create New App, From a manifest, pick the workspace, then paste this
+# file.
+#
+# Every key is from Slack's manifest reference, https://docs.slack.dev/reference/app-manifest, and
+# src/slack_login/tests.rs holds this file to what the login asks for:
+#   - display_information.name is required, at most 35 characters; description at most 140.
+#   - oauth_config.redirect_urls is where Slack sends the browser back with the code: the address
+#     `ctx slack login` listens on (SLACK_REDIRECT_URI in src/api/slack.rs).
+#   - oauth_config.scopes.user are the user token's scopes, the ones the login requests
+#     (SLACK_SCOPES). There is no bot scope and no features.bot_user: ctx reads as the person who
+#     signs in, from the channels that person is in, and never posts.
+#   - settings.token_rotation_enabled is true, so each token expires 12 hours after Slack issues
+#     it, and the fetch job refreshes it with its refresh token and the app's client secret
+#     (https://docs.slack.dev/authentication/using-token-rotation, which also gives this key).
+#     Slack cannot turn rotation off again once it is on.
+#   - No oauth_config.pkce_enabled: enabling PKCE marks the app a public client, cannot be undone
+#     without Slack support, and turns this localhost redirect into a desktop redirect
+#     (https://docs.slack.dev/authentication/using-pkce). The exchange and every refresh prove
+#     themselves with the client secret instead.
+#   - No event_subscriptions, interactivity, incoming webhooks or Socket Mode: Slack never calls ctx.
+display_information:
+  name: ctx-memory
+  description: Reads the Slack channels you are in for the ctx-memory fetch job. It never posts.
+oauth_config:
+  redirect_urls:
+    - http://localhost:3118/callback
+  scopes:
+    user:
+      - channels:history
+      - channels:read
+      - groups:history
+      - groups:read
+      - users:read
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: true
