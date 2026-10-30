@@ -127,17 +127,14 @@ fn hold_the_pull(tree: &Path) -> Result<(PathBuf, PathBuf)> {
     let pulling = root.join("pulling");
     let resume = root.join("resume");
     let wrapper = root.join("upload-pack");
-    std::fs::write(
+    support::write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.1; done\nexec git-upload-pack \"$@\"\n",
             pulling.display(),
             resume.display()
         ),
     )?;
-    let mut permissions = std::fs::metadata(&wrapper)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&wrapper, permissions)?;
     let wrapper_text = wrapper.to_str().context("wrapper path is not UTF-8")?;
     support::git(tree, &["config", "remote.origin.uploadpack", wrapper_text])?;
     Ok((pulling, resume))

@@ -682,6 +682,140 @@ fn schema_date_format_violation_is_structural() -> Result<()> {
     Ok(())
 }
 
+/// A question as the starter schema declares it, with `extra` frontmatter lines added.
+fn starter_question(extra: &str) -> String {
+    format!(
+        "---\n\
+         type: question\n\
+         status: open\n\
+         question: Who approves the budget?\n\
+         revisit_by: 2999-01-01\n\
+         tier: 3\n\
+         quote: \"the budget waits on an approver\"\n\
+         source: \"a planning summary\"\n\
+         {extra}\
+         ---\n\
+         # Budget\n"
+    )
+}
+
+/// The schema violations a tree with the starter's three open-item schemas reports for one
+/// question, as `(pointer, message)`.
+fn starter_schema_violations(label: &str, question: &str) -> Result<Vec<(String, String)>> {
+    let root = test_root(label)?;
+    write(
+        &root,
+        "rules.md",
+        "---\ntype: rules\n---\n[[questions/budget]]\n",
+    )?;
+    for (name, text) in [
+        ("question", include_str!("../starter/schemas/question.yaml")),
+        ("decision", include_str!("../starter/schemas/decision.yaml")),
+        (
+            "commitment",
+            include_str!("../starter/schemas/commitment.yaml"),
+        ),
+    ] {
+        write(&root, &format!("schemas/{name}.yaml"), text)?;
+    }
+    write(&root, "questions/budget.md", question)?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+    let result = result?;
+    assert_eq!(result.frontmatter_invalid.len(), 0, "{result:?}");
+    Ok(result
+        .schema_violations
+        .into_iter()
+        .map(|violation| (violation.pointer, violation.message))
+        .collect())
+}
+
+/// The starter schemas take `waiting_on` as a list of names and `tracked_by` as a list of
+/// URIs, a web address or another scheme's alike.
+#[test]
+fn the_starter_schemas_take_waiting_on_names_and_tracked_by_uris() -> Result<()> {
+    let violations = starter_schema_violations(
+        "schema-waiting-on-valid",
+        &starter_question(
+            "waiting_on: [Ada Lovelace, Grace Hopper]\n\
+             tracked_by: [\"https://tracker.example.com/ask/1\", \"tracker:ask/2\"]\n",
+        ),
+    )?;
+    assert_eq!(violations, Vec::<(String, String)>::new());
+    let empty = starter_schema_violations(
+        "schema-waiting-on-empty-lists",
+        &starter_question("waiting_on: []\ntracked_by: []\n"),
+    )?;
+    assert_eq!(empty, Vec::<(String, String)>::new());
+    Ok(())
+}
+
+/// A `tracked_by` entry that is not a URI is a schema violation at that entry.
+#[test]
+fn a_tracked_by_entry_that_is_not_a_uri_is_a_schema_violation() -> Result<()> {
+    let violations = starter_schema_violations(
+        "schema-tracked-by-not-uri",
+        &starter_question("tracked_by: [\"the budget thread\"]\n"),
+    )?;
+    let pointers: Vec<&str> = violations
+        .iter()
+        .map(|(pointer, _)| pointer.as_str())
+        .collect();
+    assert_eq!(pointers, ["/tracked_by/0"], "{violations:?}");
+    Ok(())
+}
+
+/// An empty name, or the same name twice, is a schema violation in `waiting_on`.
+#[test]
+fn an_empty_or_repeated_waiting_on_name_is_a_schema_violation() -> Result<()> {
+    let empty = starter_schema_violations(
+        "schema-waiting-on-empty-name",
+        &starter_question("waiting_on: [\"\"]\n"),
+    )?;
+    let repeated = starter_schema_violations(
+        "schema-waiting-on-repeated",
+        &starter_question("waiting_on: [Ada Lovelace, Ada Lovelace]\n"),
+    )?;
+    let pointers = |violations: &[(String, String)]| -> Vec<String> {
+        violations
+            .iter()
+            .map(|(pointer, _)| pointer.clone())
+            .collect()
+    };
+    assert_eq!(pointers(&empty), ["/waiting_on/0"], "{empty:?}");
+    assert_eq!(pointers(&repeated), ["/waiting_on"], "{repeated:?}");
+    Ok(())
+}
+
+/// One name where a list belongs is a frontmatter error the sweep reports, not a record that
+/// waits on nobody.
+#[test]
+fn a_scalar_waiting_on_is_frontmatter_invalid() -> Result<()> {
+    let root = test_root("scalar-waiting-on")?;
+    write(
+        &root,
+        "rules.md",
+        "---\ntype: rules\n---\n[[questions/budget]]\n",
+    )?;
+    write(
+        &root,
+        "questions/budget.md",
+        &starter_question("waiting_on: Ada Lovelace\n"),
+    )?;
+    let result = findings(&root);
+    remove_test_root(&root)?;
+
+    let result = result?;
+    let invalid: Vec<&str> = result
+        .frontmatter_invalid
+        .iter()
+        .map(|finding| finding.path.as_str())
+        .collect();
+    assert_eq!(invalid, ["questions/budget.md"]);
+    assert!(!result.structural_clean());
+    Ok(())
+}
+
 #[test]
 fn clean_sweep_summary_says_no_findings() -> Result<()> {
     let root = test_root("clean-summary")?;

@@ -15,7 +15,7 @@ A memory tree is a graph of markdown records with YAML frontmatter and wikilinks
 2. Search before answering:
    - `ctx search "<terms>"` matches every frontmatter value a record declares — title, quotes, statement, aliases, owner, status, dates, source pointers and a tree's own fields — and the body, and ranks direct sources above equally relevant summaries. Where embeddings are configured it also finds a record by meaning, so a paraphrase matches even with no shared word; a `--verbatim` run that finds nothing still reports how many lower-tier records matched, so it is not an absence.
    - `ctx dossier "<entity>"` follows the graph around one entity.
-   - `ctx open` lists open decisions, commitments, and questions.
+   - `ctx open` lists open decisions, commitments, and questions, with who each waits on (`waiting_on`) and what tracks it (`tracked_by`). `ctx open --waiting-on "<name>"` keeps the items that wait on that person, named as the tree names an owner (the whole name, any case); `ctx open --overdue` keeps the items past their `revisit_by` or `due` date. Filters combine with `--owner` and with each other.
 3. Cite each answer with the record path and a verbatim quote. Use `ctx resolve <pointer>` when a citation needs its source text.
 
 Treat the tree as a durable record, not a live-system dashboard. Use the record's named source system when the question requires live state.
@@ -61,6 +61,8 @@ Do not convert an incomplete search into a negative claim.
 - Preserve raw sources and keep citations resolvable.
 - Run `ctx sweep` after writing. Structural findings must be fixed; stale records are a review queue.
 - Write a record with `ctx record put <path>`, which reads it from standard input or from a file you name, and remove one with `ctx record rm <path>`. A put replaces the whole file, so an update starts from `ctx record show <path>`, which prints the record as the tree holds it, and puts back all of it. The server checks the record, commits it under your name and pushes it; a refused write prints its findings and changes nothing. Never edit a tree file by hand while a server holds it. A session with no tool that writes a file, such as the scheduled ingest cycle, writes through the record tools its own skill names instead.
+- Record a decision made in a session or on a tracker only from a source a reader can open. Where a checkable pointer exists, such as the chat message, the email or the GitHub item in which the person said it, cite that pointer at tier 1 or 2 with its quote. Only where none exists, cite the web address of the item that records the decision at tier 3, as the whole `source` with nothing else in it; the server takes a web address at tier 3 or 4 unchecked and refuses it at tier 1 or 2. Set `CTX_SESSION` so the commit names your session.
+- When an item elsewhere tracks a record, add its web address to the record's `tracked_by`, and close the record (change its `status`) when that item closes. Change `waiting_on` only as a cited source shows: a person asked by name to answer or decide, taken off when they answer or the item settles.
 
 ## Ingest
 

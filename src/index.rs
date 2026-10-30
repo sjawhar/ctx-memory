@@ -107,6 +107,8 @@ fn fields(doc: &Doc) -> Fields<'_> {
     ]
     .into_iter()
     .flatten()
+    .chain(front.waiting_on.iter().map(String::as_str))
+    .chain(front.tracked_by.iter().map(String::as_str))
     .map(str::to_owned)
     .collect();
     for date in [

@@ -34,12 +34,7 @@ pub(super) fn within<T>(seconds: u64, mut attempt: impl FnMut() -> Result<Option
 pub(super) fn install_hook(bare: &Path, name: &str, script: &str) -> Result<()> {
     let hooks = bare.join("hooks");
     std::fs::create_dir_all(&hooks)?;
-    let hook = hooks.join(name);
-    std::fs::write(&hook, script)?;
-    let mut permissions = std::fs::metadata(&hook)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&hook, permissions)?;
-    Ok(())
+    support::write_executable(&hooks.join(name), script)
 }
 
 /// Makes the bare remote refuse every push, the way a remote that is down or that refuses

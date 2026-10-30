@@ -79,6 +79,63 @@ fn the_ingest_skill_names_only_commands_the_server_answers() -> Result<()> {
     Ok(())
 }
 
+/// A maintenance pass runs in the same session as a cycle, with no tree of its own, so its
+/// instructions too name only commands the server answers, and some command at all.
+#[test]
+fn each_maintenance_pass_names_only_commands_the_server_answers() -> Result<()> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/ctx-memory-ingest/maintenance");
+    let mut passes = 0;
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let commands = ctx_commands(&text);
+        assert!(
+            commands.len() >= 3,
+            "{} names only {} ctx commands: {commands:?}",
+            path.display(),
+            commands.len()
+        );
+        for (written, argv) in &commands {
+            assert!(
+                !runs_only_locally(argv)?,
+                "{} tells the session to run `{written}`, which only a local tree answers",
+                path.display()
+            );
+        }
+        passes += 1;
+    }
+    assert!(passes >= 1, "the ingest skill keeps no maintenance pass");
+    Ok(())
+}
+
+/// The waiting-on pass changes a record only on what it could read whole: a record with any
+/// cited source it could not read keeps its list, and the pass changes nothing but
+/// `waiting_on` and moves no marker.
+#[test]
+fn the_waiting_on_pass_changes_only_what_its_sources_settle() -> Result<()> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("skills/ctx-memory-ingest/maintenance/waiting-on.md");
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for expected in [
+        "When any source the record cites does not resolve",
+        "change nothing for this record",
+        "A source you could not read is not a source that names nobody",
+        "with only `waiting_on` changed",
+        "never from the record's `owner`",
+        "do not run `ctx marker advance`",
+    ] {
+        assert!(
+            flat.contains(expected),
+            "{} does not say {expected:?}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn the_ingest_skill_writes_through_the_server() -> Result<()> {
     let text = skill("ctx-memory-ingest")?;

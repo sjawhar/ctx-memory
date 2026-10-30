@@ -4,6 +4,7 @@ use anyhow::{Context as _, Result};
 use serde_json::{json, Value};
 
 use crate::fixtures::{good_record, put_body, within};
+use crate::support::fake_http::FakeHttp;
 use crate::support::{fetch_window, fixture_clone, git, remote_of, remove_fixture, Server};
 
 #[test]
@@ -226,6 +227,197 @@ fn put_citing_a_source_that_declared_nothing_is_422() -> Result<()> {
         reply.status, reply.body
     );
     assert_eq!(kinds, vec!["unchecked".to_owned()]);
+    assert!(
+        landed.is_empty(),
+        "the refused record reached main: {landed}"
+    );
+    Ok(())
+}
+
+/// A decision whose one claim cites `address` at `tier`: the summary a tracker or a pull
+/// request holds, at the address where a reader can open it.
+fn web_sourced_record(address: &str, tier: u8) -> String {
+    format!(
+        "---\n\
+         type: decision\n\
+         status: open\n\
+         title: Keep the quarterly cadence\n\
+         quote: \"the cadence stays quarterly, as the tracker records\"\n\
+         source: \"{address}\"\n\
+         tier: {tier}\n\
+         ---\n\
+         The tracker records the answer.\n"
+    )
+}
+
+/// What one put of a record citing `address` at `tier` answered, and whether it reached the
+/// remote.
+fn put_sourced(label: &str, address: &str, tier: u8) -> Result<(u16, Value, String)> {
+    let tree = fixture_clone(label)?;
+    let server = Server::start(&tree, &[])?;
+    let reply = server.post_as(
+        "ada@example.com",
+        "/v1/records/put",
+        &put_body(
+            "decisions/web.md",
+            &web_sourced_record(address, tier),
+            "session-web",
+        ),
+    );
+    drop(server);
+    let landed = git(&remote_of(&tree)?, &["ls-tree", "main", "decisions/web.md"]);
+    remove_fixture(&tree)?;
+    let reply = reply?;
+    Ok((reply.status, reply.body, landed?))
+}
+
+/// What one put of a web-sourced record at `tier` answered, whether it reached the remote, and
+/// every request the cited address received.
+fn put_web_sourced(label: &str, tier: u8) -> Result<(u16, Value, String, usize)> {
+    let site = FakeHttp::start()?;
+    let (status, body, landed) = put_sourced(label, &site.url("/ask/1"), tier)?;
+    Ok((status, body, landed, site.requests()?.len()))
+}
+
+/// The kinds of the findings a refusal carries.
+fn finding_kinds(body: &Value) -> Result<Vec<&str>> {
+    Ok(body
+        .get("findings")
+        .and_then(Value::as_array)
+        .context("findings is a list")?
+        .iter()
+        .filter_map(|finding| finding.get("kind").and_then(Value::as_str))
+        .collect())
+}
+
+/// A summary may cite the web address where it can be read, at tier 3 or 4. The server takes
+/// the address as written and never fetches it.
+#[test]
+fn put_citing_a_web_address_at_tier_3_is_committed_unfetched() -> Result<()> {
+    let (status, body, landed, fetched) = put_web_sourced("write-web-tier-3", 3)?;
+
+    assert_eq!(status, 200, "unexpected body: {body}");
+    assert!(
+        landed.contains("decisions/web.md"),
+        "the record did not reach main"
+    );
+    assert_eq!(fetched, 0, "the server fetched the cited address");
+    Ok(())
+}
+
+/// Tier 1 and 2 are a source's own words, checked against the source; a web address is
+/// checked against nothing, so the server refuses it as unchecked, and still fetches nothing.
+#[test]
+fn put_citing_a_web_address_at_tier_1_is_422_unchecked() -> Result<()> {
+    let (status, body, landed, fetched) = put_web_sourced("write-web-tier-1", 1)?;
+
+    assert_eq!(status, 422, "unexpected body: {body}");
+    assert_eq!(
+        finding_kinds(&body)?,
+        ["unchecked"],
+        "unexpected body: {body}"
+    );
+    assert!(
+        landed.is_empty(),
+        "the refused record reached main: {landed}"
+    );
+    assert_eq!(fetched, 0, "the server fetched the cited address");
+    Ok(())
+}
+
+/// A link the URL parser reads as a Slack host in any form the scanner does not read as a
+/// message pointer, and a source that holds a web address but is not that one valid address
+/// alone, in any case, is no web address a summary may cite: the server refuses it at tiers 3
+/// and 4 as unchecked.
+#[test]
+fn put_citing_a_permalink_variant_or_a_malformed_address_is_422_at_tiers_3_and_4() -> Result<()> {
+    let port = "https://acme.slack.com:443/archives/C0EXAMPLE01/p1700000000000001";
+    let path = "/archives/C0EXAMPLE01/p1700000000000001";
+    for (label, address) in [
+        ("write-web-permalink-port", port.to_owned()),
+        (
+            "write-web-permalink-case",
+            format!("https://acme.SLACK.com{path}"),
+        ),
+        ("write-web-permalink-markdown", format!("[message]({port})")),
+        ("write-web-permalink-assignment", format!("source={port}")),
+        (
+            "write-web-permalink-paren-user",
+            format!("source=https://a)b@acme.slack.com:443{path}"),
+        ),
+        (
+            "write-web-permalink-host-tab",
+            format!("https://acme.sla\\tck.com{path}"),
+        ),
+        (
+            "write-web-permalink-scheme-tab",
+            format!("ht\\ttps://acme.slack.com:443{path}"),
+        ),
+        (
+            "write-web-markdown",
+            "[the answer](https://tracker.example.com/ask/1)".to_owned(),
+        ),
+        ("write-web-no-host", "https://:443/ask/1".to_owned()),
+        ("write-web-upper-no-host", "HTTPS://:443/ask/1".to_owned()),
+        ("write-web-control", "https://example.com/\\e[2J".to_owned()),
+        (
+            "write-web-host-space",
+            "https://exa mple.com/ask/1".to_owned(),
+        ),
+    ] {
+        for tier in [3, 4] {
+            let (status, body, landed) = put_sourced(&format!("{label}-{tier}"), &address, tier)?;
+
+            assert_eq!(
+                status, 422,
+                "{label} at tier {tier}: unexpected body: {body}"
+            );
+            assert_eq!(
+                finding_kinds(&body)?,
+                ["unchecked"],
+                "{label} at tier {tier}: {body}"
+            );
+            assert!(
+                landed.is_empty(),
+                "{label} at tier {tier}: the refused record reached main: {landed}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One checked quote does not carry another claim of the record: a `quotes` entry citing a
+/// variant of a Slack permalink beside a tier 1 quote its source holds is still refused.
+#[test]
+fn put_with_a_permalink_variant_beside_a_checked_quote_is_422() -> Result<()> {
+    let tree = fixture_clone("write-web-mixed-quotes")?;
+    fetch_window(&tree)?;
+    let server = Server::start(&tree, &[])?;
+    let record = "---\n\
+         type: decision\n\
+         status: open\n\
+         title: Keep the echo cadence\n\
+         quotes:\n\
+         \x20 - quote: \"echo C0EXAMPLE01\"\n\
+         \x20   source: \"echo:C0EXAMPLE01/record\"\n\
+         \x20   tier: 1\n\
+         \x20 - quote: \"the cadence stays quarterly, as the thread records\"\n\
+         \x20   source: \"source=https://a)b@acme.slack.com:443/archives/C0EXAMPLE01/p1700000000000001\"\n\
+         \x20   tier: 3\n\
+         ---\n\
+         The stream confirmed the cadence.\n";
+    let reply = server.post_as(
+        "ada@example.com",
+        "/v1/records/put",
+        &put_body("decisions/web.md", record, "session-web"),
+    );
+    drop(server);
+    let landed = git(&remote_of(&tree)?, &["ls-tree", "main", "decisions/web.md"]);
+    remove_fixture(&tree)?;
+    let (reply, landed) = (reply?, landed?);
+
+    assert_eq!(reply.status, 422, "unexpected body: {}", reply.body);
+    assert_eq!(finding_kinds(&reply.body)?, ["unchecked"], "{}", reply.body);
     assert!(
         landed.is_empty(),
         "the refused record reached main: {landed}"

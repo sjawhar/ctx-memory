@@ -1,10 +1,12 @@
 //! Repository paths and scratch directories that more than one agent cycle check uses.
 
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{Context as _, Result};
+use anyhow::{ensure, Context as _, Result};
 
 static NEXT_SCRATCH: AtomicUsize = AtomicUsize::new(0);
 
@@ -16,6 +18,50 @@ pub(super) fn repo() -> &'static Path {
 pub(super) fn runner(name: &str) -> Result<String> {
     let path = repo().join("runner").join(name);
     std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// The maintenance passes `runner/run-cycle.sh` runs, as its `MAINTENANCE_PASSES` names them.
+pub(super) fn maintenance_passes() -> Result<Vec<String>> {
+    let script = runner("run-cycle.sh")?;
+    let line = script
+        .lines()
+        .find_map(|line| line.strip_prefix("MAINTENANCE_PASSES="))
+        .context("run-cycle.sh names no MAINTENANCE_PASSES")?;
+    Ok(line
+        .trim_matches('"')
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// What the scheduled session is told to follow, as `(name, text)`: both skills, and the
+/// instructions of every maintenance pass the ingest skill keeps.
+pub(super) fn session_instructions() -> Result<Vec<(String, String)>> {
+    let skills = repo().join("skills");
+    let mut paths = vec![
+        skills.join("ctx-memory-ingest/SKILL.md"),
+        skills.join("ctx-memory/SKILL.md"),
+    ];
+    let maintenance = skills.join("ctx-memory-ingest/maintenance");
+    let mut passes: Vec<PathBuf> = std::fs::read_dir(&maintenance)
+        .with_context(|| format!("reading {}", maintenance.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()?;
+    passes.sort();
+    paths.extend(passes);
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let name = path
+                .strip_prefix(&skills)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            Ok((name, text))
+        })
+        .collect()
 }
 
 /// The model the tests tell `run-cycle.sh` to select: the one provider of
@@ -50,8 +96,32 @@ fn reopen_directories(path: &Path) {
     }
 }
 
+/// Writes `text` to `path` as an executable, from a child process.
+///
+/// Tests run on many threads, and each child another thread forks holds a copy of every file
+/// this process has open until that child execs. A stand-in this process wrote itself could be
+/// held open for writing by such a child at the moment a test runs it, and running it then
+/// fails with "Text file busy": `run-cycle.sh` read that as an `id` that answered nothing and
+/// refused to start as if it were not root. Here only the short-lived `sh` below holds the file
+/// open, and it starts nothing else.
 pub(super) fn write_executable(path: &Path, text: &str) -> Result<()> {
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    let mut writer = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting the writer of {}", path.display()))?;
+    writer
+        .stdin
+        .take()
+        .context("the writer has no standard input")?
+        .write_all(text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    let status = writer.wait()?;
+    ensure!(
+        status.success(),
+        "writing {} failed: {status}",
+        path.display()
+    );
     Ok(())
 }

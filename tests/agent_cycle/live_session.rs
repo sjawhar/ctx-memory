@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use crate::fixtures::{
     remove_scratch, repo, runner, scratch, write_executable, EXAMPLE_MODEL, EXAMPLE_MODEL_ID,
 };
+use crate::policy::maintenance_prompt;
 
 /// The arguments `run-cycle.sh` starts omp with, read from the script itself so this test
 /// cannot drift from it, with the container's paths replaced by this machine's.
@@ -865,6 +866,60 @@ fn a_live_session_starts_no_mcp_server_its_directory_names() -> Result<()> {
     ensure!(
         text.contains("Tree rules"),
         "`ctx rules` did not run, so the probe proves nothing: {text}"
+    );
+    Ok(())
+}
+
+/// A maintenance pass runs in the cycle's own session, under the prompt `run-cycle.sh maintain
+/// waiting-on` gives it: the session reads the pass's instructions where the prompt sends it,
+/// and every command those instructions name runs under the cycle's policy. The scripted model
+/// reads the instructions, lists the open records, shows one and resolves a pointer with its
+/// thread; none of them is stopped at the approval gate. No model is called.
+#[test]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
+fn a_live_maintenance_session_reads_its_pass_and_runs_its_commands() -> Result<()> {
+    let omp = pinned_omp()?;
+    let prompt = maintenance_prompt("waiting-on", "0123456789abcdef0123456789abcdef")?;
+    let model = FakeModel::start(vec![
+        json!({"tool": "read", "input": {"path": "skill://ctx-memory-ingest/maintenance/waiting-on.md"}}),
+        json!({"tool": "bash", "input": {"command": "ctx open --json"}}),
+        json!({"tool": "bash", "input": {"command": "ctx record show decisions/record-provenance.md"}}),
+        json!({"tool": "bash", "input": {"command": "ctx resolve --thread slack:C0EXAMPLE01/1700000000.000001"}}),
+    ])?;
+    let root = scratch("live-maintain")?;
+    let outcome = run_session(&omp, &root, &model, &prompt, &[], &[]);
+    remove_scratch(&root)?;
+    outcome?;
+
+    let results = model.tool_results()?;
+    let result = |step: usize| -> Result<(bool, String)> {
+        results
+            .iter()
+            .find(|(id, _, _)| *id == format!("toolu_{step}"))
+            .map(|(_, error, text)| (*error, text.clone()))
+            .with_context(|| {
+                format!("the session sent back no result for step {step}: {results:?}")
+            })
+    };
+    let (error, text) = result(0)?;
+    ensure!(
+        !error && text.contains("Maintenance pass: waiting-on"),
+        "the session could not read the pass's instructions where its prompt sends it: {text}"
+    );
+    let (error, text) = result(1)?;
+    ensure!(
+        !error && text.contains("waiting_on") && text.contains("record-provenance.md"),
+        "`ctx open --json` did not list the open records with waiting_on: {text}"
+    );
+    let (error, text) = result(2)?;
+    ensure!(
+        !error && !text.contains("requires approval") && text.contains("type: decision"),
+        "`ctx record show` did not print the record: {text}"
+    );
+    let (_, text) = result(3)?;
+    ensure!(
+        !text.contains("requires approval"),
+        "`ctx resolve --thread` was stopped at the approval gate: {text}"
     );
     Ok(())
 }

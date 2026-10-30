@@ -157,6 +157,12 @@ pub struct Front {
     pub last_reviewed: Option<NaiveDate>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// The people an open item waits on to answer or decide, named as the tree names an owner.
+    #[serde(default)]
+    pub waiting_on: Vec<String>,
+    /// The addresses of the items that track this record elsewhere, such as a tracker's ask.
+    #[serde(default)]
+    pub tracked_by: Vec<String>,
     tier: Option<TierValue>,
     source_tier: Option<TierValue>,
     #[serde(default)]
@@ -1135,6 +1141,43 @@ mod tests {
         assert!(front.kind.is_none());
         let error = error.ok_or_else(|| anyhow!("duplicate frontmatter keys were accepted"))?;
         assert!(error.contains("duplicate"), "{error}");
+        Ok(())
+    }
+
+    /// Who an open item waits on and what tracks it are lists. A record without them waits on
+    /// nobody and nothing tracks it.
+    #[test]
+    fn waiting_on_and_tracked_by_are_lists_that_default_to_empty() -> Result<()> {
+        let front = parse_front(
+            "waiting_on: [Ada Lovelace, Grace Hopper]\ntracked_by: [\"https://example.com/ask/1\"]\n",
+            Path::new("q.md"),
+        )?;
+        assert_eq!(front.waiting_on, ["Ada Lovelace", "Grace Hopper"]);
+        assert_eq!(front.tracked_by, ["https://example.com/ask/1"]);
+        assert!(!front.extra.contains_key("waiting_on"));
+        assert!(!front.extra.contains_key("tracked_by"));
+
+        let bare = parse_front("type: question\n", Path::new("q.md"))?;
+        assert_eq!(bare.waiting_on, Vec::<String>::new());
+        assert_eq!(bare.tracked_by, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// A single name where a list belongs is a frontmatter error, as a scalar `aliases` is: the
+    /// sweep reports it and the server refuses the write, rather than read it as nobody.
+    #[test]
+    fn a_scalar_waiting_on_or_tracked_by_is_a_frontmatter_error() -> Result<()> {
+        for field in [
+            "waiting_on: Ada Lovelace\n",
+            "tracked_by: https://example.com/ask/1\n",
+        ] {
+            let (front, error) = load_front(field, Path::new("q.md"))?;
+            assert_eq!(
+                (front.waiting_on, front.tracked_by),
+                (Vec::<String>::new(), Vec::<String>::new())
+            );
+            assert!(error.is_some(), "{field:?} was accepted");
+        }
         Ok(())
     }
 

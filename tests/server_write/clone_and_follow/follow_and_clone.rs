@@ -462,17 +462,14 @@ fn a_probe_during_the_first_follow_pass_answers_from_a_check() -> Result<()> {
     let pulling = root.join("pulling");
     let resume = root.join("resume");
     let wrapper = root.join("upload-pack");
-    std::fs::write(
+    crate::support::write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.1; done\nexec git-upload-pack \"$@\"\n",
             pulling.display(),
             resume.display()
         ),
     )?;
-    let mut permissions = std::fs::metadata(&wrapper)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&wrapper, permissions)?;
     let wrapper_text = wrapper
         .to_str()
         .context("wrapper path is not valid UTF-8")?;

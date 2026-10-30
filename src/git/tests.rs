@@ -57,12 +57,29 @@ fn output(directory: &Path, arguments: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// Writes an executable script.
+/// Writes an executable script, from a child process.
+///
+/// Tests run on many threads, and a child another thread forks holds a copy of every file this
+/// process has open until it execs. A script this process wrote itself could be held open for
+/// writing by such a child when git runs it, which then fails with "Text file busy". Only the
+/// short-lived `sh` below holds the file open, and it starts nothing else.
 fn executable(path: &Path, script: &str) -> Result<()> {
-    std::fs::write(path, script)?;
-    let mut permissions = std::fs::metadata(path)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(path, permissions)?;
+    let mut writer = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    std::io::Write::write_all(
+        &mut writer
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("the writer has no standard input"))?,
+        script.as_bytes(),
+    )?;
+    let status = writer.wait()?;
+    if !status.success() {
+        bail!("writing {} failed: {status}", path.display());
+    }
     Ok(())
 }
 
@@ -298,10 +315,7 @@ fn a_push_the_remote_holds_open_is_stopped() -> Result<()> {
         ],
     )?;
     let hook = root.join("remote.git/hooks/pre-receive");
-    std::fs::write(&hook, "#!/bin/sh\nsleep 30\n")?;
-    let mut permissions = std::fs::metadata(&hook)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&hook, permissions)?;
+    executable(&hook, "#!/bin/sh\nsleep 30\n")?;
     let remote = root.join("remote.git");
     let remote = remote.to_str().context("remote path is not UTF-8")?;
     git(&root, &["clone", "--quiet", remote, "tree"])?;

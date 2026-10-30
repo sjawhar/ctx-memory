@@ -759,6 +759,38 @@ fn search_finds_a_record_by_owner_attendee_and_source_pointer() -> Result<()> {
     Ok(())
 }
 
+/// Who a record waits on and what tracks it are frontmatter values like any other, so a
+/// search for the person or the tracker's address finds the record that only names them there.
+#[test]
+fn search_finds_a_record_by_who_it_waits_on_and_what_tracks_it() -> Result<()> {
+    let root = test_root("waiting-on")?;
+    write(
+        &root,
+        "questions/budget.md",
+        "---\n\
+         type: question\n\
+         status: open\n\
+         question: Who approves the budget?\n\
+         waiting_on: [Ada Lovelace]\n\
+         tracked_by: [\"https://tracker.example.com/ask/4417\"]\n\
+         ---\n\
+         Body text.\n",
+    )?;
+    write(
+        &root,
+        "questions/venue.md",
+        "---\ntype: question\nstatus: open\nquestion: Which venue?\n---\nBody text.\n",
+    )?;
+
+    let person = ctx(&root, &["search", "Lovelace"]);
+    let tracker = ctx(&root, &["search", "4417"]);
+    remove_test_root(&root)?;
+
+    assert_eq!(hit_paths(&person?)?, ["questions/budget.md"]);
+    assert_eq!(hit_paths(&tracker?)?, ["questions/budget.md"]);
+    Ok(())
+}
+
 #[test]
 fn search_limit_bounds_hits_and_zero_returns_every_match() -> Result<()> {
     let root = test_root("limit")?;

@@ -18,13 +18,15 @@ use crate::git;
 use crate::lease::{self, Lease};
 use crate::marker::{self, Marker};
 use crate::open::{
-    self, apply_staleness, open_items_with_filters, parse_linked, LinkedFilter, OpenItemView,
+    self, apply_staleness, open_items_with_filters, parse_linked, LinkedFilter, OpenFilter,
+    OpenItemView,
 };
 use crate::output::{self, Outcome, Sink};
 use crate::plugin::{run_external, PluginEnv};
 use crate::redact;
 use crate::remote;
 use crate::resolve::{self, Resolved};
+use crate::schema::today_utc;
 use crate::search;
 use crate::server;
 use crate::slack_login;
@@ -92,6 +94,12 @@ pub enum Command {
         linked: Vec<LinkedFilter>,
         #[arg(long, value_name = "NAME", value_delimiter = ',')]
         owner: Vec<String>,
+        /// Keep the items that wait on one of these people, matched as `--owner` matches.
+        #[arg(long = "waiting-on", value_name = "NAME", value_delimiter = ',')]
+        waiting_on: Vec<String>,
+        /// Keep the items whose `revisit_by` or `due` date has passed.
+        #[arg(long)]
+        overdue: bool,
     },
     /// Fetch all configured sources into a durable window.
     Fetch {
@@ -536,13 +544,24 @@ fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
             Ok(Outcome::Pass)
         }
         Command::Dossier { entity } => run_dossier(run, entity),
-        Command::Open { linked, owner } => {
+        Command::Open {
+            linked,
+            owner,
+            waiting_on,
+            overdue,
+        } => {
             let stale = if run.context.config.sources.is_empty() {
                 BTreeMap::new()
             } else {
                 delta::staleness(&run.context.data()?.windows(), &run.context.tree)?
             };
-            let mut items = open_items_with_filters(&run.context.tree, linked, owner)?;
+            let filter = OpenFilter {
+                linked,
+                owners: owner,
+                waiting_on,
+                overdue: *overdue,
+            };
+            let mut items = open_items_with_filters(&run.context.tree, &filter, today_utc())?;
             apply_staleness(&mut items, &stale);
             let payload = OpenPayload { items };
             run.emit("open", &payload, |payload, out| {

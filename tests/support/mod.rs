@@ -73,6 +73,34 @@ pub fn remove_scratch(path: &Path) -> Result<()> {
     std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))
 }
 
+/// Writes `script` to `path` as an executable, from a child process.
+///
+/// Tests run on many threads, and a child another thread forks holds a copy of every file this
+/// process has open until it execs. A program this process wrote itself could be held open for
+/// writing by such a child when git or ctx runs it, which then fails with "Text file busy".
+/// Only the short-lived `sh` below holds the file open, and it starts nothing else.
+pub fn write_executable(path: &Path, script: &str) -> Result<()> {
+    let mut writer = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting the writer of {}", path.display()))?;
+    std::io::Write::write_all(
+        &mut writer
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("the writer has no standard input"))?,
+        script.as_bytes(),
+    )
+    .with_context(|| format!("writing {}", path.display()))?;
+    let status = writer.wait()?;
+    if !status.success() {
+        bail!("writing {} failed: {status}", path.display());
+    }
+    Ok(())
+}
+
 /// Waits until `path` exists, or fails after two minutes with `what`.
 pub fn wait_for_path(path: &Path, what: &str) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);

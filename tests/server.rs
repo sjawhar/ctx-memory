@@ -480,6 +480,86 @@ fn remote_mode_never_reads_a_local_tree() -> Result<()> {
     Ok(())
 }
 
+/// The server runs `ctx open` for a remote caller, so `--waiting-on` and `--overdue` filter the
+/// server's tree, each item carries `waiting_on` and `tracked_by`, and the caller reads what a
+/// local run prints.
+#[test]
+fn remote_open_filters_by_waiting_on_and_overdue() -> Result<()> {
+    let tree = fixture_tree("remote-open-waiting")?;
+    std::fs::create_dir_all(tree.join("questions"))?;
+    std::fs::write(
+        tree.join("questions/budget.md"),
+        "---\ntype: question\nstatus: open\nrevisit_by: 2000-01-01\n\
+         waiting_on: [Ada Lovelace]\ntracked_by: [\"https://tracker.example.com/ask/1\"]\n\
+         ---\nWho approves the budget?\n",
+    )?;
+    std::fs::write(
+        tree.join("questions/venue.md"),
+        "---\ntype: question\nstatus: open\nrevisit_by: 2999-01-01\n\
+         waiting_on: [Grace Hopper]\n---\nWhich venue?\n",
+    )?;
+    let both = [
+        "--json",
+        "open",
+        "--waiting-on",
+        "ada lovelace",
+        "--overdue",
+    ];
+    let local = ctx_local(&tree, &both)?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let server = ingress_server(&tree, &keys)?;
+    let metadata = metadata_identity("ctx-agent@example-project.iam.gserviceaccount.com")?;
+    let environment = cloud_env(&server, &metadata)?;
+    let elsewhere = support::scratch("remote-open-waiting-cwd")?;
+    let run = |arguments: &[&str]| {
+        support::ctx_remote(&elsewhere, &borrowed(&environment), arguments, None)
+    };
+    let outcome = (|| {
+        Ok::<_, anyhow::Error>((
+            run(&["--json", "open", "--waiting-on", "ada lovelace"])?,
+            run(&["--json", "open", "--waiting-on", "Grace Hopper"])?,
+            run(&["--json", "open", "--overdue"])?,
+            run(&both)?,
+        ))
+    })();
+    drop(server);
+    support::remove_scratch(&elsewhere)?;
+    remove_fixture(&tree)?;
+    let (ada, grace, overdue, remote_both) = outcome?;
+
+    let items = |run: &support::Local| -> Result<Vec<Value>> {
+        assert_eq!(run.exit_code, 0, "{}{}", run.stdout, run.stderr);
+        let envelope: Value = serde_json::from_str(run.stdout.trim())
+            .with_context(|| format!("decoding {}", run.stdout))?;
+        envelope
+            .pointer("/data/items")
+            .and_then(Value::as_array)
+            .cloned()
+            .with_context(|| format!("no items: {}", run.stdout))
+    };
+    let paths = |run: &support::Local| -> Result<Vec<String>> {
+        Ok(items(run)?
+            .iter()
+            .filter_map(|item| item.get("path").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect())
+    };
+    assert_eq!(paths(&ada)?, ["questions/budget.md"]);
+    assert_eq!(paths(&grace)?, ["questions/venue.md"]);
+    assert_eq!(paths(&overdue)?, ["questions/budget.md"]);
+    let budget = items(&ada)?;
+    let budget = budget.first().context("no budget item")?;
+    assert_eq!(budget.get("waiting_on"), Some(&json!(["Ada Lovelace"])));
+    assert_eq!(
+        budget.get("tracked_by"),
+        Some(&json!(["https://tracker.example.com/ask/1"]))
+    );
+    assert_eq!(local.exit_code, 0, "{}", local.stderr);
+    assert_eq!(remote_both.exit_code, local.exit_code);
+    assert_eq!(remote_both.stdout, local.stdout);
+    Ok(())
+}
+
 #[test]
 fn record_put_reads_stdin() -> Result<()> {
     let tree = support::fixture_clone("remote-record-put")?;

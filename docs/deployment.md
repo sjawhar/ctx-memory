@@ -67,6 +67,12 @@ The cycle reads text that people outside the deployment wrote, so its session ru
 
 `CTX_MODELS_FILE` and `CTX_MODEL` belong with the provider file, so an image that carries the file usually sets both. The runner has no default for either.
 
+### Maintenance passes
+
+`run-cycle.sh maintain <pass>` runs one maintenance pass instead of a cycle: a one-time job over the whole tree, whose instructions are the ingest skill's `maintenance/<pass>.md`, in the same session a cycle runs, with the same image, environment, checks and policy. It handles no window and moves no marker, so it runs whether or not a window is pending. The passes are the ones `MAINTENANCE_PASSES` in `run-cycle.sh` names; any other argument is refused before anything else. On Cloud Run, run one with the job's own image and environment and the arguments overridden, for example `gcloud run jobs execute <job> --args=maintain,waiting-on`.
+
+- `waiting-on` re-checks `waiting_on` on every open record against the sources it cites, by the ingest skill's rule, for a tree whose records were written before that rule. Run it once after upgrading to a release that has it.
+
 ### Checking an image
 
 The runner's own tests (`tests/agent_cycle/`) check the policy against every `ctx` command the skills name, run `run-cycle.sh` against stand-ins for each refusal, and drive live sessions of the pinned omp. What holds only in a built image — that the session runs as `ctx-agent` with no new privileges, that its model calls reach `CTX_MODEL_BASE_URL` with the job's key as the bearer token, that a `SIGTERM` reaches the session and the transcript is sealed, that no file the session tries to write lands — is the deployment's to check, by running the image as its job runs it, as root with a share mounted, against a stand-in for the server and the model API.

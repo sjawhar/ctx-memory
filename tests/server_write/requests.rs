@@ -138,9 +138,8 @@ fn push_rejected_by_newer_main_rebases_once() -> Result<()> {
     // server's pull and its push would.
     let hooks = bare.join("hooks");
     std::fs::create_dir_all(&hooks)?;
-    let hook = hooks.join("pre-receive");
-    std::fs::write(
-        &hook,
+    crate::support::write_executable(
+        &hooks.join("pre-receive"),
         "#!/bin/sh\n\
          if [ -f \"$GIT_DIR/raced\" ]; then exit 0; fi\n\
          touch \"$GIT_DIR/raced\"\n\
@@ -149,9 +148,6 @@ fn push_rejected_by_newer_main_rebases_once() -> Result<()> {
          echo 'main moved on' >&2\n\
          exit 1\n",
     )?;
-    let mut permissions = std::fs::metadata(&hook)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&hook, permissions)?;
 
     let server = Server::start(&tree, &[])?;
     let reply = server.post_as(

@@ -202,6 +202,20 @@ impl CycleRig {
         self.command()?.output().context("running run-cycle.sh")
     }
 
+    /// Makes `ctx` report no pending window and keep each call's arguments, one line per call,
+    /// in the file this returns.
+    fn nothing_pending(&self) -> Result<PathBuf> {
+        let calls = self.root.join("ctx-calls");
+        write_executable(
+            &self.bin.join("ctx"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[]}}}}'\n",
+                calls.display()
+            ),
+        )?;
+        Ok(calls)
+    }
+
     fn omp_started(&self) -> bool {
         self.omp_log.exists()
     }
@@ -676,4 +690,80 @@ fn the_cycle_refuses_a_home_without_its_shell_startup_files() -> Result<()> {
         std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o444))?;
     }
     rig.remove()
+}
+
+/// A cycle with no pending window has nothing to do and exits 0 before any session. A
+/// maintenance pass works over the whole tree, not over windows: it does not ask what is
+/// pending and goes on to the same checks a cycle's session must pass, here the first one,
+/// which refuses a share the session's user can write.
+#[test]
+fn a_maintenance_pass_runs_whether_or_not_a_window_is_pending() -> Result<()> {
+    let rig = CycleRig::new("maintain-nothing-pending")?;
+    rig.pretend_root()?;
+    let calls = rig.nothing_pending()?;
+    let cycle = rig.run()?;
+    let cycle_calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    std::fs::remove_file(&calls)?;
+    let pass = rig
+        .command()?
+        .args(["maintain", "waiting-on"])
+        .output()
+        .context("running run-cycle.sh maintain waiting-on")?;
+    let pass_calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    let pass_refusal = assert_refused(&rig, &pass, "can write");
+    rig.remove()?;
+
+    let cycle_out = String::from_utf8_lossy(&cycle.stdout);
+    ensure!(
+        cycle.status.success() && cycle_out.contains("no pending windows"),
+        "a cycle with nothing pending did not stop at once: {cycle_out}{}",
+        String::from_utf8_lossy(&cycle.stderr)
+    );
+    ensure!(
+        cycle_calls.lines().any(|line| line.starts_with("pending")),
+        "the cycle did not ask what is pending: {cycle_calls:?}"
+    );
+    pass_refusal?;
+    ensure!(
+        pass_calls.is_empty(),
+        "the maintenance pass ran ctx before its session: {pass_calls:?}"
+    );
+    Ok(())
+}
+
+/// A maintenance pass is named, and only a pass the runner knows runs: an argument never
+/// names a file. Anything else is refused before anything is prepared for a session.
+#[test]
+fn the_runner_refuses_a_maintenance_pass_it_does_not_know() -> Result<()> {
+    let rig = CycleRig::new("maintain-unknown")?;
+    rig.pretend_root()?;
+    let mut result = Ok(());
+    for (arguments, reason) in [
+        (&["maintain", "nonesuch"][..], "no maintenance pass named"),
+        (
+            &["maintain", "../../etc/passwd"][..],
+            "no maintenance pass named",
+        ),
+        (&["maintain", ""][..], "no maintenance pass named"),
+        (
+            &["maintain", "waiting-on waiting-on"][..],
+            "no maintenance pass named",
+        ),
+        (&["maintain"][..], "usage"),
+        (&["maintain", "waiting-on", "again"][..], "usage"),
+        (&["waiting-on"][..], "usage"),
+    ] {
+        let output = rig
+            .command()?
+            .args(arguments)
+            .output()
+            .context("running run-cycle.sh")?;
+        result = assert_refused(&rig, &output, reason)
+            .with_context(|| format!("run-cycle.sh {arguments:?}"));
+        if result.is_err() {
+            break;
+        }
+    }
+    rig.remove()?;
+    result
 }

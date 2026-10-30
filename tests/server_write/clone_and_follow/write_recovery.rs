@@ -130,9 +130,8 @@ fn a_conflicting_rebase_is_409_and_leaves_no_rebase_behind() -> Result<()> {
 
     let hooks = bare.join("hooks");
     std::fs::create_dir_all(&hooks)?;
-    let hook = hooks.join("pre-receive");
-    std::fs::write(
-        &hook,
+    crate::support::write_executable(
+        &hooks.join("pre-receive"),
         "#!/bin/sh\n\
          if [ -f \"$GIT_DIR/raced\" ]; then exit 0; fi\n\
          touch \"$GIT_DIR/raced\"\n\
@@ -141,9 +140,6 @@ fn a_conflicting_rebase_is_409_and_leaves_no_rebase_behind() -> Result<()> {
          echo 'main moved on' >&2\n\
          exit 1\n",
     )?;
-    let mut permissions = std::fs::metadata(&hook)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&hook, permissions)?;
 
     let server = Server::start(&tree, &[])?;
     let reply = server.post_as(
@@ -348,9 +344,9 @@ fn a_rebase_that_cannot_reach_the_remote_is_not_a_conflict() -> Result<()> {
     // pull that would rebase does not.
     let wrapper = root.join("upload-pack");
     let count = root.join("upload-pack.count");
-    std::fs::write(
+    crate::support::write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/sh\n\
              n=$(cat '{count}' 2>/dev/null || echo 0)\n\
              n=$((n + 1))\n\
@@ -360,9 +356,6 @@ fn a_rebase_that_cannot_reach_the_remote_is_not_a_conflict() -> Result<()> {
             count = count.display()
         ),
     )?;
-    let mut permissions = std::fs::metadata(&wrapper)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&wrapper, permissions)?;
     let wrapper_text = wrapper
         .to_str()
         .context("wrapper path is not valid UTF-8")?;
@@ -476,17 +469,14 @@ fn path_with_a_git_killed_reading_the_remote(root: &Path, trigger: &Path) -> Res
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin)?;
     let script = bin.join("git");
-    std::fs::write(
+    crate::support::write_executable(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\nif [ -e '{}' ]; then\n  for argument in \"$@\"; do\n    case \"$argument\" in\n      get-url|remote.origin.url) kill -KILL $$ ;;\n    esac\n  done\nfi\nexec '{}' \"$@\"\n",
             trigger.display(),
             real_git()?.display()
         ),
     )?;
-    let mut permissions = std::fs::metadata(&script)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&script, permissions)?;
     let inherited = std::env::var_os("PATH").context("PATH is not set")?;
     let joined =
         std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))?;

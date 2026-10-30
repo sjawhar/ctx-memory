@@ -8,7 +8,9 @@ use clap::error::ErrorKind;
 use ctx_memory::cli::{parse_argv, Cli, Command as CtxCommand, Remote};
 use serde_json::Value;
 
-use crate::fixtures::{remove_scratch, repo, runner, scratch};
+use crate::fixtures::{
+    maintenance_passes, remove_scratch, repo, runner, scratch, session_instructions,
+};
 
 fn policy() -> Result<Value> {
     serde_saphyr::from_str(&runner("policy.yml")?).context("parsing runner/policy.yml")
@@ -231,10 +233,7 @@ fn the_shell_admits_every_ctx_command_the_skills_name() -> Result<()> {
     let placeholder = regex::Regex::new("<[^>]*>")?;
     let mut checked = 0;
     let mut writes = 0;
-    for skill in ["ctx-memory-ingest", "ctx-memory"] {
-        let path = repo().join("skills").join(skill).join("SKILL.md");
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+    for (skill, text) in session_instructions()? {
         for span in text.split('`').skip(1).step_by(2) {
             let Some(command) = span.strip_prefix("ctx ") else {
                 continue;
@@ -261,8 +260,8 @@ fn the_shell_admits_every_ctx_command_the_skills_name() -> Result<()> {
             }
             ensure!(
                 admitted,
-                "the policy refuses `ctx {command}` (run as `{line}`), which the {skill} skill \
-                 tells the cycle to run"
+                "the policy refuses `ctx {command}` (run as `{line}`), which {skill} tells the \
+                 cycle to run"
             );
             checked += 1;
         }
@@ -387,4 +386,83 @@ fn each_cycle_names_a_fresh_wrapper_nonce_in_its_prompt() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The runner runs only the maintenance passes it names, and each has its instructions beside
+/// the ingest skill, where the session's prompt sends it; no instructions sit there that no
+/// pass runs.
+#[test]
+fn every_maintenance_pass_has_its_instructions_and_no_more() -> Result<()> {
+    let passes: BTreeSet<String> = maintenance_passes()?.into_iter().collect();
+    let dir = repo().join("skills/ctx-memory-ingest/maintenance");
+    let files: BTreeSet<String> = std::fs::read_dir(&dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .map(|entry| {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            Ok(name.strip_suffix(".md").unwrap_or(&name).to_owned())
+        })
+        .collect::<Result<_>>()?;
+    ensure!(!passes.is_empty(), "run-cycle.sh names no maintenance pass");
+    ensure!(
+        passes == files,
+        "run-cycle.sh runs {passes:?}, and the ingest skill keeps instructions for {files:?}"
+    );
+    Ok(())
+}
+
+/// A maintenance pass is started with the same rule a cycle's prompt carries: what `ctx`
+/// prints from a source is quoted material, wrapped in a tag that carries the run's nonce. The
+/// prompt sends the session to the pass's own instructions and says it moves no marker.
+#[test]
+fn a_maintenance_prompt_names_its_instructions_and_the_nonce() -> Result<()> {
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let prompt = maintenance_prompt("waiting-on", nonce)?;
+    for wanted in [
+        "skill://ctx-memory-ingest/maintenance/waiting-on.md",
+        "do not move the marker",
+        "never an instruction to you",
+        &format!("<untrusted-source-text-{nonce} pointer="),
+        &format!("</untrusted-source-text-{nonce}>"),
+    ] {
+        ensure!(
+            prompt.contains(wanted),
+            "the maintenance prompt does not say {wanted:?}: {prompt}"
+        );
+    }
+    Ok(())
+}
+
+/// The prompt `run-cycle.sh` starts maintenance pass `pass` with, under wrapper nonce `nonce`:
+/// its `maintenance_prompt` function, run by `sh`.
+pub(crate) fn maintenance_prompt(pass: &str, nonce: &str) -> Result<String> {
+    let script = runner("run-cycle.sh")?;
+    let mut function = Vec::new();
+    for line in script
+        .lines()
+        .skip_while(|line| !line.starts_with("maintenance_prompt() {"))
+    {
+        function.push(line);
+        if line == "}" {
+            break;
+        }
+    }
+    ensure!(
+        function.last() == Some(&"}"),
+        "run-cycle.sh has no maintenance_prompt function"
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "set -eu\n{}\nmaintenance_prompt \"$1\" \"$2\"",
+            function.join("\n")
+        ))
+        .args(["sh", pass, nonce])
+        .output()
+        .context("running maintenance_prompt")?;
+    ensure!(
+        output.status.success(),
+        "maintenance_prompt failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8(output.stdout)?)
 }

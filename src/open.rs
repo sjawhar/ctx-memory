@@ -47,12 +47,27 @@ pub fn parse_linked(input: &str) -> std::result::Result<LinkedFilter, String> {
     })
 }
 
+/// What `ctx open` narrows its list to. The default keeps every open item.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenFilter<'a> {
+    /// Each filter must match a record the item links to.
+    pub linked: &'a [LinkedFilter],
+    /// The item's owner must be one of these people; `linked` names a record `linked` matched.
+    pub owners: &'a [String],
+    /// The item must wait on one of these people, matched as an owner is.
+    pub waiting_on: &'a [String],
+    /// The item's deadline must have passed.
+    pub overdue: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct OpenItemView {
     pub path: String,
     pub kind: String,
     pub status: String,
     pub owner: Option<String>,
+    pub waiting_on: Vec<String>,
+    pub tracked_by: Vec<String>,
     pub deadline: Option<NaiveDate>,
     pub days_overdue: Option<i64>,
     pub title: String,
@@ -79,32 +94,39 @@ pub fn open_items_at(tree: &Tree, today: NaiveDate) -> Vec<OpenItemView> {
     items
 }
 
-/// Returns open items after applying linked-record and owner filters.
+/// Returns the open items `filter` keeps, with overdue durations relative to `today`.
 ///
 /// # Errors
 ///
 /// Returns an error when a linked target's frontmatter cannot be read or `linked` is used
-/// as an owner without at least one linked-record filter.
+/// as an owner or a person waited on without at least one linked-record filter.
 pub fn open_items_with_filters(
     tree: &Tree,
-    linked: &[LinkedFilter],
-    owners: &[String],
+    filter: &OpenFilter<'_>,
+    today: NaiveDate,
 ) -> Result<Vec<OpenItemView>> {
-    if owners.iter().any(|owner| owner == "linked") && linked.is_empty() {
-        bail!("--owner linked requires --linked");
+    for (flag, names) in [
+        ("--owner", filter.owners),
+        ("--waiting-on", filter.waiting_on),
+    ] {
+        if names.iter().any(|name| name == "linked") && filter.linked.is_empty() {
+            bail!("{flag} linked requires --linked");
+        }
     }
 
-    let today = today_utc();
     let mut frontmatter = HashMap::new();
     let mut items = Vec::new();
     for document in tree.docs.iter().filter(|document| is_open(document)) {
+        if filter.overdue && days_overdue(document, today).is_none() {
+            continue;
+        }
         let links = resolved_links(tree, document);
         let mut linked_positions = Vec::new();
         let mut all_filters_match = true;
-        for filter in linked {
+        for linked in filter.linked {
             let mut this_filter_matches = false;
             for position in &links {
-                if linked_target_matches(tree, &mut frontmatter, *position, filter)? {
+                if linked_target_matches(tree, &mut frontmatter, *position, linked)? {
                     this_filter_matches = true;
                     if !linked_positions.contains(position) {
                         linked_positions.push(*position);
@@ -119,7 +141,26 @@ pub fn open_items_with_filters(
         if !all_filters_match {
             continue;
         }
-        if !owners.is_empty() && !owner_matches(tree, document, owners, &linked_positions)? {
+        if !filter.owners.is_empty()
+            && !any_person_matches(
+                tree,
+                document,
+                document.front.owner.as_slice(),
+                filter.owners,
+                &linked_positions,
+            )?
+        {
+            continue;
+        }
+        if !filter.waiting_on.is_empty()
+            && !any_person_matches(
+                tree,
+                document,
+                &document.front.waiting_on,
+                filter.waiting_on,
+                &linked_positions,
+            )?
+        {
             continue;
         }
         items.push(open_item(document, today));
@@ -127,6 +168,7 @@ pub fn open_items_with_filters(
     sort_items(&mut items);
     Ok(items)
 }
+
 /// Adds current unreviewed-reply flags to open-item views.
 pub fn apply_staleness(items: &mut [OpenItemView], stale: &BTreeMap<String, Vec<Staleness>>) {
     for item in items {
@@ -148,20 +190,28 @@ fn is_open(document: &Doc) -> bool {
 }
 
 fn open_item(document: &Doc, today: NaiveDate) -> OpenItemView {
-    let deadline = document.front.deadline();
     OpenItemView {
         path: document.rel.to_string_lossy().into_owned(),
         kind: document.front.kind.clone().unwrap_or_default(),
         status: document.front.status.clone().unwrap_or_default(),
         owner: document.front.owner.clone(),
-        deadline,
-        days_overdue: deadline
-            .filter(|deadline| *deadline < today)
-            .map(|deadline| (today - deadline).num_days()),
+        waiting_on: document.front.waiting_on.clone(),
+        tracked_by: document.front.tracked_by.clone(),
+        deadline: document.front.deadline(),
+        days_overdue: days_overdue(document, today),
         opened: document.front.opened.or(document.front.date),
         title: document.label(),
         unreviewed: None,
     }
+}
+
+/// How many days past its deadline an item is on `today`; none on the deadline itself.
+fn days_overdue(document: &Doc, today: NaiveDate) -> Option<i64> {
+    document
+        .front
+        .deadline()
+        .filter(|deadline| *deadline < today)
+        .map(|deadline| (today - deadline).num_days())
 }
 
 fn sort_items(items: &mut [OpenItemView]) {
@@ -225,33 +275,50 @@ fn field_matches(value: &Value, expected: &[String]) -> bool {
     }
 }
 
-fn owner_matches(
+/// Whether any of `people`, a record's owner or the people it waits on, is one of `names`.
+fn any_person_matches(
     tree: &Tree,
     document: &Doc,
-    owners: &[String],
+    people: &[String],
+    names: &[String],
     linked_positions: &[usize],
 ) -> Result<bool> {
-    let Some(owner) = document.front.owner.as_deref() else {
-        return Ok(false);
-    };
-    if owners
+    for person in people {
+        if person_matches(tree, document, person, names, linked_positions)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `person`, as a record names someone, is one of `names`: the whole name in any
+/// case, or, when `person` links a record, that record's stem or link target. The name
+/// `linked` stands for a record a `--linked` filter matched.
+fn person_matches(
+    tree: &Tree,
+    document: &Doc,
+    person: &str,
+    names: &[String],
+    linked_positions: &[usize],
+) -> Result<bool> {
+    if names
         .iter()
-        .any(|name| name != "linked" && owner.eq_ignore_ascii_case(name))
+        .any(|name| name != "linked" && person.eq_ignore_ascii_case(name))
     {
         return Ok(true);
     }
-    for link in wikilinks(owner) {
-        let Resolution::Found(owner_position) = tree.resolve(document, &link.target) else {
+    for link in wikilinks(person) {
+        let Resolution::Found(person_position) = tree.resolve(document, &link.target) else {
             continue;
         };
-        for name in owners {
+        for name in names {
             if name == "linked" {
-                if linked_positions.contains(&owner_position) {
+                if linked_positions.contains(&person_position) {
                     return Ok(true);
                 }
                 continue;
             }
-            if owner_name_matches(tree, document, owner_position, &link.target, name)? {
+            if person_name_matches(tree, document, person_position, &link.target, name)? {
                 return Ok(true);
             }
         }
@@ -259,23 +326,24 @@ fn owner_matches(
     Ok(false)
 }
 
-fn owner_name_matches(
+fn person_name_matches(
     tree: &Tree,
     document: &Doc,
-    owner_position: usize,
+    person_position: usize,
     target: &str,
     name: &str,
 ) -> Result<bool> {
-    let owner = tree
+    let person = tree
         .docs
-        .get(owner_position)
-        .ok_or_else(|| anyhow!("owner link points outside the tree"))?;
-    Ok(owner.stem().eq_ignore_ascii_case(name)
+        .get(person_position)
+        .ok_or_else(|| anyhow!("person link points outside the tree"))?;
+    Ok(person.stem().eq_ignore_ascii_case(name)
         || target.eq_ignore_ascii_case(name)
-        || matches!(tree.resolve(document, name), Resolution::Found(position) if position == owner_position))
+        || matches!(tree.resolve(document, name), Resolution::Found(position) if position == person_position))
 }
 
-/// Prints open items the way a person reads them: kind, when, owner, title and path.
+/// Prints open items the way a person reads them: kind, when, owner, title, path, who the item
+/// waits on and what tracks it.
 ///
 /// # Errors
 ///
@@ -309,6 +377,14 @@ pub fn print(items: &[OpenItemView], out: &mut dyn Write) -> std::io::Result<()>
         )?;
         writeln!(out, "     {}", printable(&item.title))?;
         writeln!(out, "     {}", printable(&item.path).dimmed())?;
+        for (label, values) in [
+            ("waiting on", &item.waiting_on),
+            ("tracked by", &item.tracked_by),
+        ] {
+            if !values.is_empty() {
+                writeln!(out, "     {label} {}", printable(&values.join(", ")))?;
+            }
+        }
         if let Some(unreviewed) = item.unreviewed.as_deref() {
             for reply in unreviewed {
                 let same_day = if reply.same_day { " (same day)" } else { "" };

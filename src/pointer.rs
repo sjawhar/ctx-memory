@@ -121,6 +121,78 @@ pub fn is_pointer_shaped(text: &str) -> bool {
         })
 }
 
+/// Whether `text` is one web address: an `http://` or `https://` URL, the scheme in any case,
+/// with a host, no user name or password, and no whitespace or control character.
+///
+/// A web address names where a reader can open a summary, such as an answered question on a
+/// tracker or a pull request. No configured source resolves it and nothing fetches it, so it
+/// claims no checked provenance: it is a location, like free text.
+#[must_use]
+pub fn is_web_address(text: &str) -> bool {
+    let text = text.trim();
+    let Some(rest) = after_web_scheme(text) else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !text.chars().any(|c| c.is_whitespace() || c.is_control())
+        && http_url(text).is_some()
+}
+
+/// Whether an `http:` or `https:` scheme stands anywhere in `text`, in any case, once the tabs
+/// and line breaks a URL parser drops are taken out.
+///
+/// A source that holds one names a web address, and a web address is accepted as a source only
+/// when it is the whole source: where a URL in prose ends is a reader's guess, so prose around
+/// one could hide where it leads.
+#[must_use]
+pub fn holds_web_scheme(text: &str) -> bool {
+    let folded: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    folded.contains("http:") || folded.contains("https:")
+}
+
+/// What follows the `http://` or `https://` that `text` starts with, in any case.
+fn after_web_scheme(text: &str) -> Option<&str> {
+    ["https://", "http://"].into_iter().find_map(|scheme| {
+        text.get(..scheme.len())
+            .filter(|start| start.eq_ignore_ascii_case(scheme))
+            .and_then(|_| text.get(scheme.len()..))
+    })
+}
+
+/// Whether `text`, read as a URL, has a Slack workspace's host.
+///
+/// The scanner reads a Slack permalink as a Slack pointer, so such a link names a message a
+/// source checks. Every other form the URL parser reads as a Slack host, whether with a port,
+/// capitals, a trailing dot, a user name, percent-encoding or full-width letters, names that
+/// message too: it is no web address a summary may cite unchecked. Only the host of the address
+/// given is read: nothing follows a redirect or reads an address inside another site's URL.
+#[must_use]
+pub fn is_source_link(text: &str) -> bool {
+    http_url(text.trim()).is_some_and(|url| url.host_str().is_some_and(is_slack_host))
+}
+
+/// `text` parsed as an `http` or `https` URL with a host.
+fn http_url(text: &str) -> Option<reqwest::Url> {
+    reqwest::Url::parse(text).ok().filter(|url| {
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some_and(|h| !h.is_empty())
+    })
+}
+
+/// Whether `host` is Slack's or one of its workspaces', in any case and with a trailing dot.
+fn is_slack_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == SLACK_HOST_SUFFIX.trim_start_matches('.') || host.ends_with(SLACK_HOST_SUFFIX)
+}
+
+/// The end of the host of a Slack workspace, whose message permalinks the scanner reads.
+const SLACK_HOST_SUFFIX: &str = ".slack.com";
+
 fn is_scheme(scheme: &str) -> bool {
     let mut bytes = scheme.bytes();
     let Some(first) = bytes.next() else {
@@ -409,7 +481,7 @@ fn slack_permalink_at(text: &str, start: usize) -> Option<Found> {
         byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')
     });
     let host = text.get(host_start..host_end)?;
-    if !host.ends_with(".slack.com") || byte_at(text, host_end) != Some(b'/') {
+    if !host.ends_with(SLACK_HOST_SUFFIX) || byte_at(text, host_end) != Some(b'/') {
         return None;
     }
     let archives_start = host_end.checked_add(1)?;
@@ -484,7 +556,7 @@ fn permalink_timestamp(digits: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Schemes;
+    use super::{holds_web_scheme, is_source_link, is_web_address, Schemes};
 
     fn parsed(text: &str) -> Option<String> {
         Schemes::new([])
@@ -543,5 +615,105 @@ mod tests {
                 "github:example-org/example-repo#12/review/88"
             ]
         );
+    }
+
+    /// A web address is an http or https URL with a host and nothing around it. A pointer of
+    /// another scheme, prose that holds a URL, a URL with no host, one that carries a user
+    /// name, and one that holds a control character are not one.
+    #[test]
+    fn a_web_address_is_one_http_url_with_a_host() {
+        for text in [
+            "https://example.com/ask/1",
+            "http://example.com",
+            "  https://example.com/pull/12#issuecomment-3  ",
+            "https://example.com:8443/a?b=c",
+            "http://127.0.0.1:4000/ask/1",
+            "HTTPS://example.com/ask/1",
+        ] {
+            assert!(is_web_address(text), "{text:?}");
+        }
+        for text in [
+            "https:// example.com",
+            "https://",
+            "https:///path",
+            "https://:443/path",
+            "https://@/path",
+            "https://user@/path",
+            "https://user@example.com/path",
+            "https://user:secret@example.com/path",
+            "https://example.com/\u{1b}[2J",
+            "https://example.com/\0x",
+            "https://example.com/\u{9b}31m",
+            "ftp://example.com/file",
+            "see https://example.com",
+            "https://example.com and more",
+            "HTTPS://:443/path",
+            "HTTPS://example.com:99999/path",
+            "https://exa mple.com/path",
+            "https:// /path",
+            "foo:bar",
+            "slack:C0EXAMPLE01/1700000000.000001",
+            "overheard in standup",
+            "",
+        ] {
+            assert!(!is_web_address(text), "{text:?}");
+        }
+    }
+
+    /// The scanner reads a Slack permalink as a Slack pointer, so a web address on a Slack host
+    /// names a message a source checks. Every form of it the URL parser reads as that host is a
+    /// source link, whatever the scanner made of it; an address on any other host is not.
+    #[test]
+    fn a_web_address_on_a_slack_host_is_a_source_link() {
+        for text in [
+            "https://acme.slack.com:443/archives/C0EXAMPLE01/p1700000000000001",
+            "https://ACME.Slack.COM/archives/C0EXAMPLE01/p1700000000000001",
+            "https://acme.slack.com./archives/C0EXAMPLE01/p1700000000000001",
+            "https://user@acme.slack.com/archives/C0EXAMPLE01/p1700000000000001",
+            "https://a)b@acme.slack.com:443/archives/C0EXAMPLE01/p1700000000000001",
+            "https://acme.slack.com/archives//C0EXAMPLE01/p1700000000000001",
+            "https://%61cme.slack.com/archives/C0EXAMPLE01/p1700000000000001",
+            "https://acme.\u{ff53}lack.com/archives/C0EXAMPLE01/p1700000000000001",
+            "http://slack.com/archives/C0EXAMPLE01",
+        ] {
+            assert!(is_source_link(text), "{text:?}");
+        }
+        for text in [
+            "https://example.com/ask/1",
+            "https://slack.com.example.com/archives/C0EXAMPLE01",
+            "https://notslack.com/archives/C0EXAMPLE01",
+            "overheard in standup",
+            "slack:C0EXAMPLE01/1700000000.000001",
+        ] {
+            assert!(!is_source_link(text), "{text:?}");
+        }
+    }
+
+    /// A text holds a web address when an http or https scheme stands anywhere in it, in any
+    /// case, even split by the tabs and line breaks a URL parser drops, or with no slashes
+    /// after it, which the parser does not need.
+    #[test]
+    fn a_text_with_an_http_scheme_anywhere_holds_a_web_address() {
+        for text in [
+            "https://example.com/ask/1",
+            "  HTTP://x y",
+            "Https://example.com, said Ada",
+            "[message](https://example.com/ask/1)",
+            "source=https://a)b@example.com",
+            "ht\ttps://example.com",
+            "htt\nps://example.com",
+            "see https:example.com",
+        ] {
+            assert!(holds_web_scheme(text), "{text:?}");
+        }
+        for text in [
+            "overheard in standup",
+            "ftp://example.com",
+            "slack:C0EXAMPLE01/1700000000.000001",
+            "the http protocol",
+            "",
+        ] {
+            assert!(!holds_web_scheme(text), "{text:?}");
+        }
     }
 }

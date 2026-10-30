@@ -1,4 +1,4 @@
-use std::os::unix::fs::PermissionsExt as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -52,17 +52,34 @@ fn ctx(tree: &Path, arguments: &[&str]) -> Result<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn make_executable(path: &Path) -> Result<()> {
-    let mut permissions = std::fs::metadata(path)?.permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions)?;
+/// Writes `script` to `path` as an executable, from a child process.
+///
+/// Tests run on many threads, and a child another thread forks holds a copy of every file this
+/// process has open until it execs. A program this process wrote itself could be held open for
+/// writing by such a child when ctx runs it, which then fails with "Text file busy". Only the
+/// short-lived `sh` below holds the file open, and it starts nothing else.
+fn write_executable(path: &Path, script: &str) -> Result<()> {
+    let mut writer = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    writer
+        .stdin
+        .take()
+        .context("the writer has no standard input")?
+        .write_all(script.as_bytes())?;
+    let status = writer.wait()?;
+    anyhow::ensure!(
+        status.success(),
+        "writing {} failed: {status}",
+        path.display()
+    );
     Ok(())
 }
 
 fn plugin(bin: &Path, script: &str) -> Result<()> {
-    let executable = bin.join("ctx-hello");
-    std::fs::write(&executable, script)?;
-    make_executable(&executable)
+    write_executable(&bin.join("ctx-hello"), script)
 }
 
 #[test]
@@ -142,12 +159,10 @@ fn dossier_page_resolves_a_unique_basename() -> Result<()> {
 #[test]
 fn unknown_command_runs_ctx_dash_name_from_path_with_context_env() -> Result<()> {
     let bin = scratch()?;
-    let executable = bin.join("ctx-hello");
-    std::fs::write(
-        &executable,
+    write_executable(
+        &bin.join("ctx-hello"),
         "#!/bin/sh\necho \"$CTX_MEMORY|$CTX_JSON|$1\"\n",
     )?;
-    make_executable(&executable)?;
     let tree = fixture_tree()?;
     let path = std::env::var("PATH").context("PATH is not set")?;
     let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;

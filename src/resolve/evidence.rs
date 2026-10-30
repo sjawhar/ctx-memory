@@ -137,6 +137,12 @@ pub(super) const UNREGISTERED_SCHEME: &str =
     "no configured source owns this scheme, so nothing resolves it";
 pub(super) const UNRESOLVED_POINTER: &str =
     "this record resolved no text for the pointer the claim names";
+pub(super) const UNREAD_SOURCE_LINK: &str =
+    "this links a source's message in a form ctx does not read as a pointer, so nothing checks \
+     it: cite the message's pointer or its permalink";
+pub(super) const MALFORMED_WEB_ADDRESS: &str =
+    "a source that holds a web address must be that address alone: one http or https URL with \
+     a host, no user name, no whitespace and no control character";
 pub(super) const NO_SOURCE: &str = "a tier 1 or 2 quote must name a source that resolves";
 /// Why a record that ranks at tier 1 or 2 is refused when nothing bears that out.
 pub(super) const UNQUOTED_TIER: &str =
@@ -319,18 +325,33 @@ fn source_provenance<'a>(
 }
 
 /// Judges a claim whose source text names no registered pointer. A pointer-shaped text claims
-/// a provenance no configured source can check; free text claims none at all.
+/// a provenance no configured source can check, and so do a text that holds a web address but
+/// is not that one valid address alone, and an address whose own host is a source's, in a form
+/// the scanner could not read as a pointer. Free text claims none at all, and neither does a
+/// web address: it names where a reader can open the claim, which nothing here fetches.
 fn untraceable(document: &Doc, claim: &QuoteClaim<'_>, texts: &[&str]) -> Provenance<'static> {
+    let uncheckable = |text: &str, why| Provenance::Uncheckable {
+        start: text_start(document, text),
+        pointer: text.to_owned(),
+        why,
+    };
     if let Some(text) = texts
         .iter()
-        .find(|text| pointer::is_pointer_shaped(text))
-        .copied()
+        .find(|text| pointer::holds_web_scheme(text) && !pointer::is_web_address(text))
     {
-        return Provenance::Uncheckable {
-            start: text_start(document, text),
-            pointer: text.to_owned(),
-            why: UNREGISTERED_SCHEME,
-        };
+        return uncheckable(text, MALFORMED_WEB_ADDRESS);
+    }
+    if let Some(text) = texts
+        .iter()
+        .find(|text| pointer::is_web_address(text) && pointer::is_source_link(text))
+    {
+        return uncheckable(text, UNREAD_SOURCE_LINK);
+    }
+    if let Some(text) = texts
+        .iter()
+        .find(|text| pointer::is_pointer_shaped(text) && !pointer::is_web_address(text))
+    {
+        return uncheckable(text, UNREGISTERED_SCHEME);
     }
     match texts.first().copied() {
         Some(text) => Provenance::Untraceable {

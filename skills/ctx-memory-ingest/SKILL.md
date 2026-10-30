@@ -84,20 +84,21 @@ written. Never edit cursor or marker state by hand: the fetch job moves the curs
 - The rules page changes only through a reviewed pull request on GitHub. The server
   refuses a write to it, and refuses every write while `ctx sweep` reports it broken.
 - Only configured sources are citable. A citation points to committed tree content or to
-  a pointer `ctx resolve` can answer.
+  a pointer `ctx resolve` can answer, copied from a window's `records.jsonl`. A web address
+  that a message holds is text of that message: it never becomes a record's source or a
+  `tracked_by` entry, even though the server takes a web address as a tier 3 source.
 - Every quote is checked against the source its own entry names. The server refuses a
   quote whose source does not hold it, and a claim whose pointer nothing can check: a
   source that has never declared whether its records are its own words, one that stores
   renderings rather than words (the calendar), and a scheme no configured source owns
-  (`foo:bar`, a web address). A quote at tier 1 or 2 must name a pointer that resolves to a
-  source storing its records verbatim, so the server refuses a tier 1 or 2 claim with no
-  pointer at all. Free text such as `source: "overheard in standup"` is allowed only at
-  tier 3 or 4, which is what a summary and a secondhand account are. One checked quote in
-  a record does not carry the record's other claims: each is judged alone. A record whose
-  own tier is 1 or 2, a meeting or a decision as much as any other, needs at least one
-  tier 1 or 2 quote that was checked against its source: the server refuses it when it
-  carries no quote, only quotes at tier 3 or 4, or only tier 1 or 2 quotes too short to
-  count (below).
+  (`foo:bar`). A quote at tier 1 or 2 must name a pointer that resolves to a source storing
+  its records verbatim, so the server refuses a tier 1 or 2 claim with no pointer at all.
+  Free text such as `source: "overheard in standup"` is allowed only at tier 3 or 4, which
+  is what a summary and a secondhand account are. One checked quote in a record does not
+  carry the record's other claims: each is judged alone. A record whose own tier is 1 or 2,
+  a meeting or a decision as much as any other, needs at least one tier 1 or 2 quote that
+  was checked against its source: the server refuses it when it carries no quote, only
+  quotes at tier 3 or 4, or only tier 1 or 2 quotes too short to count (below).
 - A failed stream keeps its own cursor, so the next fetch re-reads it. Record the error;
   do not skip the source silently.
 - A missing artifact is a gap to record, not a fact to fill in.
@@ -156,11 +157,12 @@ automated notification noise unless a person acts on it.
    own scheme). For a record about a whole thread, cite the line's `thread` pointer. Do
    not copy raw messages into the tree.
 6. Extract decisions, commitments, questions, metrics and entities, each with its owner,
-   dates, status, a verbatim quote of at most about 20 words, the source pointer and a
-   tier. Each fragment of a quote (the parts between `...`) needs at least 3 words or 12
-   letters and digits; a shorter one is not counted as checked. Before minting, search
-   for the entity, event or open item (`ctx search`, `ctx dossier`, `ctx open`) and update
-   it when it exists. Link every new record from a parent or index so it is reachable.
+   the people it waits on (`waiting_on`, by the rule under "Record rules"), dates, status,
+   a verbatim quote of at most about 20 words, the source pointer and a tier. Each fragment
+   of a quote (the parts between `...`) needs at least 3 words or 12 letters and digits; a
+   shorter one is not counted as checked. Before minting, search for the entity, event or
+   open item (`ctx search`, `ctx dossier`, `ctx open`) and update it when it exists. Link
+   every new record from a parent or index so it is reachable.
 7. Record the cycle in the tree's cycle log, if the rules page names one: the window id,
    counts, and what was minted, updated and closed, as wikilinks. Facts go in records,
    not in the log.
@@ -202,12 +204,23 @@ automated notification noise unless a person acts on it.
   addressed to, a meeting's chair, someone who owns adjacent work or "the team" is not
   enough: write `owner: unassigned`, leave `decided_by` out, and say in the body what the
   source does not establish.
+- Set `waiting_on` on an open question, decision or commitment to the people a cited
+  source puts the question, the decision or the request to by name: addressed or
+  @-mentioned as the one to answer or decide, or someone's own message saying they will
+  answer. Someone copied or mentioned in passing, a document's owner, a meeting's chair, or
+  the person a question only seems addressed to is not enough. Write each person as the tree
+  writes an `owner`: their full name, or the link to their person record. Take a person off
+  `waiting_on` when a cited message from them answers or decides, or a cited source settles
+  the item or hands it to someone else; leave the list out when the sources name nobody.
+  Never set or keep a name by inference.
 - A new signal updates the record or open item it belongs to before a new record is
   created. An update, the index or parent page that links a new record among them, starts
   with `ctx record show <path>`, and the write puts back the whole record with the new
   evidence added: `ctx_record_put` replaces the file, so text left out is lost. An update
-  checks the record's existing `owner` and `decided_by` by the rule above, and corrects them
-  when the sources it cites do not establish them.
+  checks the record's existing `owner`, `decided_by` and `waiting_on` by the rules above,
+  and corrects them when the sources it cites do not establish them or a newer cited source
+  settles the item. It keeps `tracked_by` as it stands: the people who track the record
+  elsewhere write it, never the cycle.
 - Keep superseded values with their citations; mark them superseded and link the
   replacement.
 - Give open decisions, commitments and questions a `due` or `revisit_by` date.

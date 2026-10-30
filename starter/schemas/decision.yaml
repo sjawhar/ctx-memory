@@ -19,6 +19,18 @@ properties:
   revisit_by:
     type: string
     format: date
+  waiting_on:
+    type: array
+    uniqueItems: true
+    items:
+      type: string
+      minLength: 1
+  tracked_by:
+    type: array
+    uniqueItems: true
+    items:
+      type: string
+      format: uri
   quote:
     type: string
     minLength: 1

@@ -469,6 +469,330 @@ fn an_unregistered_scheme_is_unchecked_at_every_tier() -> Result<()> {
     Ok(())
 }
 
+/// A web address names where a summary or a secondhand account can be read, such as an
+/// answered question on a tracker or a pull request, which is what tiers 3 and 4 are for. No
+/// source resolves it and nothing fetches it, so it is counted among the quotes nothing
+/// checked, and passes.
+#[test]
+fn a_tier_3_quote_sourced_by_a_web_address_is_allowed() -> Result<()> {
+    let root = test_root("web-address-tier-3")?;
+    let (tree, state_base) = provenance_tree(
+        &root,
+        "---\n\
+         type: decision\n\
+         status: open\n\
+         quotes:\n\
+         \x20 - quote: \"the answer as the tracker records it\"\n\
+         \x20   source: \"https://tracker.example.com/ask/1\"\n\
+         \x20   tier: 3\n\
+         \x20 - quote: \"a recollection of the same answer\"\n\
+         \x20   source: \"http://tracker.example.com/ask/2\"\n\
+         \x20   tier: 4\n\
+         ---\n\
+         Evidence.\n",
+    )?;
+
+    let data = verify(&tree, &state_base);
+    remove_test_root(&root)?;
+
+    let data = data?;
+    assert_eq!(
+        pointers(&data, "unchecked")?,
+        Vec::<String>::new(),
+        "{data}"
+    );
+    assert_eq!(
+        data.get("quotes_unchecked").and_then(Value::as_u64),
+        Some(2),
+        "{data}"
+    );
+    Ok(())
+}
+
+/// Tiers 1 and 2 say the record holds a source's own words, checked against that source. A
+/// web address is checked against nothing, so it carries neither tier.
+#[test]
+fn a_tier_1_or_2_quote_sourced_by_a_web_address_is_unchecked() -> Result<()> {
+    for tier in ["1", "2"] {
+        let root = test_root(&format!("web-address-tier-{tier}"))?;
+        let (tree, state_base) = provenance_tree(
+            &root,
+            &format!(
+                "---\n\
+                 type: decision\n\
+                 status: open\n\
+                 tier: {tier}\n\
+                 quote: \"the answer as the tracker records it\"\n\
+                 source: \"https://tracker.example.com/ask/1\"\n\
+                 ---\n\
+                 Evidence.\n"
+            ),
+        )?;
+
+        let data = verify(&tree, &state_base);
+        remove_test_root(&root)?;
+
+        let data = data?;
+        assert_eq!(
+            pointers(&data, "unchecked")?,
+            ["https://tracker.example.com/ask/1"],
+            "tier {tier}: {data}"
+        );
+    }
+    Ok(())
+}
+
+/// How a record writes the claim a test checks: under `source`, as a `sources` entry, or as a
+/// `quotes` entry beside a tier 1 quote its Slack source holds.
+#[derive(Clone, Copy, Debug)]
+enum Form {
+    Source,
+    Sources,
+    Quotes,
+}
+
+/// What `ctx cite verify` reports for a tree whose one record makes, in `form`, a claim at
+/// `tier` citing `source`, written into a YAML double-quoted string as it stands, whose quote
+/// the stored Slack message does not hold.
+fn verify_claim(label: &str, form: Form, tier: u8, source: &str) -> Result<Value> {
+    let claim = match form {
+        Form::Source => format!(
+            "tier: {tier}\nquote: \"words the message never held\"\nsource: \"{source}\"\n"
+        ),
+        Form::Sources => format!(
+            "tier: {tier}\nquote: \"words the message never held\"\nsources:\n  - pointer: \"{source}\"\n    tier: {tier}\n"
+        ),
+        Form::Quotes => format!(
+            "quotes:\n  - quote: \"alpha beta gamma\"\n    source: \"slack:C0EXAMPLE01/1700000000.000001\"\n    tier: 1\n  - quote: \"words the message never held\"\n    source: \"{source}\"\n    tier: {tier}\n"
+        ),
+    };
+    let root = test_root(label)?;
+    let (tree, state_base) = provenance_tree(
+        &root,
+        &format!("---\ntype: decision\nstatus: open\n{claim}---\nEvidence.\n"),
+    )?;
+    let data = verify(&tree, &state_base);
+    remove_test_root(&root)?;
+    data
+}
+
+/// [`verify_claim`] for a claim under `source`.
+fn verify_one_claim(label: &str, tier: u8, source: &str) -> Result<Value> {
+    verify_claim(label, Form::Source, tier, source)
+}
+
+/// The canonical permalink of the stored Slack message is a Slack pointer, alone or inside a
+/// Markdown link or an assignment, so even a tier 3 quote that cites it is checked against the
+/// message, and one the message does not hold is broken.
+#[test]
+fn a_tier_3_quote_citing_a_slack_permalink_is_checked() -> Result<()> {
+    let permalink = "https://acme.slack.com/archives/C0EXAMPLE01/p1700000000000001";
+    for (label, source) in [
+        ("bare", permalink.to_owned()),
+        ("markdown", format!("[message]({permalink})")),
+        ("assignment", format!("source={permalink}")),
+    ] {
+        let data = verify_one_claim(&format!("permalink-tier-3-{label}"), 3, &source)?;
+        assert_eq!(
+            pointers(&data, "broken")?,
+            ["slack:C0EXAMPLE01/1700000000.000001"],
+            "{label}: {data}"
+        );
+    }
+    Ok(())
+}
+
+/// A form of that permalink the scanner does not read as a pointer still links the message, so
+/// it is no web address a summary may cite unchecked: at tiers 3 and 4 too it is unchecked,
+/// under `source`, in `sources` and in a `quotes` entry beside a checked quote, rather than a
+/// way around the check the canonical link gets. That holds for every form the URL parser
+/// reads as the Slack host: a port, capitals, a trailing dot, a user name with or without
+/// punctuation in it, a tab or a line break inside the scheme or the host, and the link inside
+/// prose, a Markdown link or an assignment.
+#[test]
+fn a_variant_of_a_slack_permalink_is_unchecked_at_every_tier() -> Result<()> {
+    let port = "https://acme.slack.com:443/archives/C0EXAMPLE01/p1700000000000001";
+    let path = "/archives/C0EXAMPLE01/p1700000000000001";
+    for (label, source, yaml) in [
+        ("port", port.to_owned(), port.to_owned()),
+        (
+            "case",
+            format!("https://ACME.Slack.COM{path}"),
+            format!("https://ACME.Slack.COM{path}"),
+        ),
+        (
+            "dot",
+            format!("https://acme.slack.com.{path}"),
+            format!("https://acme.slack.com.{path}"),
+        ),
+        (
+            "user",
+            format!("https://user@acme.slack.com{path}"),
+            format!("https://user@acme.slack.com{path}"),
+        ),
+        (
+            "prose",
+            format!("said in {port}"),
+            format!("said in {port}"),
+        ),
+        (
+            "markdown",
+            format!("[message]({port})"),
+            format!("[message]({port})"),
+        ),
+        (
+            "assignment",
+            format!("source={port}"),
+            format!("source={port}"),
+        ),
+        (
+            "paren-user",
+            format!("source=https://a)b@acme.slack.com:443{path}"),
+            format!("source=https://a)b@acme.slack.com:443{path}"),
+        ),
+        (
+            "bracket-user",
+            format!("https://a]b@acme.slack.com{path}"),
+            format!("https://a]b@acme.slack.com{path}"),
+        ),
+        (
+            "host-tab",
+            format!("https://acme.sla\tck.com{path}"),
+            format!("https://acme.sla\\tck.com{path}"),
+        ),
+        (
+            "scheme-tab",
+            format!("ht\ttps://acme.slack.com:443{path}"),
+            format!("ht\\ttps://acme.slack.com:443{path}"),
+        ),
+        (
+            "host-newline",
+            format!("https://acme.sla\nck.com{path}"),
+            format!("https://acme.sla\\nck.com{path}"),
+        ),
+    ] {
+        for form in [Form::Source, Form::Sources, Form::Quotes] {
+            for tier in [3, 4] {
+                let data = verify_claim(
+                    &format!("permalink-variant-{label}-{form:?}-{tier}"),
+                    form,
+                    tier,
+                    &yaml,
+                )?;
+                assert_eq!(
+                    pointers(&data, "unchecked")?,
+                    [source.as_str()],
+                    "{label} in {form:?} at tier {tier}: {data}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A source that holds a web address is that address alone, one a reader can open: no host, a
+/// user name, a control character, a port out of range, whitespace, words before or after it,
+/// or a Markdown link or an assignment around it each make a claim nothing checks, at every
+/// tier, in whatever case the scheme is written.
+#[test]
+fn a_web_address_that_is_not_the_whole_source_or_not_valid_is_unchecked() -> Result<()> {
+    for (label, source, yaml) in [
+        ("no-host", "https://:443/ask/1", "https://:443/ask/1"),
+        ("upper-no-host", "HTTPS://:443/ask/1", "HTTPS://:443/ask/1"),
+        (
+            "user",
+            "https://user@example.com/ask/1",
+            "https://user@example.com/ask/1",
+        ),
+        (
+            "control",
+            "https://example.com/\u{1b}[2J",
+            "https://example.com/\\e[2J",
+        ),
+        (
+            "upper-control",
+            "HTTPS://example.com/\u{1b}[2J",
+            "HTTPS://example.com/\\e[2J",
+        ),
+        (
+            "bad-port",
+            "HTTPS://example.com:99999/ask/1",
+            "HTTPS://example.com:99999/ask/1",
+        ),
+        (
+            "host-space",
+            "https://exa mple.com/ask/1",
+            "https://exa mple.com/ask/1",
+        ),
+        ("empty-host-space", "https:// /ask/1", "https:// /ask/1"),
+        (
+            "words-after",
+            "https://example.com/ask/1, as Ada answered",
+            "https://example.com/ask/1, as Ada answered",
+        ),
+        (
+            "words-before",
+            "as Ada answered in https://example.com/ask/1",
+            "as Ada answered in https://example.com/ask/1",
+        ),
+        (
+            "markdown",
+            "[the answer](https://tracker.example.com/ask/1)",
+            "[the answer](https://tracker.example.com/ask/1)",
+        ),
+        (
+            "assignment",
+            "source=https://tracker.example.com/ask/1",
+            "source=https://tracker.example.com/ask/1",
+        ),
+    ] {
+        for tier in [3, 4] {
+            let data = verify_one_claim(&format!("malformed-web-{label}-{tier}"), tier, yaml)?;
+            assert_eq!(
+                pointers(&data, "unchecked")?,
+                [source],
+                "{label} at tier {tier}: {data}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Free text that names no web address stays free text, which tiers 3 and 4 allow.
+#[test]
+fn a_tier_3_quote_citing_free_text_that_mentions_the_web_is_allowed() -> Result<()> {
+    let data = verify_one_claim("free-text-web", 3, "the http answer on the tracker, item 1")?;
+    assert_eq!(
+        pointers(&data, "unchecked")?,
+        Vec::<String>::new(),
+        "{data}"
+    );
+    Ok(())
+}
+
+/// The Slack check reads the host of the address a record gives; it does not follow the
+/// address. An address on another host is a location like any other, even when its query holds
+/// a variant of a Slack permalink or the page redirects there: nothing fetches it. A canonical
+/// permalink anywhere in the source text is still a Slack pointer, and its quote is checked.
+#[test]
+fn the_slack_check_reads_the_given_address_and_follows_nothing() -> Result<()> {
+    let elsewhere = "https://redirect.example.com/to?u=https://acme.slack.com:443/archives/C0EXAMPLE01/p1700000000000001";
+    let data = verify_one_claim("web-elsewhere-variant", 3, elsewhere)?;
+    assert_eq!(
+        pointers(&data, "unchecked")?,
+        Vec::<String>::new(),
+        "{data}"
+    );
+    let canonical = "https://redirect.example.com/to?u=https://acme.slack.com/archives/C0EXAMPLE01/p1700000000000001";
+    let data = verify_one_claim("web-elsewhere-canonical", 3, canonical)?;
+    assert_eq!(
+        pointers(&data, "broken")?,
+        ["slack:C0EXAMPLE01/1700000000.000001"],
+        "{data}"
+    );
+    Ok(())
+}
+
 /// A source that resolved but renders its records, rather than storing the words themselves,
 /// can never settle a quote. The record's other, verbatim, citation does not cover it.
 #[test]

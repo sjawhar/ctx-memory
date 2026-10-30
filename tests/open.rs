@@ -2,6 +2,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context as _, Result};
+use chrono::{Days, NaiveDate};
+use ctx_memory::{
+    config::TreeConfig,
+    open::{open_items_with_filters, OpenFilter},
+    tree::Tree,
+};
 use serde_json::Value;
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -70,6 +76,295 @@ fn item_count(response: &Value) -> Option<usize> {
         .and_then(|data| data.get("items"))
         .and_then(Value::as_array)
         .map(Vec::len)
+}
+
+/// The paths of the open items a response lists, in its order.
+fn paths(response: &Value) -> Result<Vec<String>> {
+    Ok(response
+        .get("data")
+        .and_then(|data| data.get("items"))
+        .and_then(Value::as_array)
+        .context("open items are missing")?
+        .iter()
+        .filter_map(|item| item.get("path").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// A tree of open questions, some waiting on named people and some on nobody.
+fn waiting_tree() -> Result<PathBuf> {
+    let root = test_root("waiting")?;
+    write(&root, "ctx.toml", "version = 1\n")?;
+    write(
+        &root,
+        "people/ada.md",
+        "---\nname: Ada Lovelace\n---\n# Profile\n",
+    )?;
+    write(
+        &root,
+        "questions/budget.md",
+        "---\ntype: question\nstatus: open\nrevisit_by: 2999-01-01\nowner: Grace Hopper\n\
+         waiting_on: [Ada Lovelace, Grace Hopper]\n\
+         tracked_by: [\"https://example.com/ask/1\"]\n---\nWho approves the budget?\n",
+    )?;
+    write(
+        &root,
+        "questions/venue.md",
+        "---\ntype: question\nstatus: open\nrevisit_by: 2999-01-02\nowner: Grace Hopper\n\
+         waiting_on: [Grace Hopper]\n---\nWhich venue?\n",
+    )?;
+    write(
+        &root,
+        "questions/linked.md",
+        "---\ntype: question\nstatus: open\nrevisit_by: 2999-01-03\nowner: unassigned\n\
+         waiting_on: [\"[[people/ada]]\"]\n---\nWho signs?\n",
+    )?;
+    write(
+        &root,
+        "questions/nobody.md",
+        "---\ntype: question\nstatus: open\nrevisit_by: 2999-01-04\nowner: Grace Hopper\n---\n\
+         Nobody was asked.\n",
+    )?;
+    write(
+        &root,
+        "questions/answered.md",
+        "---\ntype: question\nstatus: answered\nwaiting_on: [Ada Lovelace]\n---\nSettled.\n",
+    )?;
+    Ok(root)
+}
+
+/// `--waiting-on` keeps the open items that list one of the names, compared as `--owner`
+/// compares an owner: the whole name, in any case. A record that waits on nobody, a closed
+/// one, a part of a name and a person no record lists match nothing.
+#[test]
+fn waiting_on_filter_matches_a_listed_person_by_whole_name() -> Result<()> {
+    let root = waiting_tree()?;
+    let ada = ctx(&root, &["--waiting-on", "ada lovelace"]);
+    let grace = ctx(&root, &["--waiting-on", "GRACE HOPPER"]);
+    let either = ctx(&root, &["--waiting-on", "Ada Lovelace,Grace Hopper"]);
+    let part = ctx(&root, &["--waiting-on", "Lovelace"]);
+    let unknown = ctx(&root, &["--waiting-on", "Alan Turing"]);
+    remove_test_root(&root)?;
+
+    assert_eq!(paths(&ada?)?, ["questions/budget.md"]);
+    assert_eq!(
+        paths(&grace?)?,
+        ["questions/budget.md", "questions/venue.md"]
+    );
+    assert_eq!(
+        paths(&either?)?,
+        ["questions/budget.md", "questions/venue.md"]
+    );
+    assert_eq!(paths(&part?)?, Vec::<String>::new());
+    assert_eq!(paths(&unknown?)?, Vec::<String>::new());
+    Ok(())
+}
+
+/// A `waiting_on` entry that links a person record matches that record's stem or link target,
+/// as an owner link does.
+#[test]
+fn waiting_on_filter_follows_person_links() -> Result<()> {
+    let root = waiting_tree()?;
+    let stem = ctx(&root, &["--waiting-on", "ada"]);
+    let target = ctx(&root, &["--waiting-on", "people/ada"]);
+    remove_test_root(&root)?;
+
+    assert_eq!(paths(&stem?)?, ["questions/linked.md"]);
+    assert_eq!(paths(&target?)?, ["questions/linked.md"]);
+    Ok(())
+}
+
+/// `--waiting-on` and `--owner` together keep only the items that pass both.
+#[test]
+fn waiting_on_and_owner_filters_must_both_match() -> Result<()> {
+    let root = waiting_tree()?;
+    let both = ctx(
+        &root,
+        &["--owner", "grace hopper", "--waiting-on", "ada lovelace"],
+    );
+    let owner_only = ctx(&root, &["--owner", "grace hopper"]);
+    let disjoint = ctx(
+        &root,
+        &["--owner", "unassigned", "--waiting-on", "grace hopper"],
+    );
+    remove_test_root(&root)?;
+
+    assert_eq!(paths(&both?)?, ["questions/budget.md"]);
+    assert_eq!(
+        paths(&owner_only?)?,
+        [
+            "questions/budget.md",
+            "questions/venue.md",
+            "questions/nobody.md"
+        ]
+    );
+    assert_eq!(paths(&disjoint?)?, Vec::<String>::new());
+    Ok(())
+}
+
+#[test]
+fn waiting_on_linked_requires_a_linked_filter() -> Result<()> {
+    let root = fixture_tree()?;
+    let tree = root.to_str().context("test tree path is not valid UTF-8")?;
+    let output = binary()
+        .args(["--memory", tree, "--json", "open", "--waiting-on", "linked"])
+        .output()
+        .context("running ctx")?;
+    remove_test_root(&root)?;
+
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    let message = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.contains("--waiting-on linked requires --linked"),
+        "{value}"
+    );
+    Ok(())
+}
+
+/// Every JSON item carries `waiting_on` and `tracked_by`, as `[]` when the record has none, so
+/// a reader can select on them without testing for the key.
+#[test]
+fn open_json_always_carries_waiting_on_and_tracked_by() -> Result<()> {
+    let root = waiting_tree()?;
+    let response = ctx(&root, &[]);
+    remove_test_root(&root)?;
+    let response = response?;
+    let items = response
+        .pointer("/data/items")
+        .and_then(Value::as_array)
+        .context("open items are missing")?;
+    let item = |path: &str| -> Result<&Value> {
+        items
+            .iter()
+            .find(|item| item.get("path").and_then(Value::as_str) == Some(path))
+            .with_context(|| format!("{path} is not listed: {response}"))
+    };
+
+    let budget = item("questions/budget.md")?;
+    assert_eq!(
+        budget.get("waiting_on"),
+        Some(&serde_json::json!(["Ada Lovelace", "Grace Hopper"]))
+    );
+    assert_eq!(
+        budget.get("tracked_by"),
+        Some(&serde_json::json!(["https://example.com/ask/1"]))
+    );
+    let nobody = item("questions/nobody.md")?;
+    assert_eq!(nobody.get("waiting_on"), Some(&serde_json::json!([])));
+    assert_eq!(nobody.get("tracked_by"), Some(&serde_json::json!([])));
+    Ok(())
+}
+
+/// The text listing names who an item waits on and what tracks it, and says nothing of either
+/// for an item that has neither.
+#[test]
+fn open_text_names_who_an_item_waits_on_and_what_tracks_it() -> Result<()> {
+    let root = waiting_tree()?;
+    let tree = root.to_str().context("test tree path is not valid UTF-8")?;
+    let output = binary()
+        .args(["--memory", tree, "open", "--owner", "grace hopper"])
+        .output()
+        .context("running ctx open");
+    remove_test_root(&root)?;
+    let output = output?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "{stdout}");
+
+    assert!(
+        stdout.contains("waiting on Ada Lovelace, Grace Hopper"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("tracked by https://example.com/ask/1"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("waiting on").count(), 2, "{stdout}");
+    assert_eq!(stdout.matches("tracked by").count(), 1, "{stdout}");
+    Ok(())
+}
+
+/// `--overdue` keeps the items whose deadline has passed and drops those due later and those
+/// with no date.
+#[test]
+fn overdue_lists_only_items_past_their_deadline() -> Result<()> {
+    let root = test_root("overdue")?;
+    write(&root, "ctx.toml", "version = 1\n")?;
+    write(
+        &root,
+        "questions/late.md",
+        "---\ntype: question\nstatus: open\nrevisit_by: 2000-01-01\nwaiting_on: [Ada Lovelace]\n---\nLate.\n",
+    )?;
+    write(
+        &root,
+        "commitments/late.md",
+        "---\ntype: commitment\nstatus: open\ndue: 2001-01-01\n---\nAlso late.\n",
+    )?;
+    write(
+        &root,
+        "questions/later.md",
+        "---\ntype: question\nstatus: open\nrevisit_by: 2999-01-01\nwaiting_on: [Ada Lovelace]\n---\nLater.\n",
+    )?;
+    write(
+        &root,
+        "questions/undated.md",
+        "---\ntype: question\nstatus: open\n---\nNo date.\n",
+    )?;
+    let overdue = ctx(&root, &["--overdue"]);
+    let waiting_and_overdue = ctx(&root, &["--overdue", "--waiting-on", "Ada Lovelace"]);
+    remove_test_root(&root)?;
+
+    assert_eq!(
+        paths(&overdue?)?,
+        ["questions/late.md", "commitments/late.md"]
+    );
+    assert_eq!(paths(&waiting_and_overdue?)?, ["questions/late.md"]);
+    Ok(())
+}
+
+/// An item is overdue the day after its deadline, not on the day itself.
+#[test]
+fn an_item_due_today_is_not_overdue() -> Result<()> {
+    let today = NaiveDate::from_ymd_opt(2026, 10, 30).context("fixed date is valid")?;
+    let yesterday = today
+        .checked_sub_days(Days::new(1))
+        .context("yesterday is a date")?;
+    let root = test_root("overdue-boundary")?;
+    write(
+        &root,
+        "questions/today.md",
+        &format!("---\ntype: question\nstatus: open\nrevisit_by: {today}\n---\nToday.\n"),
+    )?;
+    write(
+        &root,
+        "questions/yesterday.md",
+        &format!("---\ntype: question\nstatus: open\nrevisit_by: {yesterday}\n---\nYesterday.\n"),
+    )?;
+    let tree = Tree::load(&root, &TreeConfig::default());
+    remove_test_root(&root)?;
+    let tree = tree?;
+
+    let overdue = open_items_with_filters(
+        &tree,
+        &OpenFilter {
+            overdue: true,
+            ..OpenFilter::default()
+        },
+        today,
+    )?;
+    let listed: Vec<(&str, Option<i64>)> = overdue
+        .iter()
+        .map(|item| (item.path.as_str(), item.days_overdue))
+        .collect();
+    assert_eq!(listed, [("questions/yesterday.md", Some(1))]);
+
+    let all = open_items_with_filters(&tree, &OpenFilter::default(), today)?;
+    assert_eq!(all.len(), 2);
+    Ok(())
 }
 
 #[test]
