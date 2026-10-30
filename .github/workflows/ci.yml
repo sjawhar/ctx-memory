@@ -1,6 +1,6 @@
 name: ci
-# A push to main runs this workflow through images.yml, which calls it and publishes the images
-# only once it passes; a pull request runs it on its own.
+# A pull request runs this workflow on its own; the release workflow calls it for the tagged
+# commit before it publishes anything.
 on: { pull_request: {}, workflow_call: {} }
 permissions:
   contents: read
@@ -16,13 +16,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      # The agent cycle's live probe drives the omp release the agent image pins: the same URL
-      # and SHA-256 as deploy/agent/Dockerfile, read from it, and a digest that does not match
-      # fails the step. The probe is #[ignore]d in the plain run above, which has no omp.
+      # The ingest runner's live probe drives the omp release runner/omp.lock pins, with the
+      # SHA-256 it names, and a digest that does not match fails the step. The probe is
+      # #[ignore]d in the plain run above, which has no omp.
       - name: agent cycle live probe (pinned omp)
         run: |
-          release="$(sed -n 's/^ARG OMP_RELEASE=//p' deploy/agent/Dockerfile)"
-          digest="$(sed -n 's/^ARG OMP_SHA256=//p' deploy/agent/Dockerfile)"
+          release="$(sed -n 's/^OMP_RELEASE=//p' runner/omp.lock)"
+          digest="$(sed -n 's/^OMP_SHA256_LINUX_X64=//p' runner/omp.lock)"
           test -n "$release" && test -n "$digest"
           curl -fsSLo "$RUNNER_TEMP/omp.tar.gz" \
             "https://github.com/sjawhar/oh-my-pi/releases/download/${release}/omp-${release}-linux-x64.tar.gz"
@@ -34,6 +34,6 @@ jobs:
       # rules page asks for: the sweep, and cite verify, which exits 1 on a claim it cannot check.
       - run: cargo run -- --memory starter sweep
       - run: cargo run -- --memory starter cite verify
-      # The agent cycle ships a shell script, and what it does with the model key and the
+      # The ingest runner ships a shell script, and what it does with the model key and the
       # session's privileges is security-relevant, so it is checked like the Rust is.
-      - run: shellcheck deploy/agent/run-cycle.sh
+      - run: shellcheck runner/run-cycle.sh

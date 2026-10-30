@@ -126,9 +126,8 @@ fn put_with_unverifiable_quote_is_422() -> Result<()> {
 /// and silently skips the quote, admitting an unverifiable record that a restarted server would
 /// refuse.
 ///
-/// Observed on the real transport (S3 acceptance, scenario 5): a remote
-/// `ctx record put` whose quote the source never carried was committed to `main` with HTTP 200
-/// instead of 422, and became searchable.
+/// Observed on the real transport: a remote `ctx record put` whose quote the source never
+/// carried was committed to `main` with HTTP 200 instead of 422, and became searchable.
 #[test]
 fn put_with_unverifiable_quote_is_422_when_source_verbatim_is_stale() -> Result<()> {
     let tree = fixture_clone("write-stale-verbatim")?;

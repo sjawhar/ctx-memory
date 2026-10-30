@@ -51,9 +51,9 @@ fn a_put_holding_a_credential_is_refused_without_repeating_it() -> Result<()> {
 /// record's path, which becomes a file name and the commit's subject, and the session, which
 /// becomes the commit's `Session:` line. The agent cycle's session chooses the path as freely
 /// as the content, so an instruction it obeys can put a key there as easily. Observed on the
-/// real surface (round-3 acceptance at b56738d): from another box over
-/// the tailnet, `ctx record put decisions/ghp_….md` and a put with `CTX_SESSION=ghp_…` both
-/// answered 200 and pushed the fake token into `main`'s tree and history.
+/// real surface: from another box over the tailnet, `ctx record put decisions/ghp_….md` and a
+/// put with `CTX_SESSION=ghp_…` both answered 200 and pushed the fake token into `main`'s tree
+/// and history.
 #[test]
 fn a_put_whose_path_or_session_holds_a_credential_is_refused() -> Result<()> {
     let tree = fixture_clone("write-credential-path")?;

@@ -1,7 +1,7 @@
 //! `ctx slack login`: the browser sign-in that seeds the Slack credential.
 //!
-//! It signs in with the ctx-memory Slack app, an internal app of the workspace that only
-//! ctx uses (`deploy/slack/ctx-memory-manifest.yaml`; `docs/sources.md`, "Slack source"). The
+//! It signs in with the ctx-memory Slack app, an internal app of the workspace that only ctx uses
+//! (`slack/app-manifest.yaml`; `docs/sources.md`, "The ctx-memory Slack app"). The
 //! flow is Slack's OAuth v2 flow for a user token: the browser authorizes with `user_scope`, and
 //! the code is exchanged at `oauth.v2.access` with the app's client id and secret, which come from
 //! the `slack_app` credential. The app has token rotation on, so the token expires in 12 hours
@@ -148,7 +148,7 @@ fn exchange(
         .filter(|token| !token.is_empty());
     let (Some(expires_in), Some(refresh)) = (expires_in, refresh) else {
         bail!(
-            "Slack issued a token that does not expire, so this Slack app has token rotation off; ctx needs the ctx-memory app with token rotation on (deploy/slack/ctx-memory-manifest.yaml). Turn it on under OAuth & Permissions (it cannot be turned off again) and sign in again. Nothing was saved"
+            "Slack issued a token that does not expire, so this Slack app has token rotation off; ctx needs the ctx-memory app with token rotation on (slack/app-manifest.yaml). Turn it on under OAuth & Permissions (it cannot be turned off again) and sign in again. Nothing was saved"
         );
     };
     Ok(AppCredential {

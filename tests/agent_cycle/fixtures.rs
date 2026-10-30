@@ -12,10 +12,16 @@ pub(super) fn repo() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-pub(super) fn deploy(name: &str) -> Result<String> {
-    let path = repo().join("deploy/agent").join(name);
+/// The text of `runner/<name>`, the ingest runner this repository ships.
+pub(super) fn runner(name: &str) -> Result<String> {
+    let path = repo().join("runner").join(name);
     std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
 }
+
+/// The model the tests tell `run-cycle.sh` to select: the one provider of
+/// `runner/models.example.yml` and its one model, which omp sends as the request's model.
+pub(super) const EXAMPLE_MODEL: &str = "gateway/example-model";
+pub(super) const EXAMPLE_MODEL_ID: &str = "example-model";
 
 pub(super) fn scratch(label: &str) -> Result<PathBuf> {
     let suffix = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);

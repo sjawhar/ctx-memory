@@ -160,9 +160,8 @@ fn parse_callback_reports_a_slack_error() {
 /// description to 140 (<https://docs.slack.dev/reference/app-manifest>, "Display").
 #[test]
 fn the_manifest_registers_what_the_login_asks_for() -> Result<()> {
-    let manifest: Value =
-        serde_saphyr::from_str(include_str!("../../deploy/slack/ctx-memory-manifest.yaml"))
-            .context("parsing deploy/slack/ctx-memory-manifest.yaml")?;
+    let manifest: Value = serde_saphyr::from_str(include_str!("../../slack/app-manifest.yaml"))
+        .context("parsing slack/app-manifest.yaml")?;
     let description = manifest
         .pointer("/display_information/description")
         .and_then(Value::as_str)

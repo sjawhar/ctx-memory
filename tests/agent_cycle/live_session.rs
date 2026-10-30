@@ -11,12 +11,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context as _, Result};
 use serde_json::{json, Value};
 
-use crate::fixtures::{deploy, remove_scratch, repo, scratch, write_executable};
+use crate::fixtures::{
+    remove_scratch, repo, runner, scratch, write_executable, EXAMPLE_MODEL, EXAMPLE_MODEL_ID,
+};
 
 /// The arguments `run-cycle.sh` starts omp with, read from the script itself so this test
 /// cannot drift from it, with the container's paths replaced by this machine's.
 fn cycle_omp_arguments(policy: &Path, session_dir: &Path, prompt: &str) -> Result<Vec<String>> {
-    let script = deploy("run-cycle.sh")?;
+    let script = runner("run-cycle.sh")?;
     let mut block = String::new();
     let mut started = false;
     for line in script.lines().map(str::trim) {
@@ -46,12 +48,12 @@ fn cycle_omp_arguments(policy: &Path, session_dir: &Path, prompt: &str) -> Resul
         .iter()
         .map(|word| match *word {
             "/opt/ctx-memory/policy.yml" => Ok(policy.display().to_string()),
-            "/opt/ctx-memory/ctx-record.ts" => Ok(repo()
-                .join("deploy/agent/ctx-record.ts")
-                .display()
-                .to_string()),
+            "/opt/ctx-memory/ctx-record.ts" => {
+                Ok(repo().join("runner/ctx-record.ts").display().to_string())
+            }
             "\"$session_dir\"" => Ok(session_dir.display().to_string()),
             "\"$prompt\"" => Ok(prompt.to_owned()),
+            "\"$CTX_MODEL\"" => Ok(EXAMPLE_MODEL.to_owned()),
             "\"${SESSION_MINUTES}m\"" => script
                 .lines()
                 .find_map(|line| line.strip_prefix("SESSION_MINUTES="))
@@ -65,11 +67,11 @@ fn cycle_omp_arguments(policy: &Path, session_dir: &Path, prompt: &str) -> Resul
         .collect()
 }
 
-/// The key the probe's session holds, in the file the shipped models.yml names; the fake model
-/// checks that every call carries it, and nothing else, as the model gateway's bearer token.
-const MODEL_KEY: &str = "live-probe-gateway-key";
+/// The key the probe's session holds, in the file the example models.yml names; the fake model
+/// checks that every call carries it, and nothing else, as the model API's bearer token.
+const MODEL_KEY: &str = "live-probe-model-key";
 
-/// A scripted stand-in for the model gateway's Anthropic Messages API. The answer to a request is
+/// A scripted stand-in for the model API, an Anthropic Messages API. The answer to a request is
 /// the step at the index of the number of tool results the request carries, so a retry or a side
 /// request (omp asks for skill summaries) never advances the script.
 struct FakeModel {
@@ -116,9 +118,9 @@ impl FakeModel {
         })
     }
 
-    /// Every request reached the model gateway's Messages API as the gateway serves one: the
-    /// model is `anthropic/claude-opus-5`, the id `run-cycle.sh` selects, sent as it is, and the
-    /// one credential is the key from the file models.yml names, as a bearer token.
+    /// Every request reached the model API as `runner/models.example.yml` routes it: the model
+    /// is the example's model id, the one `run-cycle.sh` selects, sent as it is, and the one
+    /// credential is the key from the file models.yml names, as a bearer token.
     fn check_gateway_route(&self) -> Result<()> {
         let routes = self
             .routes
@@ -129,11 +131,10 @@ impl FakeModel {
         for route in routes.iter() {
             ensure!(
                 route.get("path").and_then(Value::as_str) == Some("/v1/messages")
-                    && route.get("model").and_then(Value::as_str)
-                        == Some("anthropic/claude-opus-5")
+                    && route.get("model").and_then(Value::as_str) == Some(EXAMPLE_MODEL_ID)
                     && route.get("authorization").and_then(Value::as_str) == Some(&bearer)
                     && route.get("x-api-key").is_some_and(Value::is_null),
-                "a model call did not reach the gateway as it serves one: {route}"
+                "a model call did not reach the model API as models.yml routes it: {route}"
             );
         }
         Ok(())
@@ -391,7 +392,8 @@ fn processes_holding(token: &str) -> Vec<String> {
         .collect()
 }
 
-/// The omp binary `CTX_TEST_OMP` names, checked to run and to be the release the image pins.
+/// The omp binary `CTX_TEST_OMP` names, checked to run and to be the release `runner/omp.lock`
+/// pins.
 fn pinned_omp() -> Result<std::ffi::OsString> {
     let omp = std::env::var_os("CTX_TEST_OMP").context(
         "CTX_TEST_OMP must name the pinned omp binary; this test drives it and never skips",
@@ -406,27 +408,27 @@ fn pinned_omp() -> Result<std::ffi::OsString> {
         omp.to_string_lossy(),
         String::from_utf8_lossy(&version.stderr)
     );
-    let dockerfile = deploy("Dockerfile")?;
-    let pinned = dockerfile
+    let lock = runner("omp.lock")?;
+    let pinned = lock
         .lines()
-        .find_map(|line| line.strip_prefix("ARG OMP_RELEASE=v"))
+        .find_map(|line| line.strip_prefix("OMP_RELEASE=v"))
         .and_then(|release| release.split('-').next())
-        .context("deploy/agent/Dockerfile pins no omp release")?;
+        .context("runner/omp.lock pins no omp release")?;
     let reported = String::from_utf8_lossy(&version.stdout);
     ensure!(
         reported.trim() == format!("omp/{pinned}"),
-        "CTX_TEST_OMP is {}, not the omp {pinned} the image pins",
+        "CTX_TEST_OMP is {}, not the omp {pinned} runner/omp.lock pins",
         reported.trim()
     );
     Ok(omp)
 }
 
-/// Runs omp in `root/workspace` with `root/home` as its `HOME`: the image's skills, and the
-/// image's models.yml as `run-cycle.sh` writes it, with `model`'s address for the gateway's and
-/// [`MODEL_KEY`] in the file it names. `env` is added to the session's otherwise fixed
-/// environment, and `extra` after the cycle's own omp arguments, where a repeated flag wins
+/// Runs omp in `root/workspace` with `root/home` as its `HOME`: the repository's skills, and
+/// `runner/models.example.yml` as `run-cycle.sh` writes it, with `model`'s address for the
+/// placeholder and [`MODEL_KEY`] in the file it names. `env` is added to the session's otherwise
+/// fixed environment, and `extra` after the cycle's own omp arguments, where a repeated flag wins
 /// (`cli/flag-tables.ts:209-219`), so a probe can widen what the cycle allows. Every call the
-/// session made must have reached `model` as the gateway serves one.
+/// session made must have reached `model` as models.yml routes it.
 fn run_session(
     omp: &std::ffi::OsStr,
     root: &Path,
@@ -450,14 +452,14 @@ fn run_session(
     )?;
     let key_file = root.join("model-key");
     std::fs::write(&key_file, MODEL_KEY)?;
-    let template = deploy("models.yml")?;
+    let template = runner("models.example.yml")?;
     for placeholder in [
         "\"@CTX_MODEL_BASE_URL@\"",
         "\"!cat /run/ctx-agent/model-key\"",
     ] {
         ensure!(
             template.matches(placeholder).count() == 1,
-            "deploy/agent/models.yml does not hold {placeholder} once, which this test stands in for"
+            "runner/models.example.yml does not hold {placeholder} once, which this test stands in for"
         );
     }
     std::fs::write(
@@ -469,8 +471,7 @@ fn run_session(
             )
             .replace("/run/ctx-agent/model-key", &key_file.display().to_string()),
     )?;
-    let mut arguments =
-        cycle_omp_arguments(&repo().join("deploy/agent/policy.yml"), &sessions, prompt)?;
+    let mut arguments = cycle_omp_arguments(&repo().join("runner/policy.yml"), &sessions, prompt)?;
     // The prompt is positional and stays last.
     let prompt_argument = arguments
         .pop()
@@ -517,11 +518,11 @@ fn run_session(
 }
 
 /// One live session under `run-cycle.sh`'s own flags and `policy.yml`, against the omp
-/// release the image pins, with a scripted model that does what an injected instruction
+/// release `runner/omp.lock` pins, with a scripted model that does what an injected instruction
 /// asks: read a URL, search one, start a program through `ctx`, and write a record from a file
 /// at the shell. `ctx rules` and `ctx record show` still run. No model is called.
 #[test]
-#[ignore = "drives the omp release deploy/agent/Dockerfile pins; CI runs it with CTX_TEST_OMP naming that binary"]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
 fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
     let omp = pinned_omp()?;
     // The program prints `escaped-ctx`, a string its own command line does not hold, so the
@@ -618,13 +619,13 @@ fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
 }
 
 /// The session writes no file, so a record reaches the server through `ctx_record_put`, the
-/// tool deploy/agent/ctx-record.ts adds: the record goes to `ctx record put -- <path> -` on
+/// tool runner/ctx-record.ts adds: the record goes to `ctx record put -- <path> -` on
 /// standard input and no shell runs, so no text in it is refused or read as shell, nested
 /// bullets, ` - ` and `reboot` among them. A stand-in `ctx` keeps the arguments and standard
 /// input of each call; it refuses a record that holds `REFUSE`, as the server refuses one.
 /// No model is called.
 #[test]
-#[ignore = "drives the omp release deploy/agent/Dockerfile pins; CI runs it with CTX_TEST_OMP naming that binary"]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
 fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
     let omp = pinned_omp()?;
     let root = scratch("live-record")?;
@@ -643,7 +644,7 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
     let record = "---\ntype: decision\ntitle: The probe's record\n---\n# Heading\n\n\
         Line with `code`, $HOME, #hash, a | pipe, a > redirect, & and; (parens) \\ backslash.\n\
         - a top-level bullet\n  - one nested bullet\n* a starred bullet\n\
-        Sami - CEO said we had to reboot the host; see -e and -c.\n\
+        Ada - CEO said we had to reboot the host; see -e and -c.\n\
         It's \"quoted\" and 'single-quoted'.\n";
     let model = FakeModel::start(vec![
         json!({"tool": "ctx_record_put", "input": {"path": "decisions/probe.md", "content": record}}),
@@ -721,7 +722,7 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
 /// directory. Every call is refused, nothing lands, and nothing named runs; `ctx rules` still
 /// runs, so the refusals are not the session failing everything. No model is called.
 #[test]
-#[ignore = "drives the omp release deploy/agent/Dockerfile pins; CI runs it with CTX_TEST_OMP naming that binary"]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
 fn a_live_session_writes_no_file() -> Result<()> {
     let omp = pinned_omp()?;
     let root = scratch("live-nowrite")?;
@@ -825,7 +826,7 @@ fn a_live_session_writes_no_file() -> Result<()> {
 /// `.mcp.json` in the session's directory that names a program is not read: the program never
 /// runs, while `ctx rules` still does. No model is called.
 #[test]
-#[ignore = "drives the omp release deploy/agent/Dockerfile pins; CI runs it with CTX_TEST_OMP naming that binary"]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
 fn a_live_session_starts_no_mcp_server_its_directory_names() -> Result<()> {
     let omp = pinned_omp()?;
     let root = scratch("live-mcp")?;

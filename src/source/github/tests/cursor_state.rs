@@ -5,7 +5,7 @@ use super::fixtures::*;
 fn a_stream_the_budget_stopped_is_read_in_full_by_the_next_run_whatever_graphql_says() -> Result<()>
 {
     let base = api_base();
-    let subject = repo("sjawhar", "ctx-memory");
+    let subject = repo("example-org", "example-repo");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
         ..FakeGithub::default()
@@ -51,7 +51,7 @@ fn a_stream_the_budget_stopped_is_read_in_full_by_the_next_run_whatever_graphql_
         fake.get_log.borrow()
     );
     assert!(
-        pointers(&second).contains("github:sjawhar/ctx-memory#2/comment/9002"),
+        pointers(&second).contains("github:example-org/example-repo#2/comment/9002"),
         "{:?}",
         pointers(&second)
     );
@@ -65,7 +65,7 @@ fn a_stream_the_budget_stopped_is_read_in_full_by_the_next_run_whatever_graphql_
 #[test]
 fn a_stream_that_failed_is_read_through_rest_by_the_next_run_whatever_graphql_says() -> Result<()> {
     let base = api_base();
-    let subject = repo("sjawhar", "ctx-memory");
+    let subject = repo("example-org", "example-repo");
     let stream = stream_id(&subject);
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
@@ -108,7 +108,7 @@ fn a_stream_that_failed_is_read_through_rest_by_the_next_run_whatever_graphql_sa
         fake.get_log.borrow()
     );
     assert!(
-        pointers(&third).contains("github:sjawhar/ctx-memory#1"),
+        pointers(&third).contains("github:example-org/example-repo#1"),
         "{:?}",
         pointers(&third)
     );
@@ -118,7 +118,7 @@ fn a_stream_that_failed_is_read_through_rest_by_the_next_run_whatever_graphql_sa
 #[test]
 fn a_listing_reads_every_page_its_link_names() -> Result<()> {
     let base = api_base();
-    let subject = repo("sjawhar", "ctx-memory");
+    let subject = repo("example-org", "example-repo");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
         ..FakeGithub::default()
@@ -129,8 +129,8 @@ fn a_listing_reads_every_page_its_link_names() -> Result<()> {
             "number": 2,
             "title": "A pull request",
             "body": "the pull request body",
-            "pull_request": {"url": "https://api.github.com/repos/sjawhar/ctx-memory/pulls/2"},
-            "user": {"login": "sami", "id": 1},
+            "pull_request": {"url": "https://api.github.com/repos/example-org/example-repo/pulls/2"},
+            "user": {"login": "ada", "id": 1},
             "updated_at": "2026-10-25T11:00:00Z"
         })]),
     );
@@ -162,8 +162,8 @@ fn a_listing_reads_every_page_its_link_names() -> Result<()> {
 
     let stored = pointers(&outcome);
     for pointer in [
-        "github:sjawhar/ctx-memory#2/review/7001",
-        "github:sjawhar/ctx-memory#2/review/7002",
+        "github:example-org/example-repo#2/review/7001",
+        "github:example-org/example-repo#2/review/7002",
     ] {
         assert!(stored.contains(pointer), "{pointer} is stored: {stored:?}");
     }
@@ -173,7 +173,7 @@ fn a_listing_reads_every_page_its_link_names() -> Result<()> {
 #[test]
 fn a_repository_larger_than_the_budget_advances_across_runs_and_loses_nothing() -> Result<()> {
     let base = api_base();
-    let subject = repo("sjawhar", "ctx-memory");
+    let subject = repo("example-org", "example-repo");
     let stream = stream_id(&subject);
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
@@ -217,10 +217,10 @@ fn a_repository_larger_than_the_budget_advances_across_runs_and_loses_nothing() 
         "sha": "c0ffee1234567",
         "commit": {
             "message": "An early commit",
-            "author": {"name": "Sami", "date": "2026-10-02T09:00:00Z"},
+            "author": {"name": "Ada", "date": "2026-10-02T09:00:00Z"},
             "committer": {"date": "2026-10-02T09:00:00Z"}
         },
-        "author": {"login": "sami", "id": 1}
+        "author": {"login": "ada", "id": 1}
     });
     branch_at(&fake, &subject, &early);
     fake.page(
@@ -251,10 +251,10 @@ fn a_repository_larger_than_the_budget_advances_across_runs_and_loses_nothing() 
         ]
     );
     for pointer in [
-        "github:sjawhar/ctx-memory#1/comment/9001",
-        "github:sjawhar/ctx-memory#2/comment/9002",
-        "github:sjawhar/ctx-memory#3/comment/9003",
-        "github:sjawhar/ctx-memory@c0ffee1234567",
+        "github:example-org/example-repo#1/comment/9001",
+        "github:example-org/example-repo#2/comment/9002",
+        "github:example-org/example-repo#3/comment/9003",
+        "github:example-org/example-repo@c0ffee1234567",
     ] {
         assert!(stored.contains(pointer), "{pointer} is stored: {stored:?}");
     }
@@ -264,7 +264,7 @@ fn a_repository_larger_than_the_budget_advances_across_runs_and_loses_nothing() 
 #[test]
 fn a_feed_longer_than_the_budget_stops_where_its_issues_can_still_be_finished() -> Result<()> {
     let base = api_base();
-    let subject = repo("sjawhar", "ctx-memory");
+    let subject = repo("example-org", "example-repo");
     let stream = stream_id(&subject);
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
@@ -290,7 +290,7 @@ fn a_feed_longer_than_the_budget_stops_where_its_issues_can_still_be_finished() 
     let outcome = run(&fake, &request, &config(vec![1], 3, 2000))?;
 
     assert!(
-        pointers(&outcome).contains("github:sjawhar/ctx-memory#1/comment/9001"),
+        pointers(&outcome).contains("github:example-org/example-repo#1/comment/9001"),
         "{:?}",
         pointers(&outcome)
     );
@@ -303,14 +303,13 @@ fn a_feed_longer_than_the_budget_stops_where_its_issues_can_still_be_finished() 
 }
 
 /// A stream the run's budget held is read by the next run at the same budget, when nothing
-/// changed in the repositories read before it. Observed on the real surface
-/// (final acceptance at b0a545d): at `request_budget = 40`, two runs
-/// read the same 20 repositories and held the same 341.
+/// changed in the repositories read before it. A real run showed the case: at
+/// `request_budget = 40`, two runs read the same 20 repositories and held the same 341.
 #[test]
 fn a_stream_the_budget_held_is_read_by_the_next_run_at_the_same_budget() -> Result<()> {
-    let first_repo = repo("sjawhar", "first");
-    let second_repo = repo("sjawhar", "second");
-    let held_repo = repo("sjawhar", "held");
+    let first_repo = repo("example-org", "first");
+    let second_repo = repo("example-org", "second");
+    let held_repo = repo("example-org", "held");
     let fake = FakeGithub {
         repos: BTreeMap::from([(
             1,
@@ -352,7 +351,7 @@ fn a_run_starts_at_the_repository_the_last_run_held() -> Result<()> {
     // Every repository changes between the runs, so the pre-pass saves no request: only
     // where the run starts decides whether the held repository is ever read.
     let names = ["first", "second", "held"];
-    let subjects: Vec<Repo> = names.iter().map(|name| repo("sjawhar", name)).collect();
+    let subjects: Vec<Repo> = names.iter().map(|name| repo("example-org", name)).collect();
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, subjects.clone())]),
         ..FakeGithub::default()
@@ -361,7 +360,7 @@ fn a_run_starts_at_the_repository_the_last_run_held() -> Result<()> {
         quiet(&fake, subject);
         fake.changed(subject, "2026-10-27T00:05:00Z");
     }
-    let held = stream_id(&repo("sjawhar", "held"));
+    let held = stream_id(&repo("example-org", "held"));
     let first_request = request(
         subjects
             .iter()
@@ -377,11 +376,11 @@ fn a_run_starts_at_the_repository_the_last_run_held() -> Result<()> {
     assert_eq!(cursor_of(&second, &held)?.as_deref(), Some(LATER_END));
     // The first repository is read after the held one, and the budget holds the second.
     assert_eq!(
-        cursor_of(&second, &stream_id(&repo("sjawhar", "first")))?.as_deref(),
+        cursor_of(&second, &stream_id(&repo("example-org", "first")))?.as_deref(),
         Some(LATER_END)
     );
     assert_eq!(
-        cursor_of(&second, &stream_id(&repo("sjawhar", "second")))?.as_deref(),
+        cursor_of(&second, &stream_id(&repo("example-org", "second")))?.as_deref(),
         Some(WINDOW_END)
     );
     Ok(())
@@ -393,22 +392,21 @@ fn a_run_starts_at_the_repository_the_last_run_held() -> Result<()> {
 /// records the first repository it stopped in, in its own order, as where to start: the held
 /// installation's, which comes first. So the next run starts there again, the other
 /// installation is read from its start, and the budget holds the same repository on every
-/// run while the first installation stays under its floor. Observed on the real surface
-/// (round-5 acceptance at d9cb9f7, floor 13,000): run A held every
-/// sjawhar repository and ran out of budget at `other-org/example-repo`, and
-/// its state named `first = github:sjawhar/vertminer-gpu`, the rate-held repository.
+/// run while the first installation stays under its floor. A real run showed the case, at a
+/// floor of 13,000: it held every repository of one installation and ran out of budget in the
+/// other's, and its state named the rate-held repository as where to start.
 #[test]
 fn a_repository_the_budget_held_is_read_next_while_another_installation_is_under_its_floor(
 ) -> Result<()> {
     let base = api_base();
-    let low = repo("sjawhar", "low");
+    let low = repo("example-org", "low");
     let names = ["first", "second", "held"];
     let subjects: Vec<Repo> = names.iter().map(|name| repo("other-org", name)).collect();
     let fake = FakeGithub {
         repos: BTreeMap::from([(2, vec![low.clone()]), (1, subjects.clone())]),
         ..FakeGithub::default()
     };
-    // The sjawhar installation answers under the floor on every run.
+    // The example-org installation answers under the floor on every run.
     quiet(&fake, &low);
     for since in [SINCE, WINDOW_END] {
         let mut under = page(Vec::new());
@@ -428,7 +426,7 @@ fn a_repository_the_budget_held_is_read_next_while_another_installation_is_under
             .map(|subject| (stream_id(subject), CURSOR.to_owned()))
             .collect(),
     )?;
-    // One request for the sjawhar repository, which its floor then holds, and two for each
+    // One request for the example-org repository, which its floor then holds, and two for each
     // of `first` and `second`: the budget holds `held`.
     let first = run(&fake, &first_request, &config(vec![2, 1], 5, 2000))?;
     assert_eq!(cursor_of(&first, &held)?.as_deref(), Some(CURSOR));
@@ -447,7 +445,7 @@ fn a_repository_the_budget_held_is_read_next_while_another_installation_is_under
 
 #[test]
 fn an_unchanged_repository_costs_no_request_on_the_next_run() -> Result<()> {
-    let subject = repo("sjawhar", "quiet");
+    let subject = repo("example-org", "quiet");
     let stream = stream_id(&subject);
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
@@ -476,8 +474,8 @@ fn an_unchanged_repository_costs_no_request_on_the_next_run() -> Result<()> {
 
 #[test]
 fn a_repository_changed_at_or_after_its_cursor_is_read_through_rest() -> Result<()> {
-    let changed = repo("sjawhar", "changed");
-    let same_second = repo("sjawhar", "same-second");
+    let changed = repo("example-org", "changed");
+    let same_second = repo("example-org", "same-second");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![changed.clone(), same_second.clone()])]),
         ..FakeGithub::default()
@@ -521,7 +519,7 @@ fn a_repository_changed_at_or_after_its_cursor_is_read_through_rest() -> Result<
 #[test]
 fn the_pre_pass_asks_fifty_repositories_a_query() -> Result<()> {
     let subjects: Vec<Repo> = (0..51)
-        .map(|index| repo("sjawhar", &format!("repo-{index}")))
+        .map(|index| repo("example-org", &format!("repo-{index}")))
         .collect();
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, subjects.clone())]),
@@ -560,8 +558,8 @@ fn the_pre_pass_asks_fifty_repositories_a_query() -> Result<()> {
 /// Runs a settled pair of quiet repositories once more, after `break_answer` spoils the
 /// GraphQL API's answer, and returns the REST requests that run sent and its warnings.
 fn a_spoiled_pre_pass(break_answer: impl Fn(&FakeGithub)) -> Result<(Vec<String>, String)> {
-    let one = repo("sjawhar", "one");
-    let two = repo("sjawhar", "two");
+    let one = repo("example-org", "one");
+    let two = repo("example-org", "two");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![one.clone(), two.clone()])]),
         ..FakeGithub::default()
@@ -604,7 +602,7 @@ fn a_graphql_answer_with_errors_reads_its_whole_batch_through_rest() -> Result<(
 
     let base = api_base();
     for name in ["one", "two"] {
-        let url = issues_url(&base, &repo("sjawhar", name), WINDOW_END);
+        let url = issues_url(&base, &repo("example-org", name), WINDOW_END);
         assert!(read.contains(&url), "{name} is read: {read:?}");
     }
     assert!(warnings.contains("GraphQL"), "{warnings}");
@@ -615,15 +613,15 @@ fn a_graphql_answer_with_errors_reads_its_whole_batch_through_rest() -> Result<(
 fn a_graphql_answer_that_leaves_a_repository_out_reads_its_whole_batch_through_rest() -> Result<()>
 {
     let (read, warnings) = a_spoiled_pre_pass(|fake| {
-        fake.activity.borrow_mut().remove("sjawhar/two");
+        fake.activity.borrow_mut().remove("example-org/two");
     })?;
 
     let base = api_base();
     for name in ["one", "two"] {
-        let url = issues_url(&base, &repo("sjawhar", name), WINDOW_END);
+        let url = issues_url(&base, &repo("example-org", name), WINDOW_END);
         assert!(read.contains(&url), "{name} is read: {read:?}");
     }
-    assert!(warnings.contains("sjawhar/two"), "{warnings}");
+    assert!(warnings.contains("example-org/two"), "{warnings}");
     Ok(())
 }
 
@@ -633,7 +631,7 @@ fn a_review_held_past_the_window_is_stored_by_the_next_run_whatever_graphql_says
     // run two is stale and names nothing after run one's window end, so only the rule that
     // a stream which held an item is read through REST brings the review in.
     let base = api_base();
-    let subject = repo("sjawhar", "ctx-memory");
+    let subject = repo("example-org", "example-repo");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
         ..FakeGithub::default()
@@ -643,8 +641,8 @@ fn a_review_held_past_the_window_is_stored_by_the_next_run_whatever_graphql_says
             "number": 2,
             "title": "A pull request",
             "body": "the pull request body",
-            "pull_request": {"url": "https://api.github.com/repos/sjawhar/ctx-memory/pulls/2"},
-            "user": {"login": "sami", "id": 1},
+            "pull_request": {"url": "https://api.github.com/repos/example-org/example-repo/pulls/2"},
+            "user": {"login": "ada", "id": 1},
             "updated_at": updated
         })
     };
@@ -678,7 +676,7 @@ fn a_review_held_past_the_window_is_stored_by_the_next_run_whatever_graphql_says
     let first_request = request(BTreeMap::from([(stream_id(&subject), CURSOR.to_owned())]))?;
     let first = run(&fake, &first_request, &config(vec![1], 600, 2000))?;
     assert!(
-        !pointers(&first).contains("github:sjawhar/ctx-memory#2/review/7005"),
+        !pointers(&first).contains("github:example-org/example-repo#2/review/7005"),
         "run one holds the review: {:?}",
         pointers(&first)
     );
@@ -694,7 +692,7 @@ fn a_review_held_past_the_window_is_stored_by_the_next_run_whatever_graphql_says
     )?;
 
     assert!(
-        pointers(&second).contains("github:sjawhar/ctx-memory#2/review/7005"),
+        pointers(&second).contains("github:example-org/example-repo#2/review/7005"),
         "{:?}",
         pointers(&second)
     );
@@ -704,8 +702,8 @@ fn a_review_held_past_the_window_is_stored_by_the_next_run_whatever_graphql_says
 #[test]
 fn the_state_file_forgets_repositories_the_app_left_and_the_old_etag_file_is_deleted() -> Result<()>
 {
-    let subject = repo("sjawhar", "ctx-memory");
-    let gone = repo("sjawhar", "gone");
+    let subject = repo("example-org", "example-repo");
+    let gone = repo("example-org", "gone");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone(), gone.clone()])]),
         ..FakeGithub::default()
@@ -722,7 +720,7 @@ fn the_state_file_forgets_repositories_the_app_left_and_the_old_etag_file_is_del
     let first = run(&fake, &request, &config(vec![1], 600, 2000))?;
     assert!(!old.exists(), "{} is deleted", old.display());
     let saved = std::fs::read_to_string(request.state_dir.join(STATE_FILE))?;
-    assert!(saved.contains("sjawhar/gone"), "{saved}");
+    assert!(saved.contains("example-org/gone"), "{saved}");
 
     // The app is removed from one repository.
     let second_fake = FakeGithub {
@@ -735,9 +733,9 @@ fn the_state_file_forgets_repositories_the_app_left_and_the_old_etag_file_is_del
     run(&second_fake, &next, &config(vec![1], 600, 2000))?;
 
     let saved = std::fs::read_to_string(request.state_dir.join(STATE_FILE))?;
-    assert!(saved.contains("sjawhar/ctx-memory"), "{saved}");
+    assert!(saved.contains("example-org/example-repo"), "{saved}");
     assert!(
-        !saved.contains("sjawhar/gone"),
+        !saved.contains("example-org/gone"),
         "a repository the app no longer reads is dropped: {saved}"
     );
     Ok(())
@@ -746,7 +744,7 @@ fn the_state_file_forgets_repositories_the_app_left_and_the_old_etag_file_is_del
 #[test]
 fn a_state_file_this_build_cannot_read_costs_a_rest_read_of_every_repository() -> Result<()> {
     let base = api_base();
-    let subject = repo("sjawhar", "ctx-memory");
+    let subject = repo("example-org", "example-repo");
     let stream = stream_id(&subject);
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),

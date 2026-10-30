@@ -19,10 +19,10 @@ const LINE_LIMIT: usize = 300;
 /// and the shape it has.
 ///
 /// The agent cycle's session can read its own model key, and an instruction it obeys could
-/// put that key, or any credential it can reach, into a record. That key is a model gateway key:
-/// `sk-` and 64 lower-case letters and digits, as the model gateway
-/// mints them. Each shape asks for the prefix and enough of a body after it that prose
-/// naming a prefix is not refused.
+/// put that key, or any credential it can reach, into a record. That key may be a model
+/// gateway's key rather than Anthropic's: `sk-` and lower-case letters and digits, 64 of them
+/// from the gateway this shape was written for, so the pattern asks for 32 or more. Each shape
+/// asks for the prefix and enough of a body after it that prose naming a prefix is not refused.
 const CREDENTIALS: &[(&str, &str)] = &[
     (
         "an Anthropic API key (sk-ant-…)",

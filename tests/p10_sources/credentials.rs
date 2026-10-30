@@ -89,7 +89,7 @@ fn a_google_fetch_saves_the_cursor_each_api_gave_it() -> Result<()> {
     let server = FakeGoogle::start(vec![
         (
             "/gmail/v1/users/me/profile",
-            json!({"emailAddress": "sami@example.com", "historyId": "185843"}),
+            json!({"emailAddress": "ada@example.com", "historyId": "185843"}),
         ),
         ("/gmail/v1/users/me/messages", json!({"messages": []})),
         (

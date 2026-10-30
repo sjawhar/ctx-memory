@@ -284,6 +284,6 @@ mod tests {
 
     #[test]
     fn a_login_without_a_domain_is_its_own_name() {
-        assert_eq!(local_part("sami"), "sami");
+        assert_eq!(local_part("ada"), "ada");
     }
 }

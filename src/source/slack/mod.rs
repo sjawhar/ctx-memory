@@ -78,8 +78,8 @@ impl Source for SlackSource {
 #[serde(deny_unknown_fields)]
 struct SlackConfig {
     workspace: String,
-    /// Private channels to fetch. Public channels Sami is in are discovered from the API; a
-    /// private channel is fetched only when it is listed here.
+    /// Private channels to fetch. Public channels the signed-in user is in are discovered from
+    /// the API; a private channel is fetched only when it is listed here.
     #[serde(default)]
     channels: Vec<String>,
     #[serde(default = "default_thread_poll_days")]

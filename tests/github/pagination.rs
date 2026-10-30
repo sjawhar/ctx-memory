@@ -35,7 +35,7 @@ fn an_issue_changed_while_the_feed_is_read_hides_no_other_issue() -> Result<()> 
     let stored = fetch_busy(address, "busy-feed")?;
 
     for number in 1..=150 {
-        let pointer = format!("github:sjawhar/busy#{number}");
+        let pointer = format!("github:example-org/busy#{number}");
         assert!(stored.contains(&pointer), "{pointer} is read");
     }
     Ok(())
@@ -68,7 +68,7 @@ fn a_comment_deleted_while_an_issues_comments_are_read_hides_no_other_comment() 
     let stored = fetch_busy(address, "busy-comments")?;
 
     for id in (1..=150).filter(|id| *id != 10) {
-        let pointer = format!("github:sjawhar/busy#1/comment/{id}");
+        let pointer = format!("github:example-org/busy#1/comment/{id}");
         assert!(stored.contains(&pointer), "{pointer} is read");
     }
     Ok(())
@@ -85,7 +85,7 @@ fn a_review_comment_edited_while_a_pull_requests_comments_are_read_hides_no_othe
     if let Some(fields) = pull.as_object_mut() {
         fields.insert(
             "pull_request".to_owned(),
-            json!({ "url": "https://api.github.com/repos/sjawhar/busy/pulls/2" }),
+            json!({ "url": "https://api.github.com/repos/example-org/busy/pulls/2" }),
         );
     }
     let busy = Busy {
@@ -113,7 +113,7 @@ fn a_review_comment_edited_while_a_pull_requests_comments_are_read_hides_no_othe
     let stored = fetch_busy(address, "busy-review-comments")?;
 
     for id in 1..=150 {
-        let pointer = format!("github:sjawhar/busy#2/review-comment/{id}");
+        let pointer = format!("github:example-org/busy#2/review-comment/{id}");
         assert!(stored.contains(&pointer), "{pointer} is read");
     }
     Ok(())
@@ -183,7 +183,7 @@ fn an_old_comment_edited_while_an_issues_comments_are_read_hides_no_other_commen
 
     let stored = fetch_busy(address, "busy-old-comment")?;
 
-    let missing = never_read(&stored, "github:sjawhar/busy#1/comment/");
+    let missing = never_read(&stored, "github:example-org/busy#1/comment/");
     assert!(missing.is_empty(), "comments never read: {missing:?}");
     Ok(())
 }
@@ -197,7 +197,7 @@ fn an_old_review_comment_edited_while_a_pull_requests_comments_are_read_hides_no
     if let Some(fields) = pull.as_object_mut() {
         fields.insert(
             "pull_request".to_owned(),
-            json!({ "url": "https://api.github.com/repos/sjawhar/busy/pulls/2" }),
+            json!({ "url": "https://api.github.com/repos/example-org/busy/pulls/2" }),
         );
     }
     let (comments, change) =
@@ -212,7 +212,7 @@ fn an_old_review_comment_edited_while_a_pull_requests_comments_are_read_hides_no
 
     let stored = fetch_busy(address, "busy-old-review-comment")?;
 
-    let missing = never_read(&stored, "github:sjawhar/busy#2/review-comment/");
+    let missing = never_read(&stored, "github:example-org/busy#2/review-comment/");
     assert!(
         missing.is_empty(),
         "review comments never read: {missing:?}"
@@ -242,15 +242,15 @@ fn a_comment_unchanged_since_the_stored_time_is_not_sent_again() -> Result<()> {
     let stored = fetch_busy(address, "busy-unchanged-comment")?;
 
     assert!(
-        !stored.contains("github:sjawhar/busy#1/comment/1"),
+        !stored.contains("github:example-org/busy#1/comment/1"),
         "{stored:?}"
     );
     assert!(
-        stored.contains("github:sjawhar/busy#1/comment/2"),
+        stored.contains("github:example-org/busy#1/comment/2"),
         "{stored:?}"
     );
     assert!(
-        stored.contains("github:sjawhar/busy#1/comment/3"),
+        stored.contains("github:example-org/busy#1/comment/3"),
         "{stored:?}"
     );
     Ok(())

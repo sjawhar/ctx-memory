@@ -1,6 +1,6 @@
 {
   "name": "ctx-memory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "The ctx-memory and ctx-memory-ingest skills, as an Oh My Pi plugin package",
   "license": "MIT",

@@ -277,10 +277,10 @@ fn a_following_copy_says_so_once_and_not_on_every_pass() -> Result<()> {
 /// match; `write failed:` folds git's error onto its line, but `following main: <why>` prints
 /// git's standard error as it came, so a pull that fails writes the prefix line and then git's
 /// further lines (and blank ones), each its own log entry in Cloud Logging, matching no form.
-/// Observed on the real binary (round-4 acceptance at d5655fc): with
-/// the remote moved away, each failed pass wrote `following main: git pull … failed: fatal:
-/// '…/remote.git' does not appear to be a git repository`, then `fatal: Could not read from
-/// remote repository.`, an empty line, and two more lines of git's advice.
+/// Observed on the real binary: with the remote moved away, each failed pass wrote
+/// `following main: git pull … failed: fatal: '…/remote.git' does not appear to be a git
+/// repository`, then `fatal: Could not read from remote repository.`, an empty line, and two
+/// more lines of git's advice.
 #[test]
 fn a_failed_follow_pass_says_so_in_one_line() -> Result<()> {
     let tree = fixture_clone("log-follow-one-line")?;

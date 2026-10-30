@@ -1,15 +1,16 @@
-//! Built-in GitHub source: the sjawhar-agent app reads every repository it is installed on.
+//! Built-in GitHub source: the deployment's GitHub App reads every repository it is installed on.
 //!
 //! The app mints a read-only installation token for each installation named in
 //! `CTX_GITHUB_INSTALLATIONS`, and no other installation is touched, so the one organization
 //! the spec does not read is never called. One repository is one stream (`github:<owner>/<repo>`)
 //! and its cursor is an `updated_at` high-water mark.
 //!
-//! The run guards the shared App quota three ways. A GraphQL pre-pass asks, for 50
-//! repositories a query, when each last changed, so a repository with nothing new since its
-//! stream's stored time costs no REST request. A per-run request budget and a floor under
-//! GitHub's reported remaining rate limit bound the REST reads: when either runs low, the run
-//! stops the stream with a warning. It reads each issue's follow-ups before the next issue's,
+//! The run guards the App's rate limit, which other clients of the App share, three ways. A
+//! GraphQL pre-pass asks, for 50 repositories a query, when each last changed, so a repository
+//! with nothing new since its stream's stored time costs no REST request. A per-run request
+//! budget and a floor under GitHub's reported remaining rate limit bound the REST reads: when
+//! either runs low, the run stops the stream with a warning. It reads each issue's follow-ups
+//! before the next issue's,
 //! so a stopped stream has finished a prefix of its feed, and its cursor names where the feed
 //! resumes and the time it is stored through (`<resume>@<stored>`); a repository too large for
 //! one run's budget therefore advances across runs, and the next run starts at the repository
@@ -53,7 +54,7 @@ const ACTIVITY_FIELDS: &str = "pushedAt \
 pub struct GithubSource;
 
 impl GithubSource {
-    /// Creates a GitHub source that acts as the sjawhar-agent app.
+    /// Creates a GitHub source that acts as the deployment's GitHub App.
     #[must_use]
     pub const fn new() -> Self {
         Self
@@ -300,22 +301,18 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
 /// query asks [`ACTIVITY_BATCH`] repositories for the newest `updatedAt` of an issue and of a
 /// pull request, `pushedAt`, and the default branch head's `oid` and `committedDate`. A
 /// repository has nothing to list when all those times are older than its stored time and its
-/// head is the one its cursor names (or the cursor names none). GitHub charged 1 point a query
-/// on 2026-10-28 (`rateLimit { cost }`, 9 queries over the 361 repositories of both
-/// installations, every repository answered).
+/// head is the one its cursor names (or the cursor names none). GitHub charges 1 point a query
+/// (`rateLimit { cost }`), whatever the batch holds, in the runs measured.
 ///
 /// That holds because GitHub moves an issue's or pull request's `updatedAt` for every follow-up
-/// a REST read lists. Probed on 2026-10-28 with the app's token on `example-org/infra`
-/// (GraphQL `pullRequests(first: 25, orderBy: UPDATED_AT DESC)` with each one's newest comment,
-/// review, review-thread comment, commit and timeline item): `updatedAt` equalled, to the
-/// second, the newest issue comment (#616, 00:16:17Z, last timeline item `IssueComment`), the
-/// newest review (#633, 00:14:24Z, `PullRequestReview`), a review with its review comment (#618,
-/// both 23:57:08Z, `updatedAt` 23:57:09Z), and came 5 s after a pushed commit's time (#630,
-/// commit 00:10:48Z, `updatedAt` 00:10:53Z, `PullRequestCommit`). The REST feed's `updated_at`
-/// equalled GraphQL's `updatedAt` for all 25 pull requests compared. `pushedAt` alone does not
-/// cover the default branch: on 2 of the 361 repositories it was older than the head's commit
-/// time, so the head is asked too, and its `oid` catches a push of commits dated before the
-/// stored time.
+/// a REST read lists. Probed with the app's token on one busy repository (GraphQL
+/// `pullRequests(first: 25, orderBy: UPDATED_AT DESC)` with each one's newest comment, review,
+/// review-thread comment, commit and timeline item): `updatedAt` equalled, to the second, the
+/// newest issue comment, the newest review, and a review with its review comment (a second
+/// apart), and came 5 s after a pushed commit's time. The REST feed's `updated_at` equalled
+/// GraphQL's `updatedAt` for all 25 pull requests compared. `pushedAt` alone does not cover the
+/// default branch: on a few repositories it was older than the head's commit time, so the head
+/// is asked too, and its `oid` catches a push of commits dated before the stored time.
 ///
 /// Only a stream that is settled — whose cursor is the one a run proposed after reading it to
 /// the end with nothing held — is asked about; any other is read through REST. A batch that

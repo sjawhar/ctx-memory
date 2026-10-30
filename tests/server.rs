@@ -695,7 +695,7 @@ fn record_show_refuses_a_principal_outside_the_allow_list() -> Result<()> {
 
 /// In remote mode `ctx cite verify <file>` names a draft on the caller's machine, which the
 /// server's tree does not hold. Forwarded as a path, it matched nothing on the server and
-/// answered `checked 0` with exit 0 (round-4 acceptance at d5655fc, R4-D1). The client sends
+/// answered `checked 0` with exit 0. The client sends
 /// the draft's text, and the server checks it against its sources; a path that names neither
 /// a local file nor a record of the server's tree is refused.
 #[test]
@@ -865,7 +865,7 @@ fn impersonation_requests_id_token_for_audience() -> Result<()> {
         200,
         &json!({ "access_token": "ya29.pod" }).to_string(),
     )?;
-    let account = "ctx-legion-client@example-project.iam.gserviceaccount.com";
+    let account = "ctx-client@example-project.iam.gserviceaccount.com";
     let token = support::google_token(AUDIENCE, account)?;
     iam.json(
         &format!("/v1/projects/-/serviceAccounts/{account}:generateIdToken"),

@@ -495,14 +495,14 @@ mod tests {
     #[test]
     fn parses_every_github_pointer_form() {
         for text in [
-            "github:sjawhar/ctx-memory#12",
-            "github:sjawhar/ctx-memory#12/comment/3894201101",
+            "github:example-org/example-repo#12",
+            "github:example-org/example-repo#12/comment/3894201101",
             "github:example-org/infra#7/review/2210047",
             "github:example-org/infra#7/review-comment/998877",
-            "github:sjawhar/ctx-memory@d56570d",
-            "github:sjawhar/ctx-memory@41481dbb1f0f0ad1f6cf9e83d3a6ad1d0ec4a0f1",
+            "github:example-org/example-repo@d56570d",
+            "github:example-org/example-repo@41481dbb1f0f0ad1f6cf9e83d3a6ad1d0ec4a0f1",
             "github:other-org/memory#1",
-            "github:sjawhar/ctx.memory#3",
+            "github:example-org/example.repo#3",
         ] {
             assert_eq!(parsed(text).as_deref(), Some(text), "{text}");
         }
@@ -511,16 +511,16 @@ mod tests {
     #[test]
     fn a_github_pointer_without_an_item_or_a_commit_is_not_a_pointer() {
         for text in [
-            "github:sjawhar",
-            "github:sjawhar/ctx-memory",
-            "github:sjawhar/ctx-memory#",
-            "github:sjawhar/ctx-memory#abc",
-            "github:/ctx-memory#1",
-            "github:sjawhar/ctx-memory#12/comment/",
-            "github:sjawhar/ctx-memory#12/comment/xyz",
-            "github:sjawhar/ctx-memory#12/reaction/4",
-            "github:sjawhar/ctx-memory@zzzzzzz",
-            "github:sjawhar/ctx-memory@d565",
+            "github:example-org",
+            "github:example-org/example-repo",
+            "github:example-org/example-repo#",
+            "github:example-org/example-repo#abc",
+            "github:/example-repo#1",
+            "github:example-org/example-repo#12/comment/",
+            "github:example-org/example-repo#12/comment/xyz",
+            "github:example-org/example-repo#12/reaction/4",
+            "github:example-org/example-repo@zzzzzzz",
+            "github:example-org/example-repo@d565",
         ] {
             assert_eq!(parsed(text), None, "{text}");
         }
@@ -530,7 +530,7 @@ mod tests {
     fn a_github_pointer_ends_before_the_prose_around_it() {
         let schemes = Schemes::new([]);
         let found = schemes.find_all(
-            "see (github:sjawhar/ctx-memory#12), and github:sjawhar/ctx-memory#12/review/88. Done.",
+            "see (github:example-org/example-repo#12), and github:example-org/example-repo#12/review/88. Done.",
         );
         let pointers: Vec<String> = found
             .iter()
@@ -539,8 +539,8 @@ mod tests {
         assert_eq!(
             pointers,
             [
-                "github:sjawhar/ctx-memory#12",
-                "github:sjawhar/ctx-memory#12/review/88"
+                "github:example-org/example-repo#12",
+                "github:example-org/example-repo#12/review/88"
             ]
         );
     }

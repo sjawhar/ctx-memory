@@ -1,0 +1,16 @@
+# The Oh My Pi (omp) build the runner is written and tested against: run-cycle.sh's flags,
+# policy.yml's settings and ctx-record.ts's extension API are omp's at this release. CI downloads
+# it and drives live sessions with it (tests/agent_cycle/live_session.rs), and an image that runs
+# the cycle installs this release and no other.
+#
+# The archive of each architecture is
+#   https://github.com/sjawhar/oh-my-pi/releases/download/<OMP_RELEASE>/omp-<OMP_RELEASE>-linux-<arch>.tar.gz
+# Its one file is omp-<OMP_RELEASE>-linux-<arch>/bin/omp, so `tar --strip-components=2` unpacks
+# `omp`. OMP_SHA256_LINUX_<ARCH> is that archive's SHA-256 as the GitHub release reports it (gh
+# release view --json assets); check it before extracting anything, because a release asset can
+# be replaced. An architecture with no line here has no build at this release.
+#
+# One KEY=VALUE per line, no quotes and no spaces, so a shell can read a value with
+# `sed -n 's/^KEY=//p'` and a Dockerfile can source the file.
+OMP_RELEASE=v18.12.2-sami.20261026-135627
+OMP_SHA256_LINUX_X64=b513556d000f4b98be33dfb42b0fa88879455c388bb6c8fdcbeb5e032f73fdfa

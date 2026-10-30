@@ -8,10 +8,10 @@ use clap::error::ErrorKind;
 use ctx_memory::cli::{parse_argv, Cli, Command as CtxCommand, Remote};
 use serde_json::Value;
 
-use crate::fixtures::{deploy, remove_scratch, repo, scratch};
+use crate::fixtures::{remove_scratch, repo, runner, scratch};
 
 fn policy() -> Result<Value> {
-    serde_saphyr::from_str(&deploy("policy.yml")?).context("parsing deploy/agent/policy.yml")
+    serde_saphyr::from_str(&runner("policy.yml")?).context("parsing runner/policy.yml")
 }
 
 /// The policy's bash rules, as `(pattern, approval)`.
@@ -42,7 +42,7 @@ fn allowed_patterns(policy: &Value) -> Result<Vec<String>> {
 }
 
 /// Whether omp's bash `allow` rule `pattern` admits `command`, decided the way omp decides
-/// it at the release `deploy/agent/Dockerfile` pins
+/// it at the release `runner/omp.lock` pins
 /// (`packages/coding-agent/src/tools/bash.ts:239-275,301-305`): a run of whitespace counts
 /// as one space in both, `*` matches any run of characters, and the pattern has to cover
 /// the whole command. omp also refuses an allow to a command that holds a shell control
@@ -74,7 +74,7 @@ fn parse_filled(words: &[&str]) -> Result<(Cli, Vec<String>)> {
 
 #[test]
 fn the_cycle_approves_no_tool_call_by_itself() -> Result<()> {
-    let script = deploy("run-cycle.sh")?;
+    let script = runner("run-cycle.sh")?;
     for forbidden in ["yolo", "--auto-approve"] {
         assert!(
             !script.contains(forbidden),
@@ -94,7 +94,7 @@ fn the_cycle_approves_no_tool_call_by_itself() -> Result<()> {
 
 #[test]
 fn the_cycle_holds_only_the_tools_it_needs() -> Result<()> {
-    let script = deploy("run-cycle.sh")?;
+    let script = runner("run-cycle.sh")?;
     assert!(
         script.contains("--tools bash,read,grep,glob,todo,ctx_record_put,ctx_record_rm"),
         "the cycle does not pass the tool allowlist; a session that can spawn subagents, \
@@ -330,12 +330,12 @@ fn the_session_reads_no_url() -> Result<()> {
 
 #[test]
 fn the_model_key_leaves_the_session_environment() -> Result<()> {
-    let script = deploy("run-cycle.sh")?;
+    let script = runner("run-cycle.sh")?;
     assert!(
         script.contains("unset ANTHROPIC_API_KEY"),
         "the cycle leaves the model key in the environment its session inherits"
     );
-    let models = deploy("models.yml")?;
+    let models = runner("models.example.yml")?;
     assert!(
         models.contains("!cat /run/ctx-agent/model-key"),
         "the model credential does not come from the file the script writes"
@@ -348,7 +348,7 @@ fn the_model_key_leaves_the_session_environment() -> Result<()> {
 /// a `</untrusted-source-text>` inside a message is just more of the message.
 #[test]
 fn each_cycle_names_a_fresh_wrapper_nonce_in_its_prompt() -> Result<()> {
-    let script = deploy("run-cycle.sh")?;
+    let script = runner("run-cycle.sh")?;
     let line = script
         .lines()
         .map(str::trim)

@@ -2,7 +2,7 @@
 //!
 //! An agent anywhere reads through `/v1/command` and writes through the record endpoints, so
 //! no session needs a clone, a store, or a source credential. Who the caller is depends on
-//! where it runs: a Legion pod impersonates a service account, anything else inside Google
+//! where it runs: a Kubernetes pod impersonates a service account, anything else inside Google
 //! Cloud takes an identity token from the metadata server, and a dev box reaches the server
 //! over the tailnet, where Tailscale itself says who is calling.
 
@@ -481,7 +481,7 @@ fn same_origin_redirects(origin: String) -> reqwest::redirect::Policy {
 
 /// The token this caller presents to the server at `origin`, in the order the deployment needs.
 ///
-/// A Legion pod runs as a Kubernetes service account Cloud Run does not accept, so it
+/// A Kubernetes pod runs as a Kubernetes service account Cloud Run does not accept, so it
 /// impersonates a Google service account; anything else inside Google Cloud asks the metadata
 /// server directly; a dev box sends no token and is identified by its Tailscale login.
 ///

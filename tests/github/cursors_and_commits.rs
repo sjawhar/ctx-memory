@@ -34,24 +34,28 @@ fn a_run_the_budget_stopped_reads_the_follow_up_it_did_not_reach_next_time() -> 
         200,
         &json!({
             "total_count": 1,
-            "repositories": [{ "full_name": "sjawhar/ctx-memory", "default_branch": "main" }],
+            "repositories": [{ "full_name": "example-org/example-repo", "default_branch": "main" }],
         })
         .to_string(),
     )?;
     api.json(
-        "/repos/sjawhar/ctx-memory/issues",
+        "/repos/example-org/example-repo/issues",
         200,
         &json!([{
             "number": 1,
             "title": "An issue",
             "body": "the issue body",
-            "user": {"login": "sami", "id": 1},
+            "user": {"login": "ada", "id": 1},
             "updated_at": "2026-10-26T10:00:00Z"
         }])
         .to_string(),
     )?;
-    api.json("/repos/sjawhar/ctx-memory/issues/1/comments", 200, "[]")?;
-    api.json("/repos/sjawhar/ctx-memory/commits", 200, "[]")?;
+    api.json(
+        "/repos/example-org/example-repo/issues/1/comments",
+        200,
+        "[]",
+    )?;
+    api.json("/repos/example-org/example-repo/commits", 200, "[]")?;
 
     let credential = json!({
         "app_id": "1234567",
@@ -70,10 +74,10 @@ fn a_run_the_budget_stopped_reads_the_follow_up_it_did_not_reach_next_time() -> 
             state.clone(),
             BTreeMap::new(),
         )?;
-        let held = proposed(&first, "github:sjawhar/ctx-memory");
+        let held = proposed(&first, "github:example-org/example-repo");
         let boundary = api.requests()?.len();
         let cursors = held.clone().map_or_else(BTreeMap::new, |cursor| {
-            BTreeMap::from([("github:sjawhar/ctx-memory".to_owned(), cursor)])
+            BTreeMap::from([("github:example-org/example-repo".to_owned(), cursor)])
         });
         let second = run_fetch(json!({ "installations": [1_000_002] }), state, cursors)?;
         Ok((held, boundary, second))
@@ -90,11 +94,11 @@ fn a_run_the_budget_stopped_reads_the_follow_up_it_did_not_reach_next_time() -> 
     assert!(
         after_hold
             .iter()
-            .any(|request| request.path == "/repos/sjawhar/ctx-memory/issues/1/comments"),
+            .any(|request| request.path == "/repos/example-org/example-repo/issues/1/comments"),
         "the follow-up the held run never reached is read: {after_hold:?}"
     );
     assert_eq!(
-        proposed(&second, "github:sjawhar/ctx-memory").as_deref(),
+        proposed(&second, "github:example-org/example-repo").as_deref(),
         Some("2026-10-27T00:00:00Z"),
         "the second run finished, so its cursor moves to the window end",
     );
@@ -115,7 +119,7 @@ fn a_review_held_over_two_runs(api: &FakeHttp) -> Result<()> {
         200,
         &json!({
             "total_count": 1,
-            "repositories": [{ "full_name": "sjawhar/ctx-memory", "default_branch": "main" }],
+            "repositories": [{ "full_name": "example-org/example-repo", "default_branch": "main" }],
         })
         .to_string(),
     )?;
@@ -126,27 +130,35 @@ fn a_review_held_over_two_runs(api: &FakeHttp) -> Result<()> {
             "number": 2,
             "title": "A pull request",
             "body": "the pull request body",
-            "pull_request": {"url": "https://api.github.com/repos/sjawhar/ctx-memory/pulls/2"},
-            "user": {"login": "sami", "id": 1},
+            "pull_request": {"url": "https://api.github.com/repos/example-org/example-repo/pulls/2"},
+            "user": {"login": "ada", "id": 1},
             "updated_at": updated
         }])
         .to_string()
     };
     api.json(
-        "/repos/sjawhar/ctx-memory/issues",
+        "/repos/example-org/example-repo/issues",
         200,
         &pull("2026-10-26T11:00:00Z"),
     )?;
     api.then_json(
-        "/repos/sjawhar/ctx-memory/issues",
+        "/repos/example-org/example-repo/issues",
         200,
         &pull("2026-10-27T00:03:00Z"),
     )?;
-    api.json("/repos/sjawhar/ctx-memory/issues/2/comments", 200, "[]")?;
-    api.json("/repos/sjawhar/ctx-memory/pulls/2/comments", 200, "[]")?;
-    api.json("/repos/sjawhar/ctx-memory/commits", 200, "[]")?;
     api.json(
-        "/repos/sjawhar/ctx-memory/pulls/2/reviews",
+        "/repos/example-org/example-repo/issues/2/comments",
+        200,
+        "[]",
+    )?;
+    api.json(
+        "/repos/example-org/example-repo/pulls/2/comments",
+        200,
+        "[]",
+    )?;
+    api.json("/repos/example-org/example-repo/commits", 200, "[]")?;
+    api.json(
+        "/repos/example-org/example-repo/pulls/2/reviews",
         200,
         &json!([{
             "id": 7005,
@@ -185,13 +197,13 @@ fn a_review_held_past_the_window_is_read_by_the_next_run_whatever_graphql_says()
             state.clone(),
             BTreeMap::new(),
         )?;
-        let cursor = proposed(&first, "github:sjawhar/ctx-memory")
+        let cursor = proposed(&first, "github:example-org/example-repo")
             .context("the first run proposed a cursor")?;
         let boundary = api.requests()?.len();
         let second = run_fetch_until(
             json!({ "installations": [1_000_002] }),
             state,
-            BTreeMap::from([("github:sjawhar/ctx-memory".to_owned(), cursor)]),
+            BTreeMap::from([("github:example-org/example-repo".to_owned(), cursor)]),
             "2026-10-27T01:00:00Z",
         )?;
         Ok((first, boundary, second))
@@ -201,7 +213,7 @@ fn a_review_held_past_the_window_is_read_by_the_next_run_whatever_graphql_says()
     std::env::remove_var("CTX_GITHUB_API");
 
     let (first, boundary, second) = outcome?;
-    let review = "github:sjawhar/ctx-memory#2/review/7005".to_owned();
+    let review = "github:example-org/example-repo#2/review/7005".to_owned();
     assert!(
         !pointers(&first).contains(&review),
         "the first run's window ends before the review: {:?}",
@@ -211,7 +223,7 @@ fn a_review_held_past_the_window_is_read_by_the_next_run_whatever_graphql_says()
     let reviews = requests
         .iter()
         .skip(boundary)
-        .filter(|request| request.path == "/repos/sjawhar/ctx-memory/pulls/2/reviews")
+        .filter(|request| request.path == "/repos/example-org/example-repo/pulls/2/reviews")
         .count();
     assert_eq!(reviews, 1, "the stream that held a review is read again");
     assert!(
@@ -234,11 +246,10 @@ fn activity(newest: &str) -> Value {
 }
 
 /// GitHub ties an `ETag` to the token that read the page, and every fetch mints its own
-/// installation token, so no stored `ETag` ever answered `304` on a later run (round-3
-/// acceptance at b56738d: 627 conditions, 0 answers of `304`). An unchanged repository must
-/// still cost no REST request on the next run: the GraphQL pre-pass says nothing changed since
-/// its cursor. The acceptance test asserted `304` answers; with no condition sent any more, it
-/// asserts that the second run sends no REST request at all.
+/// installation token, so no stored `ETag` ever answered `304` on a later run: hundreds of
+/// conditional requests got no `304`. An unchanged repository must still cost no REST request on
+/// the next run: the GraphQL pre-pass says nothing changed since its cursor. With no condition
+/// sent any more, the test asserts that the second run sends no REST request at all.
 #[test]
 fn an_unchanged_listing_costs_nothing_on_the_next_run_under_its_new_token() -> Result<()> {
     let _guard = guard();
@@ -309,7 +320,7 @@ fn linear(count: u64) -> (BTreeMap<String, (Vec<String>, String)>, String) {
 }
 
 fn busy_commit(sha: &str) -> String {
-    format!("github:sjawhar/busy@{sha}")
+    format!("github:example-org/busy@{sha}")
 }
 
 /// A force push between two runs replaces the default branch with a history that shares only
@@ -378,7 +389,7 @@ fn a_force_push_between_runs_leaves_no_rewritten_commit_unread() -> Result<()> {
     Ok(())
 }
 
-/// Two runs of `sjawhar/busy`: the first stores the linear history `c000001`…`c000003` and its
+/// Two runs of `example-org/busy`: the first stores the linear history `c000001`…`c000003` and its
 /// head; then 150 commits `d000001`… dated by `dated` land on top of it, and the comparison
 /// from the stored head lists only the oldest 100 of them, as GitHub cuts a long one short.
 /// Returns the second run's messages.
@@ -544,7 +555,10 @@ fn a_second_with_more_issues_than_one_runs_budget_is_finished_across_runs() -> R
     })?;
 
     for number in 1..=150 {
-        let pointer = format!("github:sjawhar/busy#{number}/comment/{}", 10_000 + number);
+        let pointer = format!(
+            "github:example-org/busy#{number}/comment/{}",
+            10_000 + number
+        );
         assert!(
             stored.contains(&pointer),
             "{pointer} is read: cursors {cursors:?}"

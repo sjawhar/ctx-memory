@@ -323,10 +323,9 @@ fn search_finds_title() -> Result<()> {
 ///
 /// The ctx server captures a command's stdout and returns it in `/v1/command`, which agents
 /// read and parse, so styling meant for a terminal must not reach that text. Observed on the
-/// real surface (final acceptance at b0a545d): `ctx search` piped to
-/// `od -c` with `NO_COLOR=1`, locally and through the server from another box, printed
-/// `[ 033 [ 1 m E 1 033 [ 0 m ]`. It was older than remote mode, which is what makes agents
-/// read it.
+/// real surface: `ctx search` piped to `od -c` with `NO_COLOR=1`, locally and through the
+/// server from another box, printed `[ 033 [ 1 m E 1 033 [ 0 m ]`. It was older than remote
+/// mode, which is what makes agents read it.
 #[test]
 fn piped_text_output_carries_no_escape_codes() -> Result<()> {
     let root = test_root("no-escape")?;

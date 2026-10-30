@@ -1,6 +1,6 @@
 //! The graph repository is private, so every git call carries a credential.
 //!
-//! `other-org/memory` answers an anonymous clone with `401`, and a container holds no
+//! A private GitHub repository answers an anonymous clone with `401`, and a container holds no
 //! git credential helper and no ssh key. These checks run a real `ctx serve` against a git
 //! remote that demands an `Authorization` header: the server has to mint an installation
 //! token and carry it on the clone, the pull and the push, or it cannot start at all.

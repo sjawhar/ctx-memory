@@ -226,7 +226,7 @@ fn meet_transcript_goes_to_drive_meet_stream() -> Result<()> {
         ],
         exports: BTreeMap::from([(
             "1WeeklySyncTranscript0000000".to_owned(),
-            ("Sami: let us ship it.".to_owned(), false),
+            ("Ada: let us ship it.".to_owned(), false),
         )]),
         ..FakeDriveApi::default()
     };
@@ -239,7 +239,7 @@ fn meet_transcript_goes_to_drive_meet_stream() -> Result<()> {
         .context("the Meet folder produced a record")?;
     assert_eq!(record.stream, STREAM_MEET);
     assert_eq!(record.pointer, "drive:1WeeklySyncTranscript0000000");
-    assert_eq!(record.text, "Sami: let us ship it.");
+    assert_eq!(record.text, "Ada: let us ship it.");
     assert_eq!(
         stream_cursor(&messages, STREAM_MEET),
         Some("2026-10-25T18:00:00Z".to_owned())

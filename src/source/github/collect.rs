@@ -760,12 +760,11 @@ const REST_RESOURCE: &str = "core";
 /// a REST request, so it is held by its installation's `core` count. The pre-pass's GraphQL
 /// answers are not read here.
 ///
-/// GitHub's answers for one installation do not always come from one counter: on 2026-10-28,
-/// within one minute and with one token, `/repos/example-org/infra/issues` answered
-/// `remaining 14407, reset 03:15:34Z` and the next request, to its commits, `remaining 13790,
-/// reset 03:47:48Z`; `sjawhar/legion` showed the same with 11,521 and 10,484. A count under
-/// the floor is still a count GitHub keeps, so it holds that installation for the rest of the
-/// run.
+/// GitHub's answers for one installation do not always come from one counter: in one observed
+/// run, within one minute and with one token, one repository's `/issues` answered `remaining 14407,
+/// reset 03:15:34Z` and the next request, to its commits, `remaining 13790, reset 03:47:48Z`;
+/// another installation's repository showed the same with 11,521 and 10,484. A count under the
+/// floor is still a count GitHub keeps, so it holds that installation for the rest of the run.
 pub(super) struct Governor {
     budget: u32,
     floor: u32,

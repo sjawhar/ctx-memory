@@ -119,7 +119,7 @@ fn a_gmail_history_id_that_expires_mid_catch_up_lists_again_from_the_start() -> 
     let server = FakeGoogle::start(vec![
         (
             "/gmail/v1/users/me/profile",
-            json!({"emailAddress": "sami@example.com", "historyId": "4242"}),
+            json!({"emailAddress": "ada@example.com", "historyId": "4242"}),
         ),
         (
             "/gmail/v1/users/me/messages/00000000000000c1",
@@ -160,7 +160,7 @@ fn a_gmail_history_id_that_expires_mid_catch_up_lists_again_from_the_start() -> 
         (
             "/gmail/v1/users/me/profile",
             200,
-            json!({"emailAddress": "sami@example.com", "historyId": "4400"}).to_string(),
+            json!({"emailAddress": "ada@example.com", "historyId": "4400"}).to_string(),
         ),
         (
             "/gmail/v1/users/me/messages/00000000000000c1",

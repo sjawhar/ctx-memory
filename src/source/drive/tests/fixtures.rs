@@ -95,7 +95,7 @@ pub(super) fn document_at(id: &str, name: &str, modified: &str) -> Value {
         "mimeType": "application/vnd.google-apps.document",
         "modifiedTime": modified,
         "webViewLink": format!("https://docs.google.com/document/d/{id}"),
-        "lastModifyingUser": {"displayName": "Sami Jawhar"}
+        "lastModifyingUser": {"displayName": "Ada Lovelace"}
     })
 }
 

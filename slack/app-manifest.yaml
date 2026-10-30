@@ -1,8 +1,7 @@
-# The Slack app `ctx slack login` signs in with: "ctx-memory", an internal app of the
-# workspace that only ctx uses, so no other client's tokens count against its token
-# limit (docs/sources.md, "Slack source"). Create it at
-# https://api.slack.com/apps: Create New App, From a manifest, pick the workspace, then paste this
-# file.
+# The Slack app `ctx slack login` signs in with: "ctx-memory", an internal app of the workspace
+# that only ctx uses, so no other client's tokens count against its token limit (docs/sources.md,
+# "The ctx-memory Slack app"). Create it at https://api.slack.com/apps: Create New App, From a
+# manifest, pick the workspace, then paste this file.
 #
 # Every key is from Slack's manifest reference, https://docs.slack.dev/reference/app-manifest, and
 # src/slack_login/tests.rs holds this file to what the login asks for:

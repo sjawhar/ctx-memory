@@ -28,7 +28,7 @@ fn a_branch_read_once(
 #[test]
 fn a_branch_whose_head_has_not_moved_lists_no_commit() -> Result<()> {
     let base = api_base();
-    let subject = repo("sjawhar", "steady");
+    let subject = repo("example-org", "steady");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
         ..FakeGithub::default()
@@ -60,7 +60,7 @@ fn a_branch_whose_head_has_not_moved_lists_no_commit() -> Result<()> {
 #[test]
 fn a_moved_head_is_read_as_a_comparison_whatever_its_commits_dates() -> Result<()> {
     let base = api_base();
-    let subject = repo("sjawhar", "moved");
+    let subject = repo("example-org", "moved");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
         ..FakeGithub::default()
@@ -85,8 +85,8 @@ fn a_moved_head_is_read_as_a_comparison_whatever_its_commits_dates() -> Result<(
 
     let stored = pointers(&second);
     for pointer in [
-        "github:sjawhar/moved@ccccccc3",
-        "github:sjawhar/moved@bbbbbbb2",
+        "github:example-org/moved@ccccccc3",
+        "github:example-org/moved@bbbbbbb2",
     ] {
         assert!(stored.contains(pointer), "{pointer} is stored: {stored:?}");
     }
@@ -100,7 +100,7 @@ fn a_moved_head_is_read_as_a_comparison_whatever_its_commits_dates() -> Result<(
 #[test]
 fn a_comparison_github_cannot_make_lists_the_new_head_since_the_stored_time() -> Result<()> {
     let base = api_base();
-    let subject = repo("sjawhar", "unrelated");
+    let subject = repo("example-org", "unrelated");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
         ..FakeGithub::default()
@@ -130,7 +130,7 @@ fn a_comparison_github_cannot_make_lists_the_new_head_since_the_stored_time() ->
     )?;
 
     assert!(
-        pointers(&second).contains("github:sjawhar/unrelated@bbbbbbb2"),
+        pointers(&second).contains("github:example-org/unrelated@bbbbbbb2"),
         "{:?}",
         pointers(&second)
     );
@@ -144,7 +144,7 @@ fn a_comparison_github_cannot_make_lists_the_new_head_since_the_stored_time() ->
 #[test]
 fn a_commit_dated_after_the_window_end_keeps_the_stored_head() -> Result<()> {
     let base = api_base();
-    let subject = repo("sjawhar", "skewed");
+    let subject = repo("example-org", "skewed");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
         ..FakeGithub::default()
@@ -166,7 +166,7 @@ fn a_commit_dated_after_the_window_end_keeps_the_stored_head() -> Result<()> {
     )?;
 
     // The commit is held, and the next run compares from the head before it again.
-    assert!(!pointers(&second).contains("github:sjawhar/skewed@ddddddd4"));
+    assert!(!pointers(&second).contains("github:example-org/skewed@ddddddd4"));
     assert_eq!(
         cursor_of(&second, &stream_id(&subject))?,
         Some(format!("feed={LATER_END},head=aaaaaaa1@{LATER_END}"))
@@ -177,8 +177,8 @@ fn a_commit_dated_after_the_window_end_keeps_the_stored_head() -> Result<()> {
 #[test]
 fn the_pre_pass_reads_a_repository_whose_head_moved_to_an_older_commit() -> Result<()> {
     let base = api_base();
-    let steady = repo("sjawhar", "steady");
-    let pushed = repo("sjawhar", "pushed");
+    let steady = repo("example-org", "steady");
+    let pushed = repo("example-org", "pushed");
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![steady.clone(), pushed.clone()])]),
         ..FakeGithub::default()
@@ -222,7 +222,7 @@ fn the_pre_pass_reads_a_repository_whose_head_moved_to_an_older_commit() -> Resu
 
     let read = fake.get_log.borrow().clone();
     assert!(
-        !read.iter().any(|url| url.contains("/sjawhar/steady/")),
+        !read.iter().any(|url| url.contains("/example-org/steady/")),
         "{read:?}"
     );
     // The skipped stream's cursor still names the head it holds, so a later push of older
@@ -232,7 +232,7 @@ fn the_pre_pass_reads_a_repository_whose_head_moved_to_an_older_commit() -> Resu
         Some(format!("feed={LATER_END},head=aaaaaaa1@{LATER_END}"))
     );
     assert!(
-        pointers(&second).contains("github:sjawhar/pushed@eeeeeee5"),
+        pointers(&second).contains("github:example-org/pushed@eeeeeee5"),
         "{:?}",
         pointers(&second)
     );

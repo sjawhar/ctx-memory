@@ -289,7 +289,7 @@ pub fn ctx_local(tree: &Path, arguments: &[&str]) -> Result<Local> {
 }
 
 /// Runs `ctx` as a remote client: no tree, a working directory that holds none, and the
-/// environment a dev box or a Legion pod would carry.
+/// environment a dev box or a Kubernetes pod would carry.
 pub fn ctx_remote(
     cwd: &Path,
     environment: &[(&str, &str)],

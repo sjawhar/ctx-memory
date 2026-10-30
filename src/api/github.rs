@@ -1,4 +1,4 @@
-//! The sjawhar-agent GitHub App: the only way this program touches GitHub.
+//! The deployment's GitHub App: the only way this program touches GitHub.
 //!
 //! The app's key signs a short-lived JWT, and the JWT buys an installation token limited to
 //! the repositories and permissions the caller asks for. The server asks for one repository
@@ -317,7 +317,7 @@ pub struct Page {
     pub kind: PageKind,
 }
 
-/// The sjawhar-agent app as a reader: it mints a read-only token for each installation and
+/// The GitHub App as a reader: it mints a read-only token for each installation and
 /// reads the repositories that installation covers. One token is minted per installation and
 /// reused until it is nearly expired, so a fetch that runs longer than a token's hour mints a
 /// fresh one rather than failing on a stale one.

@@ -113,9 +113,9 @@ pub(super) fn against<T>(address: SocketAddr, body: impl FnOnce() -> Result<T>) 
 }
 
 /// The one repository the emulated GitHub holds.
-pub(super) const BUSY: &str = "/repos/sjawhar/busy";
+pub(super) const BUSY: &str = "/repos/example-org/busy";
 /// Its stream.
-pub(super) const BUSY_STREAM: &str = "github:sjawhar/busy";
+pub(super) const BUSY_STREAM: &str = "github:example-org/busy";
 
 /// A change the emulated GitHub makes to its data once.
 pub(super) type Change = Box<dyn FnOnce(&mut Busy) + Send>;
@@ -125,7 +125,7 @@ pub(super) type Change = Box<dyn FnOnce(&mut Busy) + Send>;
 /// rest by page number — from data a test changes between two page requests.
 #[derive(Default)]
 pub(super) struct Busy {
-    /// The issues and pull requests of `sjawhar/busy`.
+    /// The issues and pull requests of `example-org/busy`.
     pub(super) issues: Vec<Value>,
     /// Each issue's comments, by number.
     pub(super) comments: BTreeMap<u64, Vec<Value>>,
@@ -187,7 +187,7 @@ impl Busy {
             return Ok(Response::json(
                 200,
                 json!({ "total_count": 1, "repositories": [
-                    { "full_name": "sjawhar/busy", "default_branch": "main" } ] })
+                    { "full_name": "example-org/busy", "default_branch": "main" } ] })
                 .to_string(),
             ));
         }
@@ -241,10 +241,10 @@ impl Busy {
             "sha": sha,
             "commit": {
                 "message": format!("commit {sha}"),
-                "author": { "name": "Sami", "date": date },
+                "author": { "name": "Ada", "date": date },
                 "committer": { "date": date }
             },
-            "author": { "login": "sami", "id": 1 },
+            "author": { "login": "ada", "id": 1 },
             "parents": parents.iter().map(|parent| json!({ "sha": parent })).collect::<Vec<_>>()
         })
     }
@@ -511,7 +511,7 @@ pub(super) fn busy_issue(number: u64, updated: &str) -> Value {
         "number": number,
         "title": format!("Issue {number}"),
         "body": "the issue body",
-        "user": { "login": "sami", "id": 1 },
+        "user": { "login": "ada", "id": 1 },
         "updated_at": updated
     })
 }
@@ -525,7 +525,7 @@ pub(super) fn busy_comment(id: u64, updated: &str) -> Value {
     })
 }
 
-/// Runs one fetch of `sjawhar/busy` from 2026-10-01, and returns its records' pointers.
+/// Runs one fetch of `example-org/busy` from 2026-10-01, and returns its records' pointers.
 pub(super) fn fetch_busy(address: SocketAddr, label: &str) -> Result<BTreeSet<String>> {
     let messages = against(address, || {
         run_fetch(

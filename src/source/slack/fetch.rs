@@ -135,9 +135,10 @@ pub(super) fn emit_resolve_hello(
     })
 }
 
-/// Discovers the streams to fetch: public channels Sami is in, plus the private channels the
-/// configuration lists. Direct and group messages are never listed, so they are never fetched;
-/// a configured channel that is not a readable public or private channel is warned and skipped.
+/// Discovers the streams to fetch: public channels the signed-in user is in, plus the private
+/// channels the configuration lists. Direct and group messages are never listed, so they are
+/// never fetched; a configured channel that is not a readable public or private channel is warned
+/// and skipped.
 /// A fetch leaves out archived channels, which take no new messages; a resolve keeps them
 /// (`include_archived`), since what a fetch read there before is still in scope.
 pub(super) fn discover_streams<C: SlackApi + ?Sized>(

@@ -8,7 +8,8 @@
 # CTX_SERVER is required: the script names no server of its own and stops before any request
 # without one. On a dev box the tailnet says who is calling and no token is needed. Inside
 # Google Cloud, set CTX_SERVER to the Cloud Run URL and CTX_SERVER_AUDIENCE to the same value,
-# and from a Legion pod also set CTX_IMPERSONATE_SA.
+# and from a Kubernetes pod without a Google service account of its own also set
+# CTX_IMPERSONATE_SA.
 set -eu
 
 write=0

@@ -41,7 +41,7 @@ fn mints_read_only_tokens_per_installation() -> Result<()> {
     api.json(
         "/app/installations/1000001/access_tokens",
         201,
-        &json!({ "token": "ghs_sjawhar", "expires_at": "2026-10-27T09:00:00Z" }).to_string(),
+        &json!({ "token": "ghs_example", "expires_at": "2026-10-27T09:00:00Z" }).to_string(),
     )?;
     // The excluded organization's installation is registered, so a stray call would succeed; the
     // assertion below proves it is never made.
@@ -151,7 +151,7 @@ fn empty_repository_commits_409_is_not_a_stream_error() -> Result<()> {
     )?;
     api.json("/repos/other-org/empty-repo/issues", 200, "[]")?;
     // An empty repository (no commits yet) answers the commits listing with 409, exactly as
-    // sjawhar/slack-tui did in a real fetch on 2026-10-27. That is "no commits", not a fetch
+    // one did in a real fetch on 2026-10-27. That is "no commits", not a fetch
     // failure: the stream must end OK, so the fetch does not report a permanent error and the
     // repository's cursor can advance.
     api.json(
@@ -216,14 +216,14 @@ fn an_empty_repository_is_a_quiet_stream_whose_cursor_moves() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "sjawhar/slack-tui", "default_branch": "main" },
+                { "full_name": "example-org/slack-tui", "default_branch": "main" },
             ],
         })
         .to_string(),
     )?;
-    api.json("/repos/sjawhar/slack-tui/issues", 200, "[]")?;
+    api.json("/repos/example-org/slack-tui/issues", 200, "[]")?;
     api.json(
-        "/repos/sjawhar/slack-tui/commits",
+        "/repos/example-org/slack-tui/commits",
         409,
         &json!({ "message": "Git Repository is empty." }).to_string(),
     )?;
@@ -261,7 +261,7 @@ fn an_empty_repository_is_a_quiet_stream_whose_cursor_moves() -> Result<()> {
     assert_eq!(
         stream_ends(&messages),
         vec![(
-            "github:sjawhar/slack-tui".to_owned(),
+            "github:example-org/slack-tui".to_owned(),
             StreamStatus::Ok,
             Some("2026-10-27T00:00:00Z".to_owned()),
             None,
@@ -361,7 +361,7 @@ fn a_throttled_repository_listing_skips_one_installation_only() -> Result<()> {
     api.json(
         "/app/installations/1000001/access_tokens",
         201,
-        &json!({ "token": "ghs_sjawhar", "expires_at": "2026-10-27T09:00:00Z" }).to_string(),
+        &json!({ "token": "ghs_example", "expires_at": "2026-10-27T09:00:00Z" }).to_string(),
     )?;
     // Each installation carries its own rate limit, so the first one being refused says nothing
     // about the second. The first listing is throttled; the second answers.
@@ -376,13 +376,13 @@ fn a_throttled_repository_listing_skips_one_installation_only() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "sjawhar/ctx-memory", "default_branch": "main" },
+                { "full_name": "example-org/example-repo", "default_branch": "main" },
             ],
         })
         .to_string(),
     )?;
-    api.json("/repos/sjawhar/ctx-memory/issues", 200, "[]")?;
-    api.json("/repos/sjawhar/ctx-memory/commits", 200, "[]")?;
+    api.json("/repos/example-org/example-repo/issues", 200, "[]")?;
+    api.json("/repos/example-org/example-repo/commits", 200, "[]")?;
 
     let credential = json!({
         "app_id": "1234567",
@@ -427,7 +427,7 @@ fn a_throttled_repository_listing_skips_one_installation_only() -> Result<()> {
     assert_eq!(
         stream_ends(&messages),
         vec![(
-            "github:sjawhar/ctx-memory".to_owned(),
+            "github:example-org/example-repo".to_owned(),
             StreamStatus::Ok,
             Some("2026-10-27T00:00:00Z".to_owned()),
             None,

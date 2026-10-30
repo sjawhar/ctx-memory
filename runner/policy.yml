@@ -1,12 +1,12 @@
 # What the ingest cycle's session may do. run-cycle.sh loads this file with --config, and
-# the image copies it to /opt/ctx-memory/policy.yml. A --config overlay outranks the
+# the image installs it at /opt/ctx-memory/policy.yml. A --config overlay outranks the
 # global and project settings for every key it sets.
 #
 # The session reads the verbatim text of every message a source delivered: a GitHub issue
-# or comment any GitHub user can open on a public repository, mail from outside the organization, a
-# message in a channel. None of that text can be trusted, so the session must not be able
-# to do what it says. What the cycle needs is named here; everything else has no approval
-# it can get, because a headless session cannot answer a prompt and a call that needs one
+# or comment any GitHub user can open on a public repository, mail from outside the
+# organization, a message in a channel. None of that text can be trusted, so the session must
+# not be able to do what it says. What the cycle needs is named here; everything else has no
+# approval it can get, because a headless session cannot answer a prompt and a call that needs one
 # fails instead of running.
 tools:
   # read and write tier calls run unattended; the exec tier — bash, and anything else that
@@ -36,7 +36,7 @@ tools:
     checkpoint: deny
     rewind: deny
     github: deny
-    # The cycle's only writes: the two tools deploy/agent/ctx-record.ts adds, which hand a record
+    # The cycle's only writes: the two tools runner/ctx-record.ts adds, which hand a record
     # to `ctx record put` on standard input, or a path to `ctx record rm`, with no shell.
     ctx_record_put: allow
     ctx_record_rm: allow

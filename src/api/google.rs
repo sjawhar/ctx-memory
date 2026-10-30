@@ -1,4 +1,4 @@
-//! Google Workspace APIs called directly with Sami's OAuth credential.
+//! Google Workspace APIs called directly with the signed-in user's OAuth credential.
 //!
 //! The credential is named `google` and comes from `credentials::load`: a Secret Manager
 //! version in Google Cloud, and a file or an environment variable on a dev box. A source runs
@@ -53,10 +53,10 @@ const PAGE_SIZE: u32 = 100;
 /// Drive documents `fileNotExportable`, `insufficientFilePermissions`, `notFound` and the
 /// caller's reasons at <https://developers.google.com/workspace/drive/api/guides/handle-errors>.
 /// `exportSizeLimitExceeded` is not on that page; Google's issue tracker shows Drive answering
-/// it (<https://issuetracker.google.com/issues/36761333>). On 2026-10-28 Drive answered
+/// it (<https://issuetracker.google.com/issues/36761333>). Drive has answered
 /// `fileNotExportable` live for a plain-text file and a folder, and `notFound` for an unknown
-/// id. No reply with `cannotExportFile` has been seen: the Drive the check ran against holds no
-/// document with download turned off, and every one of its 110 Google documents exported.
+/// id. No reply with `cannotExportFile` has been seen, because no Drive checked so far held a
+/// document with download turned off.
 const FILE_REFUSALS: [(u16, &str); 5] = [
     (403, "cannotExportFile"),
     (403, "exportSizeLimitExceeded"),
@@ -704,9 +704,9 @@ mod tests {
     }
 
     /// Drive's answer, observed live on 2026-10-28, to an export of a file that is not a Docs
-    /// Editors file (a plain-text file and a folder in Sami's Drive); Google documents the same
-    /// reason for a Google Vids file. It names the file's kind, so a later run gets the same
-    /// answer.
+    /// Editors file (a plain-text file and a folder in the signed-in user's Drive); Google
+    /// documents the same reason for a Google Vids file. It names the file's kind, so a later
+    /// run gets the same answer.
     #[test]
     fn an_export_of_a_file_drive_cannot_export_is_a_refusal() -> Result<()> {
         let message = "Export only supports Docs Editors files.";

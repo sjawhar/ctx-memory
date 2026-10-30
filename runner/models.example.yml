@@ -1,0 +1,41 @@
+# An example of the model provider file run-cycle.sh takes as CTX_MODELS_FILE: the one place the
+# session's model calls can go, and the credential they carry. A deployment writes its own, with
+# its provider's name, API and model ids, and installs it where only root can change it, file and
+# every directory above it; the runner's tests use this one.
+#
+# run-cycle.sh writes the file, with CTX_MODEL_BASE_URL in place of baseUrl's placeholder, to
+# <HOME>/.omp/agent/models.yml as root before every session. omp takes a provider's baseUrl as it
+# is written (packages/coding-agent/src/config/model-registry.ts:1806-1828 at the release
+# runner/omp.lock pins); only apiKey and header values can name a command or an environment
+# variable (config/resolve-config-value.ts:111-115). So the address is written into the file,
+# and the session's user can rewrite neither it nor anything else in HOME. Past its comment
+# lines, the file names baseUrl on one line, the placeholder line exactly as below, four spaces
+# in, so no model names an address of its own; run-cycle.sh refuses a file that does not.
+#
+# The provider is its own, not one of omp's built-in providers: CTX_MODEL names it and one of its
+# models, `gateway/example-model` here, which omp splits at the first slash
+# (config/model-resolver.ts:708-723), and omp sends the model's id as it is listed here as the
+# request's model. No built-in provider holds a key in the session, so no request can go
+# anywhere but CTX_MODEL_BASE_URL.
+#
+# auth: apiKey makes these plain API-key calls: unset, omp sends an anthropic-messages model of a
+# custom provider in its Claude Code OAuth shape (config/custom-models.ts:59-64). To an address
+# that is not Anthropic's, omp sends the key as `Authorization: Bearer <key>` and no X-Api-Key
+# (providers/anthropic.ts:502-514, 4291-4303).
+#
+# apiKey must be the command below: run-cycle.sh writes the key from ANTHROPIC_API_KEY into that
+# file, readable only by the session's user, and removes ANTHROPIC_API_KEY from the environment
+# before it starts the session, so the key is not inherited by `ctx` or any other process the
+# session starts and is not in the session's own /proc/<pid>/environ. omp runs the command when
+# a request needs the credential, not when it loads the catalog. run-cycle.sh refuses a file
+# whose apiKey is anything else, because a key written into the file itself would be readable by
+# the session, and one that names the key file on any other line, such as a second provider's
+# key or a header.
+providers:
+  gateway:
+    baseUrl: "@CTX_MODEL_BASE_URL@"
+    api: anthropic-messages
+    auth: apiKey
+    apiKey: "!cat /run/ctx-agent/model-key"
+    models:
+      - {id: example-model, name: Example model, reasoning: true, input: [text, image], contextWindow: 200000, maxTokens: 64000, cost: {input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75}}

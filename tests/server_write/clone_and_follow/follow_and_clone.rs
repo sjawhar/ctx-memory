@@ -281,9 +281,9 @@ fn commit_without_pushing(tree: &Path) -> Result<()> {
 /// `ctx serve` refused to start in such a tree while it held uncommitted changes, but started
 /// in one whose only difference from the remote was a local commit, and the first remote write
 /// then pushed that commit to `main` — under its own author, without the check every write
-/// through the server gets. Observed on the real surface (final
-/// acceptance at b0a545d): a put through `ctx serve` in a person's tree published the commit
-/// `local work Sami has not pushed`, which held a record with no quote and no tier.
+/// through the server gets. Observed on the real surface: a put through `ctx serve` in a
+/// person's tree published that person's unpushed commit, which held a record with no quote and
+/// no tier.
 #[test]
 fn a_write_never_publishes_their_unpushed_commit() -> Result<()> {
     let tree = fixture_clone("write-unpushed-theirs")?;

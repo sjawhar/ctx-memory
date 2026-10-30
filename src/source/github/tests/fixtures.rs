@@ -236,7 +236,7 @@ pub(super) fn issue(number: u64, updated: &str) -> Value {
         "number": number,
         "title": format!("Issue {number}"),
         "body": "the issue body",
-        "user": {"login": "sami", "id": 1},
+        "user": {"login": "ada", "id": 1},
         "updated_at": updated
     })
 }
@@ -274,10 +274,10 @@ pub(super) fn commit(sha: &str, date: &str) -> Value {
         "sha": sha,
         "commit": {
             "message": format!("commit {sha}"),
-            "author": {"name": "Sami", "date": date},
+            "author": {"name": "Ada", "date": date},
             "committer": {"date": date}
         },
-        "author": {"login": "sami", "id": 1}
+        "author": {"login": "ada", "id": 1}
     })
 }
 

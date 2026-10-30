@@ -190,7 +190,7 @@ fn a_meet_document_is_not_repeated_in_the_changes_stream() -> Result<()> {
         ],
         exports: BTreeMap::from([(
             "1WeeklySyncTranscript0000000".to_owned(),
-            ("Sami: let us ship it.".to_owned(), false),
+            ("Ada: let us ship it.".to_owned(), false),
         )]),
         ..FakeDriveApi::default()
     };

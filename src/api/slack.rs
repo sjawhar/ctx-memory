@@ -20,7 +20,7 @@ const SLACK_API: &str = "https://slack.com/api";
 pub const SLACK_AUTHORIZE_URL: &str = "https://slack.com/oauth/v2/authorize";
 /// Where `ctx slack login` exchanges the authorization code for the user token.
 pub const SLACK_ACCESS_URL: &str = "https://slack.com/api/oauth.v2.access";
-/// The redirect URI the ctx-memory app registers (`deploy/slack/ctx-memory-manifest.yaml`).
+/// The redirect URI the ctx-memory app registers (`slack/app-manifest.yaml`).
 pub const SLACK_REDIRECT_URI: &str = "http://localhost:3118/callback";
 /// The user scopes `ctx` needs: public and private channel listing and history, and user
 /// names. They are the manifest's `oauth_config.scopes.user`, in the same order.
@@ -31,8 +31,8 @@ pub const SLACK_SCOPES: [&str; 5] = [
     "groups:read",
     "users:read",
 ];
-/// Longest permitted `ctx-fetch` run. The deployment's fetch job timeout must not be
-/// longer than this, so a token cannot expire during a fetch.
+/// Longest permitted `ctx fetch` run: the deployment's fetch job timeout, which must not be
+/// longer than this, so a token renewed at fetch start cannot expire during the fetch.
 const FETCH_JOB_MAX_RUNTIME_SECONDS: i64 = 3_600;
 /// Slack's token lifetime, used when a refresh response omits `expires_in`.
 const DEFAULT_EXPIRES_IN_SECONDS: i64 = 43_200;
@@ -918,8 +918,8 @@ mod tests {
         Ok(())
     }
 
-    /// The shape `ctx-slack` version 1 holds:
-    /// the earlier sign-in stays readable, and stays the kind the fetch job refreshes.
+    /// The shape of a credential an earlier build stored from the Claude Code app's sign-in: it
+    /// stays readable, and stays the kind the fetch job refreshes.
     #[test]
     fn the_claude_code_apps_credential_is_still_read() -> Result<()> {
         let secret = Secret::new(format!(

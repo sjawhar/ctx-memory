@@ -4,7 +4,7 @@
  * file. run-cycle.sh loads this module with --trusted-extension from /opt/ctx-memory, which is
  * root's. That flag makes omp load this module and discover no other extension; it does not stop
  * omp discovering custom tools or MCP servers, which the image closes by keeping every place they
- * are read from root's (deploy/agent/Dockerfile, checked by run-cycle.sh). No shell runs: the
+ * are read from root's (docs/deployment.md, checked by run-cycle.sh). No shell runs: the
  * arguments are a fixed argv with the record's path after `--`, so nothing in a path or a record
  * is read as an option or as shell.
  */

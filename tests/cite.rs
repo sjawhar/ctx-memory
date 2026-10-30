@@ -182,17 +182,17 @@ fn sweep_accepts_quotes_list() -> Result<()> {
 fn github_stored(pointer: &str, seconds: i64, text: &str) -> Result<Record> {
     Ok(Record {
         pointer: pointer.to_owned(),
-        stream: "github:sjawhar/ctx-memory".to_owned(),
+        stream: "github:example-org/example-repo".to_owned(),
         ts: Utc
             .timestamp_opt(seconds, 0)
             .single()
             .context("constructing test timestamp")?,
         label: Some("pull_request".to_owned()),
-        author: Some("sjawhar".to_owned()),
+        author: Some("ada".to_owned()),
         author_id: Some("MDQ6VXNlcjE".to_owned()),
         thread: None,
         title: Some("Add the GitHub source".to_owned()),
-        url: Some("https://github.com/sjawhar/ctx-memory/pull/12".to_owned()),
+        url: Some("https://github.com/example-org/example-repo/pull/12".to_owned()),
         text: text.to_owned(),
         aliases: Vec::new(),
         context: false,
@@ -219,10 +219,10 @@ fn cite_verify_checks_a_github_quote() -> Result<()> {
          status: open\n\
          quotes:\n\
          \x20 - quote: \"ship the GitHub source\"\n\
-         \x20   source: \"github:sjawhar/ctx-memory#12\"\n\
+         \x20   source: \"github:example-org/example-repo#12\"\n\
          \x20   tier: 1\n\
          \x20 - quote: \"this phrase is not in the pull request\"\n\
-         \x20   source: \"github:sjawhar/ctx-memory#12/comment/900001\"\n\
+         \x20   source: \"github:example-org/example-repo#12/comment/900001\"\n\
          \x20   tier: 1\n\
          ---\n\
          Evidence.\n",
@@ -236,12 +236,12 @@ fn cite_verify_checks_a_github_quote() -> Result<()> {
         "github",
         &[
             github_stored(
-                "github:sjawhar/ctx-memory#12",
+                "github:example-org/example-repo#12",
                 1_700_000_000,
                 "Let us ship the GitHub source this week.",
             )?,
             github_stored(
-                "github:sjawhar/ctx-memory#12/comment/900001",
+                "github:example-org/example-repo#12/comment/900001",
                 1_700_000_001,
                 "Looks good to me.",
             )?,
@@ -278,7 +278,10 @@ fn cite_verify_checks_a_github_quote() -> Result<()> {
         .iter()
         .filter_map(|entry| entry.get("pointer").and_then(Value::as_str))
         .collect();
-    assert_eq!(pointers, ["github:sjawhar/ctx-memory#12/comment/900001"]);
+    assert_eq!(
+        pointers,
+        ["github:example-org/example-repo#12/comment/900001"]
+    );
     Ok(())
 }
 
@@ -705,10 +708,10 @@ fn a_statement_of_absence_backed_by_a_quote_that_does_not_hold_is_refused() -> R
 /// compared with each record's tree-relative path as written, so `./decision.md`, an absolute
 /// path, or a path relative to a subdirectory of the tree matches nothing, and a path that names
 /// no record at all also matches nothing: each run checks nothing, prints `checked 0` and exits 0.
-/// Observed on the real binary (round-4 acceptance at d5655fc): a tier 1
-/// record whose quote its source does not hold exits 1 as `decisions/bad.md` and 0 as
-/// `./decisions/bad.md`; and in remote mode `ctx cite verify recs/cited.md`, a draft on the
-/// caller's machine that the server's tree does not hold, answers `checked 0` with exit 0.
+/// Observed on the real binary: a tier 1 record whose quote its source does not hold exits 1 as
+/// `decisions/bad.md` and 0 as `./decisions/bad.md`; and in remote mode
+/// `ctx cite verify recs/cited.md`, a draft on the caller's machine that the server's tree does
+/// not hold, answers `checked 0` with exit 0.
 #[test]
 fn cite_verify_checks_or_refuses_every_file_it_is_given() -> Result<()> {
     let root = test_root("named-file")?;
@@ -821,11 +824,10 @@ fn cite_verify_reports_a_record_whose_frontmatter_does_not_parse() -> Result<()>
 /// that names it compares no quote. Today that run exits 0 with no finding: here it reports
 /// `checked 1`, for the source pointer it finds in the text and resolves, and never compares the
 /// tier 1 quote beside it, which its source does not hold. A person or a cycle that verifies
-/// before writing reads that as "the quotes hold": the same false pass the round-4 fix ended for
-/// a path that names no record. Observed on the real binary (round-5
-/// acceptance at d9cb9f7), locally and in remote mode: a draft whose tier 1 quote is an
-/// unterminated YAML string answers `checked 0`, exit 0, while the server refuses the same
-/// record as `frontmatter-invalid`.
+/// before writing reads that as "the quotes hold": the same false pass the earlier fix ended for
+/// a path that names no record. Observed on the real binary, locally and in remote mode: a draft
+/// whose tier 1 quote is an unterminated YAML string answers `checked 0`, exit 0, while the
+/// server refuses the same record as `frontmatter-invalid`.
 #[test]
 fn cite_verify_refuses_a_named_file_whose_frontmatter_does_not_parse() -> Result<()> {
     let root = test_root("unparsed-front")?;

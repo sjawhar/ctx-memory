@@ -6,14 +6,17 @@ use std::process::Command;
 
 use anyhow::{ensure, Context as _, Result};
 
-use crate::fixtures::{deploy, remove_scratch, repo, scratch, write_executable};
+use crate::fixtures::{remove_scratch, repo, runner, scratch, write_executable, EXAMPLE_MODEL};
 
 /// Stand-ins for what `run-cycle.sh` calls, so the script runs on a machine without the
-/// image: `ctx` reports one pending window and `omp` records that it was started.
+/// image: `ctx` reports one pending window and `omp` records that it was started. The model
+/// provider file is the runner's example, in a directory closed to the session's user, as an
+/// image installs its own.
 struct CycleRig {
     root: PathBuf,
     bin: PathBuf,
     data: PathBuf,
+    models: PathBuf,
     omp_log: PathBuf,
 }
 
@@ -22,6 +25,9 @@ impl CycleRig {
         let root = scratch(label)?;
         let bin = root.join("bin");
         let data = root.join("data");
+        // The provider file's directories, this one among them, must be closed to group and
+        // others, whatever the umask this test runs under made them.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))?;
         std::fs::create_dir_all(&bin)?;
         std::fs::create_dir_all(data.join("windows/w1"))?;
         std::fs::create_dir_all(root.join("home/.omp/agent"))?;
@@ -42,6 +48,11 @@ impl CycleRig {
             std::fs::write(&path, "")?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
         }
+        let models = root.join("opt/models.yml");
+        std::fs::create_dir_all(root.join("opt"))?;
+        std::fs::write(&models, runner("models.example.yml")?)?;
+        std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o444))?;
+        std::fs::set_permissions(root.join("opt"), std::fs::Permissions::from_mode(0o555))?;
         let omp_log = root.join("omp-started");
         write_executable(
             &bin.join("ctx"),
@@ -58,19 +69,24 @@ impl CycleRig {
             root,
             bin,
             data,
+            models,
             omp_log,
         })
     }
 
     /// Makes the script believe it started as root and that `ctx-agent` is this test's own
     /// user: `id` answers as root would, `setpriv` runs the command it is handed as this
-    /// user, and `chown` changes nothing.
+    /// user, and `chown` changes nothing. `id -u ctx-agent` answers what `agent-uid` holds,
+    /// 65534 unless [`Self::set_agent_uid`] changed it: a uid that owns nothing here, so the
+    /// files this test's user made are not the session's own.
     fn pretend_root(&self) -> Result<()> {
         let gid = String::from_utf8(Command::new("id").arg("-g").output()?.stdout)?;
+        self.set_agent_uid("65534")?;
         write_executable(
             &self.bin.join("id"),
             &format!(
-                "#!/bin/sh\ncase \"$1\" in\n  -u) echo 0 ;;\n  -g) echo {} ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/bin/sh\ncase \"$1\" in\n  -u) if [ -n \"${{2-}}\" ]; then cat '{}'; else echo 0; fi ;;\n  -g) echo {} ;;\n  *) exit 0 ;;\nesac\n",
+                self.root.join("agent-uid").display(),
                 gid.trim()
             ),
         )?;
@@ -79,6 +95,13 @@ impl CycleRig {
             "#!/bin/sh\nwhile [ \"${1#--}\" != \"$1\" ]; do shift; done\nexec \"$@\"\n",
         )?;
         write_executable(&self.bin.join("chown"), "#!/bin/sh\nexit 0\n")
+    }
+
+    /// What `id -u ctx-agent` answers from now on. A data file, not a rewritten stub, so no
+    /// program is rewritten while another test may be starting one.
+    fn set_agent_uid(&self, uid: &str) -> Result<()> {
+        std::fs::write(self.root.join("agent-uid"), format!("{uid}\n"))?;
+        Ok(())
     }
 
     fn home(&self) -> PathBuf {
@@ -144,7 +167,7 @@ impl CycleRig {
         let path = std::env::var("PATH").context("PATH is not set")?;
         let mut command = Command::new("sh");
         command
-            .arg(repo().join("deploy/agent/run-cycle.sh"))
+            .arg(repo().join("runner/run-cycle.sh"))
             .current_dir(self.workspace())
             .env("PWD", self.workspace())
             .env("PATH", format!("{}:{path}", self.bin.display()))
@@ -153,12 +176,26 @@ impl CycleRig {
             .env("CTX_DATA_DIR", &self.data)
             .env("CTX_SERVER", "http://127.0.0.1:9")
             .env("CTX_MODEL_BASE_URL", "http://127.0.0.1:9")
+            .env("CTX_MODELS_FILE", &self.models)
+            .env("CTX_MODEL", EXAMPLE_MODEL)
             .env("ANTHROPIC_API_KEY", "not-a-key")
             .env("CLOUD_RUN_EXECUTION", "ctx-agent-test-1")
             .env("XDG_DATA_HOME", self.xdg("data"))
             .env("XDG_STATE_HOME", self.xdg("state"))
             .env("XDG_CACHE_HOME", self.xdg("cache"));
         Ok(command)
+    }
+
+    /// Puts `text` in the model provider file and leaves it as the image keeps it: closed to
+    /// writes, in a directory closed to writes.
+    fn replace_models(&self, text: &str) -> Result<()> {
+        let dir = self.root.join("opt");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::remove_file(&self.models)?;
+        std::fs::write(&self.models, text)?;
+        std::fs::set_permissions(&self.models, std::fs::Permissions::from_mode(0o444))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))?;
+        Ok(())
     }
 
     fn run(&self) -> Result<std::process::Output> {
@@ -208,8 +245,8 @@ fn the_cycle_refuses_to_start_its_session_without_root_to_drop() -> Result<()> {
     result
 }
 
-/// Without the model gateway's address the session would have nowhere its calls may go; the
-/// cycle stops before anything else, rather than start one that calls Anthropic directly.
+/// Without the model API's address the session would have nowhere its calls may go; the cycle
+/// stops before anything else, rather than start one that calls a model somewhere else.
 #[test]
 fn the_cycle_refuses_to_start_without_the_model_gateway_address() -> Result<()> {
     let rig = CycleRig::new("gateway-unset")?;
@@ -226,6 +263,177 @@ fn the_cycle_refuses_to_start_without_the_model_gateway_address() -> Result<()> 
         .context("running run-cycle.sh")?;
     let result = assert_refused(&rig, &unset, "CTX_MODEL_BASE_URL must")
         .and_then(|()| assert_refused(&rig, &empty, "CTX_MODEL_BASE_URL must"));
+    rig.remove()?;
+    result
+}
+
+/// The deployment names the model provider file and the model the session selects; the runner
+/// has no default for either, so a cycle without them stops before anything else.
+#[test]
+fn the_cycle_refuses_to_start_without_its_model_provider_and_model() -> Result<()> {
+    let rig = CycleRig::new("model-unset")?;
+    rig.pretend_root()?;
+    let mut result = Ok(());
+    for variable in ["CTX_MODELS_FILE", "CTX_MODEL"] {
+        let unset = rig
+            .command()?
+            .env_remove(variable)
+            .output()
+            .context("running run-cycle.sh")?;
+        let empty = rig
+            .command()?
+            .env(variable, "")
+            .output()
+            .context("running run-cycle.sh")?;
+        let reason = format!("{variable} must");
+        result = result
+            .and_then(|()| assert_refused(&rig, &unset, &reason))
+            .and_then(|()| assert_refused(&rig, &empty, &reason))
+            .with_context(|| format!("{variable} unset or empty"));
+    }
+    rig.remove()?;
+    result
+}
+
+/// root copies the provider file into the session's HOME before every session, so a file the
+/// session's user could change is one an earlier session could have pointed at another address,
+/// with the next session's key. Each way to change it is refused: the file the session's own (its
+/// owner can give itself the write it lacks), the file or a directory above it writable by group
+/// or others, the path running through a symbolic link, whose target and its directories are not
+/// the ones checked, and a path that is not absolute. A file that is not there is refused too.
+#[test]
+fn the_cycle_refuses_a_model_provider_file_the_session_user_can_change() -> Result<()> {
+    let rig = CycleRig::new("models-writable")?;
+    let dir = rig.root.join("opt");
+    let set_mode = |path: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    };
+    rig.pretend_root()?;
+    let own_uid = String::from_utf8(Command::new("id").arg("-u").output()?.stdout)?;
+    rig.set_agent_uid(own_uid.trim())?;
+    let owned = rig.run()?;
+    rig.set_agent_uid("65534")?;
+    set_mode(&rig.models, 0o464)?;
+    let group_writable = rig.run()?;
+    set_mode(&rig.models, 0o444)?;
+    set_mode(&dir, 0o557)?;
+    let directory = rig.run()?;
+    set_mode(&dir, 0o755)?;
+    let elsewhere = rig.root.join("elsewhere.yml");
+    std::fs::write(&elsewhere, runner("models.example.yml")?)?;
+    set_mode(&elsewhere, 0o444)?;
+    let link = dir.join("link.yml");
+    std::os::unix::fs::symlink(&elsewhere, &link)?;
+    set_mode(&dir, 0o555)?;
+    let linked = rig
+        .command()?
+        .env("CTX_MODELS_FILE", &link)
+        .output()
+        .context("running run-cycle.sh")?;
+    let relative = rig
+        .command()?
+        .env("CTX_MODELS_FILE", "opt/models.yml")
+        .current_dir(&rig.root)
+        .output()
+        .context("running run-cycle.sh")?;
+    let missing = rig
+        .command()?
+        .env("CTX_MODELS_FILE", dir.join("absent.yml"))
+        .output()
+        .context("running run-cycle.sh")?;
+    let unchanged = rig.run()?;
+    let result = assert_refused(&rig, &owned, &format!("owns {}", rig.models.display()))
+        .context("a file the session's user owns")
+        .and_then(|()| {
+            assert_refused(
+                &rig,
+                &group_writable,
+                &format!("can rewrite {}, on the way", rig.models.display()),
+            )
+            .context("a group-writable file")
+        })
+        .and_then(|()| {
+            assert_refused(
+                &rig,
+                &directory,
+                &format!("can rewrite {}, on the way", dir.display()),
+            )
+            .context("a directory others can write")
+        })
+        .and_then(|()| assert_refused(&rig, &linked, "no symbolic link").context("a symbolic link"))
+        .and_then(|()| assert_refused(&rig, &relative, "absolute path").context("a relative path"))
+        .and_then(|()| {
+            assert_refused(&rig, &missing, "CTX_MODELS_FILE must name a file")
+                .context("a missing file")
+        })
+        .and_then(|()| {
+            // With the file closed again, the cycle goes on to its next check, so each
+            // refusal above was the provider file's.
+            assert_refused(&rig, &unchanged, "can write").context("the closed file")
+        });
+    rig.remove()?;
+    result
+}
+
+/// The provider file is the deployment's, so the runner checks what its guarantees rest on: one
+/// address, the placeholder, so every call goes to `CTX_MODEL_BASE_URL`, even one to a model
+/// that names its own; and one key, read from the file only the session's user can read, never a
+/// key written into the provider file, which the session could read, nor that file's key handed
+/// to a second provider or header.
+#[test]
+fn the_cycle_refuses_a_model_provider_file_that_routes_a_call_or_a_key_elsewhere() -> Result<()> {
+    let rig = CycleRig::new("models-shape")?;
+    rig.pretend_root()?;
+    let example = runner("models.example.yml")?;
+    let placeholder = "    baseUrl: \"@CTX_MODEL_BASE_URL@\"\n";
+    let key = "    apiKey: \"!cat /run/ctx-agent/model-key\"\n";
+    let model = "      - {id: example-model,";
+    ensure!(
+        example.matches(placeholder).count() == 1
+            && example.matches(key).count() == 1
+            && example.matches(model).count() == 1,
+        "runner/models.example.yml does not hold the lines this test changes"
+    );
+    let mut result = Ok(());
+    for (label, text, reason) in [
+        (
+            "no placeholder",
+            example.replace(placeholder, "    baseUrl: \"https://elsewhere.example\"\n"),
+            "CTX_MODELS_FILE must hold one address",
+        ),
+        (
+            "two placeholders",
+            example.replace(placeholder, &format!("{placeholder}{placeholder}")),
+            "CTX_MODELS_FILE must hold one address",
+        ),
+        (
+            "a model's own address",
+            example.replace(
+                model,
+                "      - {baseUrl: \"https://elsewhere.example\", id: example-model,",
+            ),
+            "CTX_MODELS_FILE must hold one address",
+        ),
+        (
+            "a key in the file",
+            example.replace(key, "    apiKey: \"sk-written-into-the-file\"\n"),
+            "CTX_MODELS_FILE must take its one apiKey",
+        ),
+        (
+            "the key file in a header too",
+            example.replace(
+                key,
+                &format!("{key}    headers: {{x-key: \"!cat /run/ctx-agent/model-key\"}}\n"),
+            ),
+            "CTX_MODELS_FILE must take its one apiKey",
+        ),
+    ] {
+        rig.replace_models(&text)?;
+        let output = rig.run()?;
+        result = result.and_then(|()| {
+            assert_refused(&rig, &output, reason).with_context(|| format!("a file with {label}"))
+        });
+    }
     rig.remove()?;
     result
 }
@@ -315,7 +523,7 @@ fn the_cycle_refuses_a_session_user_that_can_write_the_share() -> Result<()> {
 /// to root once omp exits, rather than handing its process to omp.
 #[test]
 fn the_cycle_seals_its_transcript_after_the_session() -> Result<()> {
-    let script = deploy("run-cycle.sh")?;
+    let script = runner("run-cycle.sh")?;
     let code: Vec<&str> = script
         .lines()
         .map(str::trim)
