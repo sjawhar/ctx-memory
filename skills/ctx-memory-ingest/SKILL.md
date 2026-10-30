@@ -198,13 +198,16 @@ automated notification noise unless a person acts on it.
   unless a cited reply settles it.
 - Name a person as `owner` or `decided_by` only when the cited source names that person as
   the one who undertook the commitment, made the decision or owns the question. A recipient,
-  someone copied or mentioned, a document's author, a meeting's chair, someone who owns
-  adjacent work or "the team" is not enough: write `owner: unassigned`, leave `decided_by`
-  out, and say in the body what the source does not establish.
+  someone copied or mentioned, a document's author or owner, the person a question seems
+  addressed to, a meeting's chair, someone who owns adjacent work or "the team" is not
+  enough: write `owner: unassigned`, leave `decided_by` out, and say in the body what the
+  source does not establish.
 - A new signal updates the record or open item it belongs to before a new record is
   created. An update, the index or parent page that links a new record among them, starts
   with `ctx record show <path>`, and the write puts back the whole record with the new
-  evidence added: `ctx_record_put` replaces the file, so text left out is lost.
+  evidence added: `ctx_record_put` replaces the file, so text left out is lost. An update
+  checks the record's existing `owner` and `decided_by` by the rule above, and corrects them
+  when the sources it cites do not establish them.
 - Keep superseded values with their citations; mark them superseded and link the
   replacement.
 - Give open decisions, commitments and questions a `due` or `revisit_by` date.
