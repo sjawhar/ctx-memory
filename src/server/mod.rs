@@ -792,10 +792,13 @@ mod tests {
     /// happened, and carries no credential.
     #[test]
     fn a_panic_is_reported_in_one_line() {
-        let line = panic_line(
-            Some("failed\nat line two\u{1b}[2J with ghp_A1b2C3d4E5f6G7h8I9j0K1l2"),
-            Some("src/server/write.rs:42:7"),
+        // The token is built from parts so the source holds no literal that secret scanning
+        // reads as a live token.
+        let message = format!(
+            "failed\nat line two\u{1b}[2J with ghp_{}",
+            "A1b2C3d4E5f6G7h8I9j0K1l2"
         );
+        let line = panic_line(Some(message.as_str()), Some("src/server/write.rs:42:7"));
         assert!(
             line.starts_with("the server panicked at src/server/write.rs:42:7: failed at line two"),
             "{line}"

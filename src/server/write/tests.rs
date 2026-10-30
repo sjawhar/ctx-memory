@@ -10,6 +10,10 @@ use super::validation::{credential_findings, inside_the_tree, is_rules_page};
 use super::Change;
 use crate::tree::record_path;
 
+/// Slack's token prefix. Each Slack test token is built from it, so the source holds no literal
+/// that secret scanning reads as a live Slack token.
+const SLACK_TOKEN_PREFIX: &str = "xox";
+
 /// A token's shape began with `\b`, and `_` is a word character, so a token written after
 /// one, as in `decisions/x_ghp_…`, passed every check and reached the graph's file names
 /// (round-4 review of d5655fc, older items). Only a letter or digit before it hides it.
@@ -19,7 +23,7 @@ fn a_token_after_an_underscore_or_a_dot_is_refused() -> Result<()> {
     for path in [
         format!("decisions/x_ghp_{body}.md"),
         format!("decisions/x_github_pat_11ABCDEFG0_{body}.md"),
-        format!("decisions/x_xoxb-1234567890-{body}.md"),
+        format!("decisions/x_{SLACK_TOKEN_PREFIX}b-1234567890-{body}.md"),
         format!("decisions/x_ya29.a0AfB_{body}.md"),
         format!("decisions/x_1//0gLm{body}.md"),
     ] {
@@ -148,10 +152,10 @@ fn a_github_token_is_refused() -> Result<()> {
 fn a_slack_token_is_refused() -> Result<()> {
     refused(
         &[
-            "xoxb-1234567890-0987654321-AbCdEfGhIjKlMnOp".to_owned(),
-            "xoxp-1234567890-0987654321-AbCdEfGhIjKlMnOp".to_owned(),
-            "xoxe-1-AbCdEfGhIjKlMnOpQrStUvWx".to_owned(),
-            "xoxe.xoxp-1-AbCdEfGhIjKlMnOpQrStUvWx".to_owned(),
+            format!("{SLACK_TOKEN_PREFIX}b-1234567890-0987654321-AbCdEfGhIjKlMnOp"),
+            format!("{SLACK_TOKEN_PREFIX}p-1234567890-0987654321-AbCdEfGhIjKlMnOp"),
+            format!("{SLACK_TOKEN_PREFIX}e-1-AbCdEfGhIjKlMnOpQrStUvWx"),
+            format!("{SLACK_TOKEN_PREFIX}e.{SLACK_TOKEN_PREFIX}p-1-AbCdEfGhIjKlMnOpQrStUvWx"),
         ],
         "Slack",
     )
