@@ -18,7 +18,8 @@ use crate::source::{
 
 use super::auth::SlackAuth;
 use super::records::{
-    apply_scheme, is_timestamp, message_timestamp, record_from_message, slack_timestamp,
+    apply_scheme, is_timestamp, mentions, message_timestamp, record_from_message, slack_timestamp,
+    Mention,
 };
 use super::SlackConfig;
 
@@ -82,6 +83,12 @@ fn is_absent_user(error: &anyhow::Error) -> bool {
         error.to_string().as_str(),
         r#"slack users.info: "user_not_found""# | r#"slack users.info: "users_not_found""#
     )
+}
+
+/// Whether a failed `conversations.info` lookup, as `Names` keeps it, says Slack does not
+/// know the channel, as it says of a private channel the user is not in.
+fn is_absent_channel(error: &str) -> bool {
+    error == r#"slack conversations.info: "channel_not_found""#
 }
 
 /// Resolves the token, discovers the streams, and fetches them.
@@ -211,6 +218,7 @@ pub(super) fn fetch_with_api<C: SlackApi + ?Sized>(
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
     let mut thread_index = read_thread_index(&request.state_dir)?;
+    let mut names = Names::new(streams);
     let mut skipped_threads = 0_usize;
     // A stream that ends Ok moves its cursor past this window, and the threads found in it are
     // polled again only through the index. So no stream ends until the index is saved: a save
@@ -237,6 +245,7 @@ pub(super) fn fetch_with_api<C: SlackApi + ?Sized>(
                 config,
                 &request.source.scheme,
                 &mut thread_index,
+                &mut names,
             )
             .map(|(records, skipped)| (records, skipped, span))
         });
@@ -283,6 +292,12 @@ pub(super) fn fetch_with_api<C: SlackApi + ?Sized>(
             ),
         })?;
     }
+    if let Some(warning) = names.warning() {
+        sink(Message::Warning {
+            stream: None,
+            message: warning,
+        })?;
+    }
     write_thread_index(&request.state_dir, &thread_index)?;
     for end in ends {
         sink(end)?;
@@ -308,13 +323,10 @@ fn fetch_channel<C: SlackApi + ?Sized>(
     config: &SlackConfig,
     scheme: &str,
     thread_index: &mut ThreadIndex,
+    names: &mut Names<'_>,
 ) -> Result<(Vec<Record>, usize)> {
     let Span { start, end, .. } = span;
-    let info = api
-        .channel_info(channel)
-        .with_context(|| format!("reading Slack channel {channel}"))?;
-    let channel_name = info.get("name").and_then(Value::as_str).unwrap_or(channel);
-    let label = format!("#{channel_name}");
+    let label = names.channel_label(api, channel)?;
     let horizon = span.window_end - Duration::days(i64::from(config.thread_poll_days));
     // A thread reply is not in the channel's history unless it was also sent to the channel,
     // and a message nobody had answered when it was read carries no `latest_reply` to track its
@@ -385,19 +397,21 @@ fn fetch_channel<C: SlackApi + ?Sized>(
         }
     }
 
-    let names = resolve_user_names(
+    names.learn(
         api,
         contexts.iter().chain(messages.iter()).chain(replies.iter()),
     )?;
     let mut records = Vec::with_capacity(contexts.len() + messages.len() + replies.len());
     for message in contexts {
-        let mut record = record_from_message(&message, channel, &label, &names, &config.workspace)?;
+        let mut record =
+            record_from_message(&message, channel, &label, names.named(), &config.workspace)?;
         record.context = true;
         apply_scheme(&mut record, scheme);
         records.push(record);
     }
     for message in messages.into_iter().chain(replies) {
-        let mut record = record_from_message(&message, channel, &label, &names, &config.workspace)?;
+        let mut record =
+            record_from_message(&message, channel, &label, names.named(), &config.workspace)?;
         apply_scheme(&mut record, scheme);
         records.push(record);
     }
@@ -434,8 +448,8 @@ pub(super) fn resolve_with_api<C: SlackApi + ?Sized>(
     // reads: the fetch's own discovery decides, before any message is read, rather than the
     // token's wider scopes.
     let (readable, _warnings) = discover_streams(api, config, true)?;
+    let mut names = Names::new(&readable);
     let mut found: Vec<(String, String, Value)> = Vec::new();
-    let mut labels: BTreeMap<String, String> = BTreeMap::new();
     for (channel, timestamp) in pointers {
         if !readable.iter().any(|stream| stream == channel) {
             bail!(
@@ -446,27 +460,23 @@ pub(super) fn resolve_with_api<C: SlackApi + ?Sized>(
         if messages.is_empty() {
             continue;
         }
-        let label = if let Some(label) = labels.get(channel) {
-            label.clone()
-        } else {
-            let info = api
-                .channel_info(channel)
-                .with_context(|| format!("reading Slack channel {channel}"))?;
-            let name = info.get("name").and_then(Value::as_str).unwrap_or(channel);
-            let label = format!("#{name}");
-            labels.insert(channel.to_owned(), label.clone());
-            label
-        };
+        let label = names.channel_label(api, channel)?;
         for message in messages {
             found.push((channel.to_owned(), label.clone(), message));
         }
     }
-    let names = resolve_user_names(api, found.iter().map(|(_, _, message)| message))?;
+    names.learn(api, found.iter().map(|(_, _, message)| message))?;
     for (channel, label, message) in found {
         let mut record =
-            record_from_message(&message, &channel, &label, &names, &config.workspace)?;
+            record_from_message(&message, &channel, &label, names.named(), &config.workspace)?;
         apply_scheme(&mut record, &request.source.scheme);
         sink(Message::Record(Box::new(record)))?;
+    }
+    if let Some(warning) = names.warning() {
+        sink(Message::Warning {
+            stream: None,
+            message: warning,
+        })?;
     }
     Ok(())
 }
@@ -520,29 +530,169 @@ fn resolve_messages<C: SlackApi + ?Sized>(
         .collect())
 }
 
-fn resolve_user_names<'a, C, I>(api: &C, messages: I) -> Result<BTreeMap<String, String>>
-where
-    C: SlackApi + ?Sized,
-    I: IntoIterator<Item = &'a Value>,
-{
-    let user_ids = messages
-        .into_iter()
-        .filter_map(|message| message.get("user").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    let mut names = BTreeMap::new();
-    for user_id in user_ids {
-        if let Some(user) = api
-            .user_info(&user_id)
-            .with_context(|| format!("reading Slack user {user_id}"))?
-        {
-            names.insert(user_id.clone(), display_name(&user, &user_id));
-        }
-    }
-    Ok(names)
+/// What one fetch or resolve run has learned from Slack about the ids in the messages it
+/// read: the name of each person who wrote or is mentioned in one, of each channel it reads,
+/// and of each channel a message mentions without a name. Slack is asked about each id once
+/// per run, and the answer, a failure included, holds for the rest of the run. A person's name
+/// is the one the author line gives them.
+struct Names<'r> {
+    /// The channels this run reads. A private channel's name is shown only for one of these.
+    readable: &'r [String],
+    /// Each id Slack named, as `record_from_message` takes them.
+    named: BTreeMap<String, String>,
+    /// Each id Slack answered for with no name to show: a user it does not know or gave no
+    /// name, and a private channel this run does not read.
+    unnamed: BTreeSet<String>,
+    /// Each id whose lookup failed, with the error.
+    failed: BTreeMap<String, String>,
+    /// Each mentioned id that kept its id because its lookup failed, which the run warns of.
+    kept: BTreeSet<String>,
 }
 
-fn display_name(user: &Value, fallback: &str) -> String {
+impl<'r> Names<'r> {
+    const fn new(readable: &'r [String]) -> Self {
+        Self {
+            readable,
+            named: BTreeMap::new(),
+            unnamed: BTreeSet::new(),
+            failed: BTreeMap::new(),
+            kept: BTreeSet::new(),
+        }
+    }
+
+    /// The names learned so far.
+    const fn named(&self) -> &BTreeMap<String, String> {
+        &self.named
+    }
+
+    fn asked(&self, id: &str) -> bool {
+        self.named.contains_key(id) || self.unnamed.contains(id) || self.failed.contains_key(id)
+    }
+
+    /// The label of a channel this run reads: `#` and its name, or its id when Slack gives no
+    /// name. A failed lookup fails the channel's read, as it always has.
+    fn channel_label<C: SlackApi + ?Sized>(&mut self, api: &C, channel: &str) -> Result<String> {
+        self.look_up_channel(api, channel);
+        if let Some(error) = self.failed.get(channel) {
+            bail!("reading Slack channel {channel}: {error}");
+        }
+        Ok(format!(
+            "#{}",
+            self.named.get(channel).map_or(channel, String::as_str)
+        ))
+    }
+
+    /// Learns the names `messages` need: each author's, and each mentioned person's and
+    /// unnamed channel's. A failed author lookup fails the run's read of these messages, as
+    /// it always has; a failed mention lookup leaves that mention its id.
+    fn learn<'m, C: SlackApi + ?Sized>(
+        &mut self,
+        api: &C,
+        messages: impl IntoIterator<Item = &'m Value>,
+    ) -> Result<()> {
+        for message in messages {
+            if let Some(author) = message.get("user").and_then(Value::as_str) {
+                self.look_up_user(api, author);
+                if let Some(error) = self.failed.get(author) {
+                    bail!("reading Slack user {author}: {error}");
+                }
+            }
+            let text = message
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            for mention in mentions(text) {
+                let id = match mention {
+                    Mention::User { id, .. } => {
+                        self.look_up_user(api, id);
+                        id
+                    }
+                    Mention::Channel { id, label: None } => {
+                        self.look_up_channel(api, id);
+                        id
+                    }
+                    Mention::Channel { .. } | Mention::Group { .. } | Mention::Everyone(_) => {
+                        continue
+                    }
+                };
+                if self
+                    .failed
+                    .get(id)
+                    .is_some_and(|error| !is_absent_channel(error))
+                {
+                    self.kept.insert(id.to_owned());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn look_up_user<C: SlackApi + ?Sized>(&mut self, api: &C, id: &str) {
+        if self.asked(id) {
+            return;
+        }
+        match api.user_info(id) {
+            Ok(user) => match user.as_ref().and_then(display_name) {
+                Some(name) => {
+                    self.named.insert(id.to_owned(), name.to_owned());
+                }
+                None => {
+                    self.unnamed.insert(id.to_owned());
+                }
+            },
+            Err(error) => {
+                self.failed.insert(id.to_owned(), format!("{error:#}"));
+            }
+        }
+    }
+
+    /// Learns a channel's name when the channel is public or one this run reads. A private
+    /// channel the run does not read keeps its id, so no record shows a name its configuration
+    /// did not open.
+    fn look_up_channel<C: SlackApi + ?Sized>(&mut self, api: &C, id: &str) {
+        if self.asked(id) {
+            return;
+        }
+        match api.channel_info(id) {
+            Ok(info) => {
+                let shown =
+                    !flag(&info, "is_private") || self.readable.iter().any(|read| read == id);
+                match info.get("name").and_then(Value::as_str).filter(|_| shown) {
+                    Some(name) => {
+                        self.named.insert(id.to_owned(), name.to_owned());
+                    }
+                    None => {
+                        self.unnamed.insert(id.to_owned());
+                    }
+                }
+            }
+            Err(error) => {
+                self.failed.insert(id.to_owned(), format!("{error:#}"));
+            }
+        }
+    }
+
+    /// The warning for the mentions that kept their id because a lookup failed, if any did.
+    fn warning(&self) -> Option<String> {
+        if self.kept.is_empty() {
+            return None;
+        }
+        let failures = self
+            .kept
+            .iter()
+            .filter_map(|id| self.failed.get(id).map(|error| format!("{id} ({error})")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!(
+            "Slack could not name {} mentioned id(s), which keep their id: {failures}",
+            self.kept.len()
+        ))
+    }
+}
+
+/// The name Slack gives a user, as the author line shows it: the display name, else the real
+/// name, else the user name. `None` when Slack gives none of them.
+fn display_name(user: &Value) -> Option<&str> {
     let profile = user.get("profile");
     [
         profile
@@ -553,12 +703,10 @@ fn display_name(user: &Value, fallback: &str) -> String {
             .and_then(Value::as_str),
         user.get("real_name").and_then(Value::as_str),
         user.get("name").and_then(Value::as_str),
-        user.get("id").and_then(Value::as_str),
     ]
     .into_iter()
     .flatten()
     .find(|name| !name.is_empty())
-    .map_or_else(|| fallback.to_owned(), str::to_owned)
 }
 
 fn inside_window(message: &Value, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<bool> {

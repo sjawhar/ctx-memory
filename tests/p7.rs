@@ -570,6 +570,67 @@ fn normalized_source_quote_matches_markup_mentions_and_ellipsis() -> Result<()> 
     remove_scratch(&root)
 }
 
+/// A quote taken while a mention read as its id still holds once the message reads with the
+/// person's name, even where no earlier version of the message is stored: the check also
+/// reads Slack's own text of the message, which the record keeps in `raw`. A labelled mention
+/// used to read as `@U…|label`.
+#[test]
+fn a_quote_taken_while_a_mention_read_as_its_id_still_holds() -> Result<()> {
+    for (raw, rendered, quote) in [
+        (
+            "Please ask <@U0EXAMPLE9> to approve the change",
+            "Please ask @Grace Hopper to approve the change",
+            "please ask @U0EXAMPLE9 to approve the change",
+        ),
+        (
+            "Please ask <@U0EXAMPLE8|lin> to approve the change",
+            "Please ask @Lin Okafor to approve the change",
+            "please ask @U0EXAMPLE8|lin to approve the change",
+        ),
+    ] {
+        let root = scratch("quote-mention-id")?;
+        let tree = root.join("tree");
+        let state_base = root.join("state");
+        std::fs::create_dir(&tree)?;
+        std::fs::write(
+            tree.join("ctx.toml"),
+            "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
+        )?;
+        std::fs::write(
+            tree.join("decision.md"),
+            format!("---\ntype: decision\nstatus: open\nquote: \"{quote}\"\nsource: \"slack:C0EXAMPLE01/1700000000.000005\"\n---\n"),
+        )?;
+        let mut message = record(
+            "slack:C0EXAMPLE01/1700000000.000005",
+            None,
+            1_700_000_000,
+            rendered,
+        )?;
+        message.raw = serde_json::json!({ "text": raw });
+        let store = tree_store(&state_base)?;
+        store.put_all(
+            "slack",
+            &[message],
+            DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?,
+        )?;
+
+        let verified = run_ctx(&tree, &state_base, &["cite", "verify"])?;
+        remove_scratch(&root)?;
+
+        let data = response_data(&verified)?
+            .get("data")
+            .context("verification response has data")?
+            .clone();
+        assert_eq!(
+            data.get("broken").and_then(Value::as_array).map(Vec::len),
+            Some(0),
+            "{quote}: {data}"
+        );
+        assert_eq!(verified.status.code(), Some(0), "{quote}");
+    }
+    Ok(())
+}
+
 #[test]
 fn live_verification_fills_a_partially_stored_source_thread() -> Result<()> {
     let root = scratch("quote-live-thread")?;

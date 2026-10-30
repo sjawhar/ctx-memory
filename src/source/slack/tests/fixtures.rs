@@ -75,6 +75,14 @@ pub(super) struct FakeSlackApi {
     pub(super) histories: BTreeMap<String, Vec<Value>>,
     pub(super) replies_by_thread: BTreeMap<(String, String), Vec<Value>>,
     pub(super) users: BTreeMap<String, Option<Value>>,
+    /// Users whose `users.info` call fails, with the Slack error it fails with.
+    pub(super) user_errors: BTreeMap<String, String>,
+    /// Every user the fetch or resolve asked `users.info` about, in order.
+    pub(super) user_calls: RefCell<Vec<String>>,
+    /// Channels whose `conversations.info` call fails, with the Slack error it fails with.
+    pub(super) channel_errors: BTreeMap<String, String>,
+    /// Every channel the fetch or resolve asked `conversations.info` about, in order.
+    pub(super) channel_calls: RefCell<Vec<String>>,
     pub(super) reply_calls: RefCell<Vec<(String, String)>>,
     pub(super) conversations: Vec<Value>,
     pub(super) list_calls: std::cell::Cell<usize>,
@@ -126,6 +134,10 @@ impl SlackApi for FakeSlackApi {
     }
 
     fn channel_info(&self, channel: &str) -> Result<Value> {
+        self.channel_calls.borrow_mut().push(channel.to_owned());
+        if let Some(error) = self.channel_errors.get(channel) {
+            bail!("slack conversations.info: {error:?}");
+        }
         Ok(self
             .channels
             .get(channel)
@@ -134,6 +146,10 @@ impl SlackApi for FakeSlackApi {
     }
 
     fn user_info(&self, user: &str) -> Result<Option<Value>> {
+        self.user_calls.borrow_mut().push(user.to_owned());
+        if let Some(error) = self.user_errors.get(user) {
+            bail!("slack users.info: {error:?}");
+        }
         Ok(self.users.get(user).cloned().flatten())
     }
 

@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::pointer::{self, Pointer, Schemes};
+use crate::record::Record;
 use crate::store::Store;
 use crate::tree::{Doc, Tier};
 
@@ -68,7 +69,8 @@ pub(super) enum Provenance<'a> {
     /// The claim names no pointer at all, which only a summary or a secondhand account may do.
     Untraceable { start: usize, pointer: String },
 }
-/// The text a cited pointer resolves to, with the earlier versions a quote may predate.
+/// The text a cited pointer resolves to, with the other texts a quote may have been taken
+/// from: earlier versions of its records, and the source's own text of each.
 pub(super) struct QuoteSource {
     pub(super) pointer: Pointer,
     pub(super) start: usize,
@@ -77,7 +79,8 @@ pub(super) struct QuoteSource {
 }
 
 impl QuoteSource {
-    /// Reads the newest text of a pointer's thread and every earlier version of its records.
+    /// Reads the newest text of a pointer's thread, every earlier version of its records, and
+    /// the source's own text of each.
     pub(super) fn load(
         store: &Store,
         schemes: &Schemes,
@@ -91,13 +94,22 @@ impl QuoteSource {
             .collect::<Vec<_>>()
             .join("\n");
         let mut older = Vec::new();
+        let mut keep = |record: &Record, candidate: &str| {
+            if candidate != record.text && !older.iter().any(|kept| kept == candidate) {
+                older.push(candidate.to_owned());
+            }
+        };
         for record in &records {
+            if let Some(own) = source_text(record) {
+                keep(record, own);
+            }
             let Some(parsed) = schemes.parse(&record.pointer) else {
                 continue;
             };
             for (_, version) in store.versions(&parsed)? {
-                if version.text != record.text && !older.contains(&version.text) {
-                    older.push(version.text);
+                keep(record, &version.text);
+                if let Some(own) = source_text(&version) {
+                    keep(record, own);
                 }
             }
         }
@@ -109,11 +121,19 @@ impl QuoteSource {
         })
     }
 
-    /// Reports whether the quote appears in the current text or in one earlier version of one
-    /// of its records. A quote taken before an edit stays verifiable.
+    /// Reports whether the quote appears in the current text or in one of the other texts it
+    /// may have been taken from. A quote taken before an edit stays verifiable, and so does one
+    /// taken while a Slack mention read as its id.
     pub(super) fn holds(&self, quote: &str) -> bool {
         quote_matches(&self.text, quote) || self.older.iter().any(|text| quote_matches(text, quote))
     }
+}
+
+/// The source's own text of a record, as its `raw` keeps it: for Slack, the message as Slack
+/// sent it, each mention still the id that normalising strips (`strip_mentions`), where the
+/// record's text names the person.
+fn source_text(record: &Record) -> Option<&str> {
+    record.raw.get("text").and_then(Value::as_str)
 }
 
 /// One quoted claim to verify: the quote, the source text the record wrote beside it, and the
@@ -532,17 +552,18 @@ fn strip_mentions(text: &str) -> String {
             let Some(after) = remaining.get(character.len_utf8()..) else {
                 break;
             };
-            let name_end = after
-                .char_indices()
-                .find_map(|(offset, character)| {
-                    (!character.is_alphanumeric() && character != '_' && character != '-')
-                        .then_some(offset)
-                })
-                .unwrap_or(after.len());
+            let name_end = mention_name_end(after);
             if name_end > 0 {
-                let Some(after_mention) = after.get(name_end..) else {
+                let Some(mut after_mention) = after.get(name_end..) else {
                     break;
                 };
+                // A labelled Slack mention, `<@U…|label>`, once read as `@U…|label`.
+                if let Some(label) = after_mention.strip_prefix('|') {
+                    let label_end = mention_name_end(label);
+                    if let Some(after_label) = label.get(label_end..).filter(|_| label_end > 0) {
+                        after_mention = after_label;
+                    }
+                }
                 remaining = after_mention;
                 continue;
             }
@@ -554,4 +575,14 @@ fn strip_mentions(text: &str) -> String {
         remaining = after_character;
     }
     stripped
+}
+
+/// Where the name of a mention that `text` starts with ends: the first character that is not
+/// a letter, a digit, `_` or `-`.
+fn mention_name_end(text: &str) -> usize {
+    text.char_indices()
+        .find_map(|(offset, character)| {
+            (!character.is_alphanumeric() && character != '_' && character != '-').then_some(offset)
+        })
+        .unwrap_or(text.len())
 }

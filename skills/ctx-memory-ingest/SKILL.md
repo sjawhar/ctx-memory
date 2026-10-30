@@ -236,9 +236,12 @@ automated notification noise unless a person acts on it.
 - Set `waiting_on` on an open question, decision or commitment to the people a cited
   source puts the question, the decision or the request to by name: addressed or
   @-mentioned as the one to answer or decide, or someone's own message saying they will
-  answer. Someone copied or mentioned in passing, a document's owner, a meeting's chair, or
-  the person a question only seems addressed to is not enough. Write each person as the tree
-  writes an `owner`: their full name, or the link to their person record. Take a person off
+  answer. A Slack message shows a person it @-mentions as `@` and the name its author line
+  gives them, such as `@Ada Lovelace`; a mention Slack could not name shows the handle the
+  message carried or else the bare id, such as `@U0123ABCD`, which names nobody. Someone
+  copied or mentioned in passing, a document's owner, a meeting's chair, or the person a
+  question only seems addressed to is not enough. Write each person as the tree writes an
+  `owner`: their full name, or the link to their person record. Take a person off
   `waiting_on` when a cited message from them answers or decides, or a cited source settles
   the item or hands it to someone else; leave the list out when the sources name nobody.
   Never set or keep a name by inference.
