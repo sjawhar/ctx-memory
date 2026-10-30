@@ -11,11 +11,13 @@ use serde::{Deserialize, Serialize};
 use crate::atomic::write_replace;
 use crate::config::SourceConfig;
 use crate::embed::{cosine, Embed, MEANING_THRESHOLD};
+use crate::exclude::Exclusion;
 use crate::index;
+use crate::output;
 use crate::pointer::Schemes;
 use crate::record::Record;
 use crate::schema::{OPEN_KINDS, OPEN_STATES};
-use crate::source;
+use crate::source::{self, MAX_POINTER_BYTES};
 use crate::tree::{Doc, Tree};
 use crate::windows::{SourcedRecord, Window};
 
@@ -122,6 +124,288 @@ pub struct Delta {
     pub unreviewed: Vec<OpenFlag>,
     pub closed_since_previous: Vec<StatusChange>,
     pub opened_since_previous: Vec<String>,
+    /// How many new messages this copy leaves out to stay within one answer's size
+    /// ([`Delta::fit`]): the newest ones, which the windows' own `delta.json` still list. A
+    /// delta a fetch writes never leaves any out, and then the field is not written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_messages: Option<usize>,
+    /// How many record status changes (`closed_since_previous`, then `opened_since_previous`),
+    /// open flags, and record matches of a message listed alone this copy leaves out to stay
+    /// within one answer's size; not written when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_changes: Option<usize>,
+}
+
+/// The most bytes the delta of one remote answer — `ctx pending`, `ctx delta` — takes on the
+/// wire, as [`Delta::answer_len`] counts them.
+///
+/// A host may refuse a larger answer outright: Cloud Run refuses an HTTP/1 response over
+/// 32 MiB. This leaves the rest of an answer, the window list of `ctx pending` included, room
+/// under that.
+pub const ANSWER_DELTA_BYTES: usize = 24 * 1024 * 1024;
+
+/// What status changes may take of an answer: a quarter, so a tree with very many records
+/// leaves room for the messages.
+const CHANGES_SHARE: usize = 4;
+
+impl Delta {
+    /// Leaves out every message `exclusion` names, and every reply it names from the open
+    /// flags, dropping a flag left with no reply.
+    ///
+    /// A delta written before a pattern existed still lists what it names; reading it through
+    /// this is what lets an exclusion shrink a window that was already fetched, with its files
+    /// as they are.
+    pub fn exclude(&mut self, exclusion: &Exclusion) {
+        if exclusion.is_empty() {
+            return;
+        }
+        self.new_messages
+            .retain(|message| !exclusion.matches(&message.pointer));
+        self.retain_replies(|pointer| !exclusion.matches(pointer));
+    }
+
+    /// Holds a delta written before sources were held to [`MAX_POINTER_BYTES`] to it, as the
+    /// protocol now holds every record: a message or reply whose own pointer is longer is left
+    /// out, as no source may name it, and a thread pointer that is longer is dropped from the
+    /// message that names it. Every answer quotes a pointer whole, so this is what bounds one.
+    pub fn bound_pointers(&mut self) {
+        self.new_messages
+            .retain(|message| message.pointer.len() <= MAX_POINTER_BYTES);
+        for message in &mut self.new_messages {
+            if message
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.len() > MAX_POINTER_BYTES)
+            {
+                message.thread = None;
+            }
+        }
+        self.retain_replies(|pointer| pointer.len() <= MAX_POINTER_BYTES);
+    }
+
+    /// Keeps the open flags' replies whose pointer `keep` admits, dropping a flag left with
+    /// none.
+    fn retain_replies(&mut self, keep: impl Fn(&str) -> bool) {
+        for flag in &mut self.unreviewed {
+            flag.replies.retain(|reply| keep(&reply.pointer));
+        }
+        self.unreviewed.retain(|flag| !flag.replies.is_empty());
+    }
+
+    /// The bytes this delta takes in a remote answer: printed the way `--json` prints it
+    /// ([`output::write_json`]), and then escaped again into the JSON string the server answers
+    /// with, where each `"` and `\` gains a backslash.
+    #[must_use]
+    pub fn answer_len(&self) -> usize {
+        answer_len(self)
+    }
+
+    /// Leaves out the `count` oldest new messages, with the open flags' replies that are among
+    /// them: what an earlier answer already listed (`ctx pending --offset`).
+    pub fn skip(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.new_messages
+            .drain(..count.min(self.new_messages.len()));
+        self.keep_replies_to_listed();
+    }
+
+    /// Cuts the delta to at most `budget` answer bytes ([`Delta::answer_len`]), keeping the
+    /// oldest new messages that fit, with the open flags' replies that are among them, and
+    /// counts the messages it left out in `omitted_messages`. A flag left with no reply is
+    /// dropped: the messages that made the record stale are among those left out. The record
+    /// status changes keep at most a quarter of the budget, and `omitted_changes` counts any
+    /// left out.
+    ///
+    /// Messages come oldest first, so what an answer leaves out is the newest: `ctx pending
+    /// --offset` lists it next. An answer always lists at least one message when any remain,
+    /// so following `next_offset` always moves on; a message that alone passes the budget is
+    /// listed with the open flags and record matches that fit (`fit_alone`).
+    pub fn fit(&mut self, budget: usize) {
+        if self.answer_len() <= budget {
+            return;
+        }
+        self.fit_changes(budget / CHANGES_SHARE);
+        // What each message costs in replies, and which flags its replies open: a flag's own
+        // fields are charged once, to the first message kept that replies under it.
+        let mut replies = BTreeMap::<&str, (usize, Vec<usize>)>::new();
+        let mut headers = Vec::with_capacity(self.unreviewed.len());
+        for (index, flag) in self.unreviewed.iter().enumerate() {
+            headers.push(
+                answer_len(&OpenFlag {
+                    record: flag.record.clone(),
+                    kind: flag.kind.clone(),
+                    status: flag.status.clone(),
+                    title: flag.title.clone(),
+                    owner: flag.owner.clone(),
+                    last_reviewed: flag.last_reviewed,
+                    replies: Vec::new(),
+                }) + 1,
+            );
+            for reply in &flag.replies {
+                let entry = replies.entry(reply.pointer.as_str()).or_default();
+                entry.0 += answer_len(reply) + 1;
+                entry.1.push(index);
+            }
+        }
+        // Everything but the messages and the flags, with the counts' widest values, so the
+        // counts this writes never push the answer past the budget.
+        let frame = Self {
+            version: self.version,
+            window: self.window.clone(),
+            window_end: self.window_end,
+            generated_at: self.generated_at,
+            previous_window: self.previous_window.clone(),
+            new_messages: Vec::new(),
+            unreviewed: Vec::new(),
+            closed_since_previous: self.closed_since_previous.clone(),
+            opened_since_previous: self.opened_since_previous.clone(),
+            omitted_messages: Some(usize::MAX),
+            omitted_changes: Some(usize::MAX),
+        };
+        let mut used = frame.answer_len();
+        let mut opened = vec![false; headers.len()];
+        let mut kept = 0;
+        for message in &self.new_messages {
+            let (reply_bytes, flags) = replies
+                .get(message.pointer.as_str())
+                .map_or((0, &[][..]), |(bytes, flags)| (*bytes, flags.as_slice()));
+            let header_bytes: usize = flags
+                .iter()
+                .filter(|index| !opened.get(**index).copied().unwrap_or(true))
+                .filter_map(|index| headers.get(*index))
+                .sum();
+            let cost = answer_len(message) + 1 + reply_bytes + header_bytes;
+            if kept > 0 && used + cost > budget {
+                break;
+            }
+            used += cost;
+            kept += 1;
+            for index in flags {
+                if let Some(open) = opened.get_mut(*index) {
+                    *open = true;
+                }
+            }
+        }
+        let left_out = self.new_messages.len() - kept;
+        self.omitted_messages = Some(self.omitted_messages.unwrap_or_default() + left_out);
+        self.new_messages.truncate(kept);
+        self.keep_replies_to_listed();
+        self.fit_alone(budget);
+    }
+
+    /// Holds a delta whose one message, listed alone, still passes `budget` to it: it keeps
+    /// the open flags that fit, oldest first, then the message's record matches that fit, and
+    /// counts what it leaves out in `omitted_changes`. Then, if the message's own text still
+    /// passes it, its author and label are cut to an excerpt's length: a source can name either
+    /// with any number of characters, and they only describe the message, which the window's
+    /// files hold whole.
+    fn fit_alone(&mut self, budget: usize) {
+        let mut over = self.answer_len().saturating_sub(budget);
+        if over == 0 {
+            return;
+        }
+        let mut left_out = 0;
+        while over > 0 {
+            let Some(flag) = self.unreviewed.pop() else {
+                break;
+            };
+            over = over.saturating_sub(answer_len(&flag) + 1);
+            left_out += 1;
+        }
+        for message in &mut self.new_messages {
+            while over > 0 {
+                let Some(found) = message.matches.pop() else {
+                    break;
+                };
+                over = over.saturating_sub(answer_len(&found) + 1);
+                left_out += 1;
+            }
+        }
+        self.omitted_changes = Some(self.omitted_changes.unwrap_or_default() + left_out);
+        if self.answer_len() > budget {
+            for message in &mut self.new_messages {
+                message.author = message.author.as_deref().map(excerpt);
+                message.label = message.label.as_deref().map(excerpt);
+                message.excerpt = excerpt(&message.excerpt);
+            }
+        }
+    }
+
+    /// Keeps the status changes, closed ones first, within `budget` answer bytes, and counts
+    /// the rest in `omitted_changes`.
+    fn fit_changes(&mut self, budget: usize) {
+        let mut used = 0;
+        let mut left_out = 0;
+        self.closed_since_previous.retain(|change| {
+            used += answer_len(change) + 1;
+            let keep = used <= budget;
+            left_out += usize::from(!keep);
+            keep
+        });
+        self.opened_since_previous.retain(|path| {
+            used += answer_len(path) + 1;
+            let keep = used <= budget;
+            left_out += usize::from(!keep);
+            keep
+        });
+        if left_out > 0 {
+            self.omitted_changes = Some(self.omitted_changes.unwrap_or_default() + left_out);
+        }
+    }
+
+    /// Keeps the open flags' replies to the messages listed, dropping a flag left with none.
+    fn keep_replies_to_listed(&mut self) {
+        let listed = self
+            .new_messages
+            .iter()
+            .map(|message| message.pointer.as_str())
+            .collect::<BTreeSet<_>>();
+        for flag in &mut self.unreviewed {
+            flag.replies
+                .retain(|reply| listed.contains(reply.pointer.as_str()));
+        }
+        self.unreviewed.retain(|flag| !flag.replies.is_empty());
+    }
+}
+
+/// Counts the bytes written to it, and how many of them are `"` or `\`, and keeps none.
+#[derive(Default)]
+struct AnswerCount {
+    bytes: usize,
+    escaped: usize,
+}
+
+impl std::io::Write for AnswerCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes += bytes.len();
+        self.escaped += bytes
+            .iter()
+            .filter(|byte| matches!(byte, b'"' | b'\\'))
+            .count();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The bytes `value` takes in a remote answer, counted without building them: printed as
+/// `--json` prints it, then with a backslash more for each `"` and `\` once the server wraps
+/// the printed text in a JSON string. Printed JSON holds no raw control character, so nothing
+/// else grows in that second escaping.
+pub fn answer_len_of(value: &impl Serialize) -> usize {
+    let mut count = AnswerCount::default();
+    // Writing to a counter cannot fail, and every type here serializes; a failure would only
+    // make the count short.
+    let _ = output::write_json(&mut count, value);
+    count.bytes + count.escaped
+}
+
+fn answer_len(value: &impl Serialize) -> usize {
+    answer_len_of(value)
 }
 
 /// One open record captured when a fetch window was created.
@@ -193,20 +477,26 @@ pub fn open_snapshot(tree: &Tree, generated_at: DateTime<Utc>) -> OpenSnapshot {
 
 /// Computes one window's record matches and open-state changes.
 ///
+/// A message `exclusion` names is no arrival: it is not listed, matched, or counted against an
+/// open record.
+///
 /// # Errors
 ///
 /// Returns an error when the window or its prior snapshot cannot be read or decoded.
+#[allow(clippy::too_many_arguments)]
 pub fn compute(
     tree: &Tree,
     schemes: &Schemes,
     owners: &Owners,
+    exclusion: &Exclusion,
     window: &Window,
     previous: Option<&Window>,
     generated_at: DateTime<Utc>,
     embedder: Option<&dyn Embed>,
 ) -> Result<Delta> {
     let manifest = window.manifest()?;
-    let sourced_records = window.records()?;
+    let mut sourced_records = window.records()?;
+    sourced_records.retain(|sourced| !exclusion.matches(&sourced.record.pointer));
     let cited_records = tree
         .docs
         .iter()
@@ -236,6 +526,8 @@ pub fn compute(
         unreviewed: open_flags(flagged, &docs),
         closed_since_previous,
         opened_since_previous,
+        omitted_messages: None,
+        omitted_changes: None,
     })
 }
 
@@ -774,12 +1066,41 @@ fn render_messages(lines: &mut Vec<String>, messages: &[NewMessage]) {
     lines.push(String::new());
 }
 
-/// Reads one window's durable delta, if it has been written.
+/// Reads one window's durable delta, if it has been written, without the messages `exclusion`
+/// names, for an answer that hands its messages to an agent (`ctx pending`, `ctx delta`).
+///
+/// A message whose pointer is longer than [`MAX_POINTER_BYTES`], which only a delta written
+/// before sources were held to it can carry, is refused rather than left out: an answer
+/// cannot quote it whole, and leaving it out would let the marker pass a message no agent saw.
 ///
 /// # Errors
 ///
-/// Returns an error when the delta cannot be read, decoded, or uses another format version.
-pub fn read(window: &Window) -> Result<Option<Delta>> {
+/// Returns an error when the delta cannot be read, decoded, or uses another format version,
+/// or lists a message whose pointer is past the bound.
+pub fn read(window: &Window, exclusion: &Exclusion) -> Result<Option<Delta>> {
+    let Some(mut delta) = read_file(window)? else {
+        return Ok(None);
+    };
+    // What the deployment excludes is not handed to an agent, so it is not refused either.
+    delta.exclude(exclusion);
+    if let Some(long) = delta
+        .new_messages
+        .iter()
+        .find(|message| message.pointer.len() > MAX_POINTER_BYTES)
+    {
+        bail!(
+            "window {} lists a message whose pointer ({}…) is longer than {MAX_POINTER_BYTES} bytes, which no source may name now and no answer can quote whole; remove that record from the window's records.jsonl and run `ctx delta --window {} --write`",
+            window.id,
+            long.pointer.chars().take(64).collect::<String>(),
+            window.id
+        );
+    }
+    delta.bound_pointers();
+    Ok(Some(delta))
+}
+
+/// Reads one window's durable delta, if it has been written, as the file holds it.
+fn read_file(window: &Window) -> Result<Option<Delta>> {
     let path = window.dir.join("delta.json");
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -860,15 +1181,22 @@ pub fn combine(deltas: &[Delta], generated_at: DateTime<Utc>) -> Option<Delta> {
         unreviewed: unreviewed.into_values().collect(),
         closed_since_previous: closed.into_values().collect(),
         opened_since_previous: opened.into_iter().collect(),
+        omitted_messages: None,
+        omitted_changes: None,
     })
 }
 
-/// Reads all durable deltas and returns replies still unreviewed by record path.
+/// Reads all durable deltas and returns replies still unreviewed by record path, leaving out
+/// every reply `exclusion` names.
 ///
 /// # Errors
 ///
 /// Returns an error when a durable delta cannot be read or decoded.
-pub fn staleness(windows: &Path, tree: &Tree) -> Result<BTreeMap<String, Vec<Staleness>>> {
+pub fn staleness(
+    windows: &Path,
+    tree: &Tree,
+    exclusion: &Exclusion,
+) -> Result<BTreeMap<String, Vec<Staleness>>> {
     let mut stale = BTreeMap::new();
     if !windows.exists() {
         return Ok(stale);
@@ -898,9 +1226,14 @@ pub fn staleness(windows: &Path, tree: &Tree) -> Result<BTreeMap<String, Vec<Sta
 
     let mut seen = BTreeSet::new();
     for window in completed {
-        let Some(delta) = read(&window)? else {
+        // Staleness only reports replies, so a pointer past the bound is left out here rather
+        // than failing `ctx open` for the whole tree; `read` refuses it where messages are
+        // handed to an agent.
+        let Some(mut delta) = read_file(&window)? else {
             continue;
         };
+        delta.bound_pointers();
+        delta.exclude(exclusion);
         for flag in delta.unreviewed {
             let Some(last_reviewed) = reviewed.get(&flag.record) else {
                 continue;

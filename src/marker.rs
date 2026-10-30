@@ -1,5 +1,6 @@
 //! The agent marker: the newest window whose material an agent has committed.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -11,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::atomic::write_replace;
 use crate::config::DataDir;
 use crate::context::Context;
-use crate::delta::{self, Delta};
+use crate::delta::{self, Delta, ANSWER_DELTA_BYTES};
+use crate::exclude::Exclusion;
 use crate::output::printable;
 use crate::windows::{self, Status, Window, WindowId};
 
@@ -36,7 +38,11 @@ pub struct PendingWindow {
     pub dir: String,
     pub window_end: DateTime<Utc>,
     pub status: Status,
+    /// The window's new messages, less those the deployment excludes.
     pub new_messages: usize,
+    /// How many of them the answer's delta lists: all of them, unless the answer was cut to
+    /// its size, and then the rest are in the window's `delta.json`.
+    pub listed_messages: usize,
 }
 
 /// The windows an agent still has to handle, with their combined delta.
@@ -45,6 +51,14 @@ pub struct Pending {
     pub marker: Option<Marker>,
     pub windows: Vec<PendingWindow>,
     pub delta: Option<Delta>,
+    /// Completed windows after these that this answer leaves for a later one, because their
+    /// deltas would take it past one answer's size. Once the marker passes the windows listed
+    /// here, the next answer starts with them.
+    pub later_windows: usize,
+    /// When the delta leaves messages out (`omitted_messages`), the `--offset` that lists the
+    /// next of them; the marker should not pass the window until its last part is handled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 /// Reads the marker without changing it.
@@ -120,15 +134,36 @@ pub fn advance(context: &Context, window: &str, by: &str) -> Result<Marker> {
 /// whole of a backlog at once. `None` lists every pending window. The delta combines only the
 /// windows the answer holds.
 ///
+/// The answer leaves out every message the deployment excludes, and stays within one answer's
+/// size ([`ANSWER_DELTA_BYTES`]): it takes windows oldest first while they fit, and counts the
+/// rest, and those past `limit`, in `later_windows`. A window that does not fit is taken anyway
+/// when the windows before it hold no message, so empty windows never hold a large one back;
+/// its delta then lists the oldest messages that fit, `omitted_messages` counts the rest, and
+/// `next_offset` is the `offset` that lists the next part. `offset` leaves out that many of the
+/// oldest messages.
+///
 /// # Errors
 ///
 /// Returns an error when the marker, a window manifest, or a window delta cannot be read.
-pub fn pending(context: &Context, limit: Option<usize>) -> Result<Pending> {
-    pending_in(context.data()?, limit)
+pub fn pending(context: &Context, limit: Option<usize>, offset: usize) -> Result<Pending> {
+    pending_in(
+        context.data()?,
+        limit,
+        &Exclusion::configured(&context.config)?,
+        ANSWER_DELTA_BYTES,
+        offset,
+    )
 }
 
-/// [`pending`] over a data directory, so it is testable without a whole [`Context`].
-fn pending_in(data: &DataDir, limit: Option<usize>) -> Result<Pending> {
+/// [`pending`] over a data directory, with the cap, exclusion and size it answers within, so
+/// it is testable without a whole [`Context`].
+fn pending_in(
+    data: &DataDir,
+    limit: Option<usize>,
+    exclusion: &Exclusion,
+    budget: usize,
+    offset: usize,
+) -> Result<Pending> {
     let path = data.marker();
     let marker = load(&path)?;
     let held = marker
@@ -139,14 +174,20 @@ fn pending_in(data: &DataDir, limit: Option<usize>) -> Result<Pending> {
         })
         .transpose()?;
     let mut after = windows::after(&data.windows(), held.as_ref())?;
+    let waiting = after.len();
     if let Some(limit) = limit {
         after.truncate(limit);
     }
     let mut windows = Vec::new();
+    // Each listed window's delta, by its place in `windows`; a window without one has none.
     let mut deltas = Vec::new();
+    let mut delta_of = Vec::new();
+    let mut size = 0_usize;
+    let mut listing = 0_usize;
+    let mut window_bytes = 0_usize;
     for window in after {
         let manifest = window.manifest()?;
-        let delta = delta::read(&window)?;
+        let delta = delta::read(&window, exclusion)?;
         let dir = window.dir.strip_prefix(data.root()).with_context(|| {
             format!(
                 "{} is not under the data directory {}",
@@ -154,21 +195,75 @@ fn pending_in(data: &DataDir, limit: Option<usize>) -> Result<Pending> {
                 data.root().display()
             )
         })?;
-        windows.push(PendingWindow {
+        let new_messages = delta.as_ref().map_or(0, |delta| delta.new_messages.len());
+        let entry = PendingWindow {
             window: window.id.to_string(),
             dir: dir.to_string_lossy().into_owned(),
             window_end: manifest.window_end,
             status: manifest.exit_status,
-            new_messages: delta.as_ref().map_or(0, |delta| delta.new_messages.len()),
-        });
-        if let Some(delta) = delta {
+            new_messages,
+            listed_messages: new_messages,
+        };
+        let entry_bytes = delta::answer_len_of(&entry);
+        // A window with no new message adds only its entry: its status changes are capped with
+        // the combined delta's (`Delta::fit`), so a run of them never holds back a later window.
+        let bytes = if new_messages == 0 {
+            entry_bytes
+        } else {
+            delta.as_ref().map_or(0, Delta::answer_len) + entry_bytes
+        };
+        let fits = size + bytes <= budget;
+        if !fits && listing > 0 {
+            break;
+        }
+        size += bytes;
+        window_bytes += entry_bytes;
+        listing += new_messages;
+        windows.push(entry);
+        delta_of.push(delta.map(|delta| {
             deltas.push(delta);
+            deltas.len() - 1
+        }));
+        if !fits {
+            // Taken past the size because the windows before it hold nothing: it is cut below,
+            // and nothing after it is taken.
+            break;
+        }
+    }
+    let mut combined = delta::combine(&deltas, Utc::now());
+    let mut next_offset = None;
+    if let Some(combined) = combined.as_mut() {
+        combined.skip(offset);
+        combined.fit(budget.saturating_sub(window_bytes));
+        if offset > 0 || combined.omitted_messages.is_some() {
+            let listed = combined
+                .new_messages
+                .iter()
+                .map(|message| message.pointer.as_str())
+                .collect::<BTreeSet<_>>();
+            for (window, index) in windows.iter_mut().zip(&delta_of) {
+                window.listed_messages =
+                    index
+                        .and_then(|index| deltas.get(index))
+                        .map_or(0, |delta| {
+                            delta
+                                .new_messages
+                                .iter()
+                                .filter(|message| listed.contains(message.pointer.as_str()))
+                                .count()
+                        });
+            }
+        }
+        if combined.omitted_messages.is_some_and(|omitted| omitted > 0) {
+            next_offset = Some(offset + combined.new_messages.len());
         }
     }
     Ok(Pending {
         marker,
-        delta: delta::combine(&deltas, Utc::now()),
+        later_windows: waiting - windows.len(),
+        delta: combined,
         windows,
+        next_offset,
     })
 }
 
@@ -206,12 +301,36 @@ pub fn print_pending(pending: &Pending, out: &mut dyn Write) -> std::io::Result<
         writeln!(out, "(no pending windows)")?;
     }
     for window in &pending.windows {
+        if window.listed_messages < window.new_messages {
+            writeln!(
+                out,
+                "{} {} {} new message(s), {} listed below",
+                window.window,
+                window.status.label(),
+                window.new_messages,
+                window.listed_messages
+            )?;
+        } else {
+            writeln!(
+                out,
+                "{} {} {} new message(s)",
+                window.window,
+                window.status.label(),
+                window.new_messages
+            )?;
+        }
+    }
+    if let Some(next) = pending.next_offset {
         writeln!(
             out,
-            "{} {} {} new message(s)",
-            window.window,
-            window.status.label(),
-            window.new_messages
+            "more messages wait: `ctx pending --offset {next}` lists the next part"
+        )?;
+    }
+    if pending.later_windows > 0 {
+        writeln!(
+            out,
+            "{} later window(s) wait for the next answer, once the marker passes these",
+            pending.later_windows
         )?;
     }
     if let Some(delta) = pending.delta.as_ref() {
@@ -315,6 +434,8 @@ mod tests {
             unreviewed: Vec::new(),
             closed_since_previous: Vec::new(),
             opened_since_previous: Vec::new(),
+            omitted_messages: None,
+            omitted_changes: None,
         };
         std::fs::write(dir.join("delta.json"), serde_json::to_vec(&delta)?)?;
         Ok(())
@@ -361,10 +482,19 @@ mod tests {
         }
 
         // No cap lists every pending window.
-        assert_eq!(ids(&pending_in(&data, None)?), windows);
+        let all = |data: &DataDir, limit| {
+            pending_in(
+                data,
+                limit,
+                &crate::exclude::Exclusion::default(),
+                usize::MAX,
+                0,
+            )
+        };
+        assert_eq!(ids(&all(&data, None)?), windows);
 
         // A cap of two lists only the two oldest, and the delta combines only those.
-        let capped = pending_in(&data, Some(2))?;
+        let capped = all(&data, Some(2))?;
         assert_eq!(ids(&capped), &windows[..2]);
         let combined = capped.delta.as_ref().map_or(0, |d| d.new_messages.len());
         assert_eq!(
@@ -375,15 +505,18 @@ mod tests {
         // The session handles the cap and advances the marker to the newest it handled; the
         // next cycle's capped read is the remainder, never the windows already done.
         set_marker(&data, windows[1])?;
-        let next = pending_in(&data, Some(2))?;
+        let next = all(&data, Some(2))?;
         assert_eq!(ids(&next), &windows[2..4]);
 
         // A cap larger than the backlog lists all of it and nothing waits.
         set_marker(&data, windows[3])?;
-        assert_eq!(ids(&pending_in(&data, Some(10))?), &windows[4..]);
+        assert_eq!(ids(&all(&data, Some(10))?), &windows[4..]);
 
         std::fs::remove_dir_all(&root).ok();
         let _: &Path = root.as_path();
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod pending_size;

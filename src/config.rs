@@ -59,12 +59,16 @@ pub struct DossierConfig {
 pub struct IngestConfig {
     #[serde(default = "default_backfill_hours")]
     pub backfill_hours: u32,
+    /// Pointer patterns of the messages this tree never ingests ([`crate::exclude`]).
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 impl Default for IngestConfig {
     fn default() -> Self {
         Self {
             backfill_hours: default_backfill_hours(),
+            exclude: Vec::new(),
         }
     }
 }
@@ -157,6 +161,7 @@ impl TreeConfig {
                 );
             }
         }
+        crate::exclude::Exclusion::new(&self.ingest.exclude).context("ingest.exclude")?;
         Ok(())
     }
 }

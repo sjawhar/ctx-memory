@@ -238,7 +238,8 @@ fn the_shell_admits_every_ctx_command_the_skills_name() -> Result<()> {
             let Some(command) = span.strip_prefix("ctx ") else {
                 continue;
             };
-            let filled = placeholder.replace_all(command, "x");
+            // `1` parses wherever a placeholder stands: a path, an id or a count.
+            let filled = placeholder.replace_all(command, "1");
             let words: Vec<&str> = filled
                 .split_whitespace()
                 .map(|word| word.trim_matches('"'))

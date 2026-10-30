@@ -540,6 +540,7 @@ mod tests {
             cursors,
             discovered: Vec::new(),
             state_dir: std::env::temp_dir(),
+            exclude: Vec::new(),
         })
     }
 

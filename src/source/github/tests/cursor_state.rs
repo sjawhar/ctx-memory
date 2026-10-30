@@ -793,7 +793,8 @@ fn cursors_an_earlier_build_wrote_still_parse_and_new_ones_say_what_they_hold() 
             resume: at(CURSOR)?,
             after: None,
             stored: at(CURSOR)?,
-            head: None
+            head: None,
+            reading: None,
         }
     );
     // `<resume>@<stored>`, which a stopped stream wrote: the feed resumes at that time, a
@@ -804,7 +805,8 @@ fn cursors_an_earlier_build_wrote_still_parse_and_new_ones_say_what_they_hold() 
             resume: at("2026-10-25T09:59:59Z")?,
             after: None,
             stored: at(CURSOR)?,
-            head: None
+            head: None,
+            reading: None,
         }
     );
     let stopped = "feed=2026-10-25T10:00:00Z,issue=7,head=abc1234@2026-10-01T00:00:00Z";
@@ -815,7 +817,8 @@ fn cursors_an_earlier_build_wrote_still_parse_and_new_ones_say_what_they_hold() 
             resume: at("2026-10-25T10:00:00Z")?,
             after: Some(7),
             stored: at(CURSOR)?,
-            head: Some("abc1234".to_owned())
+            head: Some("abc1234".to_owned()),
+            reading: None,
         }
     );
     assert_eq!(position.cursor(), stopped);
@@ -823,10 +826,37 @@ fn cursors_an_earlier_build_wrote_still_parse_and_new_ones_say_what_they_hold() 
     assert!(!position.open((at("2026-10-25T10:00:00Z")?, 7)));
     assert!(position.open((at("2026-10-25T10:00:00Z")?, 8)));
     assert!(position.open((at("2026-10-25T10:00:01Z")?, 1)));
+    // A run that stopped in a commit listing names the commit and the pages it read.
+    let reading = "feed=2026-10-25T10:00:00Z,reading=def5678:12@2026-10-01T00:00:00Z";
+    let position = read(reading)?;
+    assert_eq!(
+        position.reading,
+        Some(Reading {
+            target: "def5678".to_owned(),
+            pages: 12,
+            comparison: false,
+        })
+    );
+    assert_eq!(position.cursor(), reading);
+    let comparing =
+        "feed=2026-10-25T10:00:00Z,head=abc1234,comparing=def5678:3@2026-10-01T00:00:00Z";
+    let position = read(comparing)?;
+    assert_eq!(
+        position.reading,
+        Some(Reading {
+            target: "def5678".to_owned(),
+            pages: 3,
+            comparison: true,
+        })
+    );
+    assert_eq!(position.cursor(), comparing);
     for bad in [
         "feed=2026-10-25T10:00:00Z,colour=blue@2026-10-01T00:00:00Z",
         "feed=2026-10-25T10:00:00Z,head=../../x@2026-10-01T00:00:00Z",
         "feed=yesterday@2026-10-01T00:00:00Z",
+        "feed=2026-10-25T10:00:00Z,reading=../x:1@2026-10-01T00:00:00Z",
+        "feed=2026-10-25T10:00:00Z,reading=def5678@2026-10-01T00:00:00Z",
+        "feed=2026-10-25T10:00:00Z,reading=def5678:many@2026-10-01T00:00:00Z",
     ] {
         assert!(read(bad).is_err(), "{bad} is refused");
     }

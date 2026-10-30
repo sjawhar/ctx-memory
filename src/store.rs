@@ -17,10 +17,10 @@ use crate::atomic::write_replace;
 use crate::config::{DataDir, StateDir};
 use crate::pointer::Pointer;
 use crate::record::Record;
-use crate::windows;
+use crate::windows::{self, Window, WindowId};
 
 /// The schema this build reads. A store written by another one is rebuilt from the files.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Numbers the staging files of rebuilds that run at the same time in one process.
 static NEXT_REBUILD: AtomicUsize = AtomicUsize::new(0);
@@ -143,6 +143,14 @@ impl Store {
                 source TEXT PRIMARY KEY,
                 verbatim INTEGER NOT NULL CHECK (verbatim IN (0, 1))
             );
+            CREATE TABLE IF NOT EXISTS delivered (
+                pointer TEXT PRIMARY KEY,
+                version TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS indexed (
+                key TEXT PRIMARY KEY,
+                window TEXT NOT NULL
+            );
             PRAGMA user_version = {SCHEMA_VERSION};
             "
         ))
@@ -185,8 +193,11 @@ impl Store {
         {
             let store = Self::open(staging.path(), &data.sources(), &state.resolved())?;
             let mut batches: Vec<(DateTime<Utc>, String, Vec<Record>)> = Vec::new();
+            let mut through = None;
             for window in windows::after(&data.windows(), None)? {
                 let (fetched_at, by_source) = window.records_by_source()?;
+                store.deliver(by_source.values().flatten(), &window.id)?;
+                through = Some(window.id.clone());
                 batches.extend(
                     by_source
                         .into_iter()
@@ -202,6 +213,9 @@ impl Store {
             batches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
             for (fetched_at, source, records) in batches {
                 store.put_all(&source, &records, fetched_at)?;
+            }
+            if let Some(through) = through {
+                store.mark_indexed(&through)?;
             }
             publish(&store.conn, &path)?;
         }
@@ -284,6 +298,121 @@ impl Store {
             .commit()
             .context("committing record store transaction")?;
         Ok(inserted)
+    }
+
+    /// Whether each record is the version of its message the newest window that delivered the
+    /// message as new delivered, in `records`' order: then a source that sends it again sends
+    /// nothing new.
+    ///
+    /// Only windows count. A record a live resolve obtained, or one a window carried only as
+    /// context, was never handed to the agent as new, so it hides nothing. And only the newest
+    /// delivered version counts, so a message edited back to an earlier text is new again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a record cannot be serialized or SQLite cannot answer.
+    pub fn unchanged(&self, records: &[Record]) -> Result<Vec<bool>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT version FROM delivered WHERE pointer = ?1")
+            .context("preparing the delivered version lookup")?;
+        records
+            .iter()
+            .map(|record| {
+                let delivered: Option<String> = statement
+                    .query_row(params![record.pointer], |row| row.get(0))
+                    .optional()
+                    .with_context(|| format!("looking up the delivered {}", record.pointer))?;
+                Ok(match delivered {
+                    Some(delivered) => version(record)? == delivered,
+                    None => false,
+                })
+            })
+            .collect()
+    }
+
+    /// Adds a published window to the store: every record it holds, and, for each message it
+    /// delivered as new, the version it delivered. The store then counts the window as indexed,
+    /// so [`Store::catch_up`] does not read it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the window cannot be read or SQLite cannot write.
+    pub fn index_window(&self, window: &Window) -> Result<()> {
+        let (fetched_at, by_source) = window.records_by_source()?;
+        for (source, records) in &by_source {
+            self.put_all(source, records, fetched_at)?;
+        }
+        self.deliver(by_source.values().flatten(), &window.id)?;
+        self.mark_indexed(&window.id)
+    }
+
+    /// Indexes every completed window after the last one the store indexed, oldest first, so a
+    /// store that another machine's fetches left behind knows what they delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a window cannot be read or SQLite cannot write.
+    pub fn catch_up(&self, data: &DataDir) -> Result<()> {
+        let indexed: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT window FROM indexed WHERE key = 'windows'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading the newest indexed window")?;
+        let indexed = indexed.map(|window| WindowId::parse(&window)).transpose()?;
+        for window in windows::after(&data.windows(), indexed.as_ref())? {
+            self.index_window(&window)?;
+        }
+        Ok(())
+    }
+
+    /// Notes, for each record a window delivered as new, the version it delivered. Context
+    /// records are not new, so they leave the delivered version as it was.
+    fn deliver<'a>(
+        &self,
+        records: impl IntoIterator<Item = &'a Record>,
+        window: &WindowId,
+    ) -> Result<()> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("starting the delivered versions transaction")?;
+        {
+            let mut upsert = transaction
+                .prepare(
+                    "INSERT INTO delivered(pointer, version) VALUES (?1, ?2)
+                     ON CONFLICT(pointer) DO UPDATE SET version = excluded.version",
+                )
+                .context("preparing the delivered version update")?;
+            for record in records.into_iter().filter(|record| !record.context) {
+                upsert
+                    .execute(params![record.pointer, version(record)?])
+                    .with_context(|| {
+                        format!(
+                            "noting the version window {window} delivered of {}",
+                            record.pointer
+                        )
+                    })?;
+            }
+        }
+        transaction
+            .commit()
+            .context("committing the delivered versions")
+    }
+
+    fn mark_indexed(&self, window: &WindowId) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO indexed(key, window) VALUES ('windows', ?1)
+                 ON CONFLICT(key) DO UPDATE SET window = excluded.window",
+                params![window.to_string()],
+            )
+            .with_context(|| format!("noting window {window} as indexed"))?;
+        Ok(())
     }
 
     /// Keeps the records one live resolution obtained, so a rebuilt index still holds them.
@@ -780,6 +909,80 @@ mod tests {
         }
         std::fs::write(dir.join("records.jsonl"), jsonl)?;
         std::fs::write(dir.join("rendered.md"), b"# window\n")?;
+        Ok(())
+    }
+
+    /// What `unchanged` says of `text` at `pointer`.
+    fn unchanged(store: &Store, pointer: &str, text: &str) -> Result<bool> {
+        Ok(store
+            .unchanged(&[record(pointer, text)])?
+            .first()
+            .copied()
+            .unwrap_or_default())
+    }
+
+    /// Only a window that delivered a message as new makes it not new again: a live resolve
+    /// and a window that carried it as context do not, and a message edited back to an earlier
+    /// text is new again.
+    #[test]
+    fn only_the_newest_version_a_window_delivered_is_unchanged() -> Result<()> {
+        let root = scratch("delivered")?;
+        let data = DataDir::new(root.join("data"));
+        let state = StateDir::new(root.join("state"));
+        let store = Store::load(&data, &state)?;
+        let resolved = "slack:C0EXAMPLE01/1";
+        store.put_resolved(
+            "slack",
+            Some(true),
+            &[record(resolved, "resolved live")],
+            at(10),
+        )?;
+        let parent = "slack:C0EXAMPLE01/2";
+        let mut context = record(parent, "a parent");
+        context.context = true;
+        let edited = "slack:C0EXAMPLE01/3";
+        window(
+            &data,
+            "20261025T110000Z-0000",
+            at(11),
+            &[context, record(edited, "A")],
+        )?;
+        window(
+            &data,
+            "20261025T120000Z-0000",
+            at(12),
+            &[record(edited, "B")],
+        )?;
+        store.catch_up(&data)?;
+        let caught_up = (
+            unchanged(&store, resolved, "resolved live")?,
+            unchanged(&store, parent, "a parent")?,
+            unchanged(&store, edited, "B")?,
+            unchanged(&store, edited, "A")?,
+        );
+        window(
+            &data,
+            "20261025T130000Z-0000",
+            at(13),
+            &[record(edited, "A")],
+        )?;
+        store.catch_up(&data)?;
+        let restored = unchanged(&store, edited, "A")?;
+        let rebuilt = Store::rebuild(&data, &state)?;
+        let after_rebuild = (
+            unchanged(&rebuilt, edited, "A")?,
+            unchanged(&rebuilt, edited, "B")?,
+        );
+        drop((store, rebuilt));
+        remove_scratch(&root)?;
+
+        assert_eq!(
+            caught_up,
+            (false, false, true, false),
+            "resolved, context, newest delivered, earlier delivered"
+        );
+        assert!(restored, "the restored text is the newest delivered");
+        assert_eq!(after_rebuild, (true, false), "a rebuild agrees");
         Ok(())
     }
 

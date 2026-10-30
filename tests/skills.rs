@@ -26,7 +26,8 @@ fn ctx_commands(text: &str) -> Vec<(String, Vec<String>)> {
             let mut rest = command;
             while let Some((before, after)) = rest.split_once('<') {
                 filled.push_str(before);
-                filled.push('x');
+                // `1` parses wherever a placeholder stands: a path, an id or a count.
+                filled.push('1');
                 rest = after.split_once('>').map_or("", |(_, tail)| tail);
             }
             filled.push_str(rest);

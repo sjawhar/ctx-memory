@@ -1,0 +1,30 @@
+#!/bin/sh
+# cargo starts every test binary through this script (.cargo/config.toml). The `ctx` a test runs
+# reads CTX_SERVER, and the `server` key of the user configuration, like any other `ctx`: set
+# in the shell that runs the tests, they send the test's commands, marker moves among them, to
+# that server instead of the test's own scratch tree. So no test binary starts while the
+# environment names a server, nor while the identity variables a remote call carries are set,
+# and every test binary reads an empty user configuration directory rather than the caller's.
+# A program `cargo run` starts is not a test, and passes through untouched.
+set -eu
+
+case "$1" in
+*/deps/*)
+	for name in CTX_SERVER CTX_SERVER_AUDIENCE CTX_IMPERSONATE_SA; do
+		value="$(printenv "$name" || :)"
+		if [ -n "$(printf '%s' "$value" | tr -d '[:space:]')" ]; then
+			echo "test-runner: refusing to run tests while $name is set; run them with env -u CTX_SERVER -u CTX_SERVER_AUDIENCE -u CTX_IMPERSONATE_SA" >&2
+			exit 1
+		fi
+	done
+	# An empty directory of its own, so no user configuration, whatever it spells, reaches a
+	# test; a test that needs one sets XDG_CONFIG_HOME for the `ctx` it runs.
+	XDG_CONFIG_HOME="$(mktemp -d "${TMPDIR:-/tmp}/ctx-test-config.XXXXXX")"
+	export XDG_CONFIG_HOME
+	status=0
+	"$@" || status=$?
+	rmdir "$XDG_CONFIG_HOME" 2>/dev/null || :
+	exit "$status"
+	;;
+esac
+exec "$@"

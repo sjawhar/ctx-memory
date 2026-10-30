@@ -9,6 +9,7 @@ pub mod credentials;
 pub mod cursor;
 pub mod delta;
 pub mod embed;
+pub mod exclude;
 pub mod fetch;
 pub mod git;
 pub mod index;

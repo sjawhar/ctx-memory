@@ -64,6 +64,18 @@ pub(super) fn run_fetch_until(
     cursors: BTreeMap<String, String>,
     window_end: &str,
 ) -> Result<Vec<Message>> {
+    run_fetch_excluding(config, state_dir, cursors, window_end, &[])
+}
+
+/// Runs the source once for the window that ends at `window_end`, with the deployment's
+/// exclusion patterns.
+pub(super) fn run_fetch_excluding(
+    config: Value,
+    state_dir: std::path::PathBuf,
+    cursors: BTreeMap<String, String>,
+    window_end: &str,
+    exclude: &[&str],
+) -> Result<Vec<Message>> {
     let request = Request::Fetch(FetchRequest {
         protocol: 1,
         source: SourceRef {
@@ -77,6 +89,10 @@ pub(super) fn run_fetch_until(
         cursors,
         discovered: Vec::new(),
         state_dir,
+        exclude: exclude
+            .iter()
+            .map(|pattern| (*pattern).to_owned())
+            .collect(),
     });
     let mut messages = Vec::new();
     GithubSource::new().run(&request, &mut |message| {

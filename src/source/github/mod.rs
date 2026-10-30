@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 
 use crate::api::github::{GithubClient, Page, Repo};
 use crate::credentials;
+use crate::exclude::Exclusion;
 
 use super::{FetchRequest, Message, Op, Request, ResolveRequest, Source, PROTOCOL_VERSION};
 use collect::{collect_repo, Governor, Stop};
@@ -235,6 +236,7 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
         })?;
     }
     let unchanged = unchanged_repositories(&repos, request, &state, api, sink)?;
+    let exclusion = Exclusion::new(&request.exclude)?;
     let mut governor = Governor::new(config.request_budget, config.rate_limit_floor);
     // The run starts at the repository the last run's budget stopped at and goes round, so the
     // budget reaches every repository in turn rather than the same ones first on every run. A
@@ -260,13 +262,14 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
                 after: None,
                 stored: request.window_end,
                 head: head.clone(),
+                reading: None,
             }
             .cursor();
             state.settle(&stream, &cursor);
             super::emit_stream(&stream, Ok((Vec::new(), Vec::new(), cursor)), sink)?;
             continue;
         }
-        let collected = collect_repo(*installation, repo, request, &mut governor, api);
+        let collected = collect_repo(*installation, repo, request, &exclusion, &mut governor, api);
         match &collected {
             Ok(collected) if collected.stop.is_none() && collected.held == 0 => {
                 state.settle(&stream, &collected.cursor);

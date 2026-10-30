@@ -12,6 +12,7 @@ use crate::config::{DataDir, SourceConfig, StateDir};
 use crate::context::Context;
 use crate::cursor::{self, AdvanceOutcome, Cursors};
 use crate::delta::{self, Delta};
+use crate::exclude::Exclusion;
 use crate::lease::{self, Lease};
 use crate::record::Record;
 use crate::redact::one_line;
@@ -69,10 +70,14 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
     // that may not write writes nothing at all.
     let lease = lease::for_role("fetch")?;
     validate_selection(&context.config.sources, &options.only)?;
+    let exclusion = Exclusion::configured(&context.config)?;
 
     let cursors = cursor::load(&data.cursors())?;
     let staged = windows::stage(&data.windows(), options.window_end)?;
     let store = Store::load(data, state)?;
+    // What the windows this store has not indexed yet delivered — another machine's fetches, or
+    // a window whose indexing failed after it was published — counts as delivered too.
+    store.catch_up(data)?;
     let schemes = source::configured_schemes(&context.config.sources)?;
     let generated_at = Utc::now();
     let mut collected = Collected::default();
@@ -87,8 +92,8 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
             .as_ref()
             .map_or(Ok(()), Lease::check)
             .with_context(|| format!("before fetching {}", spec.id))?;
-        let result = run_source(context, data, spec, options, &cursors, &schemes)?;
-        collect_source_result(spec, result, &mut collected, &store, generated_at)?;
+        let result = run_source(context, data, spec, options, &cursors, &schemes, &exclusion)?;
+        collect_source_result(spec, result, &mut collected, &store, &exclusion)?;
     }
 
     let Collected {
@@ -123,6 +128,7 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
         &context.tree,
         &schemes,
         &owners,
+        &exclusion,
         &staged,
         previous.as_ref(),
         generated_at,
@@ -137,6 +143,11 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
         .map_or(Ok(()), Lease::check)
         .context("before publishing the window")?;
     let window = windows::complete(staged, &data.windows())?;
+    // The store learns what this window delivered only once the window is published: a message
+    // whose delivered version the store holds is one no later fetch delivers as new, so a run
+    // that stopped before publishing must leave nothing there. A store write that fails here
+    // leaves the window unindexed, and the next fetch indexes it first.
+    store.index_window(&window)?;
     // The streams that stored their messages move their own cursors; a failed stream holds only
     // its own, so the next fetch re-reads only what this one did not store.
     lease
@@ -198,6 +209,7 @@ fn run_source(
     options: &FetchOptions,
     cursors: &Cursors,
     schemes: &crate::pointer::Schemes,
+    exclusion: &Exclusion,
 ) -> Result<SourceRun> {
     let scheme = source::scheme(spec)?;
     let discovered = spec
@@ -230,6 +242,7 @@ fn run_source(
         cursors: requested_cursors.clone(),
         discovered: discovered.clone(),
         state_dir,
+        exclude: source_exclude(spec, exclusion),
     });
     let mut session = Session::new(&request, schemes);
     let outcome = match source::open(spec, request.source().scheme.as_str()) {
@@ -255,18 +268,41 @@ struct Collected {
     errored: Vec<(String, String)>,
 }
 
+/// The exclusion patterns a source's request carries: a built-in source's reading skips what
+/// they name. An external source gets none, because one written for protocol 1 may refuse a
+/// request field it does not know; the fetch drops what the patterns name all the same.
+pub(crate) fn source_exclude(spec: &SourceConfig, exclusion: &Exclusion) -> Vec<String> {
+    if crate::config::default_scheme(&spec.kind).is_some() {
+        exclusion.patterns().to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 fn collect_source_result(
     spec: &SourceConfig,
     result: SourceRun,
     collected: &mut Collected,
     store: &Store,
-    fetched_at: DateTime<Utc>,
+    exclusion: &Exclusion,
 ) -> Result<()> {
-    if let Some(verbatim) = result.outcome.verbatim {
+    let SourceRun {
+        cursors,
+        discovered,
+        outcome,
+    } = result;
+    if let Some(verbatim) = outcome.verbatim {
         store.set_source_verbatim(&spec.id, verbatim)?;
     }
-    store.put_all(&spec.id, &result.outcome.records, fetched_at)?;
-    for warning in &result.outcome.warnings {
+    let failed = outcome.has_errors();
+    let SourceOutcome {
+        records: fetched,
+        streams: results,
+        warnings,
+        error,
+        ..
+    } = outcome;
+    for warning in &warnings {
         let stream = warning
             .stream
             .as_deref()
@@ -275,9 +311,21 @@ fn collect_source_result(
             .warnings
             .push(format!("source {}{stream}: {}", spec.id, warning.message));
     }
+    let fetched = fetched
+        .into_iter()
+        .filter(|record| !exclusion.matches(&record.pointer))
+        .collect::<Vec<_>>();
+    let held = store.unchanged(&fetched)?;
+    let (records, repeated) = window_records(&fetched, &held);
+    for (stream, count) in repeated {
+        collected.warnings.push(format!(
+            "source {} stream {stream}: {count} message(s) were delivered again unchanged since an earlier window and are not new",
+            spec.id
+        ));
+    }
 
     let mut streams = BTreeMap::new();
-    for (stream, outcome) in &result.outcome.streams {
+    for (stream, outcome) in &results {
         if outcome.status == StreamStatus::Error {
             collected.errored.push((
                 spec.id.clone(),
@@ -289,43 +337,62 @@ fn collect_source_result(
         }
         streams.insert(
             stream.clone(),
-            stream_manifest(
-                stream,
-                outcome,
-                &result.cursors,
-                &result.discovered,
-                &result.outcome.records,
-            ),
+            stream_manifest(stream, outcome, &cursors, &discovered, &records),
         );
     }
-    if let Some(error) = result.outcome.error.as_deref() {
+    if let Some(error) = error.as_deref() {
         collected.errored.push((spec.id.clone(), error.to_owned()));
     }
-    let status = if result.outcome.has_errors() {
-        Status::Error
-    } else {
-        Status::Ok
-    };
+    let status = if failed { Status::Error } else { Status::Ok };
     collected.sources.insert(
         spec.id.clone(),
         SourceManifest {
             kind: spec.kind.clone(),
             status,
-            error: result.outcome.error,
+            error,
             streams,
         },
     );
-    collected.records.extend(
-        result
-            .outcome
-            .records
-            .into_iter()
-            .map(|record| SourcedRecord {
-                source: spec.id.clone(),
-                record,
-            }),
-    );
+    collected
+        .records
+        .extend(records.into_iter().map(|record| SourcedRecord {
+            source: spec.id.clone(),
+            record,
+        }));
     Ok(())
+}
+
+/// The records of `fetched` that go into the window, and how many of each stream's were left
+/// out because the store already held them (`held`, in `fetched`'s order).
+///
+/// A message whose newest delivered version is this one was handed to the agent by an earlier
+/// window, so it is not new: a source that reads a stretch of its feed again — a cursor held
+/// after a stopped run, a listing restarted from its top — must not hand the agent the same
+/// messages as new in every window. Such a message stays in the window, as context and not as
+/// a new message, only when a new message of this fetch replies to it, so the reply keeps the
+/// text it answers; otherwise it is left out. A changed message has a new version and is new
+/// again. A record the source itself sent as context is kept as it is.
+fn window_records(fetched: &[Record], held: &[bool]) -> (Vec<Record>, BTreeMap<String, usize>) {
+    let answered = fetched
+        .iter()
+        .zip(held)
+        .filter(|(record, held)| !**held && !record.context)
+        .filter_map(|(record, _)| record.thread.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut repeated = BTreeMap::<String, usize>::new();
+    let mut records = Vec::with_capacity(fetched.len());
+    for (record, held) in fetched.iter().zip(held) {
+        if !*held || record.context {
+            records.push(record.clone());
+        } else if answered.contains(record.pointer.as_str()) {
+            let mut context = record.clone();
+            context.context = true;
+            records.push(context);
+        } else {
+            *repeated.entry(record.stream.clone()).or_default() += 1;
+        }
+    }
+    (records, repeated)
 }
 
 fn stream_manifest(

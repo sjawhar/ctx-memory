@@ -100,8 +100,9 @@ pub(super) type FeedKey = (DateTime<Utc>, u64);
 /// alone when the default branch has no commit. A run that stops names where the issues feed
 /// resumes and the time the stream is stored through:
 /// `feed=<time>,issue=<number>[,head=<sha>]@<stored>` when it finished issues, or
-/// `feed=<window end>[,head=<sha>]@<stored>` when it finished every issue but not the commits.
-/// Cursors an earlier build wrote still parse: a bare time, and `<resume>@<stored>`.
+/// `feed=<window end>[,head=<sha>][,reading=<sha>:<pages>]@<stored>` when it finished every
+/// issue but not the commits. Cursors an earlier build wrote still parse: a bare time, and
+/// `<resume>@<stored>`.
 ///
 /// The feed's position cannot stall. Issues are finished in the order of `(updated_at,
 /// number)`, and the position names the last one finished, so the next run skips exactly
@@ -114,6 +115,9 @@ pub(super) type FeedKey = (DateTime<Utc>, u64);
 /// does not cover one issue's follow-ups (three requests at most); listing a second's issues
 /// costs one request a hundred, so at the default budget of 600 that takes about 59,000 issues
 /// changed in one second.
+///
+/// The commits cannot stall either: a commit listing longer than one run's budget goes on in
+/// the next run from the page after the last one read (`reading`), see `read_commits`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Position {
     /// The issues feed lists the issues changed at or after this time…
@@ -127,6 +131,38 @@ pub(super) struct Position {
     pub(super) stored: DateTime<Utc>,
     /// The default branch head whose commits are stored.
     pub(super) head: Option<String>,
+    /// A commit listing an earlier run stopped part way through.
+    pub(super) reading: Option<Reading>,
+}
+
+/// A commit listing that a run stopped in, of which pages 1 to `pages` are read: the history of
+/// `target` dated since the stream's stored time, newest first (`reading=`), or, when
+/// `comparison`, the commits `target` has that the stored head lacks, oldest first
+/// (`comparing=`).
+///
+/// Either listing names commits, not a branch, and a commit's history never changes, so the
+/// same page holds the same commits in every later run, and the next run goes on from the page
+/// after these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Reading {
+    pub(super) target: String,
+    pub(super) pages: u32,
+    pub(super) comparison: bool,
+}
+
+impl Reading {
+    /// Reads `<sha>:<pages>`.
+    fn parse(value: &str, comparison: bool) -> Result<Self> {
+        let (target, pages) = value
+            .split_once(':')
+            .filter(|(target, _)| is_sha(target))
+            .with_context(|| format!("{value} is not <sha>:<pages>"))?;
+        Ok(Self {
+            target: target.to_owned(),
+            pages: pages.parse().with_context(|| format!("pages in {value}"))?,
+            comparison,
+        })
+    }
 }
 
 impl Position {
@@ -142,6 +178,7 @@ impl Position {
                 after: None,
                 stored: start,
                 head: None,
+                reading: None,
             });
         };
         match TokenCursor::parse(cursor) {
@@ -150,6 +187,7 @@ impl Position {
                 after: None,
                 stored: time,
                 head: None,
+                reading: None,
             }),
             TokenCursor::Token {
                 token,
@@ -163,6 +201,7 @@ impl Position {
                     after: None,
                     stored,
                     head: None,
+                    reading: None,
                 }),
             },
             TokenCursor::Token {
@@ -176,7 +215,7 @@ impl Position {
         }
     }
 
-    /// Reads `<time>[,issue=<number>][,head=<sha>]`.
+    /// Reads `<time>[,issue=<number>][,head=<sha>][,reading=<sha>:<pages>|,comparing=<sha>:<pages>]`.
     fn fields(fields: &str, stored: DateTime<Utc>) -> Result<Self> {
         let mut parts = fields.split(',');
         let resume = parse_time(parts.next().unwrap_or_default())?;
@@ -185,6 +224,7 @@ impl Position {
             after: None,
             stored,
             head: None,
+            reading: None,
         };
         for part in parts {
             match part.split_once('=') {
@@ -193,6 +233,12 @@ impl Position {
                         Some(number.parse().with_context(|| format!("issue {number}"))?);
                 }
                 Some(("head", sha)) if is_sha(sha) => position.head = Some(sha.to_owned()),
+                Some(("reading", reading)) => {
+                    position.reading = Some(Reading::parse(reading, false)?);
+                }
+                Some(("comparing", reading)) => {
+                    position.reading = Some(Reading::parse(reading, true)?);
+                }
                 _ => bail!("unknown field {part}"),
             }
         }
@@ -201,7 +247,7 @@ impl Position {
 
     /// The cursor that names this position.
     pub(super) fn cursor(&self) -> String {
-        if self.after.is_none() && self.head.is_none() {
+        if self.after.is_none() && self.head.is_none() && self.reading.is_none() {
             return if self.resume == self.stored {
                 rfc3339(self.stored)
             } else {
@@ -215,6 +261,14 @@ impl Position {
         if let Some(head) = &self.head {
             fields.push(format!("head={head}"));
         }
+        if let Some(reading) = &self.reading {
+            let field = if reading.comparison {
+                "comparing"
+            } else {
+                "reading"
+            };
+            fields.push(format!("{field}={}:{}", reading.target, reading.pages));
+        }
         token_cursor(&fields.join(","), self.stored)
     }
 
@@ -223,13 +277,26 @@ impl Position {
         time > self.resume || (time == self.resume && self.after.is_none_or(|after| number > after))
     }
 
-    /// Where the feed resumes, in words.
+    /// Where the stream resumes, in words.
     pub(super) fn describe(&self) -> String {
         let time = rfc3339(self.resume);
-        self.after.map_or_else(
+        let feed = self.after.map_or_else(
             || format!("the issues changed since {time}"),
             |number| format!("the issues after #{number}, changed {time}"),
-        )
+        );
+        match &self.reading {
+            Some(reading) if reading.comparison => format!(
+                "{feed}, and the comparison with {} from page {}",
+                reading.target,
+                reading.pages + 1
+            ),
+            Some(reading) => format!(
+                "{feed}, and the commits of {} from page {}",
+                reading.target,
+                reading.pages + 1
+            ),
+            None => feed,
+        }
     }
 }
 

@@ -1,0 +1,4 @@
+# Every binary cargo runs goes through scripts/test-runner, which refuses to start a test binary
+# while the environment names a ctx server: a test's `ctx` would send its commands there.
+[target.'cfg(all())']
+runner = "scripts/test-runner"

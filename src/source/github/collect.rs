@@ -8,13 +8,14 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::api::github::{api_base, Page, PageKind, Repo};
+use crate::exclude::Exclusion;
 use crate::record::Record;
 
-use super::cursor_state::{is_sha, rfc3339, FeedKey, Position};
+use super::cursor_state::{is_sha, rfc3339, FeedKey, Position, Reading};
 use super::records::{
     comment_built, comment_time, commit_built, commit_time, commits_url, compare_url, head_url,
     issue_built, issue_comments_url, issues_url, item_time, pull_review_comments_url,
-    pull_reviews_url, review_built, review_comment_built, stream_id, Built,
+    pull_reviews_url, review_built, review_comment_built, stream_id, Built, PAGE_SIZE,
 };
 use super::{FetchRequest, GithubApi};
 
@@ -28,10 +29,16 @@ pub(super) struct Collected {
     pub(super) stop: Option<Stop>,
 }
 
+/// Reads one repository's stream. A part of it the deployment excludes whole — every issue
+/// and pull request with their follow-ups (`github:<owner>/<repo>#…`), or every commit
+/// (`github:<owner>/<repo>@…`) — is not read at all: the fetch would drop all of it, and a
+/// repository whose agents commit thousands of times an hour would spend the run's budget on
+/// it.
 pub(super) fn collect_repo<C: GithubApi + ?Sized>(
     installation: u64,
     repo: &Repo,
     request: &FetchRequest,
+    exclusion: &Exclusion,
     governor: &mut Governor,
     api: &C,
 ) -> Result<Collected> {
@@ -39,7 +46,6 @@ pub(super) fn collect_repo<C: GithubApi + ?Sized>(
     let window_end = request.window_end;
     let input_cursor = request.cursors.get(&stream).map(String::as_str);
     let position = Position::read(input_cursor, window_end, request.backfill_hours)?;
-    let stored_from = rfc3339(position.stored);
     let base = api_base();
     let mut collected = Collected {
         records: Vec::new(),
@@ -60,11 +66,15 @@ pub(super) fn collect_repo<C: GithubApi + ?Sized>(
     // it by key (see `issues_url`), so following its next link skips nothing that changes
     // meanwhile.
     let reserve = |items: &[Value]| feed_reserve(items, &position);
-    let (listed, feed_stop) = reader.drain(
-        issues_url(&base, repo, &rfc3339(position.resume)),
-        &reserve,
-        Paging::Forward,
-    )?;
+    let (listed, feed_stop) = if exclusion.covers(&format!("{stream}#")) {
+        (Vec::new(), None)
+    } else {
+        reader.drain(
+            issues_url(&base, repo, &rfc3339(position.resume)),
+            &reserve,
+            Paging::Forward,
+        )?
+    };
     let issues = finishable(listed, &position, feed_stop.is_some());
     for item in &issues {
         push_built(&mut collected, issue_built(item, repo, window_end));
@@ -106,6 +116,7 @@ pub(super) fn collect_repo<C: GithubApi + ?Sized>(
             collected,
             &position,
             resume,
+            position.reading.clone(),
             input_cursor,
             stop,
             &stream,
@@ -114,23 +125,50 @@ pub(super) fn collect_repo<C: GithubApi + ?Sized>(
 
     // Phase three: the default branch's commits, once every issue is stored.
     let held_before_commits = collected.held;
-    let commits = read_commits(&base, repo, &position, &stored_from, &mut reader)?;
+    let commits = if exclusion.covers(&format!("{stream}@")) {
+        Commits::default()
+    } else {
+        read_commits(&base, repo, &position, window_end, &mut reader)?
+    };
     for item in &commits.items {
         push_built(&mut collected, commit_built(item, repo, window_end));
     }
+    Ok(after_commits(
+        collected,
+        &position,
+        commits,
+        held_before_commits,
+        input_cursor,
+        &stream,
+        window_end,
+    ))
+}
+
+/// Ends a stream once its commits are read, or the run stopped in them.
+fn after_commits(
+    mut collected: Collected,
+    position: &Position,
+    commits: Commits,
+    held_before_commits: usize,
+    input_cursor: Option<&str>,
+    stream: &str,
+    window_end: DateTime<Utc>,
+) -> Collected {
     collected.warnings.extend(commits.warning);
     if let Some(stop) = commits.stop {
-        // Every issue changed by the window end is stored, so the feed resumes there, and the
-        // commits are read again from the head the stream holds.
+        // Every issue changed by the window end is stored, so the feed resumes there. The
+        // commits go on from the page `reading` names, or are read again from the head the
+        // stream holds when the run read no page of them.
         let resume = Some((window_end, None));
-        return Ok(stopped(
+        return stopped(
             collected,
-            &position,
+            position,
             resume,
+            commits.reading,
             input_cursor,
             stop,
-            &stream,
-        ));
+            stream,
+        );
     }
     // A commit dated after the window end is held, and its head is not taken as stored, so the
     // next run compares from the head before it and reads it again.
@@ -150,9 +188,10 @@ pub(super) fn collect_repo<C: GithubApi + ?Sized>(
         after: None,
         stored: window_end,
         head,
+        reading: None,
     }
     .cursor();
-    Ok(collected)
+    collected
 }
 
 fn feed_key(item: &Value) -> Option<FeedKey> {
@@ -205,12 +244,14 @@ fn finishable(listed: Vec<Value>, position: &Position, cut_short: bool) -> Vec<V
 }
 
 /// Ends a stream that stopped. It keeps what it fetched, and its cursor names where the feed
-/// resumes, with the time the stream is stored through and the head it holds, when that moves
-/// the feed on; otherwise it holds the cursor the run was given.
+/// resumes, with the time the stream is stored through, the head it holds and the commit
+/// listing it is part way through, when that moves the stream on; otherwise it holds the
+/// cursor the run was given.
 fn stopped(
     mut collected: Collected,
     position: &Position,
     resume: Option<(DateTime<Utc>, Option<u64>)>,
+    reading: Option<Reading>,
     input_cursor: Option<&str>,
     stop: Stop,
     stream: &str,
@@ -221,8 +262,12 @@ fn stopped(
             after,
             stored: position.stored,
             head: position.head.clone(),
+            reading,
         })
-        .filter(|next| (next.resume, next.after) > (position.resume, position.after));
+        .filter(|next| {
+            (next.resume, next.after) > (position.resume, position.after)
+                || next.reading != position.reading
+        });
     if let Some(next) = next {
         collected.cursor = next.cursor();
         collected
@@ -236,12 +281,15 @@ fn stopped(
     collected
 }
 
-/// What the commits phase read: the commits, the head they belong to, why it stopped, and what
-/// the stream's owner should know about it.
+/// What the commits phase read: the commits, the head they belong to, why it stopped, where
+/// the next run goes on in a listing it stopped in, and what the stream's owner should know
+/// about it.
+#[derive(Default)]
 struct Commits {
     items: Vec<Value>,
     head: Option<String>,
     stop: Option<Stop>,
+    reading: Option<Reading>,
     warning: Option<String>,
 }
 
@@ -267,22 +315,37 @@ struct Commits {
 ///
 /// With no stored head — a first read, or a cursor an earlier build wrote — or when GitHub
 /// cannot compare (`404`: the two share no history, or the stored head is gone), it lists the
-/// head's history since the stored time.
+/// head's history since the stored time (`read_history`).
+///
+/// A listing longer than the run's budget goes on in the next run. The cursor names the
+/// listing and how many pages of it the run read (`reading`), and the next run reads the same
+/// listing over the same commits from the page after, rather than the new head's from its top:
+/// listed from a moving head, the first pages would hold the same commits run after run, and a
+/// backlog longer than one run's budget would never be read past them. When the listing ends,
+/// its target is stored as the head, and the next run compares that with the branch's head.
 fn read_commits<C: GithubApi + ?Sized>(
     base: &str,
     repo: &Repo,
     position: &Position,
-    stored_from: &str,
+    window_end: DateTime<Utc>,
     reader: &mut Reader<'_, C>,
 ) -> Result<Commits> {
+    if let Some(reading) = &position.reading {
+        let resumed = if reading.comparison {
+            read_comparison(base, repo, position, reading, window_end, reader)?
+        } else {
+            read_history(base, repo, position, reading, window_end, reader)?
+        };
+        if let Some(commits) = resumed {
+            return Ok(commits);
+        }
+    }
     let opening = match reader.page(&head_url(base, repo), 0, false)? {
         Ok(page) => page,
         Err(stop) => {
             return Ok(Commits {
-                items: Vec::new(),
-                head: None,
                 stop: Some(stop),
-                warning: None,
+                ..Commits::default()
             })
         }
     };
@@ -294,81 +357,158 @@ fn read_commits<C: GithubApi + ?Sized>(
         .map(str::to_owned)
     else {
         // An empty repository (`409`) or an empty branch has no commit to read.
-        return Ok(Commits {
-            items: Vec::new(),
-            head: None,
-            stop: None,
-            warning: None,
-        });
+        return Ok(Commits::default());
     };
     if !is_sha(&head) {
         bail!("GitHub named {head} as the head of {}", repo.default_branch);
     }
     if position.head.as_deref() == Some(head.as_str()) {
         return Ok(Commits {
-            items: Vec::new(),
             head: Some(head),
-            stop: None,
-            warning: None,
+            ..Commits::default()
         });
     }
-    if let Some(stored) = &position.head {
-        match reader.page(&compare_url(base, repo, stored, &head), 0, true)? {
-            Err(stop) => {
-                return Ok(Commits {
-                    items: Vec::new(),
-                    head: Some(head),
-                    stop: Some(stop),
-                    warning: None,
-                })
-            }
-            Ok(page) if page.kind == PageKind::Missing => {}
-            Ok(page) => {
-                let total = page.total;
-                let mut items = page.items;
-                let mut stop = None;
-                if let Some(next) = page.next {
-                    let (more, halted) = reader.forward(next, &no_reserve)?;
-                    items.extend(more);
-                    stop = halted;
-                }
-                let listed = u64::try_from(items.len()).unwrap_or(u64::MAX);
-                if let (None, Some(total)) = (stop, total.filter(|total| *total > listed)) {
-                    let (since, halted) =
-                        reader.forward(commits_url(base, repo, &head, stored_from), &no_reserve)?;
-                    return Ok(short_comparison(
-                        Comparison {
-                            listed: items,
-                            total,
-                            head,
-                        },
-                        since,
-                        halted,
-                        position,
-                        repo,
-                    ));
-                }
-                return Ok(Commits {
-                    items,
-                    head: Some(head),
-                    stop,
-                    warning: None,
-                });
-            }
+    if position.head.is_some() {
+        let from = Reading {
+            target: head.clone(),
+            pages: 0,
+            comparison: true,
+        };
+        if let Some(commits) = read_comparison(base, repo, position, &from, window_end, reader)? {
+            return Ok(commits);
         }
     }
-    let (items, stop) = reader.forward(commits_url(base, repo, &head, stored_from), &no_reserve)?;
-    Ok(Commits {
-        items,
-        head: Some(head),
-        stop,
-        warning: None,
+    let from = Reading {
+        target: head,
+        pages: 0,
+        comparison: false,
+    };
+    read_history(base, repo, position, &from, window_end, reader)?.with_context(|| {
+        format!(
+            "GitHub has no history for {}, which it just named as the head of {}",
+            from.target, repo.default_branch
+        )
     })
 }
 
-/// A comparison that listed fewer commits than its `total_commits`.
+/// How many of `pages`, from the first, hold no commit dated after the window end: such a
+/// commit is held for a later window, so a stopped listing reads its page again.
+fn clean_pages(pages: &[Vec<Value>], window_end: DateTime<Utc>) -> u32 {
+    let clean = pages
+        .iter()
+        .take_while(|page| {
+            !page
+                .iter()
+                .any(|item| commit_time(item).is_some_and(|time| time > window_end))
+        })
+        .count();
+    u32::try_from(clean).unwrap_or(u32::MAX)
+}
+
+/// Reads `from.target`'s history since the stored time, newest first, from the page after
+/// `from.pages`, or `None` when GitHub no longer has that commit (`404`).
+///
+/// A run the budget stops names the pages it read in `reading`, up to the first page that held
+/// a commit dated after the window end. A run that reads to the end stores the target as the
+/// head.
+fn read_history<C: GithubApi + ?Sized>(
+    base: &str,
+    repo: &Repo,
+    position: &Position,
+    from: &Reading,
+    window_end: DateTime<Utc>,
+    reader: &mut Reader<'_, C>,
+) -> Result<Option<Commits>> {
+    let url = commits_url(base, repo, &from.target, &rfc3339(position.stored));
+    let listing = reader.numbered(&url, from.pages + 1)?;
+    if listing.missing {
+        return Ok(None);
+    }
+    let reading = listing.stop.map(|_| Reading {
+        target: from.target.clone(),
+        pages: from.pages + clean_pages(&listing.pages, window_end),
+        comparison: false,
+    });
+    Ok(Some(Commits {
+        items: listing.pages.into_iter().flatten().collect(),
+        head: Some(from.target.clone()),
+        stop: listing.stop,
+        reading,
+        warning: None,
+    }))
+}
+
+/// Reads the comparison of the stored head with `from.target`, oldest first, from the page
+/// after `from.pages`, or `None` when there is no stored head or GitHub cannot compare the two
+/// (`404`). A run the budget stops names the pages it read, as `read_history` does. A
+/// comparison GitHub lists fewer commits of than its `total_commits` ends in
+/// `short_comparison`; the pages earlier runs read were full ones.
+fn read_comparison<C: GithubApi + ?Sized>(
+    base: &str,
+    repo: &Repo,
+    position: &Position,
+    from: &Reading,
+    window_end: DateTime<Utc>,
+    reader: &mut Reader<'_, C>,
+) -> Result<Option<Commits>> {
+    let Some(stored) = position.head.as_deref() else {
+        return Ok(None);
+    };
+    let listing = reader.numbered(
+        &compare_url(base, repo, stored, &from.target),
+        from.pages + 1,
+    )?;
+    if listing.missing {
+        return Ok(None);
+    }
+    let pages = from.pages + clean_pages(&listing.pages, window_end);
+    let total = listing.total;
+    let stop = listing.stop;
+    let items: Vec<Value> = listing.pages.into_iter().flatten().collect();
+    if stop.is_some() {
+        return Ok(Some(Commits {
+            items,
+            head: Some(from.target.clone()),
+            stop,
+            reading: Some(Reading {
+                target: from.target.clone(),
+                pages,
+                comparison: true,
+            }),
+            warning: None,
+        }));
+    }
+    let earlier = u64::from(from.pages).saturating_mul(PAGE_SIZE);
+    let listed = earlier.saturating_add(u64::try_from(items.len()).unwrap_or(u64::MAX));
+    if let Some(total) = total.filter(|total| *total > listed) {
+        let since = reader.numbered(
+            &commits_url(base, repo, &from.target, &rfc3339(position.stored)),
+            1,
+        )?;
+        return Ok(Some(short_comparison(
+            Comparison {
+                listed: items,
+                earlier,
+                total,
+                head: from.target.clone(),
+            },
+            since,
+            position,
+            repo,
+        )));
+    }
+    Ok(Some(Commits {
+        items,
+        head: Some(from.target.clone()),
+        ..Commits::default()
+    }))
+}
+
+/// A comparison that listed fewer commits than its `total_commits`: what this run listed, and
+/// how many earlier runs listed.
 struct Comparison {
     listed: Vec<Value>,
+    earlier: u64,
     total: u64,
     head: String,
 }
@@ -383,27 +523,30 @@ struct Comparison {
 /// comparison left out is dated at or before the stored time, where `since` does not reach,
 /// and the stream keeps the head it was given, with a warning: the next run compares from it
 /// again rather than from a head past commits never read. That holds until GitHub lists the
-/// whole comparison; each run still stores every commit it reads.
+/// whole comparison; each run still stores every commit it reads. A `since` listing the budget
+/// stops is read again by the next run, from the comparison: a resumed history listing could
+/// end without the commits the comparison left out and store a head past them.
 fn short_comparison(
     comparison: Comparison,
-    since: Vec<Value>,
-    stop: Option<Stop>,
+    since: Numbered,
     position: &Position,
     repo: &Repo,
 ) -> Commits {
     let Comparison {
         listed,
+        earlier,
         total,
         head,
     } = comparison;
-    let compared = listed.len();
+    let compared = earlier.saturating_add(u64::try_from(listed.len()).unwrap_or(u64::MAX));
     let mut seen: BTreeSet<String> = listed
         .iter()
         .filter_map(|item| item.get("sha").and_then(Value::as_str).map(str::to_owned))
         .collect();
-    let mut covered = u64::try_from(compared).unwrap_or(u64::MAX);
+    let mut covered = compared;
     let mut items = listed;
-    for item in since {
+    let stop = since.stop;
+    for item in since.pages.into_iter().flatten() {
         let Some(sha) = item.get("sha").and_then(Value::as_str) else {
             continue;
         };
@@ -420,6 +563,7 @@ fn short_comparison(
             items,
             head: Some(head),
             stop,
+            reading: None,
             warning: None,
         };
     }
@@ -428,6 +572,7 @@ fn short_comparison(
         items,
         head: position.head.clone(),
         stop: None,
+        reading: None,
         warning: Some(format!(
             "{}: GitHub listed {compared} of the {total} commits between {stored_head} and {head}, and those left out are older than {}, so the stream keeps {stored_head} and the next fetch compares from it again",
             stream_id(repo),
@@ -519,6 +664,32 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
         Ok((unique_by_id(items), None))
     }
 
+    /// Reads a listing GitHub pages by number, `url`'s pages from `from` on, each page's items
+    /// apart. It follows `Link: rel="next"` to the end, or until the run must stop; a `404`
+    /// ends it as missing.
+    fn numbered(&mut self, url: &str, from: u32) -> Result<Numbered> {
+        let mut numbered = Numbered::default();
+        let mut next = Some(at_page(url, from));
+        while let Some(current) = next {
+            match self.page(&current, 0, true)? {
+                Err(stop) => {
+                    numbered.stop = Some(stop);
+                    break;
+                }
+                Ok(page) if page.kind == PageKind::Missing => {
+                    numbered.missing = true;
+                    break;
+                }
+                Ok(page) => {
+                    numbered.total = numbered.total.or(page.total);
+                    numbered.pages.push(page.items);
+                    next = page.next;
+                }
+            }
+        }
+        Ok(numbered)
+    }
+
     /// Reads one page, unless the run must stop first: the budget or the rate limit is spent,
     /// or the budget left is no more than `needed`. A page GitHub refused stops the listing. A
     /// `404` is an error unless `missing_ok`, when the caller gets the missing page.
@@ -560,6 +731,30 @@ fn page_number(url: &str) -> Option<u32> {
         .find_map(|param| param.strip_prefix("page="))?
         .parse()
         .ok()
+}
+
+/// What [`Reader::numbered`] read: each page's items, in page order, and why it ended early.
+#[derive(Default)]
+struct Numbered {
+    pages: Vec<Vec<Value>>,
+    /// A comparison's `total_commits`, from the first page read.
+    total: Option<u64>,
+    stop: Option<Stop>,
+    /// GitHub answered `404`: the commit the listing names is gone.
+    missing: bool,
+}
+
+/// `url` asking for page `number`: its own `page` set to it, or one added. Page 1 is `url` as
+/// it is, the way the first request of a listing names it.
+fn at_page(url: &str, number: u32) -> String {
+    if number <= 1 {
+        return url.to_owned();
+    }
+    if page_number(url).is_some() {
+        return with_page(url, number);
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}page={number}")
 }
 
 /// `url` with its `page` number set to `number`.

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::fixtures::{
     against, busy_comment, busy_issue, fetch_busy, guard, minute, pointers, run_fetch,
-    run_fetch_until, scratch, stream_ends, Busy, BUSY, BUSY_STREAM,
+    run_fetch_excluding, run_fetch_until, scratch, stream_ends, Busy, BUSY, BUSY_STREAM,
 };
 use crate::support::fake_http::FakeHttp;
 
@@ -573,5 +573,313 @@ fn a_second_with_more_issues_than_one_runs_budget_is_finished_across_runs() -> R
             "2026-10-27T00:00:00Z".to_owned(),
         ]
     );
+    Ok(())
+}
+
+/// The commit records a run sent, in the order it sent them.
+fn commit_records(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Record(record) if record.pointer.contains('@') => Some(record.pointer.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 350 commits since the stored time, read at four requests a run: the issues feed, the head
+/// and two pages of 100 commits fit in the first run. The second run reads the same listing of
+/// the same commit from page 3, though the branch moved on meanwhile, and stores that commit as
+/// the head; the third compares it with the new head. Every commit is sent once. Listing the
+/// moving head's history from its top on every run sent its newest 200 commits again each time
+/// and never reached the rest.
+#[test]
+fn a_history_longer_than_one_runs_budget_is_read_across_runs_and_each_commit_once() -> Result<()> {
+    let _guard = guard();
+    let (mut commits, head) = linear(350);
+    commits.insert(
+        "d000001".to_owned(),
+        (vec![head.clone()], "2026-10-27T00:05:00Z".to_owned()),
+    );
+    let busy = Busy {
+        commits,
+        main: Some(head.clone()),
+        ..Busy::default()
+    };
+    let (address, shared) = busy.serve()?;
+    let config = json!({ "installations": [1_000_002], "request_budget": 4 });
+
+    let (runs, cursors, second_requests) = against(address, || {
+        let state = scratch("long-history")?;
+        let mut cursor = "2026-10-01T00:00:00Z".to_owned();
+        let mut runs = Vec::new();
+        let mut cursors = Vec::new();
+        let mut second_requests = Vec::new();
+        for (run, window_end) in [
+            "2026-10-27T00:00:00Z",
+            "2026-10-27T00:15:00Z",
+            "2026-10-27T00:30:00Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if run == 1 {
+                // The branch moves on between the first run and the second.
+                shared
+                    .lock()
+                    .map_err(|_| anyhow!("the emulated GitHub was poisoned"))?
+                    .main = Some("d000001".to_owned());
+            }
+            let before = shared
+                .lock()
+                .map_err(|_| anyhow!("the emulated GitHub was poisoned"))?
+                .requests
+                .len();
+            let messages = run_fetch_until(
+                config.clone(),
+                state.clone(),
+                BTreeMap::from([(BUSY_STREAM.to_owned(), cursor.clone())]),
+                window_end,
+            )?;
+            if run == 1 {
+                second_requests = shared
+                    .lock()
+                    .map_err(|_| anyhow!("the emulated GitHub was poisoned"))?
+                    .requests
+                    .iter()
+                    .skip(before)
+                    .cloned()
+                    .collect();
+            }
+            cursor = proposed(&messages, BUSY_STREAM).context("a cursor is proposed")?;
+            cursors.push(cursor.clone());
+            runs.push(commit_records(&messages));
+        }
+        Ok((runs, cursors, second_requests))
+    })?;
+
+    assert_eq!(
+        cursors,
+        vec![
+            format!("feed=2026-10-27T00:00:00Z,reading={head}:2@2026-10-01T00:00:00Z"),
+            format!("feed=2026-10-27T00:15:00Z,head={head}@2026-10-27T00:15:00Z"),
+            "feed=2026-10-27T00:30:00Z,head=d000001@2026-10-27T00:30:00Z".to_owned(),
+        ]
+    );
+    assert!(
+        second_requests
+            .iter()
+            .any(|target| target.contains(&format!("sha={head}")) && target.contains("page=3")),
+        "the second run goes on at page 3 of the first run's listing: {second_requests:?}"
+    );
+    assert!(
+        !second_requests
+            .iter()
+            .any(|target| target.contains("sha=d000001") || target.contains("sha=main")),
+        "the second run does not list the new head's history: {second_requests:?}"
+    );
+    let sent = runs.iter().flatten().cloned().collect::<Vec<_>>();
+    let unique = sent.iter().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(sent.len(), unique.len(), "no commit is sent twice");
+    assert_eq!(unique.len(), 351, "every commit is sent");
+    assert!(unique.contains(&busy_commit("c000001")));
+    assert!(unique.contains(&busy_commit("d000001")));
+    Ok(())
+}
+
+/// A deployment that excludes a repository's commits gets its issues and none of its commits,
+/// and the run spends no request on the commits.
+#[test]
+fn an_excluded_commit_stream_is_not_read() -> Result<()> {
+    let _guard = guard();
+    let (commits, head) = linear(3);
+    let busy = Busy {
+        commits,
+        main: Some(head),
+        issues: vec![busy_issue(1, "2026-10-26T12:00:00Z")],
+        ..Busy::default()
+    };
+    let (address, shared) = busy.serve()?;
+
+    let messages = against(address, || {
+        run_fetch_excluding(
+            json!({ "installations": [1_000_002] }),
+            scratch("excluded-commits")?,
+            BTreeMap::from([(BUSY_STREAM.to_owned(), "2026-10-01T00:00:00Z".to_owned())]),
+            "2026-10-27T00:00:00Z",
+            &["github:example-org/busy@*"],
+        )
+    })?;
+
+    let sent = pointers(&messages);
+    assert!(sent.contains("github:example-org/busy#1"), "{sent:?}");
+    assert!(commit_records(&messages).is_empty(), "{sent:?}");
+    let requests = shared
+        .lock()
+        .map_err(|_| anyhow!("the emulated GitHub was poisoned"))?
+        .requests
+        .clone();
+    assert!(
+        !requests
+            .iter()
+            .any(|target| target.starts_with(&format!("{BUSY}/commits"))
+                || target.starts_with(&format!("{BUSY}/compare"))),
+        "no commit is asked for: {requests:?}"
+    );
+    assert_eq!(
+        proposed(&messages, BUSY_STREAM).as_deref(),
+        Some("2026-10-27T00:00:00Z"),
+        "the stream is read to the window end, with no head to compare from"
+    );
+    Ok(())
+}
+
+/// 350 commits dated before the stored time land on the stored head, so only the comparison
+/// lists them, oldest first. Read at four requests a run, the comparison goes on from the page
+/// after the last one read, and every commit is sent once. Comparing from page 1 on every run
+/// sent the same first pages again and never reached the rest.
+#[test]
+fn a_comparison_longer_than_one_runs_budget_is_read_across_runs_and_each_commit_once() -> Result<()>
+{
+    let _guard = guard();
+    let (mut commits, head) = linear(3);
+    let mut parent = head.clone();
+    let mut newest = head.clone();
+    for index in 1..=350_u64 {
+        let sha = format!("d{index:06x}");
+        commits.insert(
+            sha.clone(),
+            (
+                vec![parent.clone()],
+                format!("2026-10-26T{:02}:{:02}:00Z", 1 + index / 60, index % 60),
+            ),
+        );
+        parent.clone_from(&sha);
+        newest = sha;
+    }
+    let busy = Busy {
+        commits,
+        main: Some(head.clone()),
+        ..Busy::default()
+    };
+    let (address, shared) = busy.serve()?;
+    let config = json!({ "installations": [1_000_002], "request_budget": 4 });
+
+    let (runs, cursors) = against(address, || {
+        let state = scratch("long-comparison")?;
+        let mut cursor = "2026-10-01T00:00:00Z".to_owned();
+        let mut runs = Vec::new();
+        let mut cursors = Vec::new();
+        for (run, window_end) in [
+            "2026-10-27T00:00:00Z",
+            "2026-10-27T00:15:00Z",
+            "2026-10-27T00:30:00Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if run == 1 {
+                shared
+                    .lock()
+                    .map_err(|_| anyhow!("the emulated GitHub was poisoned"))?
+                    .main = Some(newest.clone());
+            }
+            let messages = run_fetch_until(
+                config.clone(),
+                state.clone(),
+                BTreeMap::from([(BUSY_STREAM.to_owned(), cursor.clone())]),
+                window_end,
+            )?;
+            cursor = proposed(&messages, BUSY_STREAM).context("a cursor is proposed")?;
+            cursors.push(cursor.clone());
+            runs.push(commit_records(&messages));
+        }
+        Ok((runs, cursors))
+    })?;
+
+    assert_eq!(
+        cursors.get(1),
+        Some(&format!(
+            "feed=2026-10-27T00:15:00Z,head={head},comparing={newest}:2@2026-10-27T00:00:00Z"
+        )),
+        "the second run names the comparison and the two pages it read: {cursors:?}"
+    );
+    assert_eq!(
+        cursors.get(2),
+        Some(&format!(
+            "feed=2026-10-27T00:30:00Z,head={newest}@2026-10-27T00:30:00Z"
+        ))
+    );
+    let sent = runs.iter().skip(1).flatten().cloned().collect::<Vec<_>>();
+    let unique = sent.iter().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(sent.len(), unique.len(), "no commit is sent twice");
+    assert_eq!(unique.len(), 350, "every commit on top is sent");
+    Ok(())
+}
+
+/// A comparison GitHub cuts short, of commits dated before the stored time, whose fill from the
+/// head's history the budget stops: the stream keeps the stored head and compares from it
+/// again, because the history since the stored time can never reach the commits the
+/// comparison left out, and storing the new head would skip them.
+#[test]
+fn a_stopped_fill_of_a_short_comparison_keeps_the_stored_head() -> Result<()> {
+    let _guard = guard();
+    let (mut commits, head) = linear(3);
+    let mut parent = head.clone();
+    for index in 1..=350_u64 {
+        let sha = format!("d{index:06x}");
+        commits.insert(
+            sha.clone(),
+            (
+                vec![parent.clone()],
+                format!("2026-10-26T{:02}:{:02}:00Z", 1 + index / 60, index % 60),
+            ),
+        );
+        parent = sha;
+    }
+    let busy = Busy {
+        commits,
+        main: Some(head.clone()),
+        compare_cap: Some(100),
+        ..Busy::default()
+    };
+    let (address, shared) = busy.serve()?;
+
+    let cursors = against(address, || {
+        let state = scratch("short-fill")?;
+        let mut cursor = "2026-10-01T00:00:00Z".to_owned();
+        let mut cursors = Vec::new();
+        for (run, window_end) in [
+            "2026-10-27T00:00:00Z",
+            "2026-10-27T00:15:00Z",
+            "2026-10-27T00:30:00Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if run == 1 {
+                shared
+                    .lock()
+                    .map_err(|_| anyhow!("the emulated GitHub was poisoned"))?
+                    .main = Some(parent.clone());
+            }
+            let messages = run_fetch_until(
+                json!({ "installations": [1_000_002], "request_budget": 3 }),
+                state.clone(),
+                BTreeMap::from([(BUSY_STREAM.to_owned(), cursor.clone())]),
+                window_end,
+            )?;
+            cursor = proposed(&messages, BUSY_STREAM).context("a cursor is proposed")?;
+            cursors.push(cursor.clone());
+        }
+        Ok(cursors)
+    })?;
+
+    for cursor in cursors.iter().skip(1) {
+        assert!(
+            cursor.contains(&format!("head={head}")) && !cursor.contains(&parent),
+            "the stream keeps the stored head and names no new one: {cursors:?}"
+        );
+    }
     Ok(())
 }

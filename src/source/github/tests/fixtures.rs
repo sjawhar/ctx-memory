@@ -15,7 +15,7 @@ pub(super) use crate::pointer::Schemes;
 pub(super) use super::super::super::{
     FetchRequest, Session, SourceOutcome, SourceRef, StreamStatus,
 };
-pub(super) use super::super::cursor_state::{Position, OLD_ETAGS_FILE, STATE_FILE};
+pub(super) use super::super::cursor_state::{Position, Reading, OLD_ETAGS_FILE, STATE_FILE};
 pub(super) use super::super::records::{
     commits_url, compare_url, head_url, issue_comments_url, issues_url, pull_review_comments_url,
     pull_reviews_url, stream_id,
@@ -181,6 +181,7 @@ pub(super) fn request(cursors: BTreeMap<String, String>) -> Result<FetchRequest>
         cursors,
         discovered: Vec::new(),
         state_dir: scratch()?,
+        exclude: Vec::new(),
     })
 }
 

@@ -29,6 +29,9 @@ pub use slack::SlackSource;
 /// The version of the JSONL source protocol understood by this crate.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The longest pointer, or thread pointer, a source may name a record with.
+pub const MAX_POINTER_BYTES: usize = 2048;
+
 /// A request sent to a configured source.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -73,6 +76,12 @@ pub struct FetchRequest {
     /// `<data_dir>/sources/<id>`: what the source keeps between fetches, shared by every
     /// machine that fetches this tree, so a fetch elsewhere still reaches it.
     pub state_dir: PathBuf,
+    /// The deployment's exclusion patterns ([`crate::exclude`]). The fetch drops every record
+    /// one names, so a source may skip reading them; a source that ignores this loses nothing
+    /// but the requests. Omitted when there are none, so a source written before it existed
+    /// reads the same request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
 }
 
 /// Live pointer resolution input supplied to a source.
@@ -593,6 +602,16 @@ impl<'a> Session<'a> {
     }
 
     fn accept_record(&mut self, record: Record) -> Result<Accepted> {
+        // A pointer is a message's identity: every answer quotes it whole, so it is bounded
+        // here, where a source hands it over, rather than cut where an answer is sized.
+        for pointer in std::iter::once(&record.pointer).chain(record.thread.as_ref()) {
+            if pointer.len() > MAX_POINTER_BYTES {
+                bail!(
+                    "record pointer {}… is longer than {MAX_POINTER_BYTES} bytes",
+                    pointer.chars().take(64).collect::<String>()
+                );
+            }
+        }
         let pointer = self
             .schemes
             .parse(&record.pointer)
@@ -747,6 +766,7 @@ mod tests {
             cursors: std::collections::BTreeMap::default(),
             discovered: Vec::new(),
             state_dir: std::env::temp_dir(),
+            exclude: Vec::new(),
         }))
     }
 
@@ -830,6 +850,24 @@ mod tests {
             .context("failed stream is recorded")?;
         assert_eq!(stream.status, StreamStatus::Error);
         assert_eq!(stream.cursor, None);
+        Ok(())
+    }
+
+    /// Every answer quotes a record's pointer whole, so a source may not name one, or a
+    /// thread, longer than `MAX_POINTER_BYTES`.
+    #[test]
+    fn a_pointer_longer_than_the_bound_is_refused() -> Result<()> {
+        let request = request()?;
+        let schemes = Schemes::new(["echo".to_owned()]);
+        let mut session = Session::new(&request, &schemes);
+        session.accept(hello())?;
+        let mut long = record()?;
+        long.pointer = format!("echo:C0EXAMPLE01/{}", "x".repeat(super::MAX_POINTER_BYTES));
+        let mut threaded = record()?;
+        threaded.thread = Some(long.pointer.clone());
+        assert!(session.accept(Message::Record(Box::new(long))).is_err());
+        assert!(session.accept(Message::Record(Box::new(threaded))).is_err());
+        assert!(session.accept(Message::Record(Box::new(record()?))).is_ok());
         Ok(())
     }
 }

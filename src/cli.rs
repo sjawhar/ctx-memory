@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::context::Context;
 use crate::cursor::{self, AdvanceOutcome, Cursors};
 use crate::delta;
+use crate::exclude::Exclusion;
 use crate::fetch::{self, FetchOptions};
 use crate::git;
 use crate::lease::{self, Lease};
@@ -127,6 +128,10 @@ pub enum Command {
         /// cycle. Omitted, every pending window is listed.
         #[arg(long)]
         limit: Option<usize>,
+        /// Leave out this many of the oldest new messages: the `next_offset` an answer that
+        /// left messages out gave, to list the next part.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
     /// Inspect or advance the agent marker.
     Marker {
@@ -558,7 +563,11 @@ fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
             let stale = if run.context.config.sources.is_empty() {
                 BTreeMap::new()
             } else {
-                delta::staleness(&run.context.data()?.windows(), &run.context.tree)?
+                delta::staleness(
+                    &run.context.data()?.windows(),
+                    &run.context.tree,
+                    &Exclusion::configured(&run.context.config)?,
+                )?
             };
             let filter = OpenFilter {
                 linked,
@@ -583,7 +592,7 @@ fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
         ),
         Command::Delta { window, write } => run_delta(run, window.as_deref(), *write),
         Command::Cursor { command } => run_cursor(run, command),
-        Command::Pending { limit } => run_pending(run, *limit),
+        Command::Pending { limit, offset } => run_pending(run, *limit, *offset),
         Command::Marker { command } => run_marker(run, command),
         Command::Resolve { thread, pointers } => run_resolve(run, pointers, *thread),
         Command::Cite {
@@ -721,6 +730,7 @@ fn run_source(run: &mut Run<'_, '_>, id: &str, op: SourceOperation) -> Result<Ou
                     source::discover_streams(&context.tree, field)
                 }),
             state_dir,
+            exclude: fetch::source_exclude(spec, &Exclusion::configured(&context.config)?),
         }),
         SourceOperation::Resolve => SourceRequest::Resolve(ResolveRequest {
             protocol: source::PROTOCOL_VERSION,
@@ -791,6 +801,14 @@ fn run_fetch(run: &mut Run<'_, '_>, options: &FetchOptions) -> Result<Outcome> {
     })
 }
 
+/// `ctx delta` prints the delta the fetch wrote for a window, and `ctx delta --write` computes
+/// it again against the current tree and replaces it.
+///
+/// A read never computes: computing matches every message of the window against every record
+/// and embeds each one, which for a window of tens of thousands of messages holds a server for
+/// many minutes, and a server answers this read to anyone who may read the tree. A window
+/// without a delta is refused; `--write`, which only runs where the fetch lease can be taken,
+/// is what computes one.
 fn run_delta(run: &mut Run<'_, '_>, requested: Option<&str>, write: bool) -> Result<Outcome> {
     // `--write` replaces the window's `delta.json`, `delta.md` and `open-snapshot.json`, which
     // the fetch writes under its lease, on the share every machine reads. So a write takes the
@@ -806,20 +824,22 @@ fn run_delta(run: &mut Run<'_, '_>, requested: Option<&str>, write: bool) -> Res
     let data = context.data()?;
     let directory = windows::resolve_arg(requested.unwrap_or("newest"), &data.windows())?;
     let window = Window::open(directory)?;
-    let previous = windows::previous(&data.windows(), &window.id)?;
-    let schemes = source::configured_schemes(&context.config.sources)?;
-    let owners = delta::Owners::discover(&context.tree, &context.config.sources);
-    let snapshot = delta::open_snapshot(&context.tree, Utc::now());
-    let computed = delta::compute(
-        &context.tree,
-        &schemes,
-        &owners,
-        &window,
-        previous.as_ref(),
-        snapshot.generated_at,
-        context.embedding()?.embedder(),
-    )?;
-    if write {
+    let exclusion = Exclusion::configured(&context.config)?;
+    let mut shown = if write {
+        let previous = windows::previous(&data.windows(), &window.id)?;
+        let schemes = source::configured_schemes(&context.config.sources)?;
+        let owners = delta::Owners::discover(&context.tree, &context.config.sources);
+        let snapshot = delta::open_snapshot(&context.tree, Utc::now());
+        let computed = delta::compute(
+            &context.tree,
+            &schemes,
+            &owners,
+            &exclusion,
+            &window,
+            previous.as_ref(),
+            snapshot.generated_at,
+            context.embedding()?.embedder(),
+        )?;
         // The compute can wait on Vertex AI for longer than the lease survives unrenewed.
         lease
             .as_ref()
@@ -827,9 +847,20 @@ fn run_delta(run: &mut Run<'_, '_>, requested: Option<&str>, write: bool) -> Res
             .context("before writing the delta")?;
         delta::write(&window, &snapshot, &computed)?;
         give_back(lease, run.sink.err);
-    }
+        computed
+    } else {
+        delta::read(&window, &exclusion)?.with_context(|| {
+            format!(
+                "window {} has no delta; `ctx delta --window {} --write` computes one where the fetch lease can be taken",
+                window.id, window.id
+            )
+        })?
+    };
+    // What is printed is also what a server answers with, so it is cut to one answer's size;
+    // `omitted_messages` counts what the window's own delta.json lists beyond it.
+    shown.fit(delta::ANSWER_DELTA_BYTES);
     // A delta quotes each new message, which is a source's text.
-    run.emit("delta", &computed, |delta, out| {
+    run.emit("delta", &shown, |delta, out| {
         writeln!(out, "{}", output::printable(&delta::render(delta)))
     })?;
     Ok(Outcome::Pass)
@@ -863,8 +894,8 @@ fn run_cursor(run: &mut Run<'_, '_>, command: &CursorCommand) -> Result<Outcome>
     Ok(Outcome::Pass)
 }
 
-fn run_pending(run: &mut Run<'_, '_>, limit: Option<usize>) -> Result<Outcome> {
-    let payload = marker::pending(run.context, limit)?;
+fn run_pending(run: &mut Run<'_, '_>, limit: Option<usize>, offset: usize) -> Result<Outcome> {
+    let payload = marker::pending(run.context, limit, offset)?;
     run.emit("pending", &payload, marker::print_pending)?;
     Ok(Outcome::Pass)
 }

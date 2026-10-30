@@ -563,6 +563,7 @@ fn fetch_request(root: &Path) -> Result<Request> {
         cursors: std::collections::BTreeMap::default(),
         discovered: Vec::new(),
         state_dir: root.join("state"),
+        exclude: Vec::new(),
     }))
 }
 
@@ -776,6 +777,7 @@ fn built_in_slack_conforms_against_fake_api() -> Result<()> {
         cursors: std::collections::BTreeMap::new(),
         discovered: Vec::new(),
         state_dir: root.join("state"),
+        exclude: Vec::new(),
     });
     // The shared transport routes each Slack method by its path, so the test asserts what each
     // call asked for rather than the order the calls came in.

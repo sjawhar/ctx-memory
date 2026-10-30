@@ -192,6 +192,7 @@ pub(super) fn fetch_request(
         cursors: BTreeMap::new(),
         discovered,
         state_dir: root.join("state"),
+        exclude: Vec::new(),
     }
 }
 

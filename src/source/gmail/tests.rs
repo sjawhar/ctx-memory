@@ -101,6 +101,7 @@ fn fetch_request(cursor: Option<&str>) -> Result<FetchRequest> {
         cursors,
         discovered: Vec::new(),
         state_dir: std::env::temp_dir(),
+        exclude: Vec::new(),
     })
 }
 

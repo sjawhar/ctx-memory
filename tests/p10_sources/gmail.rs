@@ -59,6 +59,7 @@ fn a_gmail_history_entry_whose_message_is_gone_is_skipped() -> Result<()> {
         cursors: BTreeMap::from([("me".to_owned(), "850@2026-10-24T00:00:00Z".to_owned())]),
         discovered: Vec::new(),
         state_dir: root.join("state"),
+        exclude: Vec::new(),
     });
     let source = source::open(&spec, "gmail")?;
     let outcome = run_conformance(source.as_ref(), &request);

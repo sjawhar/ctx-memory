@@ -11,6 +11,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use ctx_memory::{
     config::TreeConfig,
     delta::{self, Delta, Match, OpenFlag, OpenRecord, OpenSnapshot, Owners, ReplyRef},
+    exclude::Exclusion,
     pointer::Schemes,
     record::Record,
     source,
@@ -144,6 +145,7 @@ fn delta_matches_thread_alias_quote_owner_and_owned_streams() -> Result<()> {
         &tree,
         &schemes,
         &owners,
+        &Exclusion::default(),
         &current,
         None,
         timestamp("2026-10-25T12:01:00Z")?,
@@ -336,6 +338,7 @@ fn delta_matches_normalised_quote_fragments_in_replies_and_parents() -> Result<(
         &tree,
         &schemes,
         &owners,
+        &Exclusion::default(),
         &current,
         None,
         timestamp("2026-10-25T12:01:00Z")?,
@@ -408,6 +411,8 @@ fn delta_diffs_open_items_from_the_previous_snapshot() -> Result<()> {
             unreviewed: Vec::new(),
             closed_since_previous: Vec::new(),
             opened_since_previous: Vec::new(),
+            omitted_messages: None,
+            omitted_changes: None,
         },
     )?;
     let current = window(&windows, "20261025T120000Z-0001", Vec::new())?;
@@ -416,6 +421,7 @@ fn delta_diffs_open_items_from_the_previous_snapshot() -> Result<()> {
         &tree,
         &schemes,
         &owners,
+        &Exclusion::default(),
         &current,
         Some(&previous),
         timestamp("2026-10-25T12:00:00Z")?,
@@ -477,10 +483,12 @@ fn staleness_tracks_current_last_reviewed_date() -> Result<()> {
         }],
         closed_since_previous: Vec::new(),
         opened_since_previous: Vec::new(),
+        omitted_messages: None,
+        omitted_changes: None,
     };
     delta::write(&current, &snapshot, &delta)?;
 
-    let stale = delta::staleness(&windows, &tree)?;
+    let stale = delta::staleness(&windows, &tree, &Exclusion::default())?;
     assert!(
         !stale
             .get("questions/example.md")
@@ -495,7 +503,7 @@ fn staleness_tracks_current_last_reviewed_date() -> Result<()> {
         "---\ntype: question\nstatus: open\nlast_reviewed: 2026-10-25\n---\n",
     )?;
     let (reviewed_same_day, _) = configured_tree(&root)?;
-    let same_day = delta::staleness(&windows, &reviewed_same_day)?;
+    let same_day = delta::staleness(&windows, &reviewed_same_day, &Exclusion::default())?;
     assert!(same_day
         .get("questions/example.md")
         .context("same-day reply remains visible")?
@@ -507,7 +515,7 @@ fn staleness_tracks_current_last_reviewed_date() -> Result<()> {
         "---\ntype: question\nstatus: open\nlast_reviewed: 2026-10-26\n---\n",
     )?;
     let (reviewed_after, _) = configured_tree(&root)?;
-    let after = delta::staleness(&windows, &reviewed_after)?;
+    let after = delta::staleness(&windows, &reviewed_after, &Exclusion::default())?;
     remove_scratch(&root)?;
     assert!(!after.contains_key("questions/example.md"));
     Ok(())
@@ -555,6 +563,8 @@ fn ctx_open_shows_unreviewed_replies_for_configured_sources() -> Result<()> {
             }],
             closed_since_previous: Vec::new(),
             opened_since_previous: Vec::new(),
+            omitted_messages: None,
+            omitted_changes: None,
         },
     )?;
 
@@ -694,6 +704,8 @@ fn unsupported_artifact_versions_fail_without_replacing_existing_files() -> Resu
         unreviewed: Vec::new(),
         closed_since_previous: Vec::new(),
         opened_since_previous: Vec::new(),
+        omitted_messages: None,
+        omitted_changes: None,
     };
 
     let rejected = delta::write(&current, &snapshot, &delta);
@@ -750,6 +762,7 @@ fn delta_suggests_semantic_match() -> Result<()> {
         &tree,
         &schemes,
         &owners,
+        &Exclusion::default(),
         &current,
         None,
         timestamp("2026-10-25T12:01:00Z")?,
@@ -759,6 +772,7 @@ fn delta_suggests_semantic_match() -> Result<()> {
         &tree,
         &schemes,
         &owners,
+        &Exclusion::default(),
         &current,
         None,
         timestamp("2026-10-25T12:01:00Z")?,

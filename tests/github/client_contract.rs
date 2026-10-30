@@ -26,6 +26,7 @@ fn fetch_request(config: Value, state_dir: std::path::PathBuf) -> Result<Request
         cursors: BTreeMap::new(),
         discovered: Vec::new(),
         state_dir,
+        exclude: Vec::new(),
     }))
 }
 

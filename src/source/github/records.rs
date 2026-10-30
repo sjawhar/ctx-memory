@@ -10,8 +10,10 @@ use crate::record::Record;
 #[cfg(doc)]
 use super::collect::Paging;
 
-/// How many items a listing asks for per page.
+/// How many items a listing asks for per page: `PAGE_SIZE`, as a request spells it.
 const PER_PAGE: &str = "100";
+/// How many items a full page of a listing holds.
+pub(super) const PAGE_SIZE: u64 = 100;
 
 /// What one API item became: a record, a held item beyond the window, or nothing usable.
 pub(super) enum Built {

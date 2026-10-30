@@ -36,4 +36,4 @@ jobs:
       - run: cargo run -- --memory starter cite verify
       # The ingest runner ships a shell script, and what it does with the model key and the
       # session's privileges is security-relevant, so it is checked like the Rust is.
-      - run: shellcheck runner/run-cycle.sh
+      - run: shellcheck runner/run-cycle.sh scripts/test-runner

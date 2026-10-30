@@ -117,6 +117,7 @@ pub(super) fn request(config: Value, cursor: Option<(&str, &str)>) -> Result<Fet
         cursors,
         discovered: Vec::new(),
         state_dir: std::env::temp_dir(),
+        exclude: Vec::new(),
     })
 }
 
