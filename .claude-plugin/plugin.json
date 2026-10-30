@@ -1,0 +1,9 @@
+{
+  "name": "ctx-memory",
+  "description": "How an agent reads and writes a ctx-memory tree with the ctx command: the ctx-memory and ctx-memory-ingest skills",
+  "author": { "name": "Sami Jawhar" },
+  "homepage": "https://github.com/sjawhar/ctx-memory",
+  "repository": "https://github.com/sjawhar/ctx-memory",
+  "license": "MIT",
+  "keywords": ["memory", "knowledge-graph", "markdown", "citations"]
+}

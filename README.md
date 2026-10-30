@@ -4,8 +4,22 @@
 
 ## Install
 
+Each `v*` tag publishes `ctx` as a GitHub release: a static build for x86_64 and aarch64 Linux (`ctx-x86_64-unknown-linux-musl.tar.gz`, `ctx-aarch64-unknown-linux-musl.tar.gz`) and a build for Apple silicon macOS (`ctx-aarch64-apple-darwin.tar.gz`), each holding the `ctx` binary alone, and `ctx-memory-<version>-share.tar.gz`, the tag's `skills/` tree for an image or a machine that installs it beside the binary. The release carries `SHA256SUMS` and a GitHub build attestation of each archive. [`.github/workflows/release.yml`](.github/workflows/release.yml) builds them from the tagged commit once it passes CI. With [mise](https://mise.jdx.dev):
+
+```bash
+mise use -g github:sjawhar/ctx-memory@0.2.0
+```
+
+From source:
+
 ```bash
 cargo install --locked --git https://github.com/sjawhar/ctx-memory
+```
+
+The skills under [`skills/`](skills/) — `ctx-memory`, how an agent reads and writes a tree, and `ctx-memory-ingest`, the ingest cycle's procedure — install as a plugin. The repository is an Oh My Pi plugin package (`package.json`): a plugin tree that installs it, for example as `github:sjawhar/ctx-memory#v0.2.0`, gives every session both skills. It is also a Claude Code plugin marketplace (`.claude-plugin/`):
+
+```
+/plugin install ctx-memory --marketplace sjawhar/ctx-memory
 ```
 
 ## Quick start

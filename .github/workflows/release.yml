@@ -1,0 +1,232 @@
+name: release
+# A `v*` tag publishes the `ctx` binary as a GitHub release: a static musl build for x86_64 and
+# aarch64 Linux and a build for Apple silicon macOS, each a tar.gz that holds `ctx` alone, and
+# ctx-memory-<version>-share.tar.gz, the tag's skills/ tree (and runner/, when the repository
+# has one) for an image or a machine that installs them beside the binary. The release carries
+# SHA256SUMS and a GitHub build attestation of each archive, which mise checks when it installs one.
+# The tag must name the version Cargo.toml and package.json both carry, and the release job needs
+# ci.yml, which this workflow calls for the tagged commit, so the commit released is the commit
+# checked. A pull request that changes what the binary builds read runs the same jobs and
+# publishes nothing, so a build that breaks fails where it is caused rather than at the next tag.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - package.json
+
+permissions: {}
+
+env:
+  # The toolchain every target builds with. rust-toolchain.toml names the `stable` channel, which
+  # rustup would resolve to whatever is newest; RUSTUP_TOOLCHAIN outranks the file, so each build
+  # uses this version.
+  RUST_VERSION: "1.99.1"
+  # rust:1.99.1-alpine3.24, pinned by the digest of its multi-platform index, so the x86_64 and
+  # aarch64 runners each pull their own platform of one image.
+  RUST_ALPINE: rust@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # package.json makes the repository an Oh My Pi plugin package, and omp reports its version
+      # as the plugin's, so it moves with the crate's.
+      - name: Cargo.toml, package.json and the tag name one version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          crate="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          package="$(jq -r .version package.json)"
+          if [ -z "$crate" ] || [ "$crate" != "$package" ]; then
+            echo "Cargo.toml has version '$crate' and package.json '$package'; they must be equal" >&2
+            exit 1
+          fi
+          if [ "$EVENT" = push ] && [ "$TAG" != "v$crate" ]; then
+            echo "the tag is $TAG, but Cargo.toml and package.json name version $crate (tag v$crate)" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$crate" >> "$GITHUB_OUTPUT"
+
+  ci:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # Built natively on each architecture inside Alpine, whose target is musl, so the C that
+  # rusqlite and aws-lc-sys compile finds musl's headers and the kernel's without a cross
+  # toolchain, and Rust links the result statically. The binary is then run on the runner itself,
+  # an Ubuntu host, which proves it needs nothing from the image it was built in.
+  linux:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e RUSTUP_TOOLCHAIN="$RUST_VERSION" -e CARGO_BUILD_JOBS=4 -e TARGET \
+            "$RUST_ALPINE" sh -euc '
+              host="$(rustc -vV | sed -n "s/^host: //p")"
+              if [ "$host" != "$TARGET" ]; then
+                echo "this runner builds $host, not $TARGET" >&2
+                exit 1
+              fi
+              apk add --no-cache musl-dev linux-headers
+              cargo build --release --locked --bin ctx'
+          sudo chown -R "$(id -u):$(id -g)" target
+      - name: Check that it is static and runs here
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if readelf -d target/release/ctx | grep -q NEEDED; then
+            echo "target/release/ctx names shared libraries:" >&2
+            readelf -d target/release/ctx | grep NEEDED >&2
+            exit 1
+          fi
+          test "$(target/release/ctx --version)" = "ctx $VERSION"
+      - name: Archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: tar -czf "ctx-$TARGET.tar.gz" -C target/release ctx
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ctx-${{ matrix.target }}
+          path: ctx-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    needs: version
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+      - name: Build
+        run: RUSTUP_TOOLCHAIN="$RUST_VERSION" cargo build --release --locked --bin ctx --target "$TARGET"
+      - name: Check that it runs here
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: test "$("target/$TARGET/release/ctx" --version)" = "ctx $VERSION"
+      - name: Archive
+        run: tar -czf "ctx-$TARGET.tar.gz" -C "target/$TARGET/release" ctx
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ctx-${{ env.TARGET }}
+          path: ctx-${{ env.TARGET }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # The files an image or a machine installs beside the binary: the skills/ tree, and runner/
+  # when the repository has one. The archive is built from the tag's tree with fixed owners,
+  # order and times, so the same commit always makes the same bytes.
+  share:
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Archive
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          dirs=(skills)
+          if [ -d runner ]; then dirs+=(runner); fi
+          name="ctx-memory-$VERSION-share.tar.gz"
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mode='u+rwX,go+rX,go-w' \
+            --mtime="@$(git log -1 --format=%ct)" -cf - "${dirs[@]}" | gzip -n > "$name"
+          tar -tzf "$name"
+          tar -tzf "$name" | grep -qx 'skills/ctx-memory/SKILL.md'
+          printf 'name=%s\n' "$name" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ctx-memory-share
+          path: ${{ env.name }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [version, ci, linux, macos, share]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      # contents: write creates the release; id-token and attestations sign and store the
+      # attestation of each archive.
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ctx-*
+          path: dist
+          merge-multiple: true
+      # The release is exactly these four archives: each must be there as a file, and nothing else
+      # the download brought in is checksummed, attested or published.
+      - name: Checksums
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cd dist
+          archives=(ctx-x86_64-unknown-linux-musl.tar.gz ctx-aarch64-unknown-linux-musl.tar.gz
+            ctx-aarch64-apple-darwin.tar.gz "ctx-memory-$VERSION-share.tar.gz")
+          for archive in "${archives[@]}"; do
+            test -f "$archive" || { echo "the release is missing $archive" >&2; exit 1; }
+          done
+          mkdir ../release
+          mv "${archives[@]}" ../release/
+          cd ../release
+          sha256sum "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/ctx-*.tar.gz
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "ctx $VERSION" --generate-notes \
+            release/ctx-*.tar.gz release/SHA256SUMS

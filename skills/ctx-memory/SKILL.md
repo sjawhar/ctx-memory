@@ -1,6 +1,6 @@
 ---
 name: ctx-memory
-description: "Use when answering a question the team memory may hold or recording a durable fact; the tree is found via CTX_MEMORY or ctx.toml."
+description: "Use when answering a question the team memory may hold or recording a durable fact; ctx reaches the tree through the server CTX_SERVER names, or a local tree via CTX_MEMORY or ctx.toml."
 ---
 
 # ctx-memory

@@ -1,0 +1,11 @@
+{
+  "name": "ctx-memory",
+  "owner": { "name": "Sami Jawhar" },
+  "plugins": [
+    {
+      "name": "ctx-memory",
+      "source": "./",
+      "description": "How an agent reads and writes a ctx-memory tree with the ctx command"
+    }
+  ]
+}
