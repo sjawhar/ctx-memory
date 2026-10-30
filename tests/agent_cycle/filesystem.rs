@@ -560,6 +560,236 @@ fn the_cycle_seals_its_transcript_after_the_session() -> Result<()> {
     Ok(())
 }
 
+/// A refused ingest cycle gets one fresh session. `run-cycle.sh` runs as its container's PID 1
+/// and cannot hand its own process to omp, so the retry is read from the script, the way the
+/// transcript sealing is: a run that reaches omp needs a locked share this pretend-root harness
+/// cannot build, and the live probe (`live_session.rs`) drives omp directly, past run-cycle.sh.
+/// The invariants the retry rests on: omp is started from a function, so the same launch serves
+/// both attempts; the retry fires only for an ingest cycle, only on a non-zero exit, and only
+/// when the session's own transcript shows a model refusal; it starts over in its own directory;
+/// and it is one retry, not a loop, so a second refusal is the cycle's outcome.
+#[test]
+fn the_cycle_retries_once_after_a_model_refusal() -> Result<()> {
+    let script = runner("run-cycle.sh")?;
+    let code: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    let has = |needle: &str| code.iter().any(|line| line.contains(needle));
+
+    ensure!(
+        has("run_session() {"),
+        "run-cycle.sh starts omp inline, so the retry has no launch to run a second time"
+    );
+    ensure!(
+        code.iter()
+            .filter(|line| line.contains("run_session"))
+            .count()
+            >= 3,
+        "run-cycle.sh does not call run_session for both attempts"
+    );
+    ensure!(
+        code.iter()
+            .filter(|line| line.contains("run_session || status="))
+            .count()
+            == 2,
+        "run-cycle.sh must run exactly two sessions at most: the cycle and its one retry"
+    );
+    ensure!(
+        has("session_refused() {") && has("stopDetails") && has("refusal"),
+        "run-cycle.sh does not read the refusal by its stopDetails"
+    );
+    ensure!(
+        has("\"$@\" >\"$event_log\" &") && has("event_log=\"$session_dir.events.json\""),
+        "run-cycle.sh does not capture omp's stdout, where the runtime emits a refusal, to a file \
+         beside the sealed transcript"
+    );
+    ensure!(
+        has("cat \"$event_log\""),
+        "run-cycle.sh drops the captured stdout instead of writing it back to the container log"
+    );
+    let retry = code
+        .iter()
+        .find(|line| {
+            line.contains("session_refused \"$session_dir.events.json\"")
+                && line.contains("[ -z \"$pass\" ]")
+        })
+        .context("the retry is not guarded by an ingest cycle whose session was refused")?;
+    ensure!(
+        retry.contains("\"$status\" -ne 0"),
+        "the retry runs even when the first session succeeded"
+    );
+    ensure!(
+        has("-retry\"")
+            && has("session_dir=\"$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION-retry\""),
+        "the retry does not open its own transcript directory"
+    );
+    Ok(())
+}
+
+/// The pattern `run-cycle.sh` reads a refusal by, run against the real shape of the event. The
+/// pinned runtime writes the refusal to its stdout as a `stopDetails` object whose `type` is
+/// `"refusal"`, after its `category` and `explanation`; an earlier pattern that expected `type`
+/// first matched none. The pattern must also not fire on a window's own copy of such an event,
+/// which reaches a tool result JSON-escaped. The pattern is read from the script so the test
+/// cannot drift from it.
+#[test]
+fn the_refusal_pattern_matches_a_real_refusal_and_not_an_escaped_copy() -> Result<()> {
+    let script = runner("run-cycle.sh")?;
+    let line = script
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("grep -qE '") && line.ends_with("\"$1\""))
+        .context("session_refused does not grep the captured stdout with one pattern")?;
+    let pattern = line
+        .strip_prefix("grep -qE '")
+        .and_then(|rest| rest.rsplit_once("' "))
+        .map(|(pattern, _)| pattern)
+        .context("could not read the refusal pattern from run-cycle.sh")?;
+
+    // A real refusal event: category and explanation precede type, and the explanation even holds
+    // a brace, so a pattern that stops at the first `}` would miss it.
+    let refusal = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","stopDetails":{"category":"reasoning_extraction","explanation":"blocked (see terms) }","type":"refusal"}}}"#;
+    // The same text as a window quoted it: a tool result, JSON-escaped, so the real quotes and
+    // brace the pattern needs are not there.
+    let escaped = r#"{"type":"message_end","message":{"role":"toolResult","content":[{"text":"...\"stopDetails\":{\"category\":\"x\",\"type\":\"refusal\"}..."}]}}"#;
+    let benign = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","stopDetails":null}}"#;
+
+    let dir = scratch("refusal-pattern")?;
+    let file = dir.join("events.json");
+    let matches = |content: &str| -> Result<bool> {
+        std::fs::write(&file, content)?;
+        Ok(std::process::Command::new("grep")
+            .args(["-qE", pattern])
+            .arg(&file)
+            .status()?
+            .success())
+    };
+    let refusal_matched = matches(refusal)?;
+    let escaped_matched = matches(escaped)?;
+    let benign_matched = matches(benign)?;
+    remove_scratch(&dir)?;
+
+    ensure!(
+        refusal_matched,
+        "the refusal pattern misses a real refusal event: {pattern}"
+    );
+    ensure!(
+        !escaped_matched,
+        "the refusal pattern fires on a window's escaped copy of a refusal: {pattern}"
+    );
+    ensure!(
+        !benign_matched,
+        "the refusal pattern fires on a non-refusal stop: {pattern}"
+    );
+    Ok(())
+}
+
+/// A maintenance pass handles no window and moves no marker; `run-cycle.sh` enforces that rather
+/// than trusting the pass's instructions. Read from the script, like the retry: the enforcement
+/// runs after the session, which this pretend-root harness cannot reach (it writes the model key
+/// to `/run/ctx-agent`, root's). The invariants: the marker is read before and after a pass, the
+/// two are compared, a move fails the job, and all of it is a pass alone, so a cycle (which moves
+/// the marker per window) is untouched.
+#[test]
+fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
+    let script = runner("run-cycle.sh")?;
+    let code: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    let has = |needle: &str| code.iter().any(|line| line.contains(needle));
+
+    ensure!(
+        code.iter()
+            .filter(|line| line.contains("ctx marker show --json"))
+            .count()
+            == 2,
+        "run-cycle.sh must read the marker before and after the pass to tell whether it moved"
+    );
+    ensure!(
+        has("marker_before=\"$(ctx marker show --json)\"")
+            && has("marker_after=\"$(ctx marker show --json)\""),
+        "run-cycle.sh does not capture the marker on each side of the pass"
+    );
+    let compared = code
+        .iter()
+        .find(|line| line.contains("\"$marker_before\" != \"$marker_after\""))
+        .context("run-cycle.sh never compares the marker before and after the pass")?;
+    let moved = code
+        .iter()
+        .position(|line| line == compared)
+        .context("locating the marker comparison")?;
+    ensure!(
+        code.get(moved + 1..moved + 3)
+            .is_some_and(|lines| lines.iter().any(|line| line.contains("status=1"))),
+        "a pass that moved the marker does not fail the job"
+    );
+    ensure!(
+        code.iter()
+            .filter(|line| *line == &"if [ -n \"$pass\" ]; then")
+            .count()
+            >= 2,
+        "the marker reads are not both guarded by a maintenance pass"
+    );
+    Ok(())
+}
+
+/// A cycle told a window cap passes it to its own `ctx pending`, so the runner's read is the
+/// size the session's will be and a long backlog is never read whole. With nothing pending the
+/// cycle stops before any session, so this reaches the pending read and no further.
+#[test]
+fn the_cycle_passes_its_window_cap_to_ctx_pending() -> Result<()> {
+    let rig = CycleRig::new("window-cap")?;
+    rig.pretend_root()?;
+    let calls = rig.nothing_pending()?;
+    let output = rig
+        .command()?
+        .env("CTX_CYCLE_MAX_WINDOWS", "3")
+        .output()
+        .context("running run-cycle.sh with a window cap")?;
+    let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+    rig.remove()?;
+    ensure!(
+        output.status.success(),
+        "a capped cycle with nothing pending did not stop cleanly: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        recorded
+            .lines()
+            .any(|line| line.starts_with("pending") && line.contains("--limit 3")),
+        "the cycle did not pass its cap to ctx pending: {recorded:?}"
+    );
+    Ok(())
+}
+
+/// The cap is optional and a positive whole number of windows: anything else is refused before
+/// anything is prepared for a session, the way a missing variable is.
+#[test]
+fn the_runner_refuses_a_window_cap_that_is_not_a_positive_number() -> Result<()> {
+    let rig = CycleRig::new("window-cap-bad")?;
+    rig.pretend_root()?;
+    rig.nothing_pending()?;
+    let mut result = Ok(());
+    for value in ["0", "00", "000", "08", "-1", "3.5", "lots", "3 4"] {
+        let output = rig
+            .command()?
+            .env("CTX_CYCLE_MAX_WINDOWS", value)
+            .output()
+            .context("running run-cycle.sh with a bad window cap")?;
+        result = assert_refused(&rig, &output, "CTX_CYCLE_MAX_WINDOWS")
+            .with_context(|| format!("CTX_CYCLE_MAX_WINDOWS={value:?}"));
+        if result.is_err() {
+            break;
+        }
+    }
+    rig.remove()?;
+    result
+}
+
 #[test]
 fn the_cycle_refuses_a_session_user_that_can_rewrite_omps_configuration() -> Result<()> {
     let rig = CycleRig::new("config-writable")?;

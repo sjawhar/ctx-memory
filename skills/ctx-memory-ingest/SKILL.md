@@ -127,12 +127,19 @@ automated notification noise unless a person acts on it.
 
 1. Run `ctx rules`, then `ctx pending --json`.
 2. Get the windows to handle. `ctx pending --json` lists every completed window after the
-   marker; handle them all, oldest first. When it lists none, say so and stop: the cycle
+   marker; handle them all, oldest first. When the cycle names a window cap, add it to
+   `ctx pending --json` as `--limit <N>`: the answer then holds only the N oldest, and the rest
+   wait for the next cycle, so one run never has to read a whole backlog at once. When it lists
+   none, say so and stop: the cycle
    never fetches, because the fetch job owns the cursors. If a stream reports an error,
    record it and report it to whoever runs the cycle (and in the cycle log, if the rules
    page names one); that stream's cursor stays where it is, so the next fetch re-reads it.
-   If every pending window's `new_messages` count is zero, report that the cycle found
-   nothing new and stop.
+   A window whose `new_messages` count is zero is still handled: there is nothing to record
+   for it, but advance the marker past it (step 11) so it does not sit in front of the
+   windows after it. When every window this cycle holds is empty, advance the marker to the
+   newest of them and report that the cycle found nothing new — never stop with an empty
+   window unmarked, or under a cap it would hide every newer window behind it, cycle after
+   cycle.
 3. Read each window's directory, its `dir` under the data directory: `manifest.json`
    (per-stream status, record counts and proposed cursors), `records.jsonl` (one
    normalized record per message, with its `pointer`, `thread`, `ts`, `author` and
@@ -163,9 +170,12 @@ automated notification noise unless a person acts on it.
    shorter one is not counted as checked. Before minting, search for the entity, event or
    open item (`ctx search`, `ctx dossier`, `ctx open`) and update it when it exists. Link
    every new record from a parent or index so it is reachable.
-7. Record the cycle in the tree's cycle log, if the rules page names one: the window id,
-   counts, and what was minted, updated and closed, as wikilinks. Facts go in records,
-   not in the log.
+7. Record the cycle in the tree's cycle log, if the rules page names one, as data only: the
+   window id, the counts, and what was minted, updated and closed, as wikilinks. Do not
+   narrate how you decided, what you weighed, what you set aside, or what you read and left
+   unchanged; that account of your own reasoning belongs in no record, and a long retelling of
+   it on the cycle's last turn is what makes the model refuse it. Facts go in records, not in
+   the log.
 8. Verify. Check each new quote against its source with `ctx resolve <pointer>`, adding
    `--thread` when the record cites a thread pointer.
 9. Write each record with the `ctx_record_put` tool: give it the record's tree path and the
@@ -182,11 +192,18 @@ automated notification noise unless a person acts on it.
     it runs after the writes it checks. Fix each structural finding you can with another
     write and run it again. Report a finding the cycle cannot fix, such as a broken rules
     page, which changes only through a reviewed pull request, to whoever runs the cycle.
-11. Move the marker. Run `ctx marker advance <newest handled window id>` once every record
-    of the cycle is written and every structural finding you can fix is fixed. The marker
-    covers every window up to the one named, repeating it for the same window changes only
-    who moved it and when, and it refuses a window older than the one the marker already
-    holds.
+11. Move the marker window by window, as you finish each — not once at the end. After a
+    window's records are written (step 9) and its quotes verified (step 8), and before you
+    start the next window, run `ctx marker advance <that window id>`. Advance it for a window
+    with no new messages too, as soon as you have seen it is empty: it is handled by having
+    nothing to record, and left unmarked it would, under a cap, keep every newer window out of
+    the next cycle's view. The marker covers every window up to the one named; repeating it for
+    the same window changes only who moved it and when, and it refuses a window older than the
+    one the marker already holds. Advancing per
+    window is what keeps a cycle that stops partway — a refused turn, a kill, a timeout — from
+    enlarging the next: the windows it finished are done, and only the rest stay pending. Run
+    the tree-wide `ctx sweep` of step 10 after the last window; a finding it reports is fixed
+    with another write, and the markers already advanced stand.
 
 ## Record rules
 
@@ -229,10 +246,12 @@ automated notification noise unless a person acts on it.
 
 ## When a cycle fails
 
-- An interrupted cycle has not moved the marker, so the next cycle finds the same windows
-  in `ctx pending` and reads them again. The records it already wrote are committed, so
-  the next cycle updates them rather than minting them twice. Do not move the marker by
-  hand to get past a failure.
+- An interrupted cycle has moved the marker for each window it finished (step 11), so the next
+  cycle finds in `ctx pending` only the windows it did not reach, plus any new ones, and never
+  the whole backlog again. A window it was partway through when it stopped is not yet marked, so
+  the next cycle reads it again; the records it already wrote for that window are committed, so
+  the next cycle updates them rather than minting them twice. Do not move the marker by hand to
+  get past a failure, and never advance it over a window whose records you have not written.
 - A scheduler that runs cycles should log each run and treat a failed run, or a log that
   stops growing while the schedule is enabled, as an outage to fix rather than a quiet
   period.

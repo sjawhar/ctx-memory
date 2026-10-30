@@ -38,6 +38,13 @@ fn deadline_error() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline exceeded")
 }
 
+/// The instant a run that began at `start` with `timeout` must finish by. `None` when `timeout`
+/// is so large the sum overflows. This is the one place a run's deadline is computed, so a test
+/// can hold it to `start + timeout` exactly, without waiting.
+fn run_deadline(start: Instant, timeout: Duration) -> Option<Instant> {
+    start.checked_add(timeout)
+}
+
 fn poll_until_ready(
     descriptor: std::os::fd::RawFd,
     events: libc::c_short,
@@ -256,9 +263,8 @@ pub fn run_command(
         .take()
         .ok_or_else(|| anyhow!("{program}: stderr not captured"))?;
     let started = Instant::now();
-    let deadline = started
-        .checked_add(timeout)
-        .ok_or_else(|| anyhow!("{program}: timeout is too large"))?;
+    let deadline =
+        run_deadline(started, timeout).ok_or_else(|| anyhow!("{program}: timeout is too large"))?;
     let stdout_reader = thread::spawn(move || read_pipe_until(stdout_pipe, deadline));
     let stderr_reader = thread::spawn(move || read_pipe_until(stderr_pipe, deadline));
     if !stdin.is_empty() {
@@ -401,12 +407,28 @@ mod tests {
             std::process::id()
         ));
         std::fs::File::create_new(&pid_file)?;
-        let script = format!("setsid sh -c 'sleep 30' & echo $! > {}", pid_file.display());
+        // The holder sleeps far longer than the one-second timeout, so the two outcomes are
+        // unmistakable: a timeout that fires returns in about a second, and one a pipe holder
+        // extended would wait the whole sleep. The bound sits between them with wide margin on
+        // each side, so neither a slow machine under load nor a longer kill path can confuse them.
+        let holder = Duration::from_secs(120);
+        let script = format!(
+            "setsid sh -c 'sleep {}' & echo $! > {}",
+            holder.as_secs(),
+            pid_file.display()
+        );
 
         let started = Instant::now();
         let output = run("sh", &["-c", &script], Duration::from_secs(1));
         let elapsed = started.elapsed();
         let pid = std::fs::read_to_string(&pid_file)?;
+        // Deterministic, not timing: the holder is still sleeping when `run` returns. A run that
+        // waited for the pipe to close would return only after the holder had exited, so finding
+        // it alive proves the timeout fired without waiting for the holder, whatever the load.
+        let holder_alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()?
+            .success();
         let process_group = format!("-{}", pid.trim());
         let cleanup = std::process::Command::new("kill")
             .args(["-KILL", "--", process_group.as_str()])
@@ -415,7 +437,73 @@ mod tests {
 
         assert!(cleanup.success());
         assert!(output.is_err());
-        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+        assert!(
+            holder_alive,
+            "the run returned only after the pipe holder had exited, so it waited for it"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1) + holder / 4,
+            "a pipe holder outside the process group extended the one-second timeout to {elapsed:?}"
+        );
         Ok(())
+    }
+
+    /// The wall-time bounds above are generous on purpose, so they prove only that a timeout is
+    /// not extended, not the deadline itself. This reads the deadline straight from the poll the
+    /// bounded runs are built on: a pipe with its write end open and no data never becomes
+    /// readable, so the poll runs to its deadline and no further. The upper bound is close enough
+    /// to the short deadline to catch a deadline computed seconds late, and far enough above it to
+    /// absorb scheduling under load; the lower bound catches a poll that gives up early.
+    #[test]
+    fn poll_waits_for_its_deadline_and_no_longer() {
+        let mut fds = [0 as std::os::fd::RawFd; 2];
+        assert_eq!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) },
+            0,
+            "could not make a pipe"
+        );
+        let [read_end, write_end] = fds;
+        let deadline_in = Duration::from_millis(300);
+        let started = Instant::now();
+        let result = poll_until_ready(read_end, libc::POLLIN, Instant::now() + deadline_in);
+        let elapsed = started.elapsed();
+        unsafe {
+            libc::close(read_end);
+            libc::close(write_end);
+        }
+        assert!(
+            result.is_err(),
+            "the poll reported ready on a pipe with no data"
+        );
+        assert!(
+            elapsed >= deadline_in,
+            "the poll gave up {elapsed:?} in, before its {deadline_in:?} deadline"
+        );
+        assert!(
+            elapsed < deadline_in + Duration::from_secs(1),
+            "the poll ran {elapsed:?}, well past its {deadline_in:?} deadline: a deadline computed \
+             late would show here"
+        );
+    }
+
+    /// The deadline the bounded runs enforce is exactly the start plus the timeout, computed in
+    /// one place so this holds it without waiting: a deadline set even a little early or late is
+    /// caught here, which a wall-time bound on a real run cannot do without flaking.
+    #[test]
+    fn the_run_deadline_is_the_start_plus_the_timeout() {
+        let start = Instant::now();
+        for seconds in [0, 1, 2, 7, 3600] {
+            let timeout = Duration::from_secs(seconds);
+            assert_eq!(
+                run_deadline(start, timeout),
+                Some(start + timeout),
+                "the run deadline for a {timeout:?} timeout is not the start plus the timeout"
+            );
+        }
+        assert_eq!(
+            run_deadline(start, Duration::MAX),
+            None,
+            "a timeout too large to add to the start must have no deadline, not a wrapped one"
+        );
     }
 }

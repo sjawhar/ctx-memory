@@ -122,7 +122,12 @@ pub enum Command {
         command: CursorCommand,
     },
     /// List the completed windows the agent has not handled yet.
-    Pending,
+    Pending {
+        /// Handle at most this many windows, oldest first, and leave the rest for the next
+        /// cycle. Omitted, every pending window is listed.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Inspect or advance the agent marker.
     Marker {
         #[command(subcommand)]
@@ -255,7 +260,7 @@ impl Command {
             Self::Cursor {
                 command: CursorCommand::Show,
             } => "cursor show".to_owned(),
-            Self::Pending => "pending".to_owned(),
+            Self::Pending { .. } => "pending".to_owned(),
             Self::Marker {
                 command: MarkerCommand::Show,
             } => "marker show".to_owned(),
@@ -307,7 +312,7 @@ impl Command {
             | Self::Search { .. }
             | Self::Dossier { .. }
             | Self::Open { .. }
-            | Self::Pending
+            | Self::Pending { .. }
             | Self::Resolve { .. }
             | Self::Marker {
                 command: MarkerCommand::Show,
@@ -578,7 +583,7 @@ fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
         ),
         Command::Delta { window, write } => run_delta(run, window.as_deref(), *write),
         Command::Cursor { command } => run_cursor(run, command),
-        Command::Pending => run_pending(run),
+        Command::Pending { limit } => run_pending(run, *limit),
         Command::Marker { command } => run_marker(run, command),
         Command::Resolve { thread, pointers } => run_resolve(run, pointers, *thread),
         Command::Cite {
@@ -858,8 +863,8 @@ fn run_cursor(run: &mut Run<'_, '_>, command: &CursorCommand) -> Result<Outcome>
     Ok(Outcome::Pass)
 }
 
-fn run_pending(run: &mut Run<'_, '_>) -> Result<Outcome> {
-    let payload = marker::pending(run.context)?;
+fn run_pending(run: &mut Run<'_, '_>, limit: Option<usize>) -> Result<Outcome> {
+    let payload = marker::pending(run.context, limit)?;
     run.emit("pending", &payload, marker::print_pending)?;
     Ok(Outcome::Pass)
 }

@@ -315,7 +315,12 @@ fn a_push_the_remote_holds_open_is_stopped() -> Result<()> {
         ],
     )?;
     let hook = root.join("remote.git/hooks/pre-receive");
-    executable(&hook, "#!/bin/sh\nsleep 30\n")?;
+    // The hook holds the push open far longer than the network timeout, so a push that is stopped
+    // at its bound returns in about that timeout, while one the remote held open would wait the
+    // whole hook. The assertion below sits between the two with wide margin, so load cannot blur
+    // them, and the push's process-group kill stops the hook when the timeout fires.
+    let held = Duration::from_secs(300);
+    executable(&hook, &format!("#!/bin/sh\nsleep {}\n", held.as_secs()))?;
     let remote = root.join("remote.git");
     let remote = remote.to_str().context("remote path is not UTF-8")?;
     git(&root, &["clone", "--quiet", remote, "tree"])?;
@@ -326,17 +331,29 @@ fn a_push_the_remote_holds_open_is_stopped() -> Result<()> {
     git(&tree, &["branch", "--quiet", "--move", "main"])?;
 
     let mut repo = Repo::open(&tree)?;
-    repo.network_timeout = Some(Duration::from_secs(2));
+    let timeout = Duration::from_secs(2);
+    repo.network_timeout = Some(timeout);
     let started = Instant::now();
     let pushed = repo.push();
     let elapsed = started.elapsed();
+    // Deterministic, not timing: the remote never took the push. The pre-receive hook holds
+    // receive-pack open until long past the bound, so a push stopped at the bound updates no ref,
+    // while one the remote let through would have landed `main`.
+    let landed = output(&tree, &["ls-remote", "--heads", remote])?;
     std::fs::remove_dir_all(&root)?;
 
     let error = pushed
         .err()
         .context("a push the remote held open succeeded")?;
     assert!(format!("{error:#}").contains("timed out"), "{error:#}");
-    assert!(elapsed < Duration::from_secs(20), "took {elapsed:?}");
+    assert!(
+        landed.is_empty(),
+        "the push landed on the remote despite being stopped: {landed}"
+    );
+    assert!(
+        elapsed < timeout + held / 5,
+        "the remote held the push open past its {timeout:?} bound, to {elapsed:?}"
+    );
     Ok(())
 }
 

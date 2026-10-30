@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::write_replace;
+use crate::config::DataDir;
 use crate::context::Context;
 use crate::delta::{self, Delta};
 use crate::output::printable;
@@ -114,11 +115,20 @@ pub fn advance(context: &Context, window: &str, by: &str) -> Result<Marker> {
 
 /// Lists the completed windows after the marker with the delta they combine into.
 ///
+/// `limit` caps how many of those windows, oldest first, the answer holds: a cycle handles
+/// the capped list and leaves the rest for the next one, so one run never has to read the
+/// whole of a backlog at once. `None` lists every pending window. The delta combines only the
+/// windows the answer holds.
+///
 /// # Errors
 ///
 /// Returns an error when the marker, a window manifest, or a window delta cannot be read.
-pub fn pending(context: &Context) -> Result<Pending> {
-    let data = context.data()?;
+pub fn pending(context: &Context, limit: Option<usize>) -> Result<Pending> {
+    pending_in(context.data()?, limit)
+}
+
+/// [`pending`] over a data directory, so it is testable without a whole [`Context`].
+fn pending_in(data: &DataDir, limit: Option<usize>) -> Result<Pending> {
     let path = data.marker();
     let marker = load(&path)?;
     let held = marker
@@ -128,9 +138,13 @@ pub fn pending(context: &Context) -> Result<Pending> {
                 .with_context(|| format!("reading the marker at {}", path.display()))
         })
         .transpose()?;
+    let mut after = windows::after(&data.windows(), held.as_ref())?;
+    if let Some(limit) = limit {
+        after.truncate(limit);
+    }
     let mut windows = Vec::new();
     let mut deltas = Vec::new();
-    for window in windows::after(&data.windows(), held.as_ref())? {
+    for window in after {
         let manifest = window.manifest()?;
         let delta = delta::read(&window)?;
         let dir = window.dir.strip_prefix(data.root()).with_context(|| {
@@ -245,4 +259,131 @@ fn load(path: &Path) -> Result<Option<Marker>> {
 fn write(path: &Path, marker: &Marker) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(marker).context("serializing the marker")?;
     write_replace(path, &bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use anyhow::Result;
+    use chrono::{TimeZone as _, Utc};
+
+    use super::{pending_in, write, Marker};
+    use crate::config::DataDir;
+    use crate::delta::Delta;
+    use crate::windows::{Manifest, Status};
+
+    /// Writes one completed window `id` under `data`, carrying `new_messages` new messages.
+    ///
+    /// A window counts as completed only when it holds `manifest.json`, `records.jsonl`,
+    /// `rendered.md` and `delta.json` (`windows::completed`), so this writes all four.
+    fn write_window(data: &DataDir, id: &str, new_messages: usize) -> Result<()> {
+        let end = Utc.with_ymd_and_hms(2026, 10, 30, 2, 0, 0).unwrap();
+        let dir = data.windows().join(id);
+        std::fs::create_dir_all(&dir)?;
+        let manifest = Manifest {
+            version: 1,
+            window: id.to_owned(),
+            generated_at: end,
+            window_end: end,
+            sources: BTreeMap::new(),
+            warnings: Vec::new(),
+            exit_status: Status::Ok,
+        };
+        std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
+        std::fs::write(dir.join("records.jsonl"), b"")?;
+        std::fs::write(dir.join("rendered.md"), b"# window\n")?;
+        let delta = Delta {
+            version: 1,
+            window: id.to_owned(),
+            window_end: end,
+            generated_at: end,
+            previous_window: None,
+            new_messages: (0..new_messages)
+                .map(|n| crate::delta::NewMessage {
+                    pointer: format!("echo:{id}/{n}"),
+                    label: None,
+                    ts: end,
+                    author: None,
+                    is_reply: false,
+                    thread: None,
+                    excerpt: String::new(),
+                    matches: Vec::new(),
+                })
+                .collect(),
+            unreviewed: Vec::new(),
+            closed_since_previous: Vec::new(),
+            opened_since_previous: Vec::new(),
+        };
+        std::fs::write(dir.join("delta.json"), serde_json::to_vec(&delta)?)?;
+        Ok(())
+    }
+
+    fn set_marker(data: &DataDir, window: &str) -> Result<()> {
+        write(
+            &data.marker(),
+            &Marker {
+                version: 1,
+                window: window.to_owned(),
+                advanced_at: Utc.with_ymd_and_hms(2026, 10, 30, 2, 0, 0).unwrap(),
+                by: "test".to_owned(),
+            },
+        )
+    }
+
+    fn ids(pending: &super::Pending) -> Vec<String> {
+        pending.windows.iter().map(|w| w.window.clone()).collect()
+    }
+
+    /// A session that reads `ctx pending --limit N` sees exactly the first N windows, oldest
+    /// first; the rest stay pending and the next cycle, after the marker advances past the
+    /// cap, reads them. This is the mechanism that keeps one failed cycle from handing the next
+    /// an ever-larger backlog: each run handles at most the cap, never the whole backlog.
+    #[test]
+    fn a_cap_leaves_the_windows_past_it_pending() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "ctx-memory-cap-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let data = DataDir::new(root.clone());
+        // Five completed windows after no marker, oldest first by id.
+        let windows = [
+            "20261030T020000Z-0000",
+            "20261030T021500Z-0000",
+            "20261030T023000Z-0000",
+            "20261030T024500Z-0000",
+            "20261030T030000Z-0000",
+        ];
+        for (n, id) in windows.iter().enumerate() {
+            write_window(&data, id, n + 1)?;
+        }
+
+        // No cap lists every pending window.
+        assert_eq!(ids(&pending_in(&data, None)?), windows);
+
+        // A cap of two lists only the two oldest, and the delta combines only those.
+        let capped = pending_in(&data, Some(2))?;
+        assert_eq!(ids(&capped), &windows[..2]);
+        let combined = capped.delta.as_ref().map_or(0, |d| d.new_messages.len());
+        assert_eq!(
+            combined, 3,
+            "delta combines windows 1 (1 msg) and 2 (2 msgs) only"
+        );
+
+        // The session handles the cap and advances the marker to the newest it handled; the
+        // next cycle's capped read is the remainder, never the windows already done.
+        set_marker(&data, windows[1])?;
+        let next = pending_in(&data, Some(2))?;
+        assert_eq!(ids(&next), &windows[2..4]);
+
+        // A cap larger than the backlog lists all of it and nothing waits.
+        set_marker(&data, windows[3])?;
+        assert_eq!(ids(&pending_in(&data, Some(10))?), &windows[4..]);
+
+        std::fs::remove_dir_all(&root).ok();
+        let _: &Path = root.as_path();
+        Ok(())
+    }
 }
