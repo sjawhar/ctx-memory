@@ -837,3 +837,389 @@ fn resolve_reads_only_the_channels_a_fetch_reads() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn a_fetch_asks_slack_about_each_person_and_channel_once() -> Result<()> {
+    let root = scratch("mention-names")?;
+    let end = at("2026-10-25T18:00:00Z")?;
+    let text = "<@U0EXAMPLEA> and <@U0EXAMPLED|ada>, <@U0UNKNOWN>: see <#C0EXAMPLE02|> \
+                and <#C0LAUNCH01|>, not <#G0SECRET01|>";
+    let mut api = FakeSlackApi::default();
+    for (channel, hours) in [("C0EXAMPLE01", 2), ("C0EXAMPLE02", 1)] {
+        api.histories.insert(
+            channel.to_owned(),
+            vec![json!({
+                "ts": slack_ts(end - Duration::hours(hours)),
+                "user": "U0AUTHOR01",
+                "text": text,
+            })],
+        );
+    }
+    api.channels = BTreeMap::from([
+        (
+            "C0EXAMPLE01".to_owned(),
+            json!({"name": "general", "is_private": false}),
+        ),
+        (
+            "C0EXAMPLE02".to_owned(),
+            json!({"name": "planning", "is_private": true}),
+        ),
+        (
+            "C0LAUNCH01".to_owned(),
+            json!({"name": "launch", "is_private": false}),
+        ),
+        (
+            "G0SECRET01".to_owned(),
+            json!({"name": "secret", "is_private": true}),
+        ),
+    ]);
+    api.users = BTreeMap::from([
+        (
+            "U0AUTHOR01".to_owned(),
+            Some(json!({"profile": {"display_name": "Kim"}})),
+        ),
+        (
+            "U0EXAMPLEA".to_owned(),
+            Some(json!({"profile": {"real_name": "Grace Hopper"}})),
+        ),
+        (
+            "U0EXAMPLED".to_owned(),
+            Some(json!({"real_name": "Ada Lovelace"})),
+        ),
+        ("U0UNKNOWN".to_owned(), None),
+    ]);
+    let request = fetch_request(
+        &root,
+        end,
+        vec!["C0EXAMPLE01".to_owned(), "C0EXAMPLE02".to_owned()],
+        Vec::new(),
+    );
+
+    let messages = fetch_messages(&request, &api)?;
+    std::fs::remove_dir_all(&root)?;
+
+    // A private channel this run reads is named; one it does not read keeps its id.
+    let expected = "@Grace Hopper and @Ada Lovelace, @U0UNKNOWN: see #planning \
+                    and #launch, not #G0SECRET01";
+    let fetched = records(&messages);
+    assert_eq!(
+        fetched
+            .iter()
+            .map(|record| record.text.as_str())
+            .collect::<Vec<_>>(),
+        [expected, expected]
+    );
+    assert!(fetched
+        .iter()
+        .all(|record| record.author.as_deref() == Some("Kim")));
+    let mut users = api.user_calls.borrow().clone();
+    users.sort();
+    assert_eq!(
+        users,
+        ["U0AUTHOR01", "U0EXAMPLEA", "U0EXAMPLED", "U0UNKNOWN"],
+        "one users.info call per person per run"
+    );
+    let mut channels = api.channel_calls.borrow().clone();
+    channels.sort();
+    assert_eq!(
+        channels,
+        ["C0EXAMPLE01", "C0EXAMPLE02", "C0LAUNCH01", "G0SECRET01"],
+        "one conversations.info call per channel per run"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_mention_whose_lookup_fails_keeps_its_id_and_is_warned() -> Result<()> {
+    let root = scratch("mention-lookup-fails")?;
+    let end = at("2026-10-25T18:00:00Z")?;
+    let mut api = FakeSlackApi::default();
+    api.histories.insert(
+        "C0EXAMPLE01".to_owned(),
+        vec![json!({
+            "ts": slack_ts(end - Duration::hours(1)),
+            "user": "U0AUTHOR01",
+            "text": "<@U0FLAKY01> please review",
+        })],
+    );
+    api.users
+        .insert("U0AUTHOR01".to_owned(), Some(json!({"real_name": "Kim"})));
+    api.user_errors
+        .insert("U0FLAKY01".to_owned(), "ratelimited".to_owned());
+    let request = fetch_request(&root, end, vec!["C0EXAMPLE01".to_owned()], Vec::new());
+
+    let messages = fetch_messages(&request, &api)?;
+    std::fs::remove_dir_all(&root)?;
+
+    assert_eq!(
+        records(&messages)
+            .iter()
+            .map(|record| record.text.as_str())
+            .collect::<Vec<_>>(),
+        ["@U0FLAKY01 please review"]
+    );
+    assert!(
+        stream_cursor(&messages, "C0EXAMPLE01").is_some(),
+        "the channel's stream still ends Ok"
+    );
+    assert!(
+        warnings(&messages)
+            .iter()
+            .any(|warning| warning.contains("U0FLAKY01") && warning.contains("ratelimited")),
+        "{:?}",
+        warnings(&messages)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_resolve_names_the_people_a_message_mentions() -> Result<()> {
+    let timestamp = "1792951800.000100";
+    let mut api = scoped_api(timestamp);
+    api.replies_by_thread.insert(
+        ("C0PUBLICIN0".to_owned(), timestamp.to_owned()),
+        vec![json!({
+            "ts": timestamp,
+            "user": "U0AUTHOR01",
+            "text": "<@U0EXAMPLEA> to decide",
+        })],
+    );
+    api.users = BTreeMap::from([
+        ("U0AUTHOR01".to_owned(), Some(json!({"real_name": "Kim"}))),
+        (
+            "U0EXAMPLEA".to_owned(),
+            Some(json!({"real_name": "Grace Hopper"})),
+        ),
+    ]);
+
+    let (result, messages) = resolve_one(&api, &[], &format!("slack:C0PUBLICIN0/{timestamp}"))?;
+    result?;
+
+    assert_eq!(
+        records(&messages)
+            .iter()
+            .map(|record| record.text.as_str())
+            .collect::<Vec<_>>(),
+        ["@Grace Hopper to decide"]
+    );
+    Ok(())
+}
+
+fn stream_error(messages: &[Message], channel: &str) -> Option<String> {
+    messages.iter().find_map(|message| match message {
+        Message::StreamEnd {
+            stream,
+            status: StreamStatus::Error,
+            error,
+            ..
+        } if stream == channel => error.clone(),
+        _ => None,
+    })
+}
+
+/// Slack is asked about each id once per run, whatever needs it. A lookup that failed for a
+/// mention still fails a channel whose author or label needs that id, as a failed author or
+/// channel lookup always has, and is not asked again.
+#[test]
+fn a_failed_lookup_is_kept_for_the_whole_run() -> Result<()> {
+    let root = scratch("mention-failure-kept")?;
+    let end = at("2026-10-25T18:00:00Z")?;
+    let mut api = FakeSlackApi::default();
+    for (channel, author, text) in [
+        (
+            "C0EXAMPLE01",
+            "U0AUTHOR01",
+            "<@U0FLAKY01> and <#C0EXAMPLE02|> please",
+        ),
+        ("C0EXAMPLE02", "U0AUTHOR01", "not read"),
+        ("C0EXAMPLE03", "U0FLAKY01", "my own words"),
+    ] {
+        api.histories.insert(
+            channel.to_owned(),
+            vec![json!({
+                "ts": slack_ts(end - Duration::hours(1)),
+                "user": author,
+                "text": text,
+            })],
+        );
+    }
+    api.users
+        .insert("U0AUTHOR01".to_owned(), Some(json!({"real_name": "Kim"})));
+    api.user_errors
+        .insert("U0FLAKY01".to_owned(), "ratelimited".to_owned());
+    api.channel_errors
+        .insert("C0EXAMPLE02".to_owned(), "channel_not_found".to_owned());
+    let request = fetch_request(
+        &root,
+        end,
+        vec![
+            "C0EXAMPLE01".to_owned(),
+            "C0EXAMPLE02".to_owned(),
+            "C0EXAMPLE03".to_owned(),
+        ],
+        Vec::new(),
+    );
+
+    let messages = fetch_messages(&request, &api)?;
+    std::fs::remove_dir_all(&root)?;
+
+    assert_eq!(
+        records(&messages)
+            .iter()
+            .map(|record| record.text.as_str())
+            .collect::<Vec<_>>(),
+        ["@U0FLAKY01 and #C0EXAMPLE02 please"]
+    );
+    assert!(stream_cursor(&messages, "C0EXAMPLE01").is_some());
+    for (channel, cause) in [
+        ("C0EXAMPLE02", "channel_not_found"),
+        ("C0EXAMPLE03", "ratelimited"),
+    ] {
+        let error = stream_error(&messages, channel)
+            .with_context(|| format!("{channel} must end in error"))?;
+        assert!(error.contains(cause), "{channel}: {error}");
+    }
+    let count = |calls: &RefCell<Vec<String>>, id: &str| {
+        calls.borrow().iter().filter(|call| *call == id).count()
+    };
+    assert_eq!(count(&api.user_calls, "U0FLAKY01"), 1);
+    assert_eq!(count(&api.channel_calls, "C0EXAMPLE02"), 1);
+    // The warning names the mention that kept its id. A channel Slack does not know is not a
+    // failure to warn of: Slack answers so for a private channel the user is not in.
+    let warned = warnings(&messages);
+    assert!(
+        warned.iter().any(|warning| warning.contains("U0FLAKY01")),
+        "{warned:?}"
+    );
+    assert!(
+        !warned.iter().any(|warning| warning.contains("C0EXAMPLE02")),
+        "{warned:?}"
+    );
+    Ok(())
+}
+
+/// A user Slack answers for with no name is shown by the mention's label, as an unknown one
+/// is; the author line still falls back to the id.
+#[test]
+fn a_user_slack_gives_no_name_is_shown_by_the_mention_label() -> Result<()> {
+    let timestamp = "1792951800.000100";
+    let mut api = scoped_api(timestamp);
+    api.replies_by_thread.insert(
+        ("C0PUBLICIN0".to_owned(), timestamp.to_owned()),
+        vec![json!({
+            "ts": timestamp,
+            "user": "U0NAMELESS",
+            "text": "<@U0NAMELESS|lin> decides",
+        })],
+    );
+    api.users
+        .insert("U0NAMELESS".to_owned(), Some(json!({"id": "U0NAMELESS"})));
+
+    let (result, messages) = resolve_one(&api, &[], &format!("slack:C0PUBLICIN0/{timestamp}"))?;
+    result?;
+
+    let record = records(&messages)
+        .first()
+        .copied()
+        .context("the message resolves")?;
+    assert_eq!(record.text, "@lin decides");
+    assert_eq!(record.author.as_deref(), Some("U0NAMELESS"));
+    Ok(())
+}
+
+/// Through Slack's own client: a user Slack answers `user_not_found` for and a channel it
+/// answers `channel_not_found` for keep their ids without a warning, a known user is named, and
+/// Slack is called exactly once for each.
+#[test]
+fn a_live_resolve_names_mentions_through_slacks_client() -> Result<()> {
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .map_err(|error| anyhow!("locking test environment: {error}"))?;
+    let timestamp = "1792951800.000100";
+    let message = json!({
+        "ok": true,
+        "messages": [{
+            "ts": timestamp,
+            "user": "U0AUTHOR01",
+            "text": "<@U0GONE0001> ask <@U0EXAMPLEA> in <#C0PRIVATE1|>",
+        }],
+    });
+    let (api, requests, server) = fake_http_api(vec![
+        r#"{"ok":true,"channels":[{"id":"C0EXAMPLE01","is_private":false,"is_member":true}]}"#
+            .to_owned(),
+        message.to_string(),
+        r#"{"ok":true,"channel":{"name":"general"}}"#.to_owned(),
+        r#"{"ok":true,"user":{"profile":{"display_name":"Kim"}}}"#.to_owned(),
+        r#"{"ok":false,"error":"user_not_found"}"#.to_owned(),
+        r#"{"ok":true,"user":{"real_name":"Grace Hopper"}}"#.to_owned(),
+        r#"{"ok":false,"error":"channel_not_found"}"#.to_owned(),
+    ])?;
+    let credential = r#"{"access":"test-token","refresh":"r","expires":"2099-01-01T00:00:00Z","client_id":"cid","token_url":"https://unused.example/token","resource":"https://mcp.slack.com"}"#;
+    let previous_credential = std::env::var_os("CTX_CREDENTIAL_SLACK");
+    let previous_secret = std::env::var_os("CTX_SECRET_SLACK");
+    std::env::remove_var("CTX_SECRET_SLACK");
+    std::env::set_var("CTX_CREDENTIAL_SLACK", credential);
+    let request = Request::Resolve(ResolveRequest {
+        protocol: PROTOCOL_VERSION,
+        source: SourceRef {
+            id: "slack".to_owned(),
+            kind: "slack".to_owned(),
+            scheme: "slack".to_owned(),
+        },
+        config: json!({"workspace": "acme"}),
+        pointers: vec![format!("slack:C0EXAMPLE01/{timestamp}")],
+        state_dir: std::env::temp_dir(),
+    });
+    let mut messages = Vec::new();
+    let result = SlackSource::with_api(api).run(&request, &mut |message| {
+        messages.push(message);
+        Ok(())
+    });
+    match previous_credential {
+        Some(value) => std::env::set_var("CTX_CREDENTIAL_SLACK", value),
+        None => std::env::remove_var("CTX_CREDENTIAL_SLACK"),
+    }
+    if let Some(value) = previous_secret {
+        std::env::set_var("CTX_SECRET_SLACK", value);
+    }
+    result?;
+    server
+        .join()
+        .map_err(|_| anyhow!("fake Slack API server panicked"))??;
+    let methods = requests
+        .lock()
+        .map_err(|error| anyhow!("locking requests: {error}"))?
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|path| path.split('?').next())
+                .unwrap_or_default()
+                .trim_start_matches('/')
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        methods,
+        [
+            "conversations.list",
+            "conversations.replies",
+            "conversations.info",
+            "users.info",
+            "users.info",
+            "users.info",
+            "conversations.info",
+        ]
+    );
+    let resolved = records(&messages);
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|record| (record.author.as_deref(), record.text.as_str()))
+            .collect::<Vec<_>>(),
+        [(Some("Kim"), "@U0GONE0001 ask @Grace Hopper in #C0PRIVATE1")]
+    );
+    assert!(warnings(&messages).is_empty(), "{:?}", warnings(&messages));
+    Ok(())
+}

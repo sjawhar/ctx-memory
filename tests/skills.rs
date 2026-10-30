@@ -137,6 +137,27 @@ fn the_waiting_on_pass_changes_only_what_its_sources_settle() -> Result<()> {
     Ok(())
 }
 
+/// The Slack source shows a person a message @-mentions by name, the way the waiting-on rule
+/// needs to find the person a message asks; a mention Slack could not name shows the handle
+/// the message carried or else a bare id, which names nobody.
+#[test]
+fn the_waiting_on_rule_says_how_a_slack_mention_reads() -> Result<()> {
+    let flat = skill("ctx-memory-ingest")?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "@-mentions as `@` and the name its author line gives them",
+        "the handle the message carried or else the bare id, such as `@U0123ABCD`, which names nobody",
+    ] {
+        assert!(
+            flat.contains(expected),
+            "the ingest skill's waiting_on rule never says {expected:?}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn the_ingest_skill_writes_through_the_server() -> Result<()> {
     let text = skill("ctx-memory-ingest")?;

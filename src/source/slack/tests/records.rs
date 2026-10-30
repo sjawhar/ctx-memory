@@ -16,6 +16,83 @@ fn permalink_uses_the_configured_workspace() -> Result<()> {
     Ok(())
 }
 
+fn rendered(text: &str, names: &[(&str, &str)]) -> Result<Record> {
+    let names = names
+        .iter()
+        .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
+        .collect();
+    record_from_message(
+        &json!({"ts": "1792951800.000100", "user": "U0EXAMPLEA", "text": text}),
+        "C0EXAMPLE01",
+        "#general",
+        &names,
+        "acme",
+    )
+}
+
+#[test]
+fn a_mention_reads_as_the_name_the_author_line_uses() -> Result<()> {
+    let text = "<@U0EXAMPLEA> can you ask <@U0EXAMPLED|ada> to decide?";
+    let record = rendered(
+        text,
+        &[
+            ("U0EXAMPLEA", "Grace Hopper"),
+            ("U0EXAMPLED", "Ada Lovelace"),
+        ],
+    )?;
+
+    assert_eq!(record.author.as_deref(), Some("Grace Hopper"));
+    assert_eq!(
+        record.text,
+        "@Grace Hopper can you ask @Ada Lovelace to decide?"
+    );
+    assert_eq!(
+        record.raw.get("text").and_then(Value::as_str),
+        Some(text),
+        "the record keeps Slack's own text, with the ids"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_mention_slack_cannot_name_keeps_its_label_or_its_id() -> Result<()> {
+    let record = rendered("<@U0UNKNOWN> and <@U0EXAMPLED|ada>, please", &[])?;
+
+    assert_eq!(record.text, "@U0UNKNOWN and @ada, please");
+    Ok(())
+}
+
+#[test]
+fn channel_group_and_broadcast_mentions_read_as_names() -> Result<()> {
+    let record = rendered(
+        "<#C0EXAMPLE02|design>, <#C0EXAMPLE03|>, <#C0EXAMPLE04>, \
+         <!subteam^S0EXAMPLE1|@platform>, <!subteam^S0EXAMPLE2>, \
+         <!here>, <!channel|channel>, <!everyone>",
+        &[("C0EXAMPLE03", "launch")],
+    )?;
+
+    assert_eq!(
+        record.text,
+        "#design, #launch, #C0EXAMPLE04, @platform, @S0EXAMPLE2, @here, @channel, @everyone"
+    );
+    Ok(())
+}
+
+#[test]
+fn typed_angle_brackets_are_not_mentions_and_links_stay() -> Result<()> {
+    // Slack escapes a typed `<`, `>` and `&`, so only its own sequences are mentions.
+    let record = rendered(
+        "&lt;@U0EXAMPLEA&gt; &amp; <https://example.com/?a=1&amp;b=2|the doc> <@U0EXAMPLEA",
+        &[("U0EXAMPLEA", "Grace Hopper")],
+    )?;
+
+    assert_eq!(
+        record.text,
+        "<@U0EXAMPLEA> & <https://example.com/?a=1&b=2|the doc> <@U0EXAMPLEA"
+    );
+    Ok(())
+}
+
 #[test]
 fn pre_window_parent_is_sent_as_a_context_record() -> Result<()> {
     let root = scratch("pre-window-parent")?;
