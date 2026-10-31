@@ -3,6 +3,7 @@
 
 mod filesystem;
 mod fixtures;
+mod job_log;
 mod live_session;
 mod outcome;
 mod policy;

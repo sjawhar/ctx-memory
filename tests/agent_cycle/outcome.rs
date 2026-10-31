@@ -29,6 +29,8 @@ pub(crate) struct Verdict {
     pub(crate) stderr: String,
     /// How many sessions the runner started.
     pub(crate) sessions: usize,
+    /// What the retry's transcript directory keeps as `events.jsonl` once the runner is done.
+    retry_kept: String,
 }
 
 impl Verdict {
@@ -48,7 +50,7 @@ pub(crate) const TIME_LIMIT: &str = "time limit";
 /// maintenance pass, where the sessions it starts end as `attempts` say, in order, and the marker
 /// never moves.
 pub(crate) fn runner_verdict(pass: Option<&str>, attempts: &[Attempt<'_>]) -> Result<Verdict> {
-    verdict(pass, attempts, None)
+    verdict(pass, attempts, None, None)
 }
 
 /// [`runner_verdict`], where the marker has moved once session `moved_by` (1 for the first) has
@@ -58,13 +60,17 @@ fn runner_verdict_moving_marker(
     attempts: &[Attempt<'_>],
     moved_by: usize,
 ) -> Result<Verdict> {
-    verdict(pass, attempts, Some(moved_by))
+    verdict(pass, attempts, Some(moved_by), None)
 }
 
+/// Runs the post-session code with `old_retry_capture` beside the retry's transcript directory
+/// when it starts, as an earlier attempt of the same execution whose capture no seal could move
+/// leaves it.
 fn verdict(
     pass: Option<&str>,
     attempts: &[Attempt<'_>],
     moved_by: Option<usize>,
+    old_retry_capture: Option<&str>,
 ) -> Result<Verdict> {
     let script = runner("run-cycle.sh")?;
     let lines: Vec<&str> = script.lines().collect();
@@ -86,7 +92,15 @@ fn verdict(
         .context("run-cycle.sh sets no SESSION_MINUTES")?;
 
     let dir = scratch("verdict")?;
-    let outcome = run_after_launch(&dir, pass, minutes, &after_launch, attempts, moved_by);
+    let outcome = run_after_launch(
+        &dir,
+        pass,
+        minutes,
+        &after_launch,
+        attempts,
+        moved_by,
+        old_retry_capture,
+    );
     remove_scratch(&dir)?;
     outcome
 }
@@ -98,7 +112,13 @@ fn run_after_launch(
     after_launch: &str,
     attempts: &[Attempt<'_>],
     moved_by: Option<usize>,
+    old_retry_capture: Option<&str>,
 ) -> Result<Verdict> {
+    if let Some(capture) = old_retry_capture {
+        let sessions = dir.join("data/agent-sessions");
+        std::fs::create_dir_all(sessions.join("ctx-agent-test-1-retry"))?;
+        std::fs::write(sessions.join("ctx-agent-test-1-retry.events.json"), capture)?;
+    }
     for (index, attempt) in attempts.iter().enumerate() {
         std::fs::write(dir.join(format!("events-{}", index + 1)), attempt.events)?;
         std::fs::write(
@@ -108,11 +128,13 @@ fn run_after_launch(
     }
     // What the script holds when its sessions start, and stand-ins for what reaches past this
     // machine: ctx-agent's checks pass, chown changes nothing, and `ctx marker show` answers `m1`
-    // until session VERDICT_MARKER_MOVED_BY has run, `m2` after.
+    // until session VERDICT_MARKER_MOVED_BY has run, `m2` after. A session leaves its events in
+    // the capture beside its transcript directory, where the real run_session's omp writes them.
     let prelude = format!(
         r#"set -eu
 {refuse}
 {complete}
+{seal}
 SESSION_MINUTES={minutes}
 AGENT_USER=ctx-agent
 pass='{pass}'
@@ -139,12 +161,12 @@ run_session() {{
 		return 99
 	fi
 	cp "$VERDICT_DIR/events-$attempt" "$session_dir.events.json"
-	cat "$session_dir.events.json"
 	return "$(cat "$VERDICT_DIR/status-$attempt")"
 }}
 "#,
         refuse = script_function("refuse")?,
         complete = script_function("pass_complete_line")?,
+        seal = script_function("seal_session")?,
         pass = pass.unwrap_or_default(),
     );
     let mut command = Command::new("sh");
@@ -167,6 +189,10 @@ run_session() {{
         status: output.status,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         sessions,
+        retry_kept: std::fs::read_to_string(
+            dir.join("data/agent-sessions/ctx-agent-test-1-retry/events.jsonl"),
+        )
+        .unwrap_or_default(),
     })
 }
 
@@ -790,6 +816,39 @@ fn a_refused_cycle_gets_one_fresh_session_judged_like_the_first() -> Result<()> 
     ensure!(
         verdict.sessions == 1,
         "the runner retried a session that was stopped by its time limit, not refused: {}",
+        verdict.stderr
+    );
+    Ok(())
+}
+
+/// A capture an earlier attempt of the same execution left beside the retry's transcript
+/// directory, which no seal could move, is moved into that directory before the retry's session
+/// writes its own capture there, so the retry never overwrites it.
+#[test]
+fn a_retry_keeps_the_capture_an_earlier_attempt_left_beside_its_directory() -> Result<()> {
+    let refused = refused();
+    let finished = finished("Handled 2 windows.");
+    let old = "{\"type\":\"agent_end\",\"note\":\"the earlier attempt's events\"}\n";
+    let verdict = verdict(
+        None,
+        &[
+            Attempt {
+                status: 1,
+                events: &refused,
+            },
+            Attempt {
+                status: 0,
+                events: &finished,
+            },
+        ],
+        None,
+        Some(old),
+    )?;
+    ensure_succeeded(&verdict, "the refused cycle's fresh session finished")?;
+    ensure!(
+        verdict.sessions == 2 && verdict.retry_kept == old,
+        "the retry did not keep the earlier attempt's capture in its directory (kept {:?}): {}",
+        verdict.retry_kept,
         verdict.stderr
     );
     Ok(())

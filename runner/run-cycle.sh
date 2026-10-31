@@ -39,6 +39,11 @@
 # a session its time limit stopped among them, which the pinned omp itself can report as a success
 # (judge_session).
 #
+# While a session runs, the job log gets one short line of JSON for each tool call and one for each
+# model turn, written as each ends (summarize_events; docs/deployment.md, "What the job log
+# holds"): never a record's text, a quote or anything a message said. omp's full event stream is
+# kept in the session's sealed transcript directory, as events.jsonl, and nowhere else.
+#
 # Every model call goes to the model API at CTX_MODEL_BASE_URL and nowhere else: the models.yml
 # this script writes as root before the session, from the provider file CTX_MODELS_FILE names,
 # names one provider at that address, and the session holds no other model key.
@@ -80,6 +85,30 @@ set -eu
 refuse() {
 	echo "run-cycle: refusing to start the session: $*" >&2
 	exit 1
+}
+
+# Gives transcript directory $1 back to root, closed to writes, and moves into it the capture of
+# its session's stdout that run_session left beside it, $1.events.json: omp's full event stream,
+# which the job log holds only in summary. The capture becomes events.jsonl in the directory, or
+# events.<n>.jsonl when an earlier attempt of the same execution left one there. It is moved, not
+# written, and only once the directory is root's, so nothing the session left at that name is
+# written through. A capture that cannot be moved stays beside the directory, root's, and fails
+# the seal like a directory that cannot be sealed; a later run moves it (below).
+seal_session() {
+	if ! { chown -R 0:0 "$1" && chmod -R go-w "$1"; }; then
+		return 1
+	fi
+	[ -e "$1.events.json" ] || return 0
+	kept="$1/events.jsonl"
+	kept_count=1
+	while [ -e "$kept" ] || [ -L "$kept" ]; do
+		kept="$1/events.$kept_count.jsonl"
+		kept_count=$((kept_count + 1))
+	done
+	if ! mv -- "$1.events.json" "$kept"; then
+		echo "run-cycle: could not move $1.events.json into $1; it stays beside it" >&2
+		return 1
+	fi
 }
 
 # Every refusal, a missing variable's too, is one line of refuse()'s form and exit status 1.
@@ -232,13 +261,20 @@ if [ -z "$pass" ]; then
 fi
 
 # The session's transcript directory is its own while it runs and root's from the moment this
-# script exits, however it exits: a sealed directory is the record of what that cycle did, and no
-# later session can rewrite it. A cycle or maintenance pass whose session is refused starts a
-# second one in its own directory; that refused attempt is sealed before the retry starts (below),
-# and this trap seals the directory of whichever attempt is current when the script exits.
+# script exits, however it exits: a sealed directory, with omp's full event stream moved into it,
+# is the record of what that cycle did, and no later session can rewrite it. A cycle or
+# maintenance pass whose session is refused starts a second one in its own directory; that refused
+# attempt is sealed before the retry starts (below), and this trap seals the directory of
+# whichever attempt is current when the script exits.
 session_dir="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION"
 mkdir -p "$session_dir"
-trap 'chown -R 0:0 "$session_dir" && chmod -R go-w "$session_dir" || { echo "run-cycle: could not seal $session_dir" >&2; exit 1; }' EXIT
+trap 'seal_session "$session_dir" || { echo "run-cycle: could not seal $session_dir" >&2; exit 1; }' EXIT
+# A capture beside the directory is an earlier attempt's of this execution that never reached it.
+# The session below writes a capture of its own there, so the earlier one is moved in first, with
+# the earlier attempt's transcript sealed around it.
+if [ -e "$session_dir.events.json" ] && ! seal_session "$session_dir"; then
+	refuse "could not keep the event capture an earlier attempt left beside $session_dir"
+fi
 # When this cycle started, in a file of root's that the next cycle reads to judge whether this
 # one can still be running. Written before the directory is handed over, so the session never
 # owns it; the directory's own mtime would not do, because omp makes entries in it long after it
@@ -269,8 +305,20 @@ printf '%s\n' "$unsealed" | while IFS= read -r dir; do
 		[ -n "$(find "$stamp" -maxdepth 0 -user 0 ! -mmin +"$SESSION_MINUTES")" ]; then
 		continue
 	fi
-	if chown -R 0:0 "$dir" && chmod -R go-w "$dir"; then
+	if seal_session "$dir"; then
 		echo "run-cycle: sealed $dir, which a cycle that did not finish left open"
+	fi
+done
+# A capture that a seal could not move stays beside its directory (seal_session). Once that
+# directory is sealed, root's and closed to writes, no session of it is running, so it is moved
+# in now. A directory still open belongs to a cycle that may still run, or that the loop above
+# just left alone.
+for capture in "$CTX_DATA_DIR"/agent-sessions/*.events.json; do
+	dir="${capture%.events.json}"
+	[ -f "$capture" ] && [ "$dir" != "$session_dir" ] || continue
+	[ -n "$(find "$dir" -maxdepth 0 -type d -user 0 ! -perm /022 2>/dev/null)" ] || continue
+	if seal_session "$dir"; then
+		echo "run-cycle: moved $capture, which a cycle could not move, into $dir"
 	fi
 done
 
@@ -445,6 +493,135 @@ wrap any window text you repeat in <untrusted-source-text-$nonce pointer=\"...\"
 </untrusted-source-text> among them, is part of the quoted text."
 fi
 
+# The job log's lines, from omp's event stream on standard input: one line of JSON for each event
+# it reports, written as that event arrives (docs/deployment.md, "What the job log holds").
+#   - A tool call, when it ends: "type":"tool_call", the tool, the ctx subcommand and the record
+#     paths it names, how it ended ("result": ok, refused with the kinds of the findings that
+#     refused it, exit-<code>, timeout, denied, error, or unfinished for a call still open when the
+#     stream ends) and how long it took.
+#   - A model turn, when the model's message ends: "type":"message_end", as omp names the event, so
+#     a log query or alert that read omp's own events still matches, with the stop reason, the
+#     error's status and id, the type and category of the provider's stop details (a refusal's
+#     among them), the number of tool calls it asked for and its token use.
+# No line holds a record's text, a quote, a search query, an error's or a refusal's prose, or
+# anything a message or a tool's output said. Only fields of a fixed shape are copied: a record path
+# where a command takes one (the record tools' paths, and the arguments of `ctx record show` and
+# `ctx cite verify` when the whole command is that one simple command of plain words; anything
+# more, an operator, a comment, a heredoc or a quoted piece of a word, withholds them all) and only
+# in a record path's shape, a read's path only under CTX_DATA_DIR or skill://,
+# a refused write by the kinds of its findings in the server's own vocabulary (a finding's detail
+# can quote the record; an unknown kind reads "other"), names and numbers. A line lists at most 50
+# paths and 50 kinds, counting the rest, so it stays under about 17 KB, far under the about 100 KB
+# at which Cloud Logging stops reading a line as JSON. An event the program cannot read is passed
+# over.
+summarize_events() {
+	jq -nRc --unbuffered --arg session "${CTX_SESSION-}" --arg data "${CTX_DATA_DIR-}" '
+		def name_shaped: type == "string" and test("^[A-Za-z][A-Za-z0-9_-]{0,63}$");
+		def record_path: type == "string" and test("^[A-Za-z0-9_][A-Za-z0-9_./-]{0,250}[.]md$");
+		def shown: if record_path then . else "(withheld)" end;
+		def listed($name; $limit): length as $all
+			| {($name): .[:$limit]} + (if $all > $limit then {($name + "_omitted"): ($all - $limit)} else {} end);
+		def read_path: if . == null then null
+			elif type == "string" and test("^[A-Za-z0-9_./:@+,=~-]{1,300}$")
+				and (startswith("skill://") or (($data | rtrimstr("/")) as $root | $root != "" and startswith($root + "/")))
+			then . else "(withheld)" end;
+		def unquoted: if test("^\u0027[^\u0027]*\u0027$") or test("^\"[^\"]*\"$") then .[1:-1] else . end;
+		def simple_arguments: test("\\A([ \t]+(--?[a-z][a-z-]*|[A-Za-z0-9_./-]+|\u0027[A-Za-z0-9_./-]+\u0027|\"[A-Za-z0-9_./-]+\"))*[ \t]*\\z");
+		def positional: [splits("[ \t]+") | select(length > 0) | select(startswith("-") | not) | unquoted];
+		def shell_call:
+			((.command? | strings) // "") as $command
+			| (($command | capture("\\A[ \t]*ctx[ \t]+(?<verb>[a-z][a-z-]{0,31})(?<rest>(\\s[\\s\\S]*)?)\\z")) // null) as $parsed
+			| if $parsed == null then {}
+			else
+				(if $parsed.verb == "record" or $parsed.verb == "cite" or $parsed.verb == "marker" then
+					(($parsed.rest | capture("\\A[ \t]+(?<object>[a-z][a-z-]{0,31})(?<rest>(\\s[\\s\\S]*)?)\\z")) // null)
+				else null end) as $sub
+				| (if $sub != null then "\($parsed.verb) \($sub.object)" else $parsed.verb end) as $name
+				| (if $sub != null then $sub.rest else $parsed.rest end) as $rest
+				| {command: $name}
+					+ (if ($name == "record show" or $name == "cite verify") and ($rest | simple_arguments | not) then
+						{paths: ["(withheld)"]}
+					elif $name == "record show" then
+						($rest | positional) as $args
+						| {paths: (if ($args | length) == 1 then [$args[0] | shown] elif $args == [] then [] else ["(withheld)"] end)}
+					elif $name == "cite verify" then [$rest | positional | .[] | shown] | listed("paths"; 50)
+					else {} end)
+			end;
+		def call_facts($tool):
+			if $tool == "bash" then shell_call
+			elif $tool == "ctx_record_put" then {command: "record put"} + ([.records[]? | .path? | shown] | listed("paths"; 50))
+			elif $tool == "ctx_record_rm" then {command: "record rm", paths: [.path? | shown]}
+			elif $tool == "read" or $tool == "grep" or $tool == "glob" then {path: (.path? | read_path)}
+			else {} end;
+		def known_kinds: ["quote", "unchecked", "not-a-record", "credential", "gap", "ambiguous", "schema",
+			"frontmatter-invalid", "untiered", "unquoted", "negative", "rules-missing", "rules-wrong-type",
+			"rules-oversize"];
+		# A finding line of the CLI report is "  <kind> — <detail>", or "  <path>: <kind> — <detail>" in
+		# a batch, where the path can hold ": " and " — " itself: the kind is the first word shaped as
+		# a kind that starts the line or follows a ": ", and is followed by " — ". jq reads raw
+		# input in pieces and turns a character split across two of them into U+FFFD replacement
+		# characters (jq 1.7.1 and 1.8.1 alike), so a run of those stands for the dash.
+		def finding_kind:
+			select(startswith("  ")) | .[2:] | gsub("\ufffd+"; "—")
+			| capture("^(?:.*?: )??(?<kind>[a-z][a-z0-9-]{0,63}) — ").kind
+			| . as $kind | if any(known_kinds[]; . == $kind) then $kind else "other" end;
+		def outcome:
+			if .isError != true then {result: "ok"}
+			else
+				([.result.content[]? | select(.type? == "text") | .text | strings] | join("\n")) as $text
+				| if (.toolName == "ctx_record_put" or .toolName == "ctx_record_rm")
+					and ($text | test("(^|\n)(Error: )?refused ")) then
+					{result: "refused"} + ([$text | split("\n")[] | finding_kind] | listed("refusals"; 50))
+				elif (.result.details.exitCode? | type) == "number" then {result: "exit-\(.result.details.exitCode)"}
+				elif .result.details.timedOut? == true then {result: "timeout"}
+				elif ($text | startswith("Tool \"")) and ($text | contains("requires approval")) then {result: "denied"}
+				else {result: "error"}
+					+ (($text | capture("the server answered (?<status>[0-9]{3})") | {status: (.status | tonumber)}) // {})
+				end
+			end;
+		def tool_line($call; $outcome; $time):
+			{type: "tool_call", severity: (if $outcome.result == "ok" then "INFO" else "WARNING" end),
+				session: $session, tool: ($call.tool | if name_shaped then . else "(other)" end)}
+			+ $call.facts + $outcome
+			+ {duration_ms: (if ($call.started | type) == "number" then (($time - $call.started) * 1000 | floor) else null end)}
+			| if any(.refusals[]?; . == "credential") then .paths |= map("(withheld)") else . end;
+		def turn_line($message):
+			{type: "message_end",
+				severity: (if $message.stopReason == "stop" or $message.stopReason == "toolUse" then "INFO" else "WARNING" end),
+				session: $session,
+				message: ({role: "assistant", stopReason: ($message.stopReason | if name_shaped then . else null end)}
+					+ ($message | {errorStatus, errorId} | with_entries(select(.value | type == "number")))
+					+ (if ($message.stopDetails | type) == "object" then
+						{stopDetails: ($message.stopDetails | {type, category} | with_entries(select(.value != null))
+							| map_values(if name_shaped then . else "(withheld)" end))}
+					else {} end)),
+				tool_calls: ([$message.content[]? | select(.type? == "toolCall")] | length)}
+			+ (if ($message.usage | type) == "object" then
+				{usage: ($message.usage | {input, output, cacheRead, cacheWrite} | with_entries(select(.value | type == "number")))}
+				+ (($message.usage.cost.total? | numbers | {cost: .}) // {})
+			else {} end);
+		foreach ((inputs | fromjson? | objects), null) as $event ({calls: {}, lines: []};
+			. as $state
+			| try (
+				now as $time
+				| .lines = []
+				| if $event == null then
+					.lines = [.calls[] | tool_line(.; {result: "unfinished"}; $time)] | .calls = {}
+				elif $event.type == "tool_execution_start" then
+					.calls[$event.toolCallId | tostring] =
+						{tool: $event.toolName, facts: ($event.args | call_facts($event.toolName)), started: $time}
+				elif $event.type == "tool_execution_end" then
+					($event.toolCallId | tostring) as $id
+					| (.calls[$id] // {tool: $event.toolName, facts: {}, started: null}) as $call
+					| .lines = [tool_line($call; $event | outcome; $time)]
+					| del(.calls[$id])
+				elif $event.type == "message_end" and $event.message.role? == "assistant" then
+					.lines = [turn_line($event.message)]
+				else . end)
+			catch ($state | .lines = []);
+			.lines[])'
+}
+
 # --approval-mode write with policy.yml: the ctx subcommands the cycle runs are the only programs
 # the session can start, every other command keeps the exec tier and a headless session cannot
 # approve one. --tools loads no tool that runs code, reaches the network, spawns a subagent or
@@ -465,14 +642,16 @@ fi
 # arguments are built here rather than once above because each attempt names its own transcript
 # directory in --session-dir.
 run_session() {
-	# omp emits a model refusal on its stdout event stream (--mode json), not into the transcript
-	# it saves under --session-dir, so its stdout is captured here and read for a refusal after the
-	# session. The capture sits beside the transcript directory, a file root owns under
-	# agent-sessions, which is the share's and closed to the session's user, so the session cannot
-	# forge or hide a refusal in it; and omp writes only its own structured events there, a window's
-	# text reaching them JSON-escaped. The whole capture is written back to this script's stdout
-	# when the session ends, so the container log still holds every event, after the session instead
-	# of during it, and the capture is on the share, not the container's memory.
+	# omp writes its events to its stdout (--mode json), one JSON object a line, and a model refusal
+	# is one of them, not in the transcript omp saves under --session-dir. The stream is captured to
+	# a file beside the transcript directory, a file root owns under agent-sessions, which is the
+	# share's and closed to the session's user, so the session cannot forge or hide a refusal in it;
+	# and omp writes only its own structured events there, a window's text reaching them
+	# JSON-escaped. The capture is on the share, not in the container's memory. After the session it
+	# is read for a refusal and for how the session ended, and seal_session moves it into the sealed
+	# transcript directory, the one place the whole stream is kept. The job log gets only
+	# summarize_events' short lines, as the session goes: an event written to it whole would be lost
+	# whenever it passed about 100 KB, and the whole stream written at once lost entries in bursts.
 	event_log="$session_dir.events.json"
 	: >"$event_log"
 	set -- setpriv --reuid="$AGENT_USER" --regid="$agent_group" --init-groups --no-new-privs \
@@ -498,13 +677,24 @@ run_session() {
 	"$@" >"$event_log" &
 	session_pid=$!
 	trap 'kill -TERM "$session_pid" 2>/dev/null || :' TERM INT HUP
+	# tail follows the capture from its first line, and once the session is gone it reads what the
+	# session wrote last and stops (--pid). The share is a network filesystem, where tail polls the
+	# file rather than being told it grew, so it looks every tenth of a second. omp writes the
+	# capture itself, so a summary that stops or falls behind costs job-log lines, never an event
+	# of the capture, and never holds up the session.
+	tail -n +1 -s 0.1 -f --pid="$session_pid" "$event_log" | summarize_events &
+	summary_pid=$!
 	session_status=0
 	wait "$session_pid" || session_status=$?
 	while kill -0 "$session_pid" 2>/dev/null; do
 		session_status=0
 		wait "$session_pid" || session_status=$?
 	done
-	cat "$event_log"
+	# The summary's last lines, a call the session left open among them, reach the log before the
+	# runner's own line about how the session ended.
+	while kill -0 "$summary_pid" 2>/dev/null; do
+		wait "$summary_pid" || :
+	done
 	return "$session_status"
 }
 
@@ -656,10 +846,10 @@ check_pass_marker
 # checked, as the first session's are.
 if [ "$status" -ne 0 ] && [ -z "$marker_moved" ] && session_refused "$session_dir.events.json"; then
 	echo "run-cycle: the session was stopped by a model refusal; starting one fresh session"
-	# The refused attempt's transcript is sealed now, before the retry opens its own directory:
-	# the sweep that seals what an unfinished cycle left open runs once, above, and a directory
-	# left writable here would be the next cycle's to seal.
-	if ! { chown -R 0:0 "$session_dir" && chmod -R go-w "$session_dir"; }; then
+	# The refused attempt's transcript is sealed now, with its capture moved into it, before the
+	# retry opens its own directory: the sweep that seals what an unfinished cycle left open runs
+	# once, above, and a directory left writable here would be the next cycle's to seal.
+	if ! seal_session "$session_dir"; then
 		refuse "could not seal $session_dir"
 	fi
 	session_dir="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION-retry"
@@ -667,6 +857,11 @@ if [ "$status" -ne 0 ] && [ -z "$marker_moved" ] && session_refused "$session_di
 	# traces back to the session that sent it: CTX_SESSION names them all.
 	export CTX_SESSION="$CLOUD_RUN_EXECUTION-retry"
 	mkdir -p "$session_dir"
+	# As for the first attempt: a capture an earlier attempt of this execution left beside the
+	# retry's directory is moved in before this session writes its own there.
+	if [ -e "$session_dir.events.json" ] && ! seal_session "$session_dir"; then
+		refuse "could not keep the event capture an earlier attempt left beside $session_dir"
+	fi
 	rm -f "$session_dir/.started"
 	: >"$session_dir/.started"
 	chown "$AGENT_USER" "$session_dir"
@@ -688,8 +883,5 @@ if [ "$status" -ne 0 ] && [ -z "$marker_moved" ] && session_refused "$session_di
 	judge_session
 	check_pass_marker
 fi
-# The captured stdout has gone to the container log and been read for a refusal; the sealed
-# transcript is the record kept on the share, so the captures are removed.
-rm -f "$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION.events.json" \
-	"$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION-retry.events.json"
+# The EXIT trap seals the current attempt's transcript directory and moves its capture into it.
 exit "$status"

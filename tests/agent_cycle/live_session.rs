@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use crate::fixtures::{
     remove_scratch, repo, runner, scratch, write_executable, EXAMPLE_MODEL, EXAMPLE_MODEL_ID,
 };
+use crate::job_log::{field_at, is_refusal, lines_of, summarized, tool_line};
 use crate::outcome::{runner_verdict, Attempt, TIME_LIMIT};
 use crate::policy::{maintenance_prompt, pass_complete_line};
 
@@ -443,6 +444,7 @@ struct SessionEnd {
 /// fixed environment, and `extra` after the cycle's own omp arguments, where a repeated flag wins
 /// (`cli/flag-tables.ts:209-219`), so a probe can widen what the cycle allows. Every call the
 /// session made must have reached `model` as models.yml routes it, and omp must have exited 0.
+/// Answers how the session ended.
 fn run_session(
     omp: &std::ffi::OsStr,
     root: &Path,
@@ -450,7 +452,7 @@ fn run_session(
     prompt: &str,
     env: &[(&str, &str)],
     extra: &[&str],
-) -> Result<()> {
+) -> Result<SessionEnd> {
     let end = run_omp(omp, root, model, prompt, env, extra)?;
     ensure!(
         end.status.success(),
@@ -458,7 +460,8 @@ fn run_session(
         end.status,
         end.stderr
     );
-    model.check_gateway_route()
+    model.check_gateway_route()?;
+    Ok(end)
 }
 
 /// [`run_session`], whatever omp's exit status: how the session ended.
@@ -678,7 +681,9 @@ fn calls_received(calls: &Path) -> Vec<(Vec<String>, Option<String>)> {
 /// input, several go to `ctx record put --batch -` as one JSON list, and no shell runs, so no
 /// text in a record is refused or read as shell, nested bullets, ` - ` and `reboot` among them.
 /// A stand-in `ctx` keeps the arguments and standard input of each call; it refuses a record
-/// that holds `REFUSE`, as the server refuses one. No model is called.
+/// that holds `REFUSE`, as the server refuses one, with the report the CLI prints for a refused
+/// write (tests/server.rs pins its form). The job log run-cycle.sh makes of omp's events holds
+/// one line for each call and none of the records' text. No model is called.
 #[test]
 #[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
 fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
@@ -692,7 +697,7 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
     write_executable(
         &bin.join("ctx"),
         &format!(
-            "#!/bin/sh\ncall='{dir}'/$(ls '{dir}' | wc -l)\nmkdir \"$call\"\ni=0\nfor arg in \"$@\"; do\n  printf '%s' \"$arg\" > \"$call/$i\"\n  i=$((i + 1))\ndone\n[ \"$2\" = rm ] || cat > \"$call/stdin\"\nif grep -q REFUSE \"$call/stdin\" 2>/dev/null; then echo 'refused: the record holds REFUSE' >&2; exit 1; fi\necho stored\n",
+            "#!/bin/sh\ncall='{dir}'/$(ls '{dir}' | wc -l)\nmkdir \"$call\"\ni=0\nfor arg in \"$@\"; do\n  printf '%s' \"$arg\" > \"$call/$i\"\n  i=$((i + 1))\ndone\n[ \"$2\" = rm ] || cat > \"$call/stdin\"\nif grep -q REFUSE \"$call/stdin\" 2>/dev/null; then printf 'refused %s\\n  quote — the record holds REFUSE\\n' \"$4\"; exit 1; fi\necho stored\n",
             dir = calls.display()
         ),
     )?;
@@ -722,7 +727,7 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
     );
     let received = calls_received(&calls);
     remove_scratch(&root)?;
-    outcome?;
+    let end = outcome?;
 
     let results = model.tool_results()?;
     let result = |step: usize| -> Result<(bool, String)> {
@@ -762,7 +767,7 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
     ensure!(!error && text.contains("stored"), "the put failed: {text}");
     let (error, text) = result(1)?;
     ensure!(
-        error && text.contains("refused: the record holds REFUSE"),
+        error && text.contains("quote — the record holds REFUSE"),
         "a refused put did not fail with ctx's findings: {text}"
     );
     let (error, text) = result(2)?;
@@ -772,6 +777,50 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
     );
     let (error, text) = result(3)?;
     ensure!(!error && text.contains("stored"), "the rm failed: {text}");
+    the_record_tool_calls_are_one_job_log_line_each(&end.stdout)
+}
+
+/// The job log run-cycle.sh makes of the live record session's events: one line for each record
+/// tool call, naming its record paths and how the stand-in server answered, the refusal by the
+/// kind of its finding, and none of the records' text.
+fn the_record_tool_calls_are_one_job_log_line_each(events: &str) -> Result<()> {
+    let log = summarized(events)?;
+    let text = serde_json::to_string(&log)?;
+    for secret in ["reboot", "Heading", "REFUSE", "Left, see", "quoted"] {
+        ensure!(
+            !text.contains(secret),
+            "the job log holds the records' text ({secret}): {text}"
+        );
+    }
+    let put = |paths: &[&str], result: &str| json!({"tool": "ctx_record_put", "command": "record put", "paths": paths, "result": result});
+    let mut refused = put(&["(withheld)"], "refused");
+    if let Some(fields) = refused.as_object_mut() {
+        fields.insert("refusals".to_owned(), json!(["quote"]));
+    }
+    let expected = vec![
+        tool_line("INFO", &put(&["decisions/probe.md"], "ok")),
+        tool_line("WARNING", &refused),
+        tool_line(
+            "INFO",
+            &put(&["decisions/left.md", "decisions/right.md"], "ok"),
+        ),
+        tool_line(
+            "INFO",
+            &json!({"tool": "ctx_record_rm", "command": "record rm", "paths": ["decisions/probe.md"], "result": "ok"}),
+        ),
+    ];
+    let calls = lines_of(&log, "tool_call")?;
+    ensure!(
+        calls == expected,
+        "the job log does not hold one line for each record tool call: {calls:?}\nomp's events:\n{events}"
+    );
+    ensure!(
+        log.iter()
+            .any(|line| field_at(line, "/type") == "message_end"
+                && field_at(line, "/message/stopReason") == "toolUse")
+            && !log.iter().any(is_refusal),
+        "the job log does not hold the model's turns: {log:?}"
+    );
     Ok(())
 }
 
@@ -1006,6 +1055,50 @@ fn a_live_maintenance_session_reads_its_pass_and_runs_its_commands() -> Result<(
         "the runner failed a pass that ended with its completion report ({}): {}",
         verdict.status,
         verdict.stderr
+    );
+    the_shell_and_read_calls_are_one_job_log_line_each(&end.stdout)
+}
+
+/// The job log run-cycle.sh makes of the live maintenance session's events: one line for each
+/// call, naming the read's path, each ctx subcommand run at the shell and the record path it
+/// names, and nothing the commands printed.
+fn the_shell_and_read_calls_are_one_job_log_line_each(events: &str) -> Result<()> {
+    let log = summarized(events)?;
+    let named: Vec<Value> = lines_of(&log, "tool_call")?
+        .iter()
+        .map(|line| {
+            json!([
+                field_at(line, "/tool"),
+                field_at(line, "/command"),
+                field_at(line, "/paths"),
+                field_at(line, "/path"),
+            ])
+        })
+        .collect();
+    let expected = vec![
+        json!([
+            "read",
+            null,
+            null,
+            "skill://ctx-memory-ingest/maintenance/waiting-on.md"
+        ]),
+        json!(["bash", "open", null, null]),
+        json!([
+            "bash",
+            "record show",
+            ["decisions/record-provenance.md"],
+            null
+        ]),
+        json!(["bash", "resolve", null, null]),
+    ];
+    ensure!(
+        named == expected,
+        "the job log does not name each call's tool, command and paths: {named:?}\nomp's events:\n{events}"
+    );
+    let text = serde_json::to_string(&log)?;
+    ensure!(
+        !text.contains("type: decision") && !text.contains("waiting_on"),
+        "the job log holds what the commands printed: {text}"
     );
     Ok(())
 }

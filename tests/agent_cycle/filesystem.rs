@@ -6,7 +6,9 @@ use std::process::Command;
 
 use anyhow::{ensure, Context as _, Result};
 
-use crate::fixtures::{remove_scratch, repo, runner, scratch, write_executable, EXAMPLE_MODEL};
+use crate::fixtures::{
+    remove_scratch, repo, runner, scratch, script_function, write_executable, EXAMPLE_MODEL,
+};
 
 /// Stand-ins for what `run-cycle.sh` calls, so the script runs on a machine without the
 /// image: `ctx` reports one pending window and `omp` records that it was started. The model
@@ -534,7 +536,7 @@ fn the_cycle_refuses_a_session_user_that_can_write_the_share() -> Result<()> {
 }
 
 /// The session's transcript is the record of what it did; the script stays to give it back
-/// to root once omp exits, rather than handing its process to omp.
+/// to root once omp exits, rather than handing its process to omp, and seals it however it exits.
 #[test]
 fn the_cycle_seals_its_transcript_after_the_session() -> Result<()> {
     let script = runner("run-cycle.sh")?;
@@ -548,14 +550,85 @@ fn the_cycle_seals_its_transcript_after_the_session() -> Result<()> {
         "run-cycle.sh still execs, so nothing runs after the session to seal its transcript"
     );
     ensure!(
-        code.iter()
-            .any(|line| line.contains("chown -R 0:0 \"$session_dir\"")),
+        script_function("seal_session")?.contains("chown -R 0:0 \"$1\""),
         "run-cycle.sh never gives the session directory back to root"
     );
     ensure!(
-        code.iter()
-            .any(|line| line.starts_with("trap ") && line.contains("EXIT")),
+        code.iter().any(|line| line.starts_with("trap ")
+            && line.contains("EXIT")
+            && line.contains("seal_session \"$session_dir\"")),
         "run-cycle.sh seals the transcript only on its happy path"
+    );
+    Ok(())
+}
+
+/// Sealing a transcript directory moves the capture of omp's stdout beside it into it, so the
+/// whole event stream is kept with the transcript, root's, and only there. A capture an earlier
+/// attempt of the same execution left in the directory is kept beside the new one, and a name the
+/// session left there, a link among them, is never written through: the capture takes the next
+/// free name. A capture that cannot be moved fails the seal, says so, and stays where it was.
+#[test]
+fn sealing_moves_the_event_capture_into_the_transcript() -> Result<()> {
+    let root = scratch("seal-capture")?;
+    let dir = root.join("agent-sessions/ctx-agent-test-1");
+    std::fs::create_dir_all(&dir)?;
+    let capture = root.join("agent-sessions/ctx-agent-test-1.events.json");
+    let elsewhere = root.join("elsewhere");
+    let seal = |events: &str, stubs: &str| -> Result<std::process::Output> {
+        std::fs::write(&capture, events)?;
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -eu\nchown() {{ :; }}\n{stubs}\n{}\nseal_session \"$1\"",
+                script_function("seal_session")?
+            ))
+            .arg("seal")
+            .arg(&dir)
+            .output()
+            .context("running seal_session")
+    };
+    let first = seal("{\"type\":\"agent_start\"}\n", "")?;
+    let second = seal("{\"type\":\"agent_end\"}\n", "")?;
+    std::os::unix::fs::symlink(&elsewhere, dir.join("events.2.jsonl"))?;
+    let third = seal("{\"type\":\"session\"}\n", "")?;
+    let capture_left = capture.exists();
+    let unmoved = seal("{\"type\":\"turn_end\"}\n", "mv() { return 1; }")?;
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+    let kept = (
+        read("events.jsonl"),
+        read("events.1.jsonl"),
+        read("events.3.jsonl"),
+    );
+    let stayed = std::fs::read_to_string(&capture).unwrap_or_default();
+    let elsewhere_written = elsewhere.exists();
+    remove_scratch(&root)?;
+
+    for (label, output) in [("first", &first), ("second", &second), ("third", &third)] {
+        ensure!(
+            output.status.success(),
+            "sealing failed the {label} time: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    ensure!(
+        kept == (
+            "{\"type\":\"agent_start\"}\n".to_owned(),
+            "{\"type\":\"agent_end\"}\n".to_owned(),
+            "{\"type\":\"session\"}\n".to_owned()
+        ),
+        "the transcript does not keep each capture under its own name: {kept:?}"
+    );
+    ensure!(!capture_left, "the capture stayed beside the transcript");
+    ensure!(
+        !elsewhere_written,
+        "sealing wrote through a link the session left in its directory"
+    );
+    ensure!(
+        !unmoved.status.success()
+            && String::from_utf8_lossy(&unmoved.stderr).contains("run-cycle: could not move")
+            && stayed == "{\"type\":\"turn_end\"}\n",
+        "a capture that could not be moved did not fail the seal, say so and stay: {}",
+        String::from_utf8_lossy(&unmoved.stderr)
     );
     Ok(())
 }
@@ -606,8 +679,9 @@ fn the_cycle_retries_once_after_a_model_refusal() -> Result<()> {
          beside the sealed transcript"
     );
     ensure!(
-        has("cat \"$event_log\""),
-        "run-cycle.sh drops the captured stdout instead of writing it back to the container log"
+        !has("cat \"$event_log\""),
+        "run-cycle.sh writes the whole captured stdout to the job log, where Cloud Logging drops \
+         events over its line limit and in bursts, rather than its summary"
     );
     let retry = code
         .iter()
