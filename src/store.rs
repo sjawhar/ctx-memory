@@ -139,6 +139,8 @@ impl Store {
                 PRIMARY KEY (pointer, version)
             );
             CREATE INDEX IF NOT EXISTS record_thread ON record(thread);
+            CREATE INDEX IF NOT EXISTS record_author
+                ON record(json_extract(json, '$.author_id'), ts);
             CREATE TABLE IF NOT EXISTS source_metadata (
                 source TEXT PRIMARY KEY,
                 verbatim INTEGER NOT NULL CHECK (verbatim IN (0, 1))
@@ -608,6 +610,58 @@ impl Store {
             .map(|record| decode_record(&record))
             .collect()
     }
+
+    /// The newest text the records `author_id` wrote, under one of `schemes`, hold at `path`, a
+    /// JSON path into the stored record such as `$.author`: the newest that is neither empty nor
+    /// the author's id, which a source writes when it could not learn the name.
+    ///
+    /// The index on `author_id` answers it from that author's own records, newest first, so it
+    /// reads only the ones the answer passes over, never the whole store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read the records.
+    pub fn authored(
+        &self,
+        schemes: &[String],
+        author_id: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        if schemes.is_empty() {
+            return Ok(None);
+        }
+        let mut statement = self
+            .conn
+            .prepare(&authored_query(schemes.len()))
+            .context("preparing the author name lookup")?;
+        let parameters = [author_id, path]
+            .into_iter()
+            .chain(schemes.iter().map(String::as_str));
+        let value: Option<String> = statement
+            .query_row(rusqlite::params_from_iter(parameters), |row| row.get(0))
+            .optional()
+            .with_context(|| format!("reading what {author_id}'s records hold at {path}"))?;
+        Ok(value.map(|value| value.trim().to_owned()))
+    }
+}
+
+/// [`Store::authored`]'s query for `schemes` schemes: `?1` the author's id, `?2` the JSON path,
+/// and `?3` onward the schemes. It names `author_id` exactly as the `record_author` index does,
+/// which is what lets SQLite answer it from that index.
+fn authored_query(schemes: usize) -> String {
+    let in_schemes = (0..schemes)
+        .map(|index| format!("?{}", index + 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT json_extract(json, ?2) FROM record
+         WHERE json_extract(json, '$.author_id') = ?1
+           AND scheme IN ({in_schemes})
+           AND typeof(json_extract(json, ?2)) = 'text'
+           AND trim(json_extract(json, ?2)) NOT IN ('', ?1)
+         ORDER BY ts DESC, rowid DESC
+         LIMIT 1"
+    )
 }
 
 /// Reports whether the store at `path` is one this build can read.
@@ -799,7 +853,7 @@ mod tests {
     use anyhow::{Context as _, Result};
     use chrono::{DateTime, TimeZone as _, Utc};
 
-    use super::{publish, Store};
+    use super::{authored_query, publish, Store};
     use crate::config::{DataDir, StateDir};
     use crate::pointer::Pointer;
     use crate::record::Record;
@@ -1388,6 +1442,77 @@ mod tests {
         assert!(
             failures.is_empty(),
             "two rebuilds at once both answer from the windows: {failures:?}"
+        );
+        Ok(())
+    }
+
+    /// A person's name is read from the records they wrote, newest first: a record whose text
+    /// at the path is empty or the author's own id names nobody, and a record of a scheme not
+    /// asked about is not read. SQLite answers through the index on `author_id`.
+    #[test]
+    fn an_authors_name_comes_from_their_newest_record_through_the_author_index() -> Result<()> {
+        let root = scratch("authored")?;
+        let store = Store::open(
+            &root.join("store.sqlite3"),
+            &root.join("sources.json"),
+            &root.join("resolved"),
+        )?;
+        let by = |pointer: &str, hour: u32, author: &str, full: Option<&str>| {
+            let mut written = record(pointer, "a message");
+            written.ts = at(hour);
+            written.author = Some(author.to_owned());
+            written.author_id = Some("U0EXAMPLEA".to_owned());
+            if let Some(full) = full {
+                written.raw = serde_json::json!({ "user_profile": { "real_name": full } });
+            }
+            written
+        };
+        store.put_all(
+            "slack",
+            &[
+                by("slack:C0EXAMPLE01/1", 9, "Kimberly", Some("Kim Lee")),
+                by("slack:C0EXAMPLE01/2", 10, "Kim", Some("")),
+                by("slack:C0EXAMPLE01/3", 11, "U0EXAMPLEA", None),
+            ],
+            at(12),
+        )?;
+        store.put_all(
+            "other",
+            &[by(
+                "other:C0EXAMPLE01/4",
+                12,
+                "Someone Else",
+                Some("Someone Else"),
+            )],
+            at(12),
+        )?;
+        let slack = ["slack".to_owned()];
+        let full = store.authored(&slack, "U0EXAMPLEA", "$.raw.user_profile.real_name")?;
+        let author = store.authored(&slack, "U0EXAMPLEA", "$.author")?;
+        let nobody = store.authored(&slack, "U0EXAMPLEB", "$.author")?;
+        let no_scheme = store.authored(&[], "U0EXAMPLEA", "$.author")?;
+        let plan = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                authored_query(slack.len())
+            ))?
+            .query_map(
+                rusqlite::params!["U0EXAMPLEA", "$.author", "slack"],
+                |row| row.get::<_, String>(3),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(store);
+        remove_scratch(&root)?;
+
+        assert_eq!(full.as_deref(), Some("Kim Lee"));
+        assert_eq!(author.as_deref(), Some("Kim"));
+        assert_eq!(nobody, None);
+        assert_eq!(no_scheme, None);
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("USING INDEX record_author")),
+            "the lookup reads the author index: {plan:?}"
         );
         Ok(())
     }
