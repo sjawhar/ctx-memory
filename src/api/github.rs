@@ -295,6 +295,12 @@ pub enum PageKind {
     /// `404 Not Found`. Most callers treat it as an error; a comparison of two commits answers
     /// it when they share no history, which its caller handles.
     Missing,
+    /// `422 Unprocessable Entity` saying the diff is not available: GitHub could not generate
+    /// the diff of a comparison (`/compare/<base>...<head>`) in time, so it lists none of the
+    /// comparison's commits. It answered so on every page of one comparison, and on every
+    /// request of it for an hour, after a merge brought about 930 commits of another branch
+    /// into a default branch (2026-10-31): the caller reads those commits another way.
+    DiffUnavailable,
 }
 
 /// One page of a GitHub list endpoint, with what the next request needs.
@@ -413,11 +419,12 @@ impl GithubClient {
 
     /// `GET url` with the installation's token.
     ///
-    /// Three answers are not failures. `409 Conflict` — which an empty repository answers its
+    /// Four answers are not failures. `409 Conflict` — which an empty repository answers its
     /// commit listing with — returns an empty page, because a repository with no commits has
     /// nothing to read. A rate limit GitHub is protecting returns a throttled page, which the
-    /// caller comes back for later. `404 Not Found` returns a missing page, which the caller
-    /// decides about. The items are the answer's array, or the `commits` array of a comparison
+    /// caller comes back for later. `404 Not Found` returns a missing page, and a comparison
+    /// whose diff GitHub cannot generate returns a page saying so; the caller decides about
+    /// both. The items are the answer's array, or the `commits` array of a comparison
     /// (`/compare/<base>...<head>`), which wraps them in an object.
     ///
     /// # Errors
@@ -450,6 +457,12 @@ impl GithubClient {
         if status == StatusCode::NOT_FOUND {
             return Ok(Page {
                 kind: PageKind::Missing,
+                ..rated
+            });
+        }
+        if status == StatusCode::UNPROCESSABLE_ENTITY && diff_unavailable(&body) {
+            return Ok(Page {
+                kind: PageKind::DiffUnavailable,
                 ..rated
             });
         }
@@ -525,6 +538,21 @@ fn throttled(status: StatusCode, headers: &HeaderMap) -> bool {
         return false;
     }
     rate_remaining(headers) == Some(0) || header_value(headers, "retry-after").is_some()
+}
+
+/// Whether a `422` answer says a comparison's diff is not available. GitHub answers a
+/// comparison whose diff it cannot generate in time with the message "Server Error: Sorry, this
+/// diff is taking too long to generate." and one error naming the field `diff` and the code
+/// `not_available`, on resource `Comparison` (read 2026-10-31).
+fn diff_unavailable(body: &Value) -> bool {
+    body.get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                error.get("field").and_then(Value::as_str) == Some("diff")
+                    && error.get("code").and_then(Value::as_str) == Some("not_available")
+            })
+        })
 }
 
 /// The URL a `Link` header names for `rel` (`next`, `last`), when it names one.
@@ -615,7 +643,7 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     use reqwest::StatusCode;
 
-    use super::{repository_of, throttled, TokenRequest};
+    use super::{diff_unavailable, repository_of, throttled, TokenRequest};
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -651,6 +679,26 @@ mod tests {
         assert!(!throttled(
             StatusCode::NOT_FOUND,
             &headers(&[("x-ratelimit-remaining", "0")])
+        ));
+    }
+
+    #[test]
+    fn a_comparison_whose_diff_github_cannot_generate_is_told_apart() {
+        // GitHub's answer to such a comparison, every page of it (read 2026-10-31).
+        let refused = serde_json::json!({
+            "message": "Server Error: Sorry, this diff is taking too long to generate.",
+            "errors": [{"resource": "Comparison", "field": "diff", "code": "not_available"}],
+            "status": "422"
+        });
+        assert!(diff_unavailable(&refused));
+        // Any other `422` is a refusal of the request itself.
+        let invalid = serde_json::json!({
+            "message": "Validation Failed",
+            "errors": [{"resource": "Issue", "field": "title", "code": "missing_field"}]
+        });
+        assert!(!diff_unavailable(&invalid));
+        assert!(!diff_unavailable(
+            &serde_json::json!({"message": "Unprocessable"})
         ));
     }
 

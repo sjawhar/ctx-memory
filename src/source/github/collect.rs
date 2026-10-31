@@ -315,7 +315,8 @@ struct Commits {
 ///
 /// With no stored head — a first read, or a cursor an earlier build wrote — or when GitHub
 /// cannot compare (`404`: the two share no history, or the stored head is gone), it lists the
-/// head's history since the stored time (`read_history`).
+/// head's history since the stored time (`read_history`). A comparison whose diff GitHub cannot
+/// generate (`422`) is read the same way, with a warning (see `read_without_comparison`).
 ///
 /// A listing longer than the run's budget goes on in the next run. The cursor names the
 /// listing and how many pages of it the run read (`reading`), and the next run reads the same
@@ -442,7 +443,8 @@ fn read_history<C: GithubApi + ?Sized>(
 /// after `from.pages`, or `None` when there is no stored head or GitHub cannot compare the two
 /// (`404`). A run the budget stops names the pages it read, as `read_history` does. A
 /// comparison GitHub lists fewer commits of than its `total_commits` ends in
-/// `short_comparison`; the pages earlier runs read were full ones.
+/// `short_comparison`, and one whose diff GitHub cannot generate in
+/// `read_without_comparison`; the pages earlier runs read were full ones.
 fn read_comparison<C: GithubApi + ?Sized>(
     base: &str,
     repo: &Repo,
@@ -460,6 +462,9 @@ fn read_comparison<C: GithubApi + ?Sized>(
     )?;
     if listing.missing {
         return Ok(None);
+    }
+    if listing.diff_unavailable {
+        return read_without_comparison(base, repo, position, &from.target, window_end, reader);
     }
     let pages = from.pages + clean_pages(&listing.pages, window_end);
     let total = listing.total;
@@ -502,6 +507,39 @@ fn read_comparison<C: GithubApi + ?Sized>(
         head: Some(from.target.clone()),
         ..Commits::default()
     }))
+}
+
+/// Reads `target`'s history since the stored time, as `read_history` does, for a comparison
+/// whose diff GitHub cannot generate. GitHub then lists none of the comparison's commits, on any
+/// page, and answers the same way on every later request; a comparison from a later head is only
+/// larger. So comparing again would hold the stream on the stored head, failing, run after run,
+/// while its issues and pull requests wait behind it too. The listing by time cannot reach a
+/// commit of that range dated at or before the stored time, such as one of a branch merged in,
+/// or a merge pushed after it was made. The stream stores `target` all the same, and a warning
+/// names the range it could not compare.
+fn read_without_comparison<C: GithubApi + ?Sized>(
+    base: &str,
+    repo: &Repo,
+    position: &Position,
+    target: &str,
+    window_end: DateTime<Utc>,
+    reader: &mut Reader<'_, C>,
+) -> Result<Option<Commits>> {
+    let from = Reading {
+        target: target.to_owned(),
+        pages: 0,
+        comparison: false,
+    };
+    let Some(mut commits) = read_history(base, repo, position, &from, window_end, reader)? else {
+        return Ok(None);
+    };
+    commits.warning = Some(format!(
+        "{}: GitHub could not generate the comparison of {} with {target} (its diff is too large), so the stream read {target}'s history since {} instead: a commit of that range dated at or before then, such as one of a merged branch, is not read",
+        stream_id(repo),
+        position.head.as_deref().unwrap_or("the stored head"),
+        rfc3339(position.stored)
+    ));
+    Ok(Some(commits))
 }
 
 /// A comparison that listed fewer commits than its `total_commits`: what this run listed, and
@@ -666,7 +704,7 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
 
     /// Reads a listing GitHub pages by number, `url`'s pages from `from` on, each page's items
     /// apart. It follows `Link: rel="next"` to the end, or until the run must stop; a `404`
-    /// ends it as missing.
+    /// ends it as missing, and a comparison whose diff GitHub cannot generate as that.
     fn numbered(&mut self, url: &str, from: u32) -> Result<Numbered> {
         let mut numbered = Numbered::default();
         let mut next = Some(at_page(url, from));
@@ -678,6 +716,10 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
                 }
                 Ok(page) if page.kind == PageKind::Missing => {
                     numbered.missing = true;
+                    break;
+                }
+                Ok(page) if page.kind == PageKind::DiffUnavailable => {
+                    numbered.diff_unavailable = true;
                     break;
                 }
                 Ok(page) => {
@@ -692,7 +734,8 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
 
     /// Reads one page, unless the run must stop first: the budget or the rate limit is spent,
     /// or the budget left is no more than `needed`. A page GitHub refused stops the listing. A
-    /// `404` is an error unless `missing_ok`, when the caller gets the missing page.
+    /// `404`, and a comparison whose diff GitHub cannot generate, is an error unless
+    /// `missing_ok`, when the caller gets that page.
     fn page(&mut self, url: &str, needed: u32, missing_ok: bool) -> Result<Result<Page, Stop>> {
         if let Some(stop) = self.governor.blocked(self.installation) {
             return Ok(Err(stop));
@@ -706,7 +749,10 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
             // GitHub refused the pace, so the rest of this listing waits for the next fetch.
             PageKind::Throttled => Ok(Err(Stop::Throttled)),
             PageKind::Missing if !missing_ok => bail!("reading {url} failed: 404 Not Found"),
-            PageKind::Items | PageKind::Missing => Ok(Ok(page)),
+            PageKind::DiffUnavailable if !missing_ok => {
+                bail!("reading {url} failed: 422 GitHub cannot generate the comparison's diff")
+            }
+            PageKind::Items | PageKind::Missing | PageKind::DiffUnavailable => Ok(Ok(page)),
         }
     }
 }
@@ -742,6 +788,9 @@ struct Numbered {
     stop: Option<Stop>,
     /// GitHub answered `404`: the commit the listing names is gone.
     missing: bool,
+    /// GitHub answered `422`: it cannot generate the comparison's diff, so it lists none of the
+    /// comparison's commits.
+    diff_unavailable: bool,
 }
 
 /// `url` asking for page `number`: its own `page` set to it, or one added. Page 1 is `url` as
