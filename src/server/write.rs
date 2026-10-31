@@ -186,33 +186,44 @@ async fn advance(shared: &Arc<Shared>, caller: Caller, request: MarkerRequest) -
         Some(session) => format!("{} ({session})", caller.email),
         None => caller.email,
     };
+    // The answer, and the `write failed:` line of a marker that did not move, are made in the
+    // blocking task: hyper drops a request whose caller hung up, not the task, and the line
+    // must still come.
     let advancing = Arc::clone(shared);
-    let advanced = tokio::task::spawn_blocking(move || -> Result<Moved> {
-        let context = advancing.tree()?;
-        if let Err(error) = advancing.hold_lease() {
-            return Ok(Moved::Unheld(format!("{error:#}")));
-        }
-        Ok(Moved::Marker(marker::advance(
-            &context,
-            &request.window,
-            &by,
-        )?))
+    let answered = tokio::task::spawn_blocking(move || {
+        let moved = move_marker(&advancing, &request.window, &by);
+        answer_advance(&advancing, moved)
     })
     .await;
-    match advanced {
-        Ok(Ok(Moved::Marker(marker))) => {
-            (StatusCode::OK, Json(MarkerResponse { marker })).into_response()
-        }
-        Ok(Ok(Moved::Unheld(why))) => unheld(shared, MARKER_ROUTE, &why),
-        Ok(Err(error)) if error.downcast_ref::<marker::Refused>().is_some() => {
-            bad_request(shared, MARKER_ROUTE, &format!("{error:#}"))
-        }
-        Ok(Err(error)) => failed(shared, MARKER_ROUTE, &format!("{error:#}")),
-        Err(error) => failed(
+    answered.unwrap_or_else(|error| {
+        failed(
             shared,
             MARKER_ROUTE,
             &format!("advancing the marker failed: {error}"),
-        ),
+        )
+    })
+}
+
+/// Moves the marker to `window` under the write lease, once the tree is this request's.
+fn move_marker(shared: &Shared, window: &str, by: &str) -> Result<Moved> {
+    let context = shared.tree()?;
+    if let Err(error) = shared.hold_lease() {
+        return Ok(Moved::Unheld(format!("{error:#}")));
+    }
+    Ok(Moved::Marker(marker::advance(&context, window, by)?))
+}
+
+/// The answer to one marker advance, with its `write failed:` line when the marker did not move.
+fn answer_advance(shared: &Shared, moved: Result<Moved>) -> Response {
+    match moved {
+        Ok(Moved::Marker(marker)) => {
+            (StatusCode::OK, Json(MarkerResponse { marker })).into_response()
+        }
+        Ok(Moved::Unheld(why)) => unheld(shared, MARKER_ROUTE, &why),
+        Err(error) if error.downcast_ref::<marker::Refused>().is_some() => {
+            bad_request(shared, MARKER_ROUTE, &format!("{error:#}"))
+        }
+        Err(error) => failed(shared, MARKER_ROUTE, &format!("{error:#}")),
     }
 }
 
@@ -231,8 +242,11 @@ fn session_label(session: Option<&str>) -> Option<String> {
     (!label.is_empty()).then(|| label.to_owned())
 }
 
-/// Applies one write for a caller already identified. The codes of the findings that refuse it
-/// go in `note` for the request log.
+/// Applies one write for a caller already identified.
+///
+/// The answer, its `write failed:` line and the refusal codes `note` carries to the request log
+/// are made in the blocking task: hyper drops a request whose caller hung up, not the task, and
+/// a write that fails after its caller left must still say so where an alert reads it.
 async fn write(
     listener: Listener,
     caller: Caller,
@@ -244,13 +258,27 @@ async fn write(
     let writing = Arc::clone(shared);
     let route = change.route();
     let session = session_label(session.as_deref()).unwrap_or_else(|| "unknown".to_owned());
-    let applied =
-        tokio::task::spawn_blocking(move || apply(&writing, &caller, &change, &session)).await;
+    let note = note.clone();
+    let answered = tokio::task::spawn_blocking(move || {
+        let applied = apply(&writing, &caller, &change, &session);
+        answer_write(&writing, route, applied, &note)
+    })
+    .await;
+    answered.unwrap_or_else(|error| failed(shared, route, &format!("the write failed: {error}")))
+}
+
+/// The answer to one write, with its `write failed:` line when it did not happen.
+fn answer_write(
+    shared: &Shared,
+    route: &str,
+    applied: Result<Applied, ApplyError>,
+    note: &Note,
+) -> Response {
     match applied {
-        Ok(Ok(Applied::Committed(commit))) => {
+        Ok(Applied::Committed(commit)) => {
             (StatusCode::OK, Json(Committed { commit })).into_response()
         }
-        Ok(Ok(Applied::Refused(findings))) => {
+        Ok(Applied::Refused(findings)) => {
             let kinds: Vec<&str> = findings
                 .iter()
                 .map(|finding| finding.kind.as_str())
@@ -272,12 +300,12 @@ async fn write(
                 .collect();
             (StatusCode::UNPROCESSABLE_ENTITY, Json(Refused { findings })).into_response()
         }
-        Ok(Ok(Applied::Conflict(why))) => not_written(shared, route, StatusCode::CONFLICT, &why),
-        Ok(Ok(Applied::Unheld(why))) => unheld(shared, route, &why),
-        Ok(Err(ApplyError::Caller(error))) => bad_request(shared, route, &format!("{error:#}")),
-        Ok(Err(ApplyError::Server(error))) => failed(shared, route, &format!("{error:#}")),
-        Ok(Err(ApplyError::Unheld(error))) => unheld(shared, route, &format!("{error:#}")),
-        Ok(Err(ApplyError::Unknown(why))) => unheld(
+        Ok(Applied::Conflict(why)) => not_written(shared, route, StatusCode::CONFLICT, &why),
+        Ok(Applied::Unheld(why)) => unheld(shared, route, &why),
+        Err(ApplyError::Caller(error)) => bad_request(shared, route, &format!("{error:#}")),
+        Err(ApplyError::Server(error)) => failed(shared, route, &format!("{error:#}")),
+        Err(ApplyError::Unheld(error)) => unheld(shared, route, &format!("{error:#}")),
+        Err(ApplyError::Unknown(why)) => unheld(
             shared,
             route,
             &format!(
@@ -285,7 +313,6 @@ async fn write(
                  follow loop takes it within one pull interval; ask again before writing it twice"
             ),
         ),
-        Err(error) => failed(shared, route, &format!("the write failed: {error}")),
     }
 }
 

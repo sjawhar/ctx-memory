@@ -62,6 +62,15 @@ impl Logged {
         })
     }
 
+    /// The next line of the request log, as the server writes it, waiting up to a minute.
+    fn next_line(&self) -> Result<Value> {
+        let line = self
+            .stdout
+            .recv_timeout(Duration::from_secs(60))
+            .context("the server logged no request")?;
+        serde_json::from_str(&line).with_context(|| format!("{line:?}"))
+    }
+
     /// Stops the server, then returns every line of its request log: all of them, so a line too
     /// many fails a test as a line too few does.
     fn stop_and_read_request_log(&mut self) -> Result<Vec<Value>> {
@@ -331,40 +340,59 @@ fn a_refused_put_logs_its_refusal_codes_and_never_its_record() -> Result<()> {
 
 /// A caller that hangs up before its answer is ready still has its line, at the moment it hung
 /// up: `unanswered`, with no status and no body, and everything the server had learned of it.
-/// The write runs on and lands; the line does not say how it ended, because nobody was told.
+/// The write runs on, and when it fails its `write failed:` line still comes: hyper drops the
+/// request, not the write, and an alert must not miss a failed write because nobody waited for
+/// it.
+///
+/// The remote's hook holds the push until the test has hung up and read the line, so no
+/// timing decides what is tested.
 #[test]
-fn a_caller_that_hangs_up_has_an_unanswered_line() -> Result<()> {
+fn a_caller_that_hangs_up_has_an_unanswered_line_and_its_failure_is_still_said() -> Result<()> {
+    use std::io::Write as _;
     let tree = fixture_clone("log-request-hang-up")?;
     // The record cites the echo fixture's message, which a fetched window stores.
     fetch_window(&tree)?;
     let root = tree.parent().context("the fixture has a root")?;
     let log = root.join("serve.log");
-    let bare = remote_of(&tree)?;
-    install_hook(&bare, "pre-receive", "#!/bin/sh\nsleep 4\nexit 0\n")?;
+    let (reached, release) = (root.join("push-reached"), root.join("push-released"));
+    install_hook(
+        &remote_of(&tree)?,
+        "pre-receive",
+        &format!(
+            "#!/bin/sh\ntouch '{}'\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 1200 ]; do \
+             sleep 0.1; i=$((i + 1)); done\necho 'the remote refused this push' >&2\nexit 1\n",
+            reached.display(),
+            release.display()
+        ),
+    )?;
     let mut server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
-    let impatient = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()?;
-    let hung_up = impatient
-        .post(format!("http://{}/v1/records/put", server.tailnet))
-        .header("Tailscale-User-Login", "ada@example.com")
-        .json(&put_body("decisions/patience.md", &good_record(), "s"))
-        .send();
-    // The write lands once the hook lets the push through.
-    let landed = within(120, || {
-        let subject = support::git(&bare, &["log", "--format=%s", "-1", "main"])?;
-        Ok(subject.contains("patience").then_some(()))
+    let body = put_body("decisions/patience.md", &good_record(), "s").to_string();
+    let mut caller = std::net::TcpStream::connect(server.tailnet)?;
+    write!(
+        caller,
+        "POST /v1/records/put HTTP/1.1\r\nHost: ctx\r\nTailscale-User-Login: ada@example.com\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )?;
+    let pushing = within(120, || Ok(reached.exists().then_some(())));
+    // The caller hangs up while its write's push is held.
+    caller.shutdown(std::net::Shutdown::Both)?;
+    drop(caller);
+    let line = server.next_line();
+    std::fs::write(&release, "")?;
+    let failed = within(120, || {
+        Ok(std::fs::read_to_string(&log)?
+            .lines()
+            .any(|line| line.starts_with("write failed: /v1/records/put 500 "))
+            .then_some(()))
     });
-    let logged = server.stop_and_read_request_log()?;
+    let rest = server.stop_and_read_request_log()?;
     drop(server);
+    let stderr = std::fs::read_to_string(&log)?;
     remove_fixture(&tree)?;
 
-    assert!(hung_up.is_err(), "the caller was answered: {hung_up:?}");
-    landed
-        .with_context(|| format!("the write did not land after its caller hung up: {logged:?}"))?;
-    let [line] = logged.as_slice() else {
-        anyhow::bail!("not one line for the request: {logged:?}");
-    };
+    pushing.context("the write never reached its push")?;
+    let line = line?;
     for (field, value) in [
         ("result", json!("unanswered")),
         ("status", Value::Null),
@@ -376,14 +404,11 @@ fn a_caller_that_hangs_up_has_an_unanswered_line() -> Result<()> {
     ] {
         assert_eq!(line.get(field), Some(&value), "{line}");
     }
-    let waited = line
-        .get("duration_ms")
-        .and_then(Value::as_u64)
-        .context("the line has no duration")?;
     assert!(
-        (900..4000).contains(&waited),
-        "the line was not written when the caller hung up: {line}"
+        rest.is_empty(),
+        "more than one line for the request: {rest:?}"
     );
+    failed.with_context(|| format!("no write failed: line after the caller hung up: {stderr}"))?;
     Ok(())
 }
 

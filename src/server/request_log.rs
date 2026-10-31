@@ -354,13 +354,20 @@ fn unwritten(why: &str) {
     );
 }
 
-/// Says `message` on standard error the first time `said` is set. Standard error that cannot
-/// be written is let be: `eprintln!` would panic, and the request log must never stop a
-/// request.
+/// Says `message` on standard error the first time `said` is set, from a thread of its own:
+/// standard error can be as full as standard output — the same pipe, or another nobody reads
+/// — and the request that met the failure must not wait on it. A message that cannot be
+/// written is let be: `eprintln!` would panic.
 fn say_once(said: &AtomicBool, message: &str) {
-    if !said.swap(true, Ordering::Relaxed) {
-        let _ = writeln!(std::io::stderr().lock(), "{message}");
+    if said.swap(true, Ordering::Relaxed) {
+        return;
     }
+    let message = message.to_owned();
+    let _ = std::thread::Builder::new()
+        .name("request-log-report".to_owned())
+        .spawn(move || {
+            let _ = writeln!(std::io::stderr().lock(), "{message}");
+        });
 }
 
 #[cfg(test)]

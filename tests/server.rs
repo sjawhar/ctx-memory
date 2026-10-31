@@ -392,58 +392,135 @@ fn assert_too_large(line: &Value, answer: Option<(u16, usize)>) {
 }
 
 /// A log collector that stops reading costs lines of the request log, never answers: with the
-/// server's standard output full, every request is still answered, and standard error says once
-/// that lines are dropped.
+/// server's standard output full, every request is still answered, and standard error, which
+/// another collector reads, says once that lines are dropped.
 #[test]
 fn a_stalled_request_log_costs_lines_not_answers() -> Result<()> {
-    use std::io::BufRead as _;
-    let tree = fixture_tree("server-request-log-stalled")?;
-    let log = tree
-        .parent()
-        .context("the fixture has a root")?
-        .join("serve.log");
+    let stalled = stalled_server("server-request-log-stalled", Pipes::Apart)?;
+    stalled.assert_every_request_answered();
+    assert_eq!(
+        stalled
+            .stderr
+            .lines()
+            .filter(|line| line.starts_with("the request log is behind standard output"))
+            .count(),
+        1,
+        "{}",
+        stalled.stderr
+    );
+    Ok(())
+}
+
+/// Standard error can be the same full pipe as standard output, as when a runtime collects
+/// both streams together and stops reading: saying that lines are dropped must not stop a
+/// request either.
+#[test]
+fn a_stalled_pipe_both_streams_share_costs_no_answers() -> Result<()> {
+    stalled_server("server-request-log-stalled-shared", Pipes::Shared)?
+        .assert_every_request_answered();
+    Ok(())
+}
+
+/// More healthz lines than a pipe shrunk to one page and the request log's queue hold together.
+const STALLED_REQUESTS: usize = 1500;
+
+/// Where a stalled server's two streams go.
+#[derive(Clone, Copy)]
+enum Pipes {
+    /// Standard output and standard error each to a pipe of its own, neither read.
+    Apart,
+    /// Both to one pipe, not read.
+    Shared,
+}
+
+/// What a server whose standard output nobody read did with [`STALLED_REQUESTS`] requests.
+struct Stalled {
+    /// How many requests in a row it answered with success before the first that it did not.
+    answered: usize,
+    /// The first request it did not answer, and why.
+    failure: Option<String>,
+    /// Whether it stopped cleanly on SIGTERM within a minute.
+    stopped: Option<std::process::ExitStatus>,
+    /// Its standard error, read once it had stopped (empty when it shares standard output).
+    stderr: String,
+}
+
+impl Stalled {
+    fn assert_every_request_answered(&self) {
+        assert_eq!(
+            (self.answered, self.failure.as_deref()),
+            (STALLED_REQUESTS, None),
+            "{}",
+            self.stderr
+        );
+        assert!(
+            self.stopped.is_some_and(|status| status.success()),
+            "ctx serve did not stop cleanly ({:?}): {}",
+            self.stopped,
+            self.stderr
+        );
+    }
+}
+
+/// Starts a server whose output pipes nobody reads past its listener line, each shrunk to one
+/// page, asks it [`STALLED_REQUESTS`] health checks, stopping at the first it does not answer,
+/// and stops it.
+fn stalled_server(label: &str, pipes: Pipes) -> Result<Stalled> {
+    use std::io::{BufRead as _, Read as _};
+    let tree = fixture_tree(label)?;
     let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
-    let mut child = support::binary()
-        .args([
-            "--memory",
-            tree_text,
-            "serve",
-            "--tailnet-listen",
-            "127.0.0.1:0",
-        ])
-        .args(["--pull-interval", "3600"])
+    let (stdout, stdout_writer) = std::io::pipe()?;
+    let (stderr, stderr_writer) = match pipes {
+        Pipes::Apart => {
+            let (reader, writer) = std::io::pipe()?;
+            (Some(reader), writer)
+        }
+        Pipes::Shared => (None, stdout_writer.try_clone()?),
+    };
+    #[cfg(target_os = "linux")]
+    for reader in std::iter::once(&stdout).chain(stderr.as_ref()) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: the descriptor is this process's own open pipe; F_SETPIPE_SZ only resizes it.
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+    }
+    let mut command = support::binary();
+    command
+        .args(["--memory", tree_text, "serve", "--tailnet-listen"])
+        .args(["127.0.0.1:0", "--pull-interval", "3600"])
         .envs(support::tree_env(&tree)?)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::fs::File::create(&log)?)
-        .spawn()
-        .context("starting ctx serve")?;
-    let mut stdout =
-        std::io::BufReader::new(child.stdout.take().context("ctx serve has no stdout")?);
-    let mut listened = String::new();
-    stdout.read_line(&mut listened)?;
-    // Nobody reads the pipe from here on, as a collector that stopped would not.
-    let answered =
-        listened
-            .trim()
-            .strip_prefix("tailnet-listen ")
-            .map(|address| -> Result<usize> {
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()?;
-                Ok((0..STALLED_REQUESTS)
-                    .filter(|_| {
-                        client
-                            .get(format!("http://{address}/healthz"))
-                            .send()
-                            .is_ok_and(|reply| reply.status().is_success())
-                    })
-                    .count())
-            });
+        .stdout(stdout_writer)
+        .stderr(stderr_writer);
+    let mut child = command.spawn().context("starting ctx serve")?;
+    // The writing ends this process held went to the child; `command` holds them until dropped.
+    drop(command);
+    let mut stdout = std::io::BufReader::new(stdout);
+    // A shared pipe may carry a line of standard error before the listener line.
+    let mut address = None;
+    let mut printed = String::new();
+    for _ in 0..10 {
+        let mut line = String::new();
+        if stdout.read_line(&mut line)? == 0 {
+            break;
+        }
+        if let Some(bound) = line.trim().strip_prefix("tailnet-listen ") {
+            address = Some(bound.to_owned());
+            break;
+        }
+        printed.push_str(&line);
+    }
+    // Nobody reads the pipes from here on, as a collector that stopped would not.
+    let (answered, failure) = match address {
+        Some(address) => ask_health(&address, STALLED_REQUESTS),
+        None => (
+            0,
+            Some(format!("ctx serve printed no listener: {printed:?}")),
+        ),
+    };
     if let Ok(pid) = i32::try_from(child.id()) {
         // SAFETY: the pid is this process's own child, which has not been waited for.
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
-    // The server waits a moment for its last lines, then stops whatever the pipe holds.
+    // The server waits a moment for its last lines, then stops whatever the pipes hold.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let stopped = loop {
         match child.try_wait()? {
@@ -458,29 +535,39 @@ fn a_stalled_request_log_costs_lines_not_answers() -> Result<()> {
             }
         }
     };
-    let logged = std::fs::read_to_string(&log)?;
+    let mut stderr_text = String::new();
+    if let Some(mut stderr) = stderr {
+        stderr.read_to_string(&mut stderr_text)?;
+    }
     drop(stdout);
     remove_fixture(&tree)?;
-
-    let answered = answered.context("ctx serve printed no tailnet listener")??;
-    assert_eq!(answered, STALLED_REQUESTS, "{logged}");
-    assert!(
-        stopped.is_some_and(|status| status.success()),
-        "ctx serve did not stop cleanly ({stopped:?}): {logged}"
-    );
-    assert_eq!(
-        logged
-            .lines()
-            .filter(|line| line.starts_with("the request log is behind standard output"))
-            .count(),
-        1,
-        "{logged}"
-    );
-    Ok(())
+    Ok(Stalled {
+        answered,
+        failure,
+        stopped,
+        stderr: stderr_text,
+    })
 }
 
-/// More healthz lines than a full pipe and the request log's queue hold together.
-const STALLED_REQUESTS: usize = 2000;
+/// Asks `address` for `/healthz` up to `count` times, and stops at the first answer that is not
+/// a success: how many were, and what the first that was not did.
+fn ask_health(address: &str, count: usize) -> (usize, Option<String>) {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return (0, Some(error.to_string())),
+    };
+    for asked in 0..count {
+        match client.get(format!("http://{address}/healthz")).send() {
+            Ok(reply) if reply.status().is_success() => {}
+            Ok(reply) => return (asked, Some(format!("request {asked}: {}", reply.status()))),
+            Err(error) => return (asked, Some(format!("request {asked}: {error}"))),
+        }
+    }
+    (count, None)
+}
 
 /// The request log, one parsed line per line printed.
 fn request_lines(printed: &[String]) -> Result<Vec<Value>> {
