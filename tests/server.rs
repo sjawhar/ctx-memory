@@ -1079,10 +1079,9 @@ fn the_session_an_agent_runs_in_names_its_requests_and_its_commits() -> Result<(
     let (put, open, printed, message) = (put?, open?, printed?, message?);
     assert_eq!(put.exit_code, 0, "{}{}", put.stdout, put.stderr);
     assert_eq!(open.exit_code, 0, "{}{}", open.stdout, open.stderr);
+    let trailer = format!("Session: {omp}");
     assert!(
-        message
-            .lines()
-            .any(|line| line == format!("Session: {omp}")),
+        message.lines().any(|line| line == trailer),
         "the commit does not name the session: {message}"
     );
     let named: Vec<(Option<Value>, Option<Value>)> = request_lines(&printed)?

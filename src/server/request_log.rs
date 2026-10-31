@@ -477,7 +477,7 @@ mod tests {
         };
         let omp = HeaderValue::from_static("01a1b2c3-0000-7000-8000-000000000001");
         assert_eq!(
-            session_of(&[omp.clone()]),
+            session_of(std::slice::from_ref(&omp)),
             Some(serde_json::json!("01a1b2c3-0000-7000-8000-000000000001"))
         );
         let token = format!("ghs_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");

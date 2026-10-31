@@ -68,8 +68,11 @@ mod tests {
 
     use super::{first_set, fits, MAX_CHARS};
 
+    /// One variable a stand-in environment sets, and its value.
+    type Binding = (&'static str, &'static str);
+
     /// A stand-in for the environment that holds exactly `set`.
-    fn read(set: &[(&'static str, &str)]) -> impl Fn(&'static str) -> Option<OsString> {
+    fn read(set: &[Binding]) -> impl Fn(&'static str) -> Option<OsString> {
         let set: BTreeMap<&'static str, OsString> = set
             .iter()
             .map(|(name, value)| (*name, OsString::from(*value)))
@@ -78,7 +81,7 @@ mod tests {
     }
 
     /// `CTX_SESSION` names the session when it is set; else Oh My Pi's id, else Claude Code's.
-    /// A variable set to white space names none.
+    /// A variable that is empty or white space counts as unset, as a blank `CTX_SERVER` does.
     #[test]
     fn the_first_variable_set_names_the_session() {
         let omp = ("OMP_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000001");
@@ -86,7 +89,7 @@ mod tests {
             "CLAUDE_CODE_SESSION_ID",
             "5f0c7d1e-2222-4333-8444-555566667777",
         );
-        let cases: [(&[(&'static str, &str)], Option<(&str, &str)>); 6] = [
+        let cases: [(&[Binding], Option<Binding>); 6] = [
             (
                 &[("CTX_SESSION", "cycle-1"), omp, claude],
                 Some(("CTX_SESSION", "cycle-1")),
