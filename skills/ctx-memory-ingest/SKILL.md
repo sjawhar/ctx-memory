@@ -253,12 +253,14 @@ automated notification noise unless a person acts on it.
 Six kinds of message make records nobody uses. Check each record against them before you
 mint it; each rule says where a fact worth keeping goes instead.
 
-- Payment receipts and invoices (card charges, top-ups, automatic recharges): no record per
-  receipt, since nobody acts on one charge. Keep one metric of the account's spending, and
-  update it only when a receipt changes it: a new amount, rate, interval, card, payer or
-  account, or a charge no record explains.
-- Spend and quota alerts: no record per alert, since the threshold, not the mail, is the
-  signal. Add the threshold and its date to that spending's metric, or mint the metric once.
+- Payment receipts and paid invoices (card charges, top-ups, automatic recharges): no
+  record per receipt, since nobody acts on one charge. Update the newest metric of that
+  account's spending, or mint one if none exists, only when a receipt changes it: a new
+  amount, rate, interval, card, payer or account, or a charge no record explains. An unpaid
+  invoice falls under "Record rules".
+- Spend and usage alerts: no record per alert, since the threshold, not the mail, is the
+  signal. Add the threshold and its date to the metric of that spending or usage, or mint
+  that metric once.
 - Fetch and cycle bookkeeping (what a window delivered, a failed or starved stream, a held
   cursor, what the cycle did): no record of any type, `gap` included, since it is about the
   pipeline, not anyone's work. Report stream trouble as step 2 says; evidence a record
@@ -271,9 +273,9 @@ mint it; each rule says where a fact worth keeping goes instead.
   completed, done, resolved, superseded or withdrawn, since it only restates its source.
   Close the open record the source closes, or update the metric whose figure it changes;
   a decision someone made is `decided`, not closed.
-- The pipeline that builds this graph (the fetch, the cycle, the ctx server, their failures
-  and checks): no record, since whoever runs the cycle tracks it; report it to them. A
-  person's decision or commitment about it is still recorded.
+- The pipeline that builds this graph (the fetch, the cycle, the ctx server): its failures,
+  fixes and checks, and the issues and messages about them, get no record of any type, since
+  whoever runs the cycle tracks them; put what you saw in your report to them.
 
 ## When a cycle fails
 

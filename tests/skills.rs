@@ -222,7 +222,9 @@ fn the_ingest_skill_closes_quoted_text_only_with_the_cycles_nonce() -> Result<()
 /// Six kinds of message made records nobody used: payment receipts, spend alerts, the fetch's
 /// own bookkeeping, mirrors of one pull request or issue, records closed when created, and
 /// records about the pipeline itself. The skill names each, and where a fact worth keeping in
-/// one goes instead, so the rule never drops what a person needs.
+/// one goes instead: a metric, a decision a merged pull request carries, the open record a
+/// closing source closes. This checks that the instructions are there, not that an agent
+/// follows them.
 #[test]
 fn the_ingest_skill_says_what_is_not_a_record() -> Result<()> {
     let flat = skill("ctx-memory-ingest")?
@@ -233,16 +235,21 @@ fn the_ingest_skill_says_what_is_not_a_record() -> Result<()> {
         "## Not a record",
         "check the record against \"Not a record\"",
         "no record per receipt",
-        "update it only when a receipt changes it",
+        "Update the newest metric of that account's spending, or mint one if none exists, only \
+         when a receipt changes it",
+        "An unpaid invoice falls under \"Record rules\"",
         "no record per alert",
+        "Add the threshold and its date to the metric of that spending or usage",
         "no record of any type, `gap` included",
         "evidence a record lacks goes in that record's body",
         "no project or ops record whose one source is a single pull request or issue",
-        "a decision and who made it, a named person's commitment",
+        "a decision and who made it, a named person's commitment, an open question or a metric, \
+         each citing the item",
         "already answered, cancelled, closed, completed, done, resolved, superseded or withdrawn",
         "Close the open record the source closes",
+        "a decision someone made is `decided`, not closed",
         "The pipeline that builds this graph",
-        "A person's decision or commitment about it is still recorded",
+        "the issues and messages about them, get no record of any type",
         "With no cycle log named, write no record about the cycle",
     ] {
         assert!(
@@ -250,6 +257,19 @@ fn the_ingest_skill_says_what_is_not_a_record() -> Result<()> {
             "the ingest skill never says {expected:?}"
         );
     }
+    Ok(())
+}
+
+/// A session can drop the end of a long skill when its context is compacted, and the ingest
+/// skill's last sections are its record rules. It stays under 20,000 bytes; a block only some
+/// cycles need goes to `references/`, as the meeting rules did.
+#[test]
+fn the_ingest_skill_stays_under_20000_bytes() -> Result<()> {
+    let bytes = skill("ctx-memory-ingest")?.len();
+    assert!(
+        bytes < 20_000,
+        "the ingest skill is {bytes} bytes; move a block only some cycles need to references/"
+    );
     Ok(())
 }
 
