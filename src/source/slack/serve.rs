@@ -187,11 +187,17 @@ impl<'s> Mentions<'s> {
             .map(Some)
     }
 
+    /// Whether `scheme` is a Slack source's pointer scheme, so its records hold Slack messages.
+    #[must_use]
+    pub fn is_slack_scheme(&self, scheme: &str) -> bool {
+        self.schemes.iter().any(|slack| slack == scheme)
+    }
+
     /// Whether `pointer` names a Slack message.
     fn holds(&self, pointer: &str) -> bool {
         pointer
             .split_once(':')
-            .is_some_and(|(scheme, _)| self.schemes.iter().any(|slack| slack == scheme))
+            .is_some_and(|(scheme, _)| self.is_slack_scheme(scheme))
     }
 
     /// The name the store holds for the person `id` names: the full name the newest message of

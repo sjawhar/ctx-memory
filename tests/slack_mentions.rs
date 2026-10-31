@@ -145,15 +145,24 @@ fn write_tree(root: &Path, claims: &[&str]) -> Result<()> {
         &tree.join("questions/hire.md"),
         "---\ntype: question\nstatus: open\nrevisit_by: 2026-12-01\n---\nWho knows the candidate.\n",
     )?;
+    write_quotes(root, "quote", ASKED, claims)
+}
+
+/// One open question for each of `claims`, `questions/<name>-<n>.md`, whose one quote is that
+/// claim, citing `pointer`.
+fn write_quotes(root: &Path, name: &str, pointer: &str, claims: &[&str]) -> Result<()> {
     for (index, claim) in claims.iter().enumerate() {
         let mut question = String::from(
             "---\ntype: question\nstatus: open\nrevisit_by: 2026-12-01\ntier: 2\nquotes:\n",
         );
         writeln!(
             question,
-            "  - quote: {claim:?}\n    source: \"{ASKED}\"\n    tier: 2\n---\nWho knows the candidate."
+            "  - quote: {claim:?}\n    source: \"{pointer}\"\n    tier: 2\n---\nWho knows the candidate."
         )?;
-        write(&tree.join(format!("questions/quote-{index}.md")), &question)?;
+        write(
+            &root.join(format!("tree/questions/{name}-{index}.md")),
+            &question,
+        )?;
     }
     Ok(())
 }
@@ -440,6 +449,102 @@ fn a_stored_text_without_slack_s_own_text_is_checked_as_it_reads() -> Result<()>
     remove_scratch(&root)?;
 
     assert_eq!(broken, ["questions/quote-0.md"]);
+    Ok(())
+}
+
+/// A quote copied from what `ctx resolve` prints for a message, or from Slack's own text of
+/// it, holds: Slack's escaped text as Slack wrote it, and a stored text that does not read as
+/// Slack's mention by mention, which `ctx resolve` serves as stored. A quote that starts inside
+/// a mention either of them writes does not hold.
+#[test]
+fn a_quote_copied_from_resolve_or_from_slack_s_own_text_holds() -> Result<()> {
+    const ESCAPED: &str = "slack:C0EXAMPLE01/1792952200.000600";
+    const UNALIGNED: &str = "slack:C0EXAMPLE01/1792952300.000700";
+    let root = scratch("literal")?;
+    write_tree(&root, &[])?;
+    write_quotes(
+        &root,
+        "escaped",
+        ESCAPED,
+        &[
+            "<@U0EXAMPLEA> please check A &amp; B",
+            "@U0EXAMPLEA please check A & B",
+            "@Kim Lee please check A & B",
+            "U0EXAMPLEA> please check A &amp; B",
+            "0EXAMPLEA please check A & B",
+        ],
+    )?;
+    write_quotes(
+        &root,
+        "unaligned",
+        UNALIGNED,
+        &[
+            "@U0EXAMPLEA please review the new plan",
+            "<@U0EXAMPLEA> please review the plan",
+            "0EXAMPLEA please review the new plan",
+        ],
+    )?;
+    fs::create_dir_all(root.join("data"))?;
+    let message = |pointer: &str, stored: &str, raw: &str| {
+        let ts = pointer.rsplit_once('/').map_or(pointer, |(_, ts)| ts);
+        record(
+            pointer,
+            "2026-10-25T12:30:00Z",
+            ("U0EXAMPLEB", "Grace Hopper"),
+            stored,
+            &json!({"ts": ts, "user": "U0EXAMPLEB", "text": raw}),
+        )
+    };
+    put(
+        &root,
+        &[
+            message(
+                ESCAPED,
+                "@U0EXAMPLEA please check A & B",
+                "<@U0EXAMPLEA> please check A &amp; B",
+            ),
+            message(
+                UNALIGNED,
+                "@U0EXAMPLEA please review the new plan",
+                "<@U0EXAMPLEA> please review the plan",
+            ),
+            record(
+                OWN,
+                "2026-10-25T12:11:00Z",
+                ("U0EXAMPLEA", "Kim"),
+                "Here.",
+                &json!({
+                    "ts": "1792951860.000200",
+                    "user": "U0EXAMPLEA",
+                    "text": "Here.",
+                    "user_profile": {"real_name": "Kim Lee", "display_name": "Kim"},
+                }),
+            ),
+        ],
+        "2026-10-25T13:00:00Z",
+    )?;
+    let resolved = data(&ctx(&root, &["resolve", ESCAPED, UNALIGNED])?)?;
+    let broken = broken_quotes(&root)?;
+    remove_scratch(&root)?;
+
+    assert!(
+        text_at(&resolved, "/results/0/text")?.ends_with("\n@Kim Lee please check A & B"),
+        "{resolved}"
+    );
+    assert!(
+        text_at(&resolved, "/results/1/text")?
+            .ends_with("\n@U0EXAMPLEA please review the new plan"),
+        "ctx resolve serves a stored text that does not read as Slack's as stored: {resolved}"
+    );
+    assert_eq!(
+        broken,
+        [
+            "questions/escaped-3.md",
+            "questions/escaped-4.md",
+            "questions/unaligned-2.md"
+        ],
+        "every quote copied whole holds, and none that starts inside a mention"
+    );
     Ok(())
 }
 

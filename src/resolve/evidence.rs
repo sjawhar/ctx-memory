@@ -96,6 +96,7 @@ impl QuoteSource {
         start: usize,
     ) -> Result<Self> {
         let records = local_records(store, schemes, &pointer, true)?;
+        let slack = mentions.is_slack_scheme(&pointer.scheme);
         let mut seen = BTreeSet::new();
         let mut thread = Vec::new();
         let mut others = Vec::new();
@@ -109,9 +110,9 @@ impl QuoteSource {
             others.extend(alternatives);
         }
         let mut readings = Vec::new();
-        add_reading(&mut readings, thread);
+        add_reading(&mut readings, thread, slack);
         for parts in others {
-            add_reading(&mut readings, parts);
+            add_reading(&mut readings, parts, slack);
         }
         for record in &records {
             let Some(parsed) = schemes.parse(&record.pointer) else {
@@ -122,9 +123,9 @@ impl QuoteSource {
                     continue;
                 }
                 let (primary, alternatives) = record_parts(&version, mentions)?;
-                add_reading(&mut readings, primary);
+                add_reading(&mut readings, primary, slack);
                 for parts in alternatives {
-                    add_reading(&mut readings, parts);
+                    add_reading(&mut readings, parts, slack);
                 }
             }
         }
@@ -139,7 +140,8 @@ impl QuoteSource {
     /// it may have been taken from. A quote taken before an edit stays verifiable, and so do
     /// one taken while a Slack mention read as its id, one taken from what ctx served when it
     /// named that mention, and one taken before that person's name changed. A Slack mention
-    /// in the quote holds only as a whole spelling of the person the message mentions there.
+    /// in the quote holds only whole: as a whole spelling of the person the message mentions
+    /// there, or, in a text read as it is stored, as the whole mention it writes.
     pub(super) fn holds(&self, quote: &str) -> bool {
         let quote = normalise_quote_text(quote);
         let fragments = fragments(&quote).collect::<Vec<_>>();
@@ -164,23 +166,26 @@ fn version_key(record: &Record) -> [u8; 32] {
 }
 
 /// The parts `record` reads as in its thread, and the other texts a quote of it may have been
-/// taken from. A Slack message that mentions anyone reads as its spelled text alone; any other
-/// record as its stored text, and as the source's own text where that differs.
+/// taken from. A Slack message that mentions anyone reads in its thread as its spelled text,
+/// and also as its stored text and Slack's own text, as they read. Any other record reads as
+/// its stored text, and as the source's own text where that differs.
 fn record_parts<'r>(
     record: &'r Record,
     mentions: &Mentions<'_>,
 ) -> Result<(Vec<Part<'r>>, Vec<Vec<Part<'r>>>)> {
-    if let Some(spelled) = mentions.spelled(record)? {
-        let parts = spelled
-            .into_iter()
-            .map(|part| match part {
-                Spelled::Text(text) => Part::Text(Cow::Owned(text)),
-                Spelled::OneOf(spellings) => Part::Mention(spellings),
-            })
-            .collect();
-        return Ok((parts, Vec::new()));
-    }
-    Ok(literal_parts(record))
+    let (stored, mut others) = literal_parts(record);
+    let Some(spelled) = mentions.spelled(record)? else {
+        return Ok((stored, others));
+    };
+    let parts = spelled
+        .into_iter()
+        .map(|part| match part {
+            Spelled::Text(text) => Part::Text(Cow::Owned(text)),
+            Spelled::OneOf(spellings) => Part::Mention(spellings),
+        })
+        .collect();
+    others.insert(0, stored);
+    Ok((parts, others))
 }
 
 /// `record` as its stored text, with the source's own text as another reading where it is
@@ -200,9 +205,10 @@ fn source_text(record: &Record) -> Option<&str> {
     record.raw.get("text").and_then(Value::as_str)
 }
 
-/// Adds the reading `parts` make to `readings`, unless an identical one is there.
-fn add_reading(readings: &mut Vec<Reading>, parts: Vec<Part<'_>>) {
-    let reading = Reading::new(parts);
+/// Adds the reading `parts` make to `readings`, unless an identical one is there. `slack` says
+/// the texts are a Slack source's, whose mentions a quote holds only whole.
+fn add_reading(readings: &mut Vec<Reading>, parts: Vec<Part<'_>>, slack: bool) {
+    let reading = Reading::new(parts, slack);
     if !readings.contains(&reading) {
         readings.push(reading);
     }
@@ -233,7 +239,10 @@ enum Segment {
 }
 
 impl Reading {
-    fn new(parts: Vec<Part<'_>>) -> Self {
+    /// The reading `parts` make. When `slack`, each mention written into a text part as Slack
+    /// writes one (`<@U…>`, `<#C…>`, `<!…>`) or as a bare person id (`@U…`) is a mention a
+    /// quote holds only whole, as it is written there.
+    fn new(parts: Vec<Part<'_>>, slack: bool) -> Self {
         if parts.iter().all(|part| matches!(part, Part::Text(_))) {
             let text = match <[_; 1]>::try_from(parts) {
                 Ok([Part::Text(text)]) => text,
@@ -248,7 +257,13 @@ impl Reading {
                         .collect(),
                 ),
             };
-            return Self::Plain(normalise_piece(&text));
+            let normalised = normalise_piece(&text);
+            if !slack || mention_tokens(&normalised).is_empty() {
+                return Self::Plain(normalised);
+            }
+            let mut segments = Vec::new();
+            push_normalised(&mut segments, &normalised, slack);
+            return Self::Spelled(segments);
         }
         let mut segments = Vec::new();
         let mut text = String::new();
@@ -256,7 +271,7 @@ impl Reading {
             match part {
                 Part::Text(more) => text.push_str(&more),
                 Part::Mention(spellings) => {
-                    push_text(&mut segments, &mut text);
+                    push_text(&mut segments, &mut text, slack);
                     let mut spellings = spellings
                         .iter()
                         .map(|spelling| normalise_quote_text(spelling))
@@ -268,7 +283,7 @@ impl Reading {
                 }
             }
         }
-        push_text(&mut segments, &mut text);
+        push_text(&mut segments, &mut text, slack);
         Self::Spelled(segments)
     }
 
@@ -301,15 +316,77 @@ impl Reading {
     }
 }
 
-/// Moves the text gathered so far into `segments`, normalised, unless it normalises to none.
-fn push_text(segments: &mut Vec<Segment>, text: &mut String) {
+/// Moves the text gathered so far into `segments`, normalised ([`push_normalised`]).
+fn push_text(segments: &mut Vec<Segment>, text: &mut String, slack: bool) {
     if text.is_empty() {
         return;
     }
     let normalised = normalise_piece(&std::mem::take(text));
-    if !normalised.is_empty() {
-        segments.push(Segment::Text(normalised));
+    push_normalised(segments, &normalised, slack);
+}
+
+/// Adds `normalised` text to `segments`: as text, and, when `slack`, each mention token in it
+/// ([`mention_tokens`]) as a mention whose one spelling is itself, so a quote holds it whole.
+fn push_normalised(segments: &mut Vec<Segment>, normalised: &str, slack: bool) {
+    let tokens = if slack {
+        mention_tokens(normalised)
+    } else {
+        Vec::new()
+    };
+    let mut written = 0;
+    for (start, end) in tokens {
+        if let Some(before) = normalised
+            .get(written..start)
+            .filter(|text| !text.is_empty())
+        {
+            segments.push(Segment::Text(before.to_owned()));
+        }
+        if let Some(token) = normalised.get(start..end) {
+            segments.push(Segment::Mention(vec![token.to_owned()]));
+        }
+        written = end;
     }
+    if let Some(rest) = normalised.get(written..).filter(|text| !text.is_empty()) {
+        segments.push(Segment::Text(rest.to_owned()));
+    }
+}
+
+/// Where a normalised Slack text writes a mention itself, as byte ranges in order: a sequence
+/// Slack writes, `<@…>`, `<#…>` or `<!…>`, and a bare person id, `@` then `u` or `w` and the
+/// letters and digits after it, where the `@` starts a word. A quote holds each whole.
+fn mention_tokens(normalised: &str) -> Vec<(usize, usize)> {
+    let bytes = normalised.as_bytes();
+    let at = |index: usize| bytes.get(index).copied();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let end = match at(index) {
+            Some(b'<') if matches!(at(index + 1), Some(b'@' | b'#' | b'!')) => normalised
+                .get(index..)
+                .and_then(|rest| rest.find('>'))
+                .map(|close| index + close + 1),
+            Some(b'@')
+                if matches!(at(index + 1), Some(b'u' | b'w'))
+                    && (index == 0
+                        || !at(index - 1).is_some_and(|byte| byte.is_ascii_alphanumeric())) =>
+            {
+                let mut end = index + 2;
+                while at(end).is_some_and(|byte| byte.is_ascii_alphanumeric()) {
+                    end += 1;
+                }
+                Some(end)
+            }
+            _ => None,
+        };
+        match end {
+            Some(end) => {
+                tokens.push((index, end));
+                index = end;
+            }
+            None => index += 1,
+        }
+    }
+    tokens
 }
 
 /// A place in a [`Reading::Spelled`]: a byte offset in one of its segments, where the offset
@@ -794,15 +871,18 @@ mod tests {
 
     /// A Slack message that asks one person, with that person's spellings.
     fn asked() -> Reading {
-        Reading::new(vec![
-            Part::Text(Cow::Borrowed("Please ask cc ")),
-            Part::Mention(vec![
-                "@U0EXAMPLEA".to_owned(),
-                "<@U0EXAMPLEA>".to_owned(),
-                "@Kim Lee".to_owned(),
-            ]),
-            Part::Text(Cow::Borrowed(" to review this proposal.")),
-        ])
+        Reading::new(
+            vec![
+                Part::Text(Cow::Borrowed("Please ask cc ")),
+                Part::Mention(vec![
+                    "@U0EXAMPLEA".to_owned(),
+                    "<@U0EXAMPLEA>".to_owned(),
+                    "@Kim Lee".to_owned(),
+                ]),
+                Part::Text(Cow::Borrowed(" to review this proposal.")),
+            ],
+            true,
+        )
     }
 
     /// A quote that includes any part of a mention holds only with one of its spellings
@@ -828,6 +908,55 @@ mod tests {
         }
     }
 
+    /// A Slack message's stored text and Slack's own text, read as they are, hold any quote
+    /// copied from them, escapes included, but a quote that starts or stops inside a mention
+    /// they write, `@U…` or `<@U…>`, does not hold.
+    #[test]
+    fn a_literal_slack_text_holds_its_mentions_only_whole() {
+        let stored = Reading::new(
+            vec![Part::Text(Cow::Borrowed(
+                "Please ask cc @U0EXAMPLEA to review the new plan",
+            ))],
+            true,
+        );
+        let own = Reading::new(
+            vec![Part::Text(Cow::Borrowed(
+                "Please ask cc <@U0EXAMPLEA> to check A &amp; B",
+            ))],
+            true,
+        );
+        for (reading, quote, expected) in [
+            (
+                &stored,
+                "Please ask cc @U0EXAMPLEA to review the new plan",
+                true,
+            ),
+            (&stored, "Please ask cc", true),
+            (&stored, "to review the new plan", true),
+            (&stored, "Please ask cc @U0EXAMPLE", false),
+            (&stored, "0EXAMPLEA to review the new plan", false),
+            (&own, "Please ask cc <@U0EXAMPLEA> to check A &amp; B", true),
+            (&own, "<@U0EXAMPLEA> to check A &amp; B", true),
+            (&own, "Please ask cc <@U0EXAMPLE", false),
+            (&own, "Please ask cc <@U0EXAMPLEA", false),
+            (&own, "U0EXAMPLEA> to check A &amp; B", false),
+        ] {
+            assert_eq!(holds(reading, quote), expected, "{quote}");
+        }
+    }
+
+    /// A text that is no Slack source's is compared as a string, `@` words and all.
+    #[test]
+    fn a_text_of_another_source_keeps_no_mention_whole() {
+        let reading = Reading::new(
+            vec![Part::Text(Cow::Borrowed("Thanks @user123 for the review"))],
+            false,
+        );
+
+        assert!(matches!(reading, Reading::Plain(_)));
+        assert!(holds(&reading, "Thanks @user123 for the review"));
+    }
+
     /// A large text with no mention is one plain string, compared as a string, and a record
     /// whose source text is the same text reads once: no graph and no second copy.
     #[test]
@@ -851,11 +980,15 @@ mod tests {
         };
         let (primary, others) = literal_parts(&record);
         let mut readings = Vec::new();
-        add_reading(&mut readings, primary);
+        add_reading(&mut readings, primary, false);
         for parts in others {
-            add_reading(&mut readings, parts);
+            add_reading(&mut readings, parts, false);
         }
-        add_reading(&mut readings, vec![Part::Text(Cow::Borrowed(&record.text))]);
+        add_reading(
+            &mut readings,
+            vec![Part::Text(Cow::Borrowed(&record.text))],
+            false,
+        );
 
         assert_eq!(readings.len(), 1, "identical texts read once");
         let [reading @ Reading::Plain(plain)] = readings.as_slice() else {
