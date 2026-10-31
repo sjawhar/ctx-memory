@@ -3,6 +3,7 @@
 mod auth;
 mod fetch;
 mod records;
+mod serve;
 
 use anyhow::{bail, Context as _, Result};
 use chrono::Utc;
@@ -16,6 +17,7 @@ use auth::{fetch_authenticator, load_credential};
 use fetch::{emit_resolve_hello, resolve_with_api, run_fetch};
 
 pub use records::record_from_message;
+pub use serve::{slack_schemes, Mentions};
 
 const DEFAULT_THREAD_POLL_DAYS: u32 = 30;
 

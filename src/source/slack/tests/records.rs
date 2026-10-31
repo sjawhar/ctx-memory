@@ -93,6 +93,82 @@ fn typed_angle_brackets_are_not_mentions_and_links_stay() -> Result<()> {
     Ok(())
 }
 
+fn people(names: &[(&str, &str)]) -> BTreeMap<String, String> {
+    names
+        .iter()
+        .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
+        .collect()
+}
+
+/// A message stored before mentions were named shows a person as the bare id; served, it
+/// reads with the name known now, as a fetch writes it now.
+#[test]
+fn a_message_stored_with_a_bare_id_is_served_with_the_name() {
+    let served = served_text(
+        "cc <@U0EXAMPLEA> looks like you reviewed his PRs. Any thoughts?",
+        "cc @U0EXAMPLEA looks like you reviewed his PRs. Any thoughts?",
+        &people(&[("U0EXAMPLEA", "Kim Lee")]),
+    );
+
+    assert_eq!(
+        served.as_deref(),
+        Some("cc @Kim Lee looks like you reviewed his PRs. Any thoughts?")
+    );
+}
+
+/// A person no name is known for reads as the label Slack wrote into the mention, else the
+/// id, as a fetch writes it now: no longer as the `@U…|label` an earlier renderer wrote.
+#[test]
+fn a_mention_no_name_is_known_for_is_served_as_its_label_or_its_id() {
+    let served = served_text(
+        "<@U0EXAMPLEB|grace> and <@U0EXAMPLEC> please",
+        "@U0EXAMPLEB|grace and @U0EXAMPLEC please",
+        &BTreeMap::new(),
+    );
+
+    assert_eq!(served.as_deref(), Some("@grace and @U0EXAMPLEC please"));
+}
+
+/// A stored text that already names a mention keeps that name when no other is known, while
+/// the person a name is known for reads with it; a name may hold spaces and stand right
+/// beside another mention.
+#[test]
+fn a_name_the_stored_text_gives_is_kept_when_none_is_known() {
+    let known = people(&[("U0EXAMPLEA", "Kim Lee")]);
+    let upgraded = served_text(
+        "<@U0EXAMPLEA> <@U0EXAMPLED> and <#C0EXAMPLE02> to decide",
+        "@Kim @Ada Lovelace and #launch to decide",
+        &known,
+    );
+    let unchanged = served_text(
+        "<@U0EXAMPLEA> <@U0EXAMPLED> to decide",
+        "@Kim Lee @Ada Lovelace to decide",
+        &known,
+    );
+
+    assert_eq!(
+        upgraded.as_deref(),
+        Some("@Kim Lee @Ada Lovelace and #launch to decide")
+    );
+    assert_eq!(unchanged, None, "the stored text is already the served one");
+}
+
+/// An earlier renderer left `<!everyone>` and a channel as Slack wrote them and named a
+/// person only from the authors of the same fetch. When nothing names that person now, the
+/// new rendering would show the id where the stored text shows a name, so the stored text is
+/// served; once the store names them, the message reads as a fetch writes it now.
+#[test]
+fn a_text_an_earlier_renderer_wrote_is_never_served_worse() {
+    let text = "<@U0EXAMPLEA> see <#C0EXAMPLE02> <!everyone>";
+    let stored = "@Kim see <#C0EXAMPLE02> <!everyone>";
+
+    assert_eq!(served_text(text, stored, &BTreeMap::new()), None);
+    assert_eq!(
+        served_text(text, stored, &people(&[("U0EXAMPLEA", "Kim Lee")])).as_deref(),
+        Some("@Kim Lee see #C0EXAMPLE02 @everyone")
+    );
+}
+
 #[test]
 fn pre_window_parent_is_sent_as_a_context_record() -> Result<()> {
     let root = scratch("pre-window-parent")?;

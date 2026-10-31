@@ -39,7 +39,12 @@ pub(super) fn refresh_quote_sources(
     evidence: &mut Evidence,
     verification: &mut Verification,
 ) -> Result<()> {
-    let Lookup { store, schemes, .. } = lookup;
+    let Lookup {
+        store,
+        schemes,
+        mentions,
+        ..
+    } = lookup;
     let record_texts: Vec<&str> = evidence.record.texts.iter().map(String::as_str).collect();
     let every_claim_matches = claims.iter().all(|claim| {
         match claim_provenance(claim, document, schemes, evidence, &record_texts) {
@@ -74,7 +79,13 @@ pub(super) fn refresh_quote_sources(
                 .push(broken(document, source.start, &source.pointer, error));
             continue;
         }
-        *source = QuoteSource::load(store, schemes, source.pointer.clone(), source.start)?;
+        *source = QuoteSource::load(
+            store,
+            schemes,
+            mentions,
+            source.pointer.clone(),
+            source.start,
+        )?;
     }
     Ok(())
 }

@@ -17,6 +17,7 @@ use crate::output;
 use crate::pointer::Schemes;
 use crate::record::Record;
 use crate::schema::{OPEN_KINDS, OPEN_STATES};
+use crate::source::slack::Mentions;
 use crate::source::{self, MAX_POINTER_BYTES};
 use crate::tree::{Doc, Tree};
 use crate::windows::{SourcedRecord, Window};
@@ -367,6 +368,27 @@ impl Delta {
                 .retain(|reply| listed.contains(reply.pointer.as_str()));
         }
         self.unreviewed.retain(|flag| !flag.replies.is_empty());
+    }
+
+    /// Shows each message's excerpt as cut from the text ctx serves for the message now
+    /// ([`Mentions`]): a Slack message's mentions read with the names the store holds, even in
+    /// a window fetched before mentions were named. The excerpt is cut from the stored version
+    /// the window's delta was written from; a message the store holds in no such version
+    /// keeps the excerpt the delta wrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read.
+    pub fn serve(&mut self, mentions: &Mentions<'_>) -> Result<()> {
+        for message in &mut self.new_messages {
+            serve_excerpt(&message.pointer, &mut message.excerpt, mentions)?;
+        }
+        for flag in &mut self.unreviewed {
+            for reply in &mut flag.replies {
+                serve_excerpt(&reply.pointer, &mut reply.excerpt, mentions)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1277,4 +1299,19 @@ fn excerpt(text: &str) -> String {
     let mut shortened = flat.chars().take(EXCERPT_CHARS).collect::<String>();
     shortened.push('\u{2026}');
     shortened
+}
+
+/// Replaces `written`, the excerpt a window's delta holds for `pointer`, with the excerpt of
+/// the text ctx serves for the stored version it was cut from, when that differs.
+fn serve_excerpt(pointer: &str, written: &mut String, mentions: &Mentions<'_>) -> Result<()> {
+    // Every mention reads with `@` or `#`, and one an earlier renderer left as Slack wrote it
+    // keeps its `<`: an excerpt with none of them shows no mention, so no name changes it.
+    if !written.contains(['@', '#', '<']) {
+        return Ok(());
+    }
+    let cut = written.as_str();
+    if let Some(text) = mentions.version_text(pointer, |stored| excerpt(stored) == cut)? {
+        *written = excerpt(&text);
+    }
+    Ok(())
 }

@@ -24,7 +24,9 @@ pub(super) use super::super::fetch::{
     discover_streams, fetch_with_api, flag, is_channel, read_thread_index, resolve_with_api,
     update_thread_activity, write_thread_index, SlackApi, ThreadIndex, THREAD_INDEX_FILE,
 };
-pub(super) use super::super::records::{message_timestamp, record_from_message, slack_timestamp};
+pub(super) use super::super::records::{
+    message_timestamp, record_from_message, served_text, slack_timestamp,
+};
 pub(super) use super::super::{
     emit_resolve_hello, parse_config, run_fetch, Message, Request, SlackConfig, SlackSource, Source,
 };

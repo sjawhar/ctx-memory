@@ -82,23 +82,189 @@ fn rescheme(pointer: &str, scheme: &str) -> String {
 /// Renders a message's text for a reader: each mention as the name of the person, group or
 /// channel it names, typed text unescaped, and every other sequence, such as a link, as Slack
 /// wrote it.
-fn render_slack_text(text: &str, names: &BTreeMap<String, String>) -> String {
+pub(super) fn render_slack_text(text: &str, names: &BTreeMap<String, String>) -> String {
     let mut rendered = String::with_capacity(text.len());
-    for part in parts(text) {
-        match part {
-            Part::Typed(typed) => rendered.push_str(&html_unescape(typed)),
-            Part::Sequence(sequence) => {
-                if let Some(mention) = Mention::parse(sequence) {
-                    mention.render(names, &mut rendered);
-                } else {
-                    rendered.push('<');
-                    rendered.push_str(&html_unescape(sequence));
-                    rendered.push('>');
-                }
-            }
+    for piece in pieces(text) {
+        match piece {
+            Piece::Fixed(fixed) => rendered.push_str(&fixed),
+            Piece::Named(mention) => mention.render(names, &mut rendered),
         }
     }
     rendered
+}
+
+/// The text to serve for a message Slack sent as `text` and a fetch stored as `stored`: each
+/// person it mentions named by `people`, the names known now by Slack id, and the rest as
+/// [`render_slack_text`] renders it. `None` when that is the stored text.
+///
+/// A served text is never worse than the stored one: a mention the stored text names keeps
+/// that name unless `people` names the person, and nothing the stored text names reads as an
+/// id. When `stored` is this renderer's text, the name it gave each mention is read off it
+/// ([`stored_names`]). An earlier renderer wrote a channel, group or broadcast mention as
+/// Slack sent it, a labelled person as `@U…|label`, and a person by name only when the same
+/// fetch read a message of theirs, so its text names no mention that this one shows as an id
+/// unless `people` lacks that person; then the stored text is served as it is.
+pub(super) fn served_text(
+    text: &str,
+    stored: &str,
+    people: &BTreeMap<String, String>,
+) -> Option<String> {
+    let served = if let Some(mut names) = stored_names(text, stored) {
+        names.extend(people.iter().map(|(id, name)| (id.clone(), name.clone())));
+        render_slack_text(text, &names)
+    } else {
+        let shows_an_id = mentions(text).any(|mention| match mention {
+            Mention::User { id, label: None } => !people.contains_key(id) && !stored.contains(id),
+            Mention::Channel { id, label: None } | Mention::Group { id, label: None } => {
+                !stored.contains(id)
+            }
+            Mention::User { .. }
+            | Mention::Channel { .. }
+            | Mention::Group { .. }
+            | Mention::Everyone(_) => false,
+        });
+        if shows_an_id {
+            return None;
+        }
+        render_slack_text(text, people)
+    };
+    (served != stored).then_some(served)
+}
+
+/// One piece of a message's text as a reader sees it.
+enum Piece<'a> {
+    /// What every rendering of the message writes alike: typed text, a link, a group or
+    /// broadcast mention, and a channel mention Slack wrote the name into.
+    Fixed(String),
+    /// A mention whose name depends on what the renderer could learn: a person, or a channel
+    /// Slack left unnamed.
+    Named(Mention<'a>),
+}
+
+/// A message's text, as Slack sends it, in the pieces a reader sees.
+fn pieces(text: &str) -> Vec<Piece<'_>> {
+    let unnamed = BTreeMap::new();
+    parts(text)
+        .into_iter()
+        .map(|part| match part {
+            Part::Typed(typed) => Piece::Fixed(html_unescape(typed)),
+            Part::Sequence(sequence) => match Mention::parse(sequence) {
+                Some(mention) if mention.named().is_some() => Piece::Named(mention),
+                Some(mention) => {
+                    let mut fixed = String::new();
+                    mention.render(&unnamed, &mut fixed);
+                    Piece::Fixed(fixed)
+                }
+                None => Piece::Fixed(format!("<{}>", html_unescape(sequence))),
+            },
+        })
+        .collect()
+}
+
+/// How many ways of reading a stored text [`stored_names`] tries before it gives up, so a
+/// message written to make the search slow costs no more than this.
+const ALIGNMENT_STEPS: usize = 10_000;
+
+/// The names `stored` gives the mentions in `text`, Slack's own text of the same message, when
+/// `stored` is what [`render_slack_text`] wrote for it: by id, each person or channel whose
+/// name the stored text shows. A mention it shows as the label Slack wrote or as its id gives
+/// none, and so does a person an earlier renderer wrote as `@U…|label`. `None` when `stored`
+/// is not this renderer's text for `text`, as when an earlier renderer left a channel, group
+/// or broadcast mention as Slack wrote it.
+fn stored_names(text: &str, stored: &str) -> Option<BTreeMap<String, String>> {
+    let pieces = pieces(text);
+    let mut shown = Vec::new();
+    let mut steps = ALIGNMENT_STEPS;
+    if !align(&pieces, stored, &mut shown, &mut steps) {
+        return None;
+    }
+    let unnamed = BTreeMap::new();
+    let mut names = BTreeMap::new();
+    for (mention, name) in shown {
+        let Some((_, id)) = mention.named() else {
+            continue;
+        };
+        let mut unnamed_text = String::new();
+        mention.render(&unnamed, &mut unnamed_text);
+        let unnamed_name = unnamed_text.get(1..).unwrap_or_default();
+        let id_and_label = name
+            .strip_prefix(id)
+            .is_some_and(|after| after.starts_with('|'));
+        if name != unnamed_name && !id_and_label {
+            names
+                .entry(id.to_owned())
+                .or_insert_with(|| name.to_owned());
+        }
+    }
+    Some(names)
+}
+
+/// Whether `stored` reads as `pieces`, with a name after each named mention's sigil, keeping
+/// each mention and the name it read as in `shown`. A name is never empty and never runs past
+/// its line. Each way tried spends one of `steps`, and none left fails the match.
+fn align<'p, 's>(
+    pieces: &[Piece<'p>],
+    stored: &'s str,
+    shown: &mut Vec<(Mention<'p>, &'s str)>,
+    steps: &mut usize,
+) -> bool {
+    let mut remaining = stored;
+    for (index, piece) in pieces.iter().enumerate() {
+        let mention = match piece {
+            Piece::Fixed(fixed) => match remaining.strip_prefix(fixed.as_str()) {
+                Some(after) => {
+                    remaining = after;
+                    continue;
+                }
+                None => return false,
+            },
+            Piece::Named(mention) => *mention,
+        };
+        let Some(name_and_after) = mention
+            .named()
+            .and_then(|(sigil, _)| remaining.strip_prefix(sigil))
+        else {
+            return false;
+        };
+        let rest = pieces.get(index + 1..).unwrap_or_default();
+        let line_end = name_and_after.find('\n').unwrap_or(name_and_after.len());
+        let ends = name_and_after
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .skip(1)
+            .chain(std::iter::once(name_and_after.len()))
+            .take_while(|end| *end <= line_end);
+        for end in ends {
+            let Some(left) = steps.checked_sub(1) else {
+                return false;
+            };
+            *steps = left;
+            let Some((name, after)) = name_and_after.split_at_checked(end) else {
+                return false;
+            };
+            if !can_start(rest, after) {
+                continue;
+            }
+            shown.push((mention, name));
+            if align(rest, after, shown, steps) {
+                return true;
+            }
+            shown.pop();
+        }
+        return false;
+    }
+    remaining.is_empty()
+}
+
+/// Whether `text` can begin what `pieces` read as: their first piece, or nothing at all.
+fn can_start(pieces: &[Piece<'_>], text: &str) -> bool {
+    match pieces.first() {
+        None => text.is_empty(),
+        Some(Piece::Fixed(fixed)) => text.starts_with(fixed.as_str()),
+        Some(Piece::Named(mention)) => mention
+            .named()
+            .is_some_and(|(sigil, _)| text.starts_with(sigil)),
+    }
 }
 
 /// One part of a message's text as Slack sends it.
@@ -175,8 +341,19 @@ impl<'a> Mention<'a> {
         }
     }
 
-    /// Writes the mention as a reader sees it: `@` and a person's name, as the author line
-    /// gives it, or a group's handle, and `#` and a channel's name. A person is named by
+    /// The sigil and id of a mention whose name depends on what a renderer could learn: a
+    /// person, or a channel Slack left unnamed. `None` for every other mention, which each
+    /// rendering writes alike.
+    fn named(self) -> Option<(char, &'a str)> {
+        match self {
+            Self::User { id, .. } => Some(('@', id)),
+            Self::Channel { id, label: None } => Some(('#', id)),
+            Self::Channel { .. } | Self::Group { .. } | Self::Everyone(_) => None,
+        }
+    }
+
+    /// Writes the mention as a reader sees it: `@` and the name `names` gives a person, or a
+    /// group's handle, and `#` and a channel's name. A person is named by
     /// `names` first, since a label is the name Slack had when the message was sent; a channel
     /// by its label first, since Slack is asked only about a channel it left unnamed. A
     /// mention neither names keeps its id.

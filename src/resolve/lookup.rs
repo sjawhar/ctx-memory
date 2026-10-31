@@ -7,6 +7,7 @@ use crate::config::SourceConfig;
 use crate::context::Context;
 use crate::pointer::{Pointer, Schemes};
 use crate::record::render;
+use crate::source::slack::Mentions;
 use crate::source::{self, Request as SourceRequest, ResolveRequest, Session, SourceRef};
 use crate::store::Store;
 
@@ -16,12 +17,14 @@ pub(super) struct ResolvedText {
     pub(super) source_error: Option<String>,
 }
 
-/// What every lookup reads: the run's context, the local store and the configured schemes.
+/// What every lookup reads: the run's context, the local store, the configured schemes, and
+/// the names a served Slack message's mentions read with.
 #[derive(Clone, Copy)]
 pub(super) struct Lookup<'a> {
     pub(super) context: &'a Context,
     pub(super) store: &'a Store,
     pub(super) schemes: &'a Schemes,
+    pub(super) mentions: &'a Mentions<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -116,8 +119,9 @@ pub(super) fn resolve_with_live(
         context,
         store,
         schemes,
+        mentions,
     } = lookup;
-    let text = resolve_local(store, schemes, pointer, thread)?;
+    let text = resolve_local(store, schemes, mentions, pointer, thread)?;
     let live = mode.live();
     let needs_verbatim = mode.needs_verbatim();
     let force_live = mode.force_live();
@@ -166,7 +170,7 @@ pub(super) fn resolve_with_live(
     // fetch job, and a rebuild of this machine's index replays what is kept here.
     store.put_resolved(&source.id, Some(verbatim), &outcome.records, Utc::now())?;
     Ok(ResolvedText {
-        text: resolve_local(store, schemes, pointer, thread)?,
+        text: resolve_local(store, schemes, mentions, pointer, thread)?,
         verbatim,
         source_error: None,
     })
@@ -199,16 +203,25 @@ fn resolve_from_source(
     Ok(session.finish(run))
 }
 
+/// The text `ctx resolve` prints for `pointer`, or its thread: each stored record as a reader
+/// reads it, a Slack message with the people it mentions named ([`Mentions`]).
 pub(super) fn resolve_local(
     store: &Store,
     schemes: &Schemes,
+    mentions: &Mentions<'_>,
     pointer: &Pointer,
     thread: bool,
 ) -> Result<Option<String>> {
-    let records = local_records(store, schemes, pointer, thread)?;
-    (!records.is_empty())
-        .then(|| records.iter().map(render).collect::<Vec<_>>().join("\n\n"))
-        .map_or(Ok(None), |text| Ok(Some(text)))
+    let mut records = local_records(store, schemes, pointer, thread)?;
+    if records.is_empty() {
+        return Ok(None);
+    }
+    for record in &mut records {
+        mentions.serve(record)?;
+    }
+    Ok(Some(
+        records.iter().map(render).collect::<Vec<_>>().join("\n\n"),
+    ))
 }
 
 pub(super) fn local_records(

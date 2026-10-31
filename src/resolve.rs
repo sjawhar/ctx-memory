@@ -16,6 +16,7 @@ use crate::context::Context;
 use crate::output::printable;
 use crate::pointer::Pointer;
 use crate::source;
+use crate::source::slack::{slack_schemes, Mentions};
 use crate::store::Store;
 use crate::tree::{Doc, Tree};
 
@@ -73,10 +74,12 @@ pub struct Verification {
 pub fn resolve(context: &Context, pointers: &[String], thread: bool) -> Result<Vec<Resolved>> {
     let schemes = source::configured_schemes(&context.config.sources)?;
     let store = Store::load(context.data()?, context.state()?)?;
+    let mentions = Mentions::new(&store, slack_schemes(&context.config.sources)?);
     let lookup = Lookup {
         context,
         store: &store,
         schemes: &schemes,
+        mentions: &mentions,
     };
     pointers
         .iter()
@@ -151,11 +154,13 @@ pub fn verify(
 pub fn verify_documents(context: &Context, documents: &[&Doc], live: bool) -> Result<Verification> {
     let schemes = source::configured_schemes(&context.config.sources)?;
     let store = Store::load(context.data()?, context.state()?)?;
+    let mentions = Mentions::new(&store, slack_schemes(&context.config.sources)?);
     let mut verification = Verification::default();
     let lookup = Lookup {
         context,
         store: &store,
         schemes: &schemes,
+        mentions: &mentions,
     };
     for document in documents {
         verify_document(lookup, document, live, &mut verification)?;

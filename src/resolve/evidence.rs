@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::pointer::{self, Pointer, Schemes};
 use crate::record::Record;
+use crate::source::slack::Mentions;
 use crate::store::Store;
 use crate::tree::{Doc, Tier};
 
@@ -70,7 +71,8 @@ pub(super) enum Provenance<'a> {
     Untraceable { start: usize, pointer: String },
 }
 /// The text a cited pointer resolves to, with the other texts a quote may have been taken
-/// from: earlier versions of its records, and the source's own text of each.
+/// from: the stored text, earlier versions of its records, the source's own text of each, and
+/// the text ctx served for each.
 pub(super) struct QuoteSource {
     pub(super) pointer: Pointer,
     pub(super) start: usize,
@@ -79,37 +81,47 @@ pub(super) struct QuoteSource {
 }
 
 impl QuoteSource {
-    /// Reads the newest text of a pointer's thread, every earlier version of its records, and
-    /// the source's own text of each.
+    /// Reads the text `ctx resolve --thread` serves for a pointer, with the stored text of each
+    /// record, every earlier version of its records, and the source's own text and the served
+    /// text of each.
     pub(super) fn load(
         store: &Store,
         schemes: &Schemes,
+        mentions: &Mentions<'_>,
         pointer: Pointer,
         start: usize,
     ) -> Result<Self> {
         let records = local_records(store, schemes, &pointer, true)?;
-        let text = records
+        let served = records
             .iter()
-            .map(|record| record.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|record| {
+                Ok(mentions
+                    .text(record)?
+                    .unwrap_or_else(|| record.text.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let text = served.join("\n");
         let mut older = Vec::new();
-        let mut keep = |record: &Record, candidate: &str| {
-            if candidate != record.text && !older.iter().any(|kept| kept == candidate) {
+        let mut keep = |current: &str, candidate: &str| {
+            if candidate != current && !older.iter().any(|kept| kept == candidate) {
                 older.push(candidate.to_owned());
             }
         };
-        for record in &records {
+        for (record, current) in records.iter().zip(&served) {
+            keep(current, &record.text);
             if let Some(own) = source_text(record) {
-                keep(record, own);
+                keep(current, own);
             }
             let Some(parsed) = schemes.parse(&record.pointer) else {
                 continue;
             };
             for (_, version) in store.versions(&parsed)? {
-                keep(record, &version.text);
+                keep(current, &version.text);
                 if let Some(own) = source_text(&version) {
-                    keep(record, own);
+                    keep(current, own);
+                }
+                if let Some(version_served) = mentions.text(&version)? {
+                    keep(current, &version_served);
                 }
             }
         }
@@ -122,8 +134,9 @@ impl QuoteSource {
     }
 
     /// Reports whether the quote appears in the current text or in one of the other texts it
-    /// may have been taken from. A quote taken before an edit stays verifiable, and so does one
-    /// taken while a Slack mention read as its id.
+    /// may have been taken from. A quote taken before an edit stays verifiable, and so do one
+    /// taken while a Slack mention read as its id and one taken from what ctx served when it
+    /// named that mention.
     pub(super) fn holds(&self, quote: &str) -> bool {
         quote_matches(&self.text, quote) || self.older.iter().any(|text| quote_matches(text, quote))
     }

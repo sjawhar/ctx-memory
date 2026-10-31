@@ -31,9 +31,11 @@ use crate::schema::today_utc;
 use crate::search;
 use crate::server;
 use crate::slack_login;
+use crate::source::slack::{slack_schemes, Mentions};
 use crate::source::{
     self, FetchRequest, Request as SourceRequest, ResolveRequest, Session, SourceRef,
 };
+use crate::store::Store;
 use crate::sweep;
 use crate::tree::Doc;
 use crate::windows::{self, SourceManifest, Status, Window};
@@ -881,6 +883,13 @@ fn run_delta(run: &mut Run<'_, '_>, requested: Option<&str>, write: bool) -> Res
             )
         })?
     };
+    // A delta quotes each new message, which a Slack message serves with the people it
+    // mentions named by the names the store holds, whatever the window's file says.
+    let slack = slack_schemes(&context.config.sources)?;
+    if !slack.is_empty() {
+        let store = Store::load(data, context.state()?)?;
+        shown.serve(&Mentions::new(&store, slack))?;
+    }
     // What is printed is also what a server answers with, so it is cut to one answer's size;
     // `omitted_messages` counts what the window's own delta.json lists beyond it.
     shown.fit(delta::ANSWER_DELTA_BYTES);

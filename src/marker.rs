@@ -15,6 +15,8 @@ use crate::context::Context;
 use crate::delta::{self, Delta, ANSWER_DELTA_BYTES};
 use crate::exclude::Exclusion;
 use crate::output::printable;
+use crate::source::slack::{slack_schemes, Mentions};
+use crate::store::Store;
 use crate::windows::{self, Status, Window, WindowId};
 
 /// The newest window an agent has turned into committed records.
@@ -142,27 +144,41 @@ pub fn advance(context: &Context, window: &str, by: &str) -> Result<Marker> {
 /// `next_offset` is the `offset` that lists the next part. `offset` leaves out that many of the
 /// oldest messages.
 ///
+/// Each message's excerpt is cut from the text ctx serves for it now ([`Delta::serve`]), so a
+/// Slack message reads with the people it mentions named by the names the store holds.
+///
 /// # Errors
 ///
-/// Returns an error when the marker, a window manifest, or a window delta cannot be read.
+/// Returns an error when the marker, a window manifest, a window delta, or the store cannot
+/// be read.
 pub fn pending(context: &Context, limit: Option<usize>, offset: usize) -> Result<Pending> {
+    let data = context.data()?;
+    let exclusion = Exclusion::configured(&context.config)?;
+    let schemes = slack_schemes(&context.config.sources)?;
+    if schemes.is_empty() {
+        return pending_in(data, limit, &exclusion, ANSWER_DELTA_BYTES, offset, None);
+    }
+    let store = Store::load(data, context.state()?)?;
+    let mentions = Mentions::new(&store, schemes);
     pending_in(
-        context.data()?,
+        data,
         limit,
-        &Exclusion::configured(&context.config)?,
+        &exclusion,
         ANSWER_DELTA_BYTES,
         offset,
+        Some(&mentions),
     )
 }
 
-/// [`pending`] over a data directory, with the cap, exclusion and size it answers within, so
-/// it is testable without a whole [`Context`].
+/// [`pending`] over a data directory, with the cap, exclusion and size it answers within, and
+/// the names it serves Slack mentions with, so it is testable without a whole [`Context`].
 fn pending_in(
     data: &DataDir,
     limit: Option<usize>,
     exclusion: &Exclusion,
     budget: usize,
     offset: usize,
+    mentions: Option<&Mentions<'_>>,
 ) -> Result<Pending> {
     let path = data.marker();
     let marker = load(&path)?;
@@ -187,7 +203,10 @@ fn pending_in(
     let mut window_bytes = 0_usize;
     for window in after {
         let manifest = window.manifest()?;
-        let delta = delta::read(&window, exclusion)?;
+        let mut delta = delta::read(&window, exclusion)?;
+        if let (Some(delta), Some(mentions)) = (delta.as_mut(), mentions) {
+            delta.serve(mentions)?;
+        }
         let dir = window.dir.strip_prefix(data.root()).with_context(|| {
             format!(
                 "{} is not under the data directory {}",
@@ -489,6 +508,7 @@ mod tests {
                 &crate::exclude::Exclusion::default(),
                 usize::MAX,
                 0,
+                None,
             )
         };
         assert_eq!(ids(&all(&data, None)?), windows);
