@@ -19,8 +19,10 @@ use crate::marker;
 use crate::output::{self, Outcome, Sink};
 use crate::protocol::{
     Captured, CommandRequest, Committed, DeleteRequest, Draft, MarkerRequest, MarkerResponse,
-    PutRequest, Refused, COMMAND_ROUTE, DELETE_ROUTE, MARKER_ROUTE, PUT_ROUTE,
+    PutBatchRequest, PutRequest, RecordFile, Refused, COMMAND_ROUTE, DELETE_ROUTE, MARKER_ROUTE,
+    PUT_BATCH_ROUTE, PUT_ROUTE,
 };
+use crate::redact;
 
 /// The default endpoint of Google's IAM credentials API.
 const IAM_CREDENTIALS: &str = "https://iamcredentials.googleapis.com";
@@ -119,6 +121,22 @@ impl Client {
             &PutRequest {
                 path: path.to_owned(),
                 content: content.to_owned(),
+                session: Some(session.to_owned()),
+            },
+        )
+    }
+
+    /// Writes several records through the server in one commit, or none of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server cannot be reached or the write fails for a reason
+    /// other than a check finding.
+    pub fn put_batch(&self, records: Vec<RecordFile>, session: &str) -> Result<Written> {
+        self.write(
+            PUT_BATCH_ROUTE,
+            &PutBatchRequest {
+                records,
                 session: Some(session.to_owned()),
             },
         )
@@ -255,7 +273,10 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
         // Only a record write has no local meaning at all: a tree on one machine still moves
         // its own marker and shows its own records, and routes both to the server when one is
         // configured.
-        if matches!(route, Remote::Put { .. } | Remote::Rm { .. }) {
+        if matches!(
+            route,
+            Remote::Put { .. } | Remote::PutBatch { .. } | Remote::Rm { .. }
+        ) {
             bail!("no ctx server is configured; set CTX_SERVER or server in the user config");
         }
         return Ok(None);
@@ -281,6 +302,12 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             let content = record_content(source)?;
             let written = client()?.put(path, &content, &session)?;
             report_write(&written, cli.json, "record put", path, sink).map(Some)
+        }
+        Remote::PutBatch { source } => {
+            let records = batch_records(source)?;
+            let paths: Vec<String> = records.iter().map(|record| record.path.clone()).collect();
+            let written = client()?.put_batch(records, &session)?;
+            report_batch(&written, cli.json, &paths, sink).map(Some)
         }
         Remote::Rm { path } => {
             let written = client()?.delete(path, &session)?;
@@ -380,6 +407,33 @@ fn record_content(source: &str) -> Result<String> {
     Ok(content)
 }
 
+/// Reads the records of a batch, a JSON list of `{"path": …, "content": …}` objects, from the
+/// named file, or from standard input for `-`.
+///
+/// serde's own error quotes the value it could not read, and that value is the caller's text:
+/// a record, or a credential pasted in by mistake. So the error says where the batch went
+/// wrong, never what it held.
+fn batch_records(source: &str) -> Result<Vec<RecordFile>> {
+    let text = record_content(source)?;
+    let records: Vec<RecordFile> = serde_json::from_str(&text).map_err(|error| {
+        let from = if source == "-" {
+            "standard input"
+        } else {
+            source
+        };
+        anyhow!(
+            "reading the batch from {from} failed at line {}, column {}: a batch is a JSON list \
+             of {{\"path\": …, \"content\": …}} objects",
+            error.line(),
+            error.column()
+        )
+    })?;
+    if records.is_empty() {
+        bail!("the batch names no record; a write changes at least one");
+    }
+    Ok(records)
+}
+
 /// Prints what a write did, and fails the command when the server refused it.
 fn report_write(
     written: &Written,
@@ -402,14 +456,64 @@ fn report_write(
             Ok(Outcome::Pass)
         }
         Written::Refused(refused) => {
+            // The server refuses a path that holds a credential and shows it redacted; the path
+            // as the caller sent it is shown the same way.
+            let path = redact::redacted(path)?;
             let payload = json!({ "path": path, "findings": refused.findings });
             // A finding can quote the record, and the record quotes its sources.
             output::emit(sink, json, command, &payload, |_, out| {
-                writeln!(out, "refused {}", output::printable(path))?;
+                writeln!(out, "refused {}", output::printable(&path))?;
                 for finding in &refused.findings {
                     writeln!(
                         out,
                         "  {} — {}",
+                        output::printable(&finding.kind),
+                        output::printable(&finding.detail)
+                    )?;
+                }
+                Ok(())
+            })?;
+            Ok(Outcome::StructuralDefects)
+        }
+    }
+}
+
+/// Prints what a batch write did, and fails the command when the server refused it. Each
+/// finding names the record it is about, since a batch has several.
+fn report_batch(
+    written: &Written,
+    json: bool,
+    paths: &[String],
+    sink: &mut Sink<'_>,
+) -> Result<Outcome> {
+    match written {
+        Written::Committed(commit) => {
+            let payload = json!({ "paths": paths, "commit": commit });
+            output::emit(sink, json, "record put", &payload, |_, out| {
+                for path in paths {
+                    let (commit, path) = (output::printable(commit), output::printable(path));
+                    writeln!(out, "{commit} {path}")?;
+                }
+                Ok(())
+            })?;
+            Ok(Outcome::Pass)
+        }
+        Written::Refused(refused) => {
+            // The server refuses a path that holds a credential and shows it redacted; the paths
+            // as the caller sent them are shown the same way.
+            let paths = paths
+                .iter()
+                .map(|path| redact::redacted(path))
+                .collect::<Result<Vec<String>>>()?;
+            let payload = json!({ "paths": paths, "findings": refused.findings });
+            // A finding can quote the record, and the record quotes its sources.
+            output::emit(sink, json, "record put", &payload, |_, out| {
+                writeln!(out, "refused {} records; none was written", paths.len())?;
+                for finding in &refused.findings {
+                    writeln!(
+                        out,
+                        "  {}: {} — {}",
+                        output::printable(&finding.path),
                         output::printable(&finding.kind),
                         output::printable(&finding.detail)
                     )?;

@@ -12,7 +12,7 @@ use crate::resolve;
 use crate::sweep;
 use crate::tree::Doc;
 
-use super::Change;
+use super::{Change, Edit};
 
 /// The absolute path a write touches, refused when any part of it is a symbolic link.
 ///
@@ -40,31 +40,48 @@ pub(super) fn inside_the_tree(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(absolute)
 }
 
-/// Every reason this one path would fail `ctx sweep` or `ctx cite verify`.
+/// Every reason the files a write changes would fail `ctx sweep` or `ctx cite verify`.
 ///
-/// Reachability is left out: a record and the page that links it are two writes, so neither
-/// could ever be the first. `ctx sweep` still reports orphans over the whole tree.
+/// Reachability is left out: a record and the page that links it are often two writes, so
+/// neither could ever be the first. `ctx sweep` still reports orphans over the whole tree.
 ///
-/// Every check below matches findings by this one path, so a path the tree does not load as
-/// a record would pass all of them by finding nothing — and be committed and pushed with no
-/// check at all. A put is therefore refused unless the written file is in the loaded tree. A
-/// delete removes a record instead of adding one, so it has nothing left to load.
-pub(super) fn check(context: &Context, path: &str, change: &Change) -> Result<Vec<Finding>> {
-    if matches!(change, Change::Put { .. })
-        && !context
+/// Every check below matches findings by the written paths, so a path the tree does not load
+/// as a record would pass all of them by finding nothing — and be committed and pushed with
+/// no check at all. A put is therefore refused unless each file it writes is in the loaded
+/// tree. A delete removes a record instead of adding one, so it has nothing left to load.
+///
+/// The tree holds every file of the write, so a link from one record of a batch to another
+/// finds its target, and the sweep runs once for the whole write.
+pub(super) fn check(context: &Context, edits: &[Edit<'_>]) -> Result<Vec<Finding>> {
+    let loaded = |path: &str| {
+        context
             .tree
             .docs
             .iter()
             .any(|document| document.rel == Path::new(path))
-    {
-        return Ok(vec![unloaded(path)]);
+    };
+    let unloadable: Vec<Finding> = edits
+        .iter()
+        .filter(|edit| edit.content.is_some() && !loaded(&edit.path))
+        .map(|edit| unloaded(&edit.path))
+        .collect();
+    if !unloadable.is_empty() {
+        return Ok(unloadable);
     }
-    let mut findings = structural_findings(&sweep::run(&context.tree)?, path);
+    let sweep = sweep::run(&context.tree)?;
+    let mut findings = rules_findings(&sweep);
+    for edit in edits {
+        findings.extend(structural_findings(&sweep, &edit.path));
+    }
     let written: Vec<&Doc> = context
         .tree
         .docs
         .iter()
-        .filter(|document| document.rel == Path::new(path))
+        .filter(|document| {
+            edits
+                .iter()
+                .any(|edit| document.rel == Path::new(&edit.path))
+        })
         .collect();
     let verification = resolve::verify_documents(context, &written, false)?;
     for broken in verification.broken {
@@ -130,8 +147,22 @@ pub(super) fn too_long(path: &str) -> Option<Finding> {
 }
 
 /// The finding for a put whose path runs through a file, or ends at a directory: no record
-/// file can be written there.
-pub(super) fn in_the_way(root: &Path, path: &str) -> Option<Finding> {
+/// file can be written there. Another record the same write puts counts as a file already
+/// there, so `batch` is every path the write names.
+pub(super) fn in_the_way(root: &Path, path: &str, batch: &[String]) -> Option<Finding> {
+    let blocked = |why: String| Finding {
+        kind: "not-a-record".to_owned(),
+        path: path.to_owned(),
+        detail: format!("no record file can be written here: {why}"),
+    };
+    if let Some(outer) = batch.iter().find(|other| {
+        path.strip_prefix(other.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+    }) {
+        return Some(blocked(format!(
+            "{outer} is another record of this write, so nothing can be written below it"
+        )));
+    }
     let parts: Vec<&str> = path.split('/').collect();
     let mut reached = root.to_path_buf();
     for (index, part) in parts.iter().enumerate() {
@@ -141,7 +172,7 @@ pub(super) fn in_the_way(root: &Path, path: &str) -> Option<Finding> {
             return None;
         };
         let last = index + 1 == parts.len();
-        let blocked = if last {
+        let why = if last {
             metadata
                 .is_dir()
                 .then(|| "a directory is at this path".to_owned())
@@ -153,26 +184,21 @@ pub(super) fn in_the_way(root: &Path, path: &str) -> Option<Finding> {
                 )
             })
         };
-        if let Some(why) = blocked {
-            return Some(Finding {
-                kind: "not-a-record".to_owned(),
-                path: path.to_owned(),
-                detail: format!("no record file can be written here: {why}"),
-            });
+        if let Some(why) = why {
+            return Some(blocked(why));
         }
     }
     None
 }
 
-/// What `ctx sweep` found about this one path, and about the rules page every write is made
-/// under.
+/// What `ctx sweep` found about this one path.
 fn structural_findings(sweep: &sweep::Findings, path: &str) -> Vec<Finding> {
     let about = |kind: &str, detail: String| Finding {
         kind: kind.to_owned(),
         path: path.to_owned(),
         detail,
     };
-    let mut findings = rules_findings(sweep);
+    let mut findings = Vec::new();
     for gap in sweep.gaps.iter().filter(|gap| gap.from == path) {
         findings.push(about("gap", format!("the link {} has no file", gap.target)));
     }
@@ -291,20 +317,26 @@ pub(super) fn is_rules_page(path: &str) -> bool {
 }
 
 /// One finding for each kind of credential a write carries, in each place the write would
-/// store it: the record's path, which becomes a file name and the commit's subject; the
-/// session, which becomes the commit's `Session:` line; and a put's content.
+/// store it: each record's path, which becomes a file name and part of the commit message; the
+/// session, which becomes the commit's `Session:` line; and each record a put writes.
 ///
 /// A finding names the kind of credential and where it is, never the credential: the answer
 /// goes back to the caller, and through it into a transcript. So the path a finding names has
-/// every credential taken out of it.
+/// every credential taken out of it. A finding about the session names the write's first path.
 pub(super) fn credential_findings(change: &Change, session: &str) -> Result<Vec<Finding>> {
-    let shown = redacted(change.path())?;
-    let mut carried = vec![("the record path", change.path()), ("the session", session)];
-    if let Change::Put { content, .. } = change {
-        carried.push(("the record", content.as_str()));
+    let mut carried = Vec::new();
+    for (index, (path, content)) in change.files().into_iter().enumerate() {
+        let shown = redacted(path)?;
+        carried.push((shown.clone(), "the record path", path));
+        if index == 0 {
+            carried.push((shown.clone(), "the session", session));
+        }
+        if let Some(content) = content {
+            carried.push((shown, "the record", content));
+        }
     }
     let mut findings = Vec::new();
-    for (place, text) in carried {
+    for (shown, place, text) in carried {
         for name in credentials_in(text)? {
             findings.push(Finding {
                 kind: "credential".to_owned(),

@@ -36,7 +36,7 @@ tools:
     checkpoint: deny
     rewind: deny
     github: deny
-    # The cycle's only writes: the two tools runner/ctx-record.ts adds, which hand a record
+    # The cycle's only writes: the two tools runner/ctx-record.ts adds, which hand records
     # to `ctx record put` on standard input, or a path to `ctx record rm`, with no shell.
     ctx_record_put: allow
     ctx_record_rm: allow

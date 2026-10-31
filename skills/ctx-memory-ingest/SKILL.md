@@ -185,15 +185,16 @@ automated notification noise unless a person acts on it.
    the log. With no cycle log named, write no record about the cycle.
 8. Verify. Check each new quote against its source with `ctx resolve <pointer>`, adding
    `--thread` when the record cites a thread pointer.
-9. Write each record with the `ctx_record_put` tool: give it the record's tree path and the
-   whole record, frontmatter and body, as `content`. Remove a record with `ctx_record_rm`,
+9. Write with the `ctx_record_put` tool: its `records` list holds each record's tree path and
+   the whole record, frontmatter and body, as `content`. Remove a record with `ctx_record_rm`,
    which takes its path. The two tools run `ctx record put <path>` and
    `ctx record rm <path>` against the server for you, each as one program with no shell, so
-   any text is fine in a record. The server checks every write the way `ctx sweep` and
-   `ctx cite verify` check that one path, commits it under your own name with the session
-   in the message, and pushes it. A write the server refuses fails with its findings and
-   changes nothing: fix the record and call the tool again. Write a record before the page
-   that links to it, so no write points at a file that does not exist yet.
+   any text is fine in a record. The server checks each write as `ctx sweep` and
+   `ctx cite verify` would, commits it under your own name with the session in the
+   message, and pushes it. A write the server refuses fails with its findings and changes
+   nothing: fix the record and call the tool again. Write a record before the page that
+   links to it. New records that link each other go in one call, since neither can be
+   written first: the server checks them together and commits all of them or none.
 10. Sweep. Once every record of the cycle is written, run `ctx sweep` for the whole tree.
     It reports what a single write cannot see, such as a record no page links to yet, so
     it runs after the writes it checks. Fix each structural finding you can with another

@@ -13,17 +13,17 @@
 # the marker, and refuses every URL read; --tools leaves out every tool but bash that runs code,
 # and every tool that reaches the network, spawns a subagent or writes a file; the model key is
 # taken out of the environment; and the session runs as ctx-agent, never as root. omp itself
-# starts no program a file the session writes could name: the session writes no file (a record
-# reaches the server through the `ctx_record_put` tool, which runs `ctx record put -- <path> -`
-# with the record on standard input), --no-lsp starts no language server, and omp keeps no shell
-# snapshot, because the directory it would write one to is root's. Before it starts, this script
-# checks that ctx-agent can read the windows and write its own transcript directory but nothing
-# else on the share, nor anything in its home or working directory (where omp reads its
-# configuration, the shell its startup files, and omp and ctx discover the tools and servers
-# they start), omp's plugin directory and native module, or that snapshot directory; if any
-# check fails, no session runs. After the session, the transcript directory goes back to root, so
-# no later cycle can rewrite it; the next cycle seals the directory of one that was killed before
-# it could.
+# starts no program a file the session writes could name: the session writes no file (records
+# reach the server through the `ctx_record_put` tool, which runs `ctx record put -- <path> -`
+# with the record, or `ctx record put --batch -` with several, on standard input), --no-lsp
+# starts no language server, and omp keeps no shell snapshot, because the directory it would
+# write one to is root's. Before it starts, this script checks that ctx-agent can read the
+# windows and write its own transcript directory but nothing else on the share, nor anything in
+# its home or working directory (where omp reads its configuration, the shell its startup files,
+# and omp and ctx discover the tools and servers they start), omp's plugin directory and native
+# module, or that snapshot directory; if any check fails, no session runs. After the session,
+# the transcript directory goes back to root, so no later cycle can rewrite it; the next cycle
+# seals the directory of one that was killed before it could.
 #
 # `run-cycle.sh maintain <pass>` runs one maintenance pass instead of a cycle: a one-time job over
 # the whole tree, such as re-checking a field on every open record after the ingest skill gained
@@ -450,7 +450,7 @@ fi
 # runs) is the session's user's, and omp's approval rules cannot keep a write tool to a directory
 # (tools/approval.ts:209-223 at the pinned release), so the session gets no write tool at all.
 # --trusted-extension loads runner/ctx-record.ts from root's /opt/ctx-memory, and no other
-# extension: its two tools hand a record to `ctx record put` on standard input, or a path to
+# extension: its two tools hand records to `ctx record put` on standard input, or a path to
 # `ctx record rm`, with no shell, and they are the cycle's only writes.
 # --no-lsp: without it, the first write or edit that checks a file reads a language-server
 # config (lsp.json, .omp/lsp.yml, …) from the session's directory and its home, files the session

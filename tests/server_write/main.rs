@@ -4,6 +4,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod batch;
 mod clone_and_follow;
 mod fixtures;
 mod lease_and_shutdown;

@@ -12,6 +12,8 @@ use crate::marker;
 pub const COMMAND_ROUTE: &str = "/v1/command";
 /// The route that writes one record.
 pub const PUT_ROUTE: &str = "/v1/records/put";
+/// The route that writes several records in one commit.
+pub const PUT_BATCH_ROUTE: &str = "/v1/records/put-batch";
 /// The route that removes one record.
 pub const DELETE_ROUTE: &str = "/v1/records/delete";
 /// The route that moves the agent marker.
@@ -50,6 +52,22 @@ pub struct PutRequest {
     pub path: String,
     #[serde(default)]
     pub session: Option<String>,
+}
+
+/// The body of [`PUT_BATCH_ROUTE`]: records written together, each checked against the tree
+/// with every one of them in it, and committed in one commit or not at all.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PutBatchRequest {
+    pub records: Vec<RecordFile>,
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+/// One record a batch writes: its tree path and its whole text, frontmatter and body.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RecordFile {
+    pub content: String,
+    pub path: String,
 }
 
 /// The body of [`DELETE_ROUTE`].

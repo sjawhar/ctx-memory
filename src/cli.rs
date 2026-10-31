@@ -188,13 +188,20 @@ pub enum RecordCommand {
         /// Tree-relative path of the record, such as `decisions/renewal.md`.
         path: String,
     },
-    /// Write a record, reading it from standard input or from a file.
+    /// Write a record, reading it from standard input or from a file; with `--batch`, several
+    /// records in one commit.
     Put {
         /// Tree-relative path of the record, such as `decisions/renewal.md`.
-        path: String,
+        #[arg(required_unless_present = "batch")]
+        path: Option<String>,
         /// `-` reads the record from standard input; anything else names a file.
         #[arg(default_value = "-")]
         source: String,
+        /// Write several records in one commit, each checked against the tree with all of them
+        /// in it, so new records may link each other. `-` reads them from standard input,
+        /// anything else names a file: a JSON list of `{"path": …, "content": …}` objects.
+        #[arg(long, value_name = "SOURCE", conflicts_with_all = ["path", "source"])]
+        batch: Option<String>,
     },
     /// Remove a record.
     Rm {
@@ -331,8 +338,23 @@ impl Command {
             // Without `--write` the command prints the delta and writes nothing.
             | Self::Delta { write: false, .. } => Remote::Forward,
             Self::Record {
-                command: RecordCommand::Put { path, source },
-            } => Remote::Put { path, source },
+                command: RecordCommand::Put {
+                    batch: Some(source),
+                    ..
+                },
+            } => Remote::PutBatch { source },
+            Self::Record {
+                command:
+                    RecordCommand::Put {
+                        path,
+                        source,
+                        batch: None,
+                    },
+            } => Remote::Put {
+                // clap requires a path whenever `--batch` is absent.
+                path: path.as_deref().unwrap_or_default(),
+                source,
+            },
             Self::Record {
                 command: RecordCommand::Rm { path },
             } => Remote::Rm { path },
@@ -367,6 +389,9 @@ pub enum Remote<'a> {
     /// `record put`: the record goes to `/v1/records/put`, read from `source` (`-` is
     /// standard input).
     Put { path: &'a str, source: &'a str },
+    /// `record put --batch`: the records go to `/v1/records/put-batch` together, read as a
+    /// JSON list from `source` (`-` is standard input).
+    PutBatch { source: &'a str },
     /// `record rm`: `/v1/records/delete`.
     Rm { path: &'a str },
     /// `marker advance`: `/v1/marker/advance`, under the server's write lease.

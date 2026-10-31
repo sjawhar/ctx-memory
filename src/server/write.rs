@@ -3,7 +3,8 @@
 //! One writer lock covers the whole sequence, so two callers cannot interleave. Every write
 //! is pulled onto the newest `main`, checked the way `ctx sweep` and `ctx cite verify` check
 //! it, committed under the caller's own name, and pushed. A push that loses a race with a
-//! merge is rebased once and checked again before it is pushed a second time.
+//! merge is rebased once and checked again before it is pushed a second time. A batch is one
+//! write: its records are checked together and land in one commit, or none of them does.
 
 use std::sync::Arc;
 
@@ -21,8 +22,8 @@ use super::request_log::Note;
 use super::{Listener, Shared};
 use crate::marker;
 use crate::protocol::{
-    Committed, DeleteRequest, Finding, MarkerRequest, MarkerResponse, PutRequest, Refused,
-    DELETE_ROUTE, MARKER_ROUTE, PUT_ROUTE,
+    Committed, DeleteRequest, Finding, MarkerRequest, MarkerResponse, PutBatchRequest, PutRequest,
+    RecordFile, Refused, DELETE_ROUTE, MARKER_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE,
 };
 use crate::redact::credentials_in;
 
@@ -51,31 +52,40 @@ enum Moved {
 
 /// What the caller asked to change.
 enum Change {
-    Put { path: String, content: String },
-    Delete { path: String },
+    /// Write each record whole, in one commit: one record, or a batch whose links are checked
+    /// against the tree with every record of the batch in it.
+    Put(Vec<RecordFile>),
+    Delete {
+        path: String,
+    },
 }
 
 impl Change {
-    fn path(&self) -> &str {
+    /// Each file the change names, as the caller wrote its path, with the whole text a put
+    /// writes there, or `None` for a delete.
+    fn files(&self) -> Vec<(&str, Option<&str>)> {
         match self {
-            Self::Put { path, .. } | Self::Delete { path } => path,
+            Self::Put(records) => records
+                .iter()
+                .map(|record| (record.path.as_str(), Some(record.content.as_str())))
+                .collect(),
+            Self::Delete { path } => vec![(path.as_str(), None)],
         }
     }
 
     const fn verb(&self) -> &'static str {
         match self {
-            Self::Put { .. } => "put",
+            Self::Put(_) => "put",
             Self::Delete { .. } => "delete",
         }
     }
+}
 
-    /// The route the change arrived on.
-    const fn route(&self) -> &'static str {
-        match self {
-            Self::Put { .. } => PUT_ROUTE,
-            Self::Delete { .. } => DELETE_ROUTE,
-        }
-    }
+/// One file a write changes: its record path, as [`record_path`](crate::tree::record_path)
+/// made it, and the whole text a put writes there, or `None` for a delete.
+struct Edit<'change> {
+    path: String,
+    content: Option<&'change str>,
 }
 
 /// Answers `POST /v1/records/put`.
@@ -91,11 +101,36 @@ pub async fn put(
             Err(refused) => return *refused,
         };
     note.path(&request.path);
-    let change = Change::Put {
+    let change = Change::Put(vec![RecordFile {
         path: request.path,
         content: request.content,
-    };
-    write(listener, caller, change, request.session, &note).await
+    }]);
+    write(listener, caller, PUT_ROUTE, change, request.session, &note).await
+}
+
+/// Answers `POST /v1/records/put-batch`: several records in one commit, or none of them.
+pub async fn put_batch(
+    State(listener): State<Listener>,
+    Extension(note): Extension<Note>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (caller, request) =
+        match admit::<PutBatchRequest>(&listener, PUT_BATCH_ROUTE, &headers, &body, &note).await {
+            Ok(admitted) => admitted,
+            Err(refused) => return *refused,
+        };
+    note.paths(request.records.iter().map(|record| record.path.as_str()));
+    let change = Change::Put(request.records);
+    write(
+        listener,
+        caller,
+        PUT_BATCH_ROUTE,
+        change,
+        request.session,
+        &note,
+    )
+    .await
 }
 
 /// Answers `POST /v1/records/delete`.
@@ -112,7 +147,15 @@ pub async fn delete(
         };
     note.path(&request.path);
     let change = Change::Delete { path: request.path };
-    write(listener, caller, change, request.session, &note).await
+    write(
+        listener,
+        caller,
+        DELETE_ROUTE,
+        change,
+        request.session,
+        &note,
+    )
+    .await
 }
 
 /// Answers `POST /v1/marker/advance`.
@@ -250,13 +293,13 @@ fn session_label(session: Option<&str>) -> Option<String> {
 async fn write(
     listener: Listener,
     caller: Caller,
+    route: &'static str,
     change: Change,
     session: Option<String>,
     note: &Note,
 ) -> Response {
     let shared = &listener.shared;
     let writing = Arc::clone(shared);
-    let route = change.route();
     let session = session_label(session.as_deref()).unwrap_or_else(|| "unknown".to_owned());
     let note = note.clone();
     let answered = tokio::task::spawn_blocking(move || {

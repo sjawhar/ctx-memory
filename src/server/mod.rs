@@ -744,6 +744,7 @@ fn router(shared: Arc<Shared>, identity: Identity) -> Router {
         .route("/healthz", get(command::healthz))
         .route(protocol::COMMAND_ROUTE, post(command::command))
         .route(protocol::PUT_ROUTE, post(write::put))
+        .route(protocol::PUT_BATCH_ROUTE, post(write::put_batch))
         .route(protocol::DELETE_ROUTE, post(write::delete))
         .route(protocol::MARKER_ROUTE, post(write::marker_advance))
         .with_state(Listener { shared, identity })

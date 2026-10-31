@@ -1,12 +1,14 @@
 /**
- * The ingest cycle's only way to write: two omp tools that hand a record to `ctx record put` on
+ * The ingest cycle's only way to write: two omp tools that hand records to `ctx record put` on
  * standard input and remove one with `ctx record rm`, so the session needs no tool that writes a
  * file. run-cycle.sh loads this module with --trusted-extension from /opt/ctx-memory, which is
  * root's. That flag makes omp load this module and discover no other extension; it does not stop
  * omp discovering custom tools or MCP servers, which the image closes by keeping every place they
  * are read from root's (docs/deployment.md, checked by run-cycle.sh). No shell runs: the
  * arguments are a fixed argv with the record's path after `--`, so nothing in a path or a record
- * is read as an option or as shell.
+ * is read as an option or as shell. Several records go together as one JSON list to
+ * `ctx record put --batch -`, which the server checks against the tree with all of them in it
+ * and commits in one commit, so new records that link each other can be written at all.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -34,16 +36,29 @@ export default function (pi: ExtensionAPI) {
 		name: "ctx_record_put",
 		label: "Record put",
 		description:
-			"Write one record to the graph through the ctx server: `ctx record put <path>` with `content` " +
-			"as the whole record. The server checks it and commits it; a refused write fails with its " +
-			"findings and changes nothing.",
+			"Write records to the graph through the ctx server, each whole: one record, or several new " +
+			"records that link each other, which the server checks together and commits in one commit. " +
+			"A refused write fails with its findings and changes nothing, for every record it holds.",
 		parameters: z.object({
-			path: z.string().describe("Tree-relative path of the record, such as decisions/renewal.md"),
-			content: z.string().describe("The whole record: frontmatter and body"),
+			records: z
+				.array(
+					z.object({
+						path: z.string().describe("Tree-relative path of the record, such as decisions/renewal.md"),
+						content: z.string().describe("The whole record: frontmatter and body"),
+					}),
+				)
+				.min(1)
+				.describe("The records to write in one commit: usually one"),
 		}),
 		approval: "write",
 		loadMode: "essential",
-		execute: (_id, params, signal) => ctx(["record", "put", "--", params.path, "-"], params.content, signal),
+		execute: (_id, params, signal) => {
+			const [only, ...rest] = params.records;
+			if (only === undefined) throw new Error("ctx_record_put needs at least one record");
+			if (rest.length === 0) return ctx(["record", "put", "--", only.path, "-"], only.content, signal);
+			const batch = params.records.map(({ path, content }) => ({ path, content }));
+			return ctx(["record", "put", "--batch", "-"], JSON.stringify(batch), signal);
+		},
 	});
 	pi.registerTool({
 		name: "ctx_record_rm",
