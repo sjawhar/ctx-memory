@@ -494,6 +494,30 @@ impl Server {
         reply(response)
     }
 
+    /// Sends a request whatever its answer, which may not be JSON or may have no body, and
+    /// returns its status and how many bytes its body held.
+    pub fn raw(
+        &self,
+        method: reqwest::Method,
+        address: SocketAddr,
+        path: &str,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> Result<(u16, usize)> {
+        let mut request = self
+            .client
+            .request(method, format!("http://{address}{path}"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        let response = request.send().context("sending to ctx serve")?;
+        let status = response.status().as_u16();
+        Ok((status, response.bytes()?.len()))
+    }
+
     /// Runs one allowlisted command over `/v1/command` as a tailnet user.
     pub fn command(&self, argv: &[&str]) -> Result<Reply> {
         self.post_as("ada@example.com", "/v1/command", &json!({ "argv": argv }))

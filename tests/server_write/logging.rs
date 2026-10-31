@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use serde_json::{json, Value};
 
-use crate::fixtures::{broken_zeppelin_record, good_record, put_body, refuse_every_push, within};
+use crate::fixtures::{
+    broken_zeppelin_record, good_record, install_hook, put_body, refuse_every_push, within,
+};
 use crate::support;
 use crate::support::{fetch_window, fixture_clone, remote_of, remove_fixture};
 
@@ -60,19 +62,40 @@ impl Logged {
         })
     }
 
-    /// The next `count` lines of the request log, waiting up to a minute for them.
-    fn request_log(&self, count: usize) -> Result<Vec<Value>> {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut lines = Vec::with_capacity(count);
-        while lines.len() < count {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = self
-                .stdout
-                .recv_timeout(left)
-                .context("the server did not log every request")?;
-            lines.push(serde_json::from_str(&line).with_context(|| format!("{line:?}"))?);
+    /// Stops the server, then returns every line of its request log: all of them, so a line too
+    /// many fails a test as a line too few does.
+    fn stop_and_read_request_log(&mut self) -> Result<Vec<Value>> {
+        self.stop();
+        // The pipe closes when the server exits, which ends the thread that reads it.
+        self.stdout
+            .iter()
+            .map(|line| serde_json::from_str(&line).with_context(|| format!("{line:?}")))
+            .collect()
+    }
+
+    /// Stops the server as Cloud Run does, with SIGTERM, so it finishes the follow pass it is in
+    /// before it exits. ctx runs each git command in a process group of its own
+    /// (`src/proc.rs`), so a SIGKILL would leave a pass's git running in the fixture while the
+    /// test removes it, and the removal would fail. SIGKILL only if it has not stopped within a
+    /// minute.
+    fn stop(&mut self) {
+        // A child already waited for is not signalled again: its pid may be another process's.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
         }
-        Ok(lines)
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            // SAFETY: the pid is this process's own child, which has not been waited for.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     /// Posts `body` to `path`, signed in as `user` when there is one, and returns the status.
@@ -104,25 +127,8 @@ impl Logged {
 }
 
 impl Drop for Logged {
-    /// Stops the server as Cloud Run does, with SIGTERM, so it finishes the follow pass it is in
-    /// before it exits. ctx runs each git command in a process group of its own
-    /// (`src/proc.rs`), so a SIGKILL would leave a pass's git running in the fixture while the
-    /// test removes it, and the removal would fail. SIGKILL only if it has not stopped within a
-    /// minute.
     fn drop(&mut self) {
-        if let Ok(pid) = i32::try_from(self.child.id()) {
-            // SAFETY: the pid is this process's own child, which has not been waited for.
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while std::time::Instant::now() < deadline {
-                if matches!(self.child.try_wait(), Ok(Some(_))) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 
@@ -234,7 +240,7 @@ fn a_refused_put_logs_its_refusal_codes_and_never_its_record() -> Result<()> {
     let log = root.join("serve.log");
     let token = format!("ghs_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
     let user = Some("ada@example.com");
-    let server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
+    let mut server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
     let (gap, gap_reply) = server.post_reply(
         user,
         "/v1/records/put",
@@ -254,7 +260,7 @@ fn a_refused_put_logs_its_refusal_codes_and_never_its_record() -> Result<()> {
         "/v1/records/put",
         &put_body("decisions/x\nforged\n\u{1b}[2J.md", &good_record(), "s"),
     )?;
-    let logged = server.request_log(3)?;
+    let logged = server.stop_and_read_request_log()?;
     drop(server);
     remove_fixture(&tree)?;
 
@@ -319,6 +325,64 @@ fn a_refused_put_logs_its_refusal_codes_and_never_its_record() -> Result<()> {
         forged_line.get("path"),
         Some(&json!("decisions/x forged [2J.md")),
         "{forged_line}"
+    );
+    Ok(())
+}
+
+/// A caller that hangs up before its answer is ready still has its line, at the moment it hung
+/// up: `unanswered`, with no status and no body, and everything the server had learned of it.
+/// The write runs on and lands; the line does not say how it ended, because nobody was told.
+#[test]
+fn a_caller_that_hangs_up_has_an_unanswered_line() -> Result<()> {
+    let tree = fixture_clone("log-request-hang-up")?;
+    // The record cites the echo fixture's message, which a fetched window stores.
+    fetch_window(&tree)?;
+    let root = tree.parent().context("the fixture has a root")?;
+    let log = root.join("serve.log");
+    let bare = remote_of(&tree)?;
+    install_hook(&bare, "pre-receive", "#!/bin/sh\nsleep 4\nexit 0\n")?;
+    let mut server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
+    let impatient = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()?;
+    let hung_up = impatient
+        .post(format!("http://{}/v1/records/put", server.tailnet))
+        .header("Tailscale-User-Login", "ada@example.com")
+        .json(&put_body("decisions/patience.md", &good_record(), "s"))
+        .send();
+    // The write lands once the hook lets the push through.
+    let landed = within(120, || {
+        let subject = support::git(&bare, &["log", "--format=%s", "-1", "main"])?;
+        Ok(subject.contains("patience").then_some(()))
+    });
+    let logged = server.stop_and_read_request_log()?;
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert!(hung_up.is_err(), "the caller was answered: {hung_up:?}");
+    landed
+        .with_context(|| format!("the write did not land after its caller hung up: {logged:?}"))?;
+    let [line] = logged.as_slice() else {
+        anyhow::bail!("not one line for the request: {logged:?}");
+    };
+    for (field, value) in [
+        ("result", json!("unanswered")),
+        ("status", Value::Null),
+        ("response_bytes", Value::Null),
+        ("severity", json!("WARNING")),
+        ("command", json!("record put")),
+        ("caller", json!("ada@example.com")),
+        ("path", json!("decisions/patience.md")),
+    ] {
+        assert_eq!(line.get(field), Some(&value), "{line}");
+    }
+    let waited = line
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .context("the line has no duration")?;
+    assert!(
+        (900..4000).contains(&waited),
+        "the line was not written when the caller hung up: {line}"
     );
     Ok(())
 }

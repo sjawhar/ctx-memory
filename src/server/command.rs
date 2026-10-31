@@ -7,10 +7,11 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
+use clap::CommandFactory as _;
 use serde_json::json;
 
-use super::request_log::Facts;
+use super::request_log::Note;
 use super::{window_count, Following, Listener, Shared};
 use crate::cli::{self, Remote};
 use crate::context::Context;
@@ -56,32 +57,21 @@ pub fn run_captured(argv: &[String], drafts: Vec<Draft>, context: &Context) -> C
     }
 }
 
-/// Answers `POST /v1/command`.
+/// Answers `POST /v1/command`. What the request log says of it goes in `note`.
 pub async fn command(
     State(listener): State<Listener>,
+    Extension(note): Extension<Note>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut facts = Facts::default();
-    let response = answer(&listener, &headers, &body, &mut facts).await;
-    facts.on(response)
-}
-
-/// The answer to one `POST /v1/command`, with what the request log says of it in `facts`.
-async fn answer(
-    listener: &Listener,
-    headers: &HeaderMap,
-    body: &[u8],
-    facts: &mut Facts,
-) -> Response {
     let shared = &listener.shared;
-    match listener.caller(headers).await {
-        Ok(caller) => facts.caller(&caller),
+    match listener.caller(&headers).await {
+        Ok(caller) => note.caller(&caller),
         Err(error) => {
             return error_response(shared, StatusCode::UNAUTHORIZED, &format!("{error:#}"))
         }
     }
-    let request: CommandRequest = match serde_json::from_slice(body) {
+    let request: CommandRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => {
             return error_response(
@@ -92,7 +82,7 @@ async fn answer(
         }
     };
     let parsed = cli::parse_argv(&request.argv).ok();
-    describe(&request.argv, parsed.as_ref(), facts);
+    describe(&request.argv, parsed.as_ref(), &note);
     if let Err(message) = allowed(&request.argv, parsed.as_ref()) {
         return error_response(shared, StatusCode::BAD_REQUEST, &message);
     }
@@ -110,7 +100,7 @@ async fn answer(
         // tree, which a cycle writes back whole, so a placeholder in it would change the
         // record. It names nothing the tree does not already hold.
         Ok(Ok(captured)) => {
-            facts.exit_code(captured.exit_code);
+            note.exit_code(captured.exit_code);
             (
                 StatusCode::OK,
                 Json(Captured {
@@ -138,31 +128,51 @@ async fn answer(
     }
 }
 
-/// What the request log says of a command: its name, the record a `record show` names, and
-/// the length of what a search looks for, never its words. A command clap refuses is named by
-/// its first word when that is one a remote caller may use; any other first word is the
-/// caller's own text, and is not logged.
-fn describe(argv: &[String], parsed: Option<&cli::Cli>, facts: &mut Facts) {
+/// What the request log says of a command: its name, the record a `record show`, `record put`
+/// or `record rm` names, and the length of what a search looks for, never its words.
+fn describe(argv: &[String], parsed: Option<&cli::Cli>, note: &Note) {
     match parsed.map(|parsed| &parsed.command) {
         // An external subcommand's name is whatever the caller wrote.
         Some(cli::Command::External(_)) => {}
         Some(command) => {
-            facts.command(command.name());
+            note.command(command.name());
             match command {
-                cli::Command::Search { query, .. } => facts.query(query),
-                cli::Command::Dossier { entity } => facts.query(entity),
+                cli::Command::Search { query, .. } => note.query(query),
+                cli::Command::Dossier { entity } => note.query(entity),
                 cli::Command::Record {
-                    command: cli::RecordCommand::Show { path },
-                } => facts.path(path),
+                    command:
+                        cli::RecordCommand::Show { path }
+                        | cli::RecordCommand::Put { path, .. }
+                        | cli::RecordCommand::Rm { path },
+                } => note.path(path),
                 _ => {}
             }
         }
         None => {
-            if let Some(name) = command_name(argv).filter(|name| ALLOWED.contains(name)) {
-                facts.command(name.to_owned());
+            if let Some(name) = refused_name(argv) {
+                note.command(name);
             }
         }
     }
+}
+
+/// The name of a command clap refused, made of names clap holds and nothing the caller wrote:
+/// its first word, when a remote caller may run that command, and the subcommand after it when
+/// clap knows one by that word, so `record show x --bogus` is `record show`. No path or query
+/// length is read from an argv clap refused.
+fn refused_name(argv: &[String]) -> Option<String> {
+    let mut words = argv
+        .iter()
+        .map(String::as_str)
+        .filter(|word| global_flag(word).is_none());
+    let first = words.next().filter(|word| ALLOWED.contains(word))?;
+    let commands = cli::Cli::command();
+    let group = commands.find_subcommand(first)?;
+    let subcommand = words
+        .next()
+        .and_then(|word| group.find_subcommand(word))
+        .map(|subcommand| format!("{first} {}", subcommand.get_name()));
+    Some(subcommand.unwrap_or_else(|| first.to_owned()))
 }
 
 /// Whether a parsed command is a `record show`, whose output, when it succeeds, is a record of

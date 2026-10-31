@@ -43,24 +43,26 @@ Where the share lets only root write, both containers run as root.
 
 ### The server's request log
 
-The server writes one line of JSON to standard output for each request either listener answers, when its answer is ready, and Cloud Run puts each line in its entry's `jsonPayload`. Cloud Run's own request log covers only `--listen`: a request through the Tailscale sidecar reaches the server on loopback, and only this log has it. The only other lines on standard output are the `listen <addr>` and `tailnet-listen <addr>` lines the server prints when it binds a port. Standard error keeps the lines an alert matches ([README](../README.md#remote-mode)).
+The server writes one line of JSON to standard output for each request either listener takes, and Cloud Run puts each line in its entry's `jsonPayload`. A request is logged when its answer is ready, or, when its caller hangs up first, at that moment. Cloud Run's own request log covers only `--listen`: a request through the Tailscale sidecar reaches the server on loopback, and only this log has it. The only other lines on standard output are the `listen <addr>` and `tailnet-listen <addr>` lines the server prints when it binds a port. Standard error keeps the lines an alert matches ([README](../README.md#remote-mode)).
 
 | Field | What it is |
 | --- | --- |
-| `time` | When the answer was ready: RFC 3339, UTC, to the millisecond. Cloud Logging takes it as the entry's timestamp and leaves it out of `jsonPayload`. |
-| `severity` | `INFO`; `WARNING` for a `4xx` answer and `ERROR` for a `5xx` one. Cloud Logging takes it as the entry's severity and leaves it out of `jsonPayload`. |
+| `time` | When the request was logged: RFC 3339, UTC, to the millisecond. Cloud Logging takes it as the entry's timestamp and leaves it out of `jsonPayload`. |
+| `severity` | `INFO`; `WARNING` for a `4xx` answer or none, and `ERROR` for a `5xx` one. Cloud Logging takes it as the entry's severity and leaves it out of `jsonPayload`. |
 | `door` | `tailnet` for `--tailnet-listen`, `identity-token` for `--listen`. |
-| `caller` | The Tailscale login name at `tailnet`, the email of the identity token's principal at `identity-token`; `null` for a caller the server did not identify and for `/healthz`, which takes no identity. Tailscale Serve sends no device name, so no line names the node. |
-| `command` | The ctx command: `search`, `open`, `record show`, `resolve`, `pending`, `delta` or another command of `/v1/command`; `record put`, `record rm` and `marker advance` for the write routes; `healthz` for the probe. `null` when the server cannot tell: a `/v1/command` request from a caller it did not identify, with a body it cannot read, or whose first word is not a command a remote caller may run; or a path no route has. |
-| `path` | The record path of `record show`, `record put` and `record rm`, as one line of at most 300 characters with control characters shown as spaces and any credential replaced by `[redacted]`. Absent for other commands. |
-| `query_chars` | How many characters the text of a `search`, or the entity of a `dossier`, holds. Absent for other commands. |
-| `result` | `ok`; `exit-<code>` for a command that ran and exited non-zero; `refused` for a write a check refused (`422`); otherwise the status's class: `bad-request` (`400`), `unidentified` (`401`), `not-found` (`404`), `method-not-allowed` (`405`), `conflict` (`409`), `too-large` (`413`), `server-error` (`500`), `unavailable` (`503`), or `http-<status>`. |
+| `caller` | The Tailscale login name at `tailnet`, the email of the identity token's principal at `identity-token`. `null` for a caller the server did not identify, for `/healthz`, which takes no identity, and for the `404`, `405` and `413` answers axum gives before a handler identifies anyone. Tailscale Serve sends no device name, so no line names the node. |
+| `command` | The ctx command: `search`, `open`, `record show`, `resolve`, `pending`, `delta` or any other command a caller sends to `/v1/command`, one it refuses included; `record put`, `record rm` and `marker advance` for the write routes; `healthz` for the probe. A `/v1/command` argv that clap refuses is named by its first word, when that is a command a remote caller may run, and the subcommand after it, when clap knows one by that word. `null` when the server cannot tell: a `/v1/command` request from a caller it did not identify or with a body it cannot read; an argv that names no ctx command, or that clap refuses and that does not start with a command a remote caller may run; and a path no route has. |
+| `path` | The record path of `record show`, `record put` and `record rm`, as one line with control characters shown as spaces and any credential of a shape the server refuses in a write replaced by `[redacted]`, cut after 300 characters with `…` added. Absent for other commands, and for an argv clap refuses. |
+| `query_chars` | How many characters the text of a `search`, or the entity of a `dossier`, holds. Absent for other commands, and for an argv clap refuses. |
+| `result` | `ok`; `exit-<code>` for a command that ran and exited non-zero; `refused` for a write a check refused (`422`); `unanswered` for a request whose caller hung up before its answer was ready, which hyper then drops (a write runs on, and how it ended is in its commit or its `write failed:` line); otherwise the status's class: `bad-request` (`400`), `unidentified` (`401`), `not-found` (`404`), `method-not-allowed` (`405`), `conflict` (`409`), `too-large` (`413`), `server-error` (`500`), `unavailable` (`503`), or `http-<status>`. |
 | `refusals` | For a refused write, the `kind` of each finding that refused it, in the answer's order, such as `gap`, `quote` or `credential`. Absent otherwise. |
-| `status` | The answer's HTTP status. |
-| `duration_ms` | Milliseconds from the request reaching the server to its answer being ready. |
-| `response_bytes` | How many bytes the answer's body holds. It is `null` when the length is not known before the body is sent, but every answer the server gives today has a known length. |
+| `status` | The answer's HTTP status; `null` when the request was unanswered. |
+| `duration_ms` | Milliseconds from the request reaching the server to its answer being ready, or to its caller hanging up. |
+| `response_bytes` | How many bytes the answer's body holds: `0` for an answer to `HEAD`, and `null` when the request was unanswered or the length is not known before the body is sent, which no answer the server gives today is. |
 
-A line carries nothing else from the request: no other argument, no search text, no quote, no record text, no draft that `cite verify` sent, no session and no token.
+A line carries nothing else from the request: no other argument, no search text, no quote, no record text, no draft that `cite verify` sent, no session and no identity token.
+
+A request never waits for its line. A thread of the server's own writes the lines, from a queue of 1,024: when standard output is not read — a log collector that stopped — the pipe fills, then the queue, and later lines are dropped while the server answers on. The first dropped line, and the first line standard output refuses, are each said once on standard error. A stopping server waits up to 2 seconds for its last lines to be written.
 
 ## The ingest cycle
 

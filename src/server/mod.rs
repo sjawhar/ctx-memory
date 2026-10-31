@@ -6,7 +6,7 @@
 
 pub mod command;
 pub mod identity;
-mod request_log;
+pub mod request_log;
 pub mod write;
 
 use std::future::IntoFuture as _;
@@ -541,13 +541,20 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     // Every connection is closed, so the lease this copy holds is given up here: the copy that
     // replaces it writes at once instead of waiting out the takeover window. A write whose
     // caller hung up may still be running, and the release waits for it. The release talks to
-    // Cloud Storage with a blocking client, so it runs off the runtime.
+    // Cloud Storage with a blocking client, so it runs off the runtime. The request log's last
+    // lines are written before the process exits.
     let releasing = Arc::clone(&shared);
-    tokio::task::spawn_blocking(move || releasing.release_lease())
-        .await
-        .context("releasing the write lease")?;
+    tokio::task::spawn_blocking(move || {
+        releasing.release_lease();
+        request_log::flush(LAST_LINES_WAIT);
+    })
+    .await
+    .context("releasing the write lease")?;
     Ok(())
 }
+
+/// The longest a stopping copy waits for the request log's last lines to reach standard output.
+const LAST_LINES_WAIT: Duration = Duration::from_secs(2);
 
 /// Resolves when the server is asked to stop.
 async fn stopped(mut stop: tokio::sync::watch::Receiver<bool>) {

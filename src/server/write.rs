@@ -12,12 +12,12 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::de::DeserializeOwned;
 
 use super::command;
 use super::identity::Caller;
-use super::request_log::Facts;
+use super::request_log::Note;
 use super::{Listener, Shared};
 use crate::marker;
 use crate::protocol::{
@@ -79,36 +79,40 @@ impl Change {
 }
 
 /// Answers `POST /v1/records/put`.
-pub async fn put(State(listener): State<Listener>, headers: HeaderMap, body: Bytes) -> Response {
-    let mut facts = Facts::default();
-    let response =
-        match admit::<PutRequest>(&listener, PUT_ROUTE, &headers, &body, &mut facts).await {
-            Ok((caller, request)) => {
-                facts.path(&request.path);
-                let change = Change::Put {
-                    path: request.path,
-                    content: request.content,
-                };
-                write(listener, caller, change, request.session, &mut facts).await
-            }
-            Err(refused) => *refused,
+pub async fn put(
+    State(listener): State<Listener>,
+    Extension(note): Extension<Note>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (caller, request) =
+        match admit::<PutRequest>(&listener, PUT_ROUTE, &headers, &body, &note).await {
+            Ok(admitted) => admitted,
+            Err(refused) => return *refused,
         };
-    facts.on(response)
+    note.path(&request.path);
+    let change = Change::Put {
+        path: request.path,
+        content: request.content,
+    };
+    write(listener, caller, change, request.session, &note).await
 }
 
 /// Answers `POST /v1/records/delete`.
-pub async fn delete(State(listener): State<Listener>, headers: HeaderMap, body: Bytes) -> Response {
-    let mut facts = Facts::default();
-    let response =
-        match admit::<DeleteRequest>(&listener, DELETE_ROUTE, &headers, &body, &mut facts).await {
-            Ok((caller, request)) => {
-                facts.path(&request.path);
-                let change = Change::Delete { path: request.path };
-                write(listener, caller, change, request.session, &mut facts).await
-            }
-            Err(refused) => *refused,
+pub async fn delete(
+    State(listener): State<Listener>,
+    Extension(note): Extension<Note>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (caller, request) =
+        match admit::<DeleteRequest>(&listener, DELETE_ROUTE, &headers, &body, &note).await {
+            Ok(admitted) => admitted,
+            Err(refused) => return *refused,
         };
-    facts.on(response)
+    note.path(&request.path);
+    let change = Change::Delete { path: request.path };
+    write(listener, caller, change, request.session, &note).await
 }
 
 /// Answers `POST /v1/marker/advance`.
@@ -120,33 +124,31 @@ pub async fn delete(State(listener): State<Listener>, headers: HeaderMap, body: 
 /// or write is its own trouble, answered 500.
 pub async fn marker_advance(
     State(listener): State<Listener>,
+    Extension(note): Extension<Note>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut facts = Facts::default();
-    let response =
-        match admit::<MarkerRequest>(&listener, MARKER_ROUTE, &headers, &body, &mut facts).await {
-            Ok((caller, request)) => advance(&listener.shared, caller, request).await,
-            Err(refused) => *refused,
-        };
-    facts.on(response)
+    match admit::<MarkerRequest>(&listener, MARKER_ROUTE, &headers, &body, &note).await {
+        Ok((caller, request)) => advance(&listener.shared, caller, request).await,
+        Err(refused) => *refused,
+    }
 }
 
 /// How each write route starts: the caller is identified and the body read, or the request is
-/// answered here. The caller goes into `facts` for the request log.
+/// answered here. The caller goes in `note` for the request log.
 async fn admit<Body: DeserializeOwned>(
     listener: &Listener,
     route: &str,
     headers: &HeaderMap,
     body: &[u8],
-    facts: &mut Facts,
+    note: &Note,
 ) -> Result<(Caller, Body), Box<Response>> {
     let shared = &listener.shared;
     let caller = match listener.caller(headers).await {
         Ok(caller) => caller,
         Err(error) => return Err(Box::new(unauthorized(shared, route, &error))),
     };
-    facts.caller(&caller);
+    note.caller(&caller);
     serde_json::from_slice(body)
         .map(|request| (caller, request))
         .map_err(|error| {
@@ -230,13 +232,13 @@ fn session_label(session: Option<&str>) -> Option<String> {
 }
 
 /// Applies one write for a caller already identified. The codes of the findings that refuse it
-/// go into `facts` for the request log.
+/// go in `note` for the request log.
 async fn write(
     listener: Listener,
     caller: Caller,
     change: Change,
     session: Option<String>,
-    facts: &mut Facts,
+    note: &Note,
 ) -> Response {
     let shared = &listener.shared;
     let writing = Arc::clone(shared);
@@ -253,7 +255,7 @@ async fn write(
                 .iter()
                 .map(|finding| finding.kind.as_str())
                 .collect();
-            facts.refused(kinds.iter().copied());
+            note.refused(kinds.iter().copied());
             log_failure(
                 route,
                 StatusCode::UNPROCESSABLE_ENTITY,
