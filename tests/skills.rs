@@ -219,6 +219,84 @@ fn the_ingest_skill_closes_quoted_text_only_with_the_cycles_nonce() -> Result<()
     Ok(())
 }
 
+/// Six kinds of message made records nobody used: payment receipts, spend alerts, the fetch's
+/// own bookkeeping, mirrors of one pull request or issue, records closed when created, and
+/// records about the pipeline itself. The skill names each, and where a fact worth keeping in
+/// one goes instead: a metric, a decision a merged pull request carries, the open record a
+/// closing source closes. This checks that the instructions are there, not that an agent
+/// follows them.
+#[test]
+fn the_ingest_skill_says_what_is_not_a_record() -> Result<()> {
+    let flat = skill("ctx-memory-ingest")?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "## Not a record",
+        "check the record against \"Not a record\"",
+        "no record per receipt",
+        "Update the newest metric of that account's spending, or mint one if none exists, only \
+         when a receipt changes it",
+        "An unpaid invoice falls under \"Record rules\"",
+        "no record per alert",
+        "Add the threshold and its date to the metric of that spending or usage",
+        "no record of any type, `gap` included",
+        "evidence a record lacks goes in that record's body",
+        "no project or ops record whose one source is a single pull request or issue",
+        "a decision and who made it, a named person's commitment, an open question or a metric, \
+         each citing the item",
+        "already answered, cancelled, closed, completed, done, resolved, superseded or withdrawn",
+        "Close the open record the source closes",
+        "a decision someone made is `decided`, not closed",
+        "The pipeline that builds this graph",
+        "the issues and messages about them, get no record of any type",
+        "With no cycle log named, write no record about the cycle",
+    ] {
+        assert!(
+            flat.contains(expected),
+            "the ingest skill never says {expected:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A session can drop the end of a long skill when its context is compacted, and the ingest
+/// skill's last sections are its record rules. It stays under 20,000 bytes; a block only some
+/// cycles need goes to `references/`, as the meeting rules did.
+#[test]
+fn the_ingest_skill_stays_under_20000_bytes() -> Result<()> {
+    let bytes = skill("ctx-memory-ingest")?.len();
+    assert!(
+        bytes < 20_000,
+        "the ingest skill is {bytes} bytes; move a block only some cycles need to references/"
+    );
+    Ok(())
+}
+
+/// A file the skill sends the session to read ships beside it: a pointer to a file that is not
+/// there leaves the session to guess what it held.
+#[test]
+fn every_file_the_ingest_skill_names_ships_with_it() -> Result<()> {
+    let text = skill("ctx-memory-ingest")?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/ctx-memory-ingest");
+    let named: Vec<&str> = text
+        .split("skill://ctx-memory-ingest/")
+        .skip(1)
+        .filter_map(|rest| rest.split(['`', ' ', ',', ')']).next())
+        .collect();
+    assert!(
+        named.iter().any(|path| path.starts_with("references/")),
+        "the ingest skill names no reference file, so this check reads nothing: {named:?}"
+    );
+    for path in named {
+        assert!(
+            root.join(path).is_file(),
+            "the ingest skill names skill://ctx-memory-ingest/{path}, which is not in the skill"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn the_reading_skill_names_remote_mode() -> Result<()> {
     let text = skill("ctx-memory")?;
