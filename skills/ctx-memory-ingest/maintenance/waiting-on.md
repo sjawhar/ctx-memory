@@ -21,10 +21,18 @@ The pass reads no window, mints no record and never moves the marker.
       not a source that names nobody.
    4. Decide `waiting_on` by the rule: the people a cited source puts the question, the
       decision or the request to by name, less each one a later cited message shows has
-      answered or decided, or from whom a cited source handed the item away. Write each
-      person as the tree writes an `owner`. A name comes only from what `ctx resolve`
-      printed: never from the record's `owner`, its body, or who usually decides. A source
-      that names nobody gives no name.
+      answered or decided, or from whom a cited source handed the item away. A mention
+      counts when the message asks that person something or puts a decision to them,
+      whether it is written as `cc @Name` or not; a cc that only informs does not count.
+      `cc @Kim looks like you reviewed his PRs … Any thoughts?` puts the question to Kim;
+      `cc @Kim for visibility` informs Kim. A mention `ctx resolve` prints as the bare id,
+      such as `@U0123ABCD`, names nobody. A person named in `waiting_on` is written in the
+      full-name form the tree already uses for that person (as `owner`, `raised_by` or
+      `waiting_on` elsewhere), or as the link to their person record: a Slack display name
+      or handle is mapped to it, and a mention that cannot be mapped to a person the tree
+      knows is written as the name the source gives. Who is named comes only from what
+      `ctx resolve` printed: never from the record's `owner`, its body, or who usually
+      decides. A source that names nobody gives no name.
    5. When the list you decided differs from the record's, write the whole record back
       with `ctx_record_put`: the text `ctx record show` printed with only `waiting_on`
       changed, and the field left out when the list is empty. Change nothing else: not the
