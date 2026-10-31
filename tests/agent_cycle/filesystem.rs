@@ -560,14 +560,14 @@ fn the_cycle_seals_its_transcript_after_the_session() -> Result<()> {
     Ok(())
 }
 
-/// A refused ingest cycle gets one fresh session. `run-cycle.sh` runs as its container's PID 1
-/// and cannot hand its own process to omp, so the retry is read from the script, the way the
-/// transcript sealing is: a run that reaches omp needs a locked share this pretend-root harness
-/// cannot build, and the live probe (`live_session.rs`) drives omp directly, past run-cycle.sh.
-/// The invariants the retry rests on: omp is started from a function, so the same launch serves
-/// both attempts; the retry fires only for an ingest cycle, only on a non-zero exit, and only
-/// when the session's own transcript shows a model refusal; it starts over in its own directory;
-/// and it is one retry, not a loop, so a second refusal is the cycle's outcome.
+/// A refused ingest cycle or maintenance pass gets one fresh session. `run-cycle.sh` runs as its
+/// container's PID 1 and cannot hand its own process to omp, so the retry's structure is read from
+/// the script, the way the transcript sealing is: a run that reaches omp needs a locked share this
+/// pretend-root harness cannot build. What the retry decides is run in `outcome.rs`. The
+/// invariants the retry rests on: omp is started from a function, so the same launch serves both
+/// attempts; the retry fires only on a non-zero exit, only when the session's own transcript shows
+/// a model refusal, and never for a pass that moved the marker; it starts over in its own
+/// directory; and it is one retry, not a loop, so a second refusal is the outcome.
 #[test]
 fn the_cycle_retries_once_after_a_model_refusal() -> Result<()> {
     let script = runner("run-cycle.sh")?;
@@ -613,9 +613,9 @@ fn the_cycle_retries_once_after_a_model_refusal() -> Result<()> {
         .iter()
         .find(|line| {
             line.contains("session_refused \"$session_dir.events.json\"")
-                && line.contains("[ -z \"$pass\" ]")
+                && line.contains("[ -z \"$marker_moved\" ]")
         })
-        .context("the retry is not guarded by an ingest cycle whose session was refused")?;
+        .context("the retry is not guarded by a refused session that left the marker alone")?;
     ensure!(
         retry.contains("\"$status\" -ne 0"),
         "the retry runs even when the first session succeeded"

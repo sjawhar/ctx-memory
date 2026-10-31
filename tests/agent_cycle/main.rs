@@ -4,4 +4,5 @@
 mod filesystem;
 mod fixtures;
 mod live_session;
+mod outcome;
 mod policy;
