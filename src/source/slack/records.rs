@@ -180,12 +180,13 @@ pub(super) enum Spelling<'a> {
     },
 }
 
-/// A message Slack sent as `text`, and a fetch stored as `stored` when that is known, in the
-/// parts a quote of it is checked against: each mention spelled each way a reader may have
-/// seen it, and the rest as a fetch renders it.
-pub(super) fn spellings<'t>(text: &'t str, stored: Option<&str>) -> Vec<Spelling<'t>> {
+/// A message Slack sent as `text`, and a fetch stored as `stored`, in the parts a quote of it
+/// is checked against: each mention spelled each way a reader may have seen it, with what the
+/// stored text shows for it when the two read alike mention by mention ([`align`]), and the
+/// rest as a fetch renders it.
+pub(super) fn spellings<'t>(text: &'t str, stored: &str) -> Vec<Spelling<'t>> {
     let pieces = pieces(text);
-    let shown = stored.and_then(|stored| align(&pieces, stored));
+    let shown = align(&pieces, stored);
     let unnamed = BTreeMap::new();
     pieces
         .iter()

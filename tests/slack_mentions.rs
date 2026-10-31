@@ -359,7 +359,8 @@ fn a_message_stored_before_mentions_were_named_is_served_with_the_name() -> Resu
 
 /// A quote's mention holds only as a spelling of the person the message mentions there: as
 /// ctx served it, by a name the store holds for that id, by the id, or as Slack wrote it. A
-/// quote that changes only the id, or only the first name, of the person does not hold.
+/// quote that changes only the id, or only the first name, of the person does not hold, and
+/// neither does one that stops inside the mention; one that stops before it does.
 #[test]
 fn a_quote_holds_only_where_its_mention_names_that_person() -> Result<()> {
     let root = scratch("quotes")?;
@@ -374,6 +375,9 @@ fn a_quote_holds_only_where_its_mention_names_that_person() -> Result<()> {
             "cc @U0EXAMPLED Lee looks like you reviewed his PRs",
             "cc @U0EXAMPLED looks like you reviewed his PRs",
             "cc @Ada Lee looks like you reviewed his PRs",
+            "Someone wants a job here. cc @U0EXAMPLE",
+            "Someone wants a job here. cc <@U0EXAMPLE",
+            "Someone wants a job here. cc",
         ],
     )?;
     let broken = broken_quotes(&root)?;
@@ -384,10 +388,58 @@ fn a_quote_holds_only_where_its_mention_names_that_person() -> Result<()> {
         [
             "questions/quote-4.md",
             "questions/quote-5.md",
-            "questions/quote-6.md"
+            "questions/quote-6.md",
+            "questions/quote-7.md",
+            "questions/quote-8.md",
         ],
-        "only the quotes that put another id or another name in the mention are broken"
+        "only the quotes that put another id or name in the mention, or stop inside it, are \
+         broken"
     );
+    Ok(())
+}
+
+/// A Slack record that keeps no `raw.text` is checked as its stored text reads: what looks
+/// like a mention there may be typed text, so no name stands for it.
+#[test]
+fn a_stored_text_without_slack_s_own_text_is_checked_as_it_reads() -> Result<()> {
+    let root = scratch("no-raw")?;
+    write_tree(
+        &root,
+        &[
+            "Please type @Kim Lee literally.",
+            "Please type <@U0EXAMPLEA> literally.",
+        ],
+    )?;
+    fs::create_dir_all(root.join("data"))?;
+    put(
+        &root,
+        &[
+            record(
+                ASKED,
+                "2026-10-25T12:10:00Z",
+                ("U0EXAMPLEB", "Grace Hopper"),
+                "Please type <@U0EXAMPLEA> literally.",
+                &json!({}),
+            ),
+            record(
+                OWN,
+                "2026-10-25T12:11:00Z",
+                ("U0EXAMPLEA", "Kim"),
+                "Here.",
+                &json!({
+                    "ts": "1792951860.000200",
+                    "user": "U0EXAMPLEA",
+                    "text": "Here.",
+                    "user_profile": {"real_name": "Kim Lee", "display_name": "Kim"},
+                }),
+            ),
+        ],
+        "2026-10-25T13:00:00Z",
+    )?;
+    let broken = broken_quotes(&root)?;
+    remove_scratch(&root)?;
+
+    assert_eq!(broken, ["questions/quote-0.md"]);
     Ok(())
 }
 

@@ -530,6 +530,9 @@ fn quote_matching_only_a_body_pointer_is_unchecked() -> Result<()> {
     remove_scratch(&root)
 }
 
+/// Links read as their label, emphasis drops out, curly quotes and dashes read as plain ones,
+/// and `...` stands for a gap. A Slack mention, as Slack's own text writes it, reads as a name
+/// the store holds for that person: the message's author is the person it mentions.
 #[test]
 fn normalized_source_quote_matches_markup_mentions_and_ellipsis() -> Result<()> {
     let root = scratch("quote-normalized")?;
@@ -545,14 +548,17 @@ fn normalized_source_quote_matches_markup_mentions_and_ellipsis() -> Result<()> 
         "---\ntype: decision\nstatus: open\nquote: \"portal hello \\\"world\\\" - @Alice ... later\"\nsource: \"slack:C0EXAMPLE01/1700000000.000005\"\n---\n",
     )?;
     let store = tree_store(&state_base)?;
+    let slack_text = "<https://example.com|Portal>  *HELLO*\n“WORLD” — <@U0EXAMPLE9> after later";
+    let mut message = record(
+        "slack:C0EXAMPLE01/1700000000.000005",
+        None,
+        1_700_000_000,
+        slack_text,
+    )?;
+    message.raw = serde_json::json!({ "text": slack_text });
     store.put_all(
         "slack",
-        &[record(
-            "slack:C0EXAMPLE01/1700000000.000005",
-            None,
-            1_700_000_000,
-            "<https://example.com|Portal>  *HELLO*\n“WORLD” — <@U0EXAMPLE9> after later",
-        )?],
+        &[message],
         DateTime::from_timestamp(1_700_000_010, 0).context("fetch time is valid")?,
     )?;
 

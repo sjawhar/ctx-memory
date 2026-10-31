@@ -142,8 +142,11 @@ impl<'s> Mentions<'s> {
     /// fetch renders it. A person may be spelled by their id, the label Slack wrote, what the
     /// stored text shows, or any name the store holds for that id: every full name and author
     /// name their stored messages carry, so a quote taken before a name changed still holds.
-    /// No other person's name stands for them. `None` when the record is no Slack message or
-    /// mentions nothing.
+    /// No other person's name stands for them.
+    ///
+    /// `None` when the record is no Slack message, mentions nothing, or keeps no `raw.text`:
+    /// only Slack's own text tells a mention from typed text that looks like one, so a stored
+    /// text with nothing beside it is checked as it reads.
     ///
     /// # Errors
     ///
@@ -152,11 +155,10 @@ impl<'s> Mentions<'s> {
         if !self.holds(&record.pointer) {
             return Ok(None);
         }
-        let (text, stored) = match record.raw.get("text").and_then(Value::as_str) {
-            Some(raw) => (raw, Some(record.text.as_str())),
-            None => (record.text.as_str(), None),
+        let Some(text) = record.raw.get("text").and_then(Value::as_str) else {
+            return Ok(None);
         };
-        let parts = spellings(text, stored);
+        let parts = spellings(text, &record.text);
         if !parts
             .iter()
             .any(|part| matches!(part, Spelling::Mention { .. }))
