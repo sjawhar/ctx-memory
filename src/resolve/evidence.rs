@@ -89,10 +89,11 @@ impl QuoteSource {
     /// Reads the thread of a pointer as `ctx resolve --thread` serves it, with every earlier
     /// version of its records.
     ///
-    /// The thread is read twice when a message in it mentions anyone: with each message's
-    /// mentions spelled, and exactly as `ctx resolve --thread` prints it, each message's served
-    /// text in order, so a quote copied across messages from that output holds even where a
-    /// served text is the stored one that does not read as Slack's.
+    /// Each message reads in the thread with its mentions spelled, which spells its stored
+    /// text and the text ctx serves for it too wherever the stored text reads as Slack's. When
+    /// one does not, the thread is read once more exactly as `ctx resolve --thread` prints it:
+    /// that message as stored and every other one spelled, so a quote copied across messages
+    /// from that output holds, and a rendered name in it is still held whole.
     pub(super) fn load(
         store: &Store,
         schemes: &Schemes,
@@ -103,29 +104,34 @@ impl QuoteSource {
         let records = local_records(store, schemes, &pointer, true)?;
         let slack = mentions.is_slack_scheme(&pointer.scheme);
         let mut seen = BTreeSet::new();
+        let mut each = Vec::with_capacity(records.len());
+        for record in &records {
+            seen.insert(version_key(record));
+            each.push(record_parts(record, mentions)?);
+        }
+        let served_apart = each.iter().any(|parts| parts.served.is_some());
         let mut thread = Vec::new();
         let mut served = Vec::new();
-        let mut spelled = false;
         let mut others = Vec::new();
-        for (index, record) in records.iter().enumerate() {
+        for (index, parts) in each.into_iter().enumerate() {
             if index > 0 {
                 thread.push(Part::Text(Cow::Borrowed("\n")));
-                served.push(Part::Text(Cow::Borrowed("\n")));
+                if served_apart {
+                    served.push(Part::Text(Cow::Borrowed("\n")));
+                }
             }
-            seen.insert(version_key(record));
-            let (primary, alternatives) = record_parts(record, mentions)?;
-            spelled |= primary.iter().any(|part| matches!(part, Part::Mention(_)));
-            thread.extend(primary);
-            others.extend(alternatives);
-            served.push(Part::Text(match mentions.text(record)? {
-                Some(text) => Cow::Owned(text),
-                None => Cow::Borrowed(record.text.as_str()),
-            }));
+            if served_apart {
+                match parts.served {
+                    Some(as_served) => served.extend(as_served),
+                    None => served.extend(parts.thread.iter().cloned()),
+                }
+            }
+            thread.extend(parts.thread);
+            others.extend(parts.others);
         }
         let mut readings = Vec::new();
         add_reading(&mut readings, thread, slack);
-        // With no message spelled, the thread as read above is the thread as served.
-        if spelled {
+        if served_apart {
             add_reading(&mut readings, served, slack);
         }
         for parts in others {
@@ -139,10 +145,13 @@ impl QuoteSource {
                 if !seen.insert(version_key(&version)) {
                     continue;
                 }
-                let (primary, alternatives) = record_parts(&version, mentions)?;
-                add_reading(&mut readings, primary, slack);
-                for parts in alternatives {
-                    add_reading(&mut readings, parts, slack);
+                let parts = record_parts(&version, mentions)?;
+                add_reading(&mut readings, parts.thread, slack);
+                if let Some(as_served) = parts.served {
+                    add_reading(&mut readings, as_served, slack);
+                }
+                for others in parts.others {
+                    add_reading(&mut readings, others, slack);
                 }
             }
         }
@@ -182,27 +191,52 @@ fn version_key(record: &Record) -> [u8; 32] {
     digest.finalize().into()
 }
 
-/// The parts `record` reads as in its thread, and the other texts a quote of it may have been
-/// taken from. A Slack message that mentions anyone reads in its thread as its spelled text,
-/// and also as its stored text and Slack's own text, as they read. Any other record reads as
-/// its stored text, and as the source's own text where that differs.
-fn record_parts<'r>(
-    record: &'r Record,
-    mentions: &Mentions<'_>,
-) -> Result<(Vec<Part<'r>>, Vec<Vec<Part<'r>>>)> {
+/// How one record reads for a quote.
+struct RecordParts<'r> {
+    /// As it reads in its thread: with its mentions spelled, or as its stored text.
+    thread: Vec<Part<'r>>,
+    /// As `ctx resolve` prints it, where `thread` does not spell that: the stored text of a
+    /// Slack message that does not read as Slack's own text mention by mention.
+    served: Option<Vec<Part<'r>>>,
+    /// The other texts a quote of it may have been taken from, each read alone.
+    others: Vec<Vec<Part<'r>>>,
+}
+
+/// How `record` reads for a quote. A Slack message that mentions anyone reads with its
+/// mentions spelled, which spells its stored and served text where the stored text reads as
+/// Slack's; Slack's own text, and the stored text where it does not read as Slack's, are read
+/// as they are. Any other record reads as its stored text, and as the source's own text where
+/// that differs.
+fn record_parts<'r>(record: &'r Record, mentions: &Mentions<'_>) -> Result<RecordParts<'r>> {
     let (stored, mut others) = literal_parts(record);
     let Some(spelled) = mentions.spelled(record)? else {
-        return Ok((stored, others));
+        return Ok(RecordParts {
+            thread: stored,
+            served: None,
+            others,
+        });
     };
-    let parts = spelled
+    let thread = spelled
+        .parts
         .into_iter()
         .map(|part| match part {
             Spelled::Text(text) => Part::Text(Cow::Owned(text)),
             Spelled::OneOf(spellings) => Part::Mention(spellings),
         })
         .collect();
+    if spelled.spells_stored {
+        return Ok(RecordParts {
+            thread,
+            served: None,
+            others,
+        });
+    }
     others.insert(0, stored);
-    Ok((parts, others))
+    Ok(RecordParts {
+        thread,
+        served: Some(vec![Part::Text(Cow::Borrowed(&record.text))]),
+        others,
+    })
 }
 
 /// `record` as its stored text, with the source's own text as another reading where it is
@@ -233,6 +267,7 @@ fn add_reading(readings: &mut Vec<Reading>, parts: Vec<Part<'_>>, slack: bool) {
 
 /// One part of a text a quote is compared against, before normalising: text, or a mention
 /// a quote may spell any one of several ways.
+#[derive(Clone)]
 enum Part<'a> {
     Text(Cow<'a, str>),
     Mention(Vec<String>),
@@ -257,8 +292,8 @@ enum Segment {
 
 impl Reading {
     /// The reading `parts` make. When `slack`, each mention written into a text part as Slack
-    /// writes one (`<@U…>`, `<#C…>`, `<!…>`) or as a bare person id (`@U…`) is a mention a
-    /// quote holds only whole, as it is written there.
+    /// writes one (`<@U…>`, `<#C…>`, `<!…>`), or as `@` and a word (an id such as `@U…`, or a
+    /// name a renderer wrote), is a mention a quote holds only whole, as it is written there.
     fn new(parts: Vec<Part<'_>>, slack: bool) -> Self {
         if parts.iter().all(|part| matches!(part, Part::Text(_))) {
             let text = match <[_; 1]>::try_from(parts) {
@@ -369,27 +404,39 @@ fn push_normalised(segments: &mut Vec<Segment>, normalised: &str, slack: bool) {
 }
 
 /// Where a normalised Slack text writes a mention itself, as byte ranges in order: a sequence
-/// Slack writes, `<@…>`, `<#…>` or `<!…>`, and a bare person id, `@` then `u` or `w` and the
-/// letters and digits after it, where the `@` starts a word. A quote holds each whole.
+/// Slack writes, `<@…>`, `<#…>` or `<!…>`, and `@` where it starts a word, with the word after
+/// it: letters and digits, joined by `.` or `-`. That word is a person's id, or a name a
+/// renderer wrote, whose end a text read as it is shows nowhere else. A quote holds each whole.
 fn mention_tokens(normalised: &str) -> Vec<(usize, usize)> {
-    let bytes = normalised.as_bytes();
-    let at = |index: usize| bytes.get(index).copied();
     let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        let end = match at(index) {
-            Some(b'<') if matches!(at(index + 1), Some(b'@' | b'#' | b'!')) => normalised
-                .get(index..)
+    let mut previous: Option<char> = None;
+    let mut characters = normalised.char_indices().peekable();
+    while let Some((start, character)) = characters.next() {
+        let starts_word = previous.is_none_or(|before| !before.is_alphanumeric());
+        let next = characters.peek().map(|(_, next)| *next);
+        let end = match character {
+            '<' if matches!(next, Some('@' | '#' | '!')) => normalised
+                .get(start..)
                 .and_then(|rest| rest.find('>'))
-                .map(|close| index + close + 1),
-            Some(b'@')
-                if matches!(at(index + 1), Some(b'u' | b'w'))
-                    && (index == 0
-                        || !at(index - 1).is_some_and(|byte| byte.is_ascii_alphanumeric())) =>
-            {
-                let mut end = index + 2;
-                while at(end).is_some_and(|byte| byte.is_ascii_alphanumeric()) {
-                    end += 1;
+                .map(|close| start + close + 1),
+            '@' if starts_word && next.is_some_and(char::is_alphanumeric) => {
+                let word = start + 1;
+                let mut end = word;
+                let rest = normalised.get(word..).unwrap_or_default();
+                for (offset, following) in rest.char_indices() {
+                    if following.is_alphanumeric() {
+                        end = word + offset + following.len_utf8();
+                        continue;
+                    }
+                    // A `.` or `-` joins the word only to more of it.
+                    let joins = matches!(following, '.' | '-')
+                        && rest
+                            .get(offset + 1..)
+                            .and_then(|after| after.chars().next())
+                            .is_some_and(char::is_alphanumeric);
+                    if !joins {
+                        break;
+                    }
                 }
                 Some(end)
             }
@@ -397,10 +444,12 @@ fn mention_tokens(normalised: &str) -> Vec<(usize, usize)> {
         };
         match end {
             Some(end) => {
-                tokens.push((index, end));
-                index = end;
+                tokens.push((start, end));
+                while characters.peek().is_some_and(|(at, _)| *at < end) {
+                    previous = characters.next().map(|(_, skipped)| skipped);
+                }
             }
-            None => index += 1,
+            None => previous = Some(character),
         }
     }
     tokens
@@ -927,7 +976,7 @@ mod tests {
 
     /// A Slack message's stored text and Slack's own text, read as they are, hold any quote
     /// copied from them, escapes included, but a quote that starts or stops inside a mention
-    /// they write, `@U…` or `<@U…>`, does not hold.
+    /// they write, `@U…`, `<@U…>` or a rendered `@Name`, does not hold.
     #[test]
     fn a_literal_slack_text_holds_its_mentions_only_whole() {
         let stored = Reading::new(
@@ -939,6 +988,12 @@ mod tests {
         let own = Reading::new(
             vec![Part::Text(Cow::Borrowed(
                 "Please ask cc <@U0EXAMPLEA> to check A &amp; B",
+            ))],
+            true,
+        );
+        let named = Reading::new(
+            vec![Part::Text(Cow::Borrowed(
+                "Please ask cc @Kimberly to review the plan. Ask @kim.lee-park too.",
             ))],
             true,
         );
@@ -957,6 +1012,13 @@ mod tests {
             (&own, "Please ask cc <@U0EXAMPLE", false),
             (&own, "Please ask cc <@U0EXAMPLEA", false),
             (&own, "U0EXAMPLEA> to check A &amp; B", false),
+            (&named, "Please ask cc @Kimberly to review the plan", true),
+            (&named, "Please ask cc @Kim", false),
+            (&named, "Please ask cc @Kim ... to review the plan", false),
+            (&named, "berly to review the plan", false),
+            (&named, "Ask @kim.lee-park too", true),
+            (&named, "Ask @kim.lee", false),
+            (&named, "the plan. Ask", true),
         ] {
             assert_eq!(holds(reading, quote), expected, "{quote}");
         }

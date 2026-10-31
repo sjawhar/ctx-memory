@@ -53,6 +53,14 @@ pub enum Spelled {
     OneOf(Vec<String>),
 }
 
+/// A stored Slack message with each mention spelled ([`Mentions::spelled`]).
+pub struct SpelledMessage {
+    pub parts: Vec<Spelled>,
+    /// Whether the stored text reads as Slack's own text mention by mention, so that it, and
+    /// the text ctx serves for the message, are among the texts `parts` spell.
+    pub spells_stored: bool,
+}
+
 /// Serves stored Slack messages with the people they mention named, for one command: each
 /// person is looked up in the store once.
 ///
@@ -151,21 +159,21 @@ impl<'s> Mentions<'s> {
     /// # Errors
     ///
     /// Returns an error when the store cannot be read.
-    pub fn spelled(&self, record: &Record) -> Result<Option<Vec<Spelled>>> {
+    pub fn spelled(&self, record: &Record) -> Result<Option<SpelledMessage>> {
         if !self.holds(&record.pointer) {
             return Ok(None);
         }
         let Some(text) = record.raw.get("text").and_then(Value::as_str) else {
             return Ok(None);
         };
-        let parts = spellings(text, &record.text);
+        let (parts, spells_stored) = spellings(text, &record.text);
         if !parts
             .iter()
             .any(|part| matches!(part, Spelling::Mention { .. }))
         {
             return Ok(None);
         }
-        parts
+        let parts = parts
             .into_iter()
             .map(|part| match part {
                 Spelling::Text(text) => Ok(Spelled::Text(text)),
@@ -183,8 +191,11 @@ impl<'s> Mentions<'s> {
                     Ok(Spelled::OneOf(spellings))
                 }
             })
-            .collect::<Result<Vec<_>>>()
-            .map(Some)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(SpelledMessage {
+            parts,
+            spells_stored,
+        }))
     }
 
     /// Whether `scheme` is a Slack source's pointer scheme, so its records hold Slack messages.

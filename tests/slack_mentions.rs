@@ -73,6 +73,44 @@ fn record(pointer: &str, ts: &str, author: (&str, &str), text: &str, raw: &Value
     })
 }
 
+/// A message `U0EXAMPLEB` (Grace Hopper) posted at `pointer`: stored as `stored`, and as Slack
+/// sent it, `text`.
+fn posted(pointer: &str, stored: &str, text: &str) -> Value {
+    let ts = pointer.rsplit_once('/').map_or(pointer, |(_, ts)| ts);
+    record(
+        pointer,
+        "2026-10-25T12:50:00Z",
+        ("U0EXAMPLEB", "Grace Hopper"),
+        stored,
+        &json!({"ts": ts, "user": "U0EXAMPLEB", "text": text}),
+    )
+}
+
+/// A message `id` wrote at `ts`, with the profile Slack sends beside it, so the store holds
+/// `name` for `id`: as its author, and as its full and display name.
+fn own_message(ts: &str, id: &str, name: &str) -> Value {
+    record(
+        &format!("slack:C0EXAMPLE01/{ts}"),
+        "2026-10-25T12:00:00Z",
+        (id, name),
+        "Here.",
+        &json!({
+            "ts": ts,
+            "user": id,
+            "text": "Here.",
+            "user_profile": {"real_name": name, "display_name": name},
+        }),
+    )
+}
+
+/// `line`, a record as [`record`] writes it, as a reply in the thread `parent` starts.
+fn in_thread(mut line: Value, parent: &str) -> Value {
+    if let Some(fields) = line.get_mut("record").and_then(Value::as_object_mut) {
+        fields.insert("thread".to_owned(), json!(parent));
+    }
+    line
+}
+
 /// A tree with one Slack source and one question that quotes the asked message with `claims`,
 /// and one window that holds the three messages and a delta listing them.
 ///
@@ -615,6 +653,97 @@ fn a_quote_across_a_thread_as_resolve_prints_it_holds() -> Result<()> {
         broken,
         ["questions/thread-2.md"],
         "a quote across the thread as served holds, and none that starts inside a mention"
+    );
+    Ok(())
+}
+
+/// One person's name is a prefix of another's: `U0EXAMPLEA` is Kimberly and `U0EXAMPLED` is
+/// Kim, with no name in common. A quote that cuts `@Kimberly` down to `@Kim` holds nowhere:
+/// not where ctx served the name for a bare id, not where the fetch stored it, and not in the
+/// thread as `ctx resolve --thread` prints it beside a reply served as stored.
+#[test]
+fn a_quote_never_cuts_a_rendered_name_down_to_another_person_s() -> Result<()> {
+    const BARE: &str = "slack:C0EXAMPLE01/1792952500.001000";
+    const REPLY: &str = "slack:C0EXAMPLE01/1792952560.001100";
+    const NAMED: &str = "slack:C0EXAMPLE01/1792952600.001200";
+    let root = scratch("prefix")?;
+    write_tree(&root, &[])?;
+    write_quotes(
+        &root,
+        "bare",
+        BARE,
+        &[
+            "Please ask cc @Kim",
+            "Please ask cc @Kim ... to review the plan",
+            "Please ask cc @Kimberly to review the plan",
+            "Please ask cc @U0EXAMPLEA to review the plan",
+            "Please ask cc @Kimberly to review the plan ... @U0EXAMPLEB see the new plan",
+            "Please ask cc @Kim ... see the new plan",
+        ],
+    )?;
+    write_quotes(
+        &root,
+        "named",
+        NAMED,
+        &[
+            "Please ask cc @Kim",
+            "Please ask cc @Kimberly to check the budget",
+        ],
+    )?;
+    fs::create_dir_all(root.join("data"))?;
+    let reply = in_thread(
+        record(
+            REPLY,
+            "2026-10-25T12:51:00Z",
+            ("U0EXAMPLED", "Kim"),
+            "@U0EXAMPLEB see the new plan",
+            &json!({
+                "ts": "1792952560.001100",
+                "thread_ts": "1792952500.001000",
+                "user": "U0EXAMPLED",
+                "text": "<@U0EXAMPLEB> see the plan",
+            }),
+        ),
+        BARE,
+    );
+    put(
+        &root,
+        &[
+            posted(
+                BARE,
+                "Please ask cc @U0EXAMPLEA to review the plan.",
+                "Please ask cc <@U0EXAMPLEA> to review the plan.",
+            ),
+            reply,
+            posted(
+                NAMED,
+                "Please ask cc @Kimberly to check the budget.",
+                "Please ask cc <@U0EXAMPLEA> to check the budget.",
+            ),
+            own_message("1792951000.000030", "U0EXAMPLEA", "Kimberly"),
+            own_message("1792951000.000040", "U0EXAMPLED", "Kim"),
+        ],
+        "2026-10-25T13:00:00Z",
+    )?;
+    let resolved = data(&ctx(&root, &["resolve", "--thread", BARE])?)?;
+    let broken = broken_quotes(&root)?;
+    remove_scratch(&root)?;
+
+    let text = text_at(&resolved, "/results/0/text")?;
+    assert!(
+        text.contains("\nPlease ask cc @Kimberly to review the plan.\n\n")
+            && text.ends_with("\n@U0EXAMPLEB see the new plan"),
+        "ctx resolve --thread names Kimberly, then prints the reply as stored: {text}"
+    );
+    assert_eq!(
+        broken,
+        [
+            "questions/bare-0.md",
+            "questions/bare-1.md",
+            "questions/bare-5.md",
+            "questions/named-0.md",
+        ],
+        "only the quotes that cut @Kimberly down to @Kim are broken"
     );
     Ok(())
 }

@@ -183,12 +183,14 @@ pub(super) enum Spelling<'a> {
 /// A message Slack sent as `text`, and a fetch stored as `stored`, in the parts a quote of it
 /// is checked against: each mention spelled each way a reader may have seen it, with what the
 /// stored text shows for it when the two read alike mention by mention ([`align`]), and the
-/// rest as a fetch renders it.
-pub(super) fn spellings<'t>(text: &'t str, stored: &str) -> Vec<Spelling<'t>> {
+/// rest as a fetch renders it. The flag says whether they read alike, so that the stored text
+/// is one of the texts the parts spell.
+pub(super) fn spellings<'t>(text: &'t str, stored: &str) -> (Vec<Spelling<'t>>, bool) {
     let pieces = pieces(text);
     let shown = align(&pieces, stored);
+    let aligned = shown.is_some();
     let unnamed = BTreeMap::new();
-    pieces
+    let parts = pieces
         .iter()
         .enumerate()
         .map(|(index, piece)| {
@@ -233,7 +235,8 @@ pub(super) fn spellings<'t>(text: &'t str, stored: &str) -> Vec<Spelling<'t>> {
                 }
             }
         })
-        .collect()
+        .collect();
+    (parts, aligned)
 }
 
 /// One piece of a message's text as a reader sees it.
