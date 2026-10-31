@@ -282,18 +282,20 @@ fn every_answer_is_one_line_whoever_gave_it() -> Result<()> {
     let rejected = server.command(&["record", "show", "decisions/renewal.md", "--bogus"])?;
     let unreadable = server.post_as("ada@example.com", "/v1/command", &json!({ "argv": 5 }))?;
     let wrong_method = server.raw(Method::GET, tailnet, "/v1/records/put", None, &ada)?;
-    // axum may close the connection before the whole body is sent; the line is what is tested.
-    let too_large = server
-        .raw(
-            Method::POST,
-            tailnet,
-            "/v1/records/put",
-            Some(vec![b'a'; 3 << 20]),
-            &ada,
-        )
-        .ok();
     let nowhere = server.raw(Method::GET, tailnet, "/nowhere", None, &[])?;
     let probe = server.raw(Method::HEAD, tailnet, "/healthz", None, &[])?;
+    // Last, and on a connection of its own: axum may close it before the whole body is sent,
+    // and a client that reused it would fail the next request. The line is what is tested.
+    let too_large = reqwest::blocking::Client::new()
+        .post(format!("http://{tailnet}/v1/records/put"))
+        .header("Tailscale-User-Login", "ada@example.com")
+        .body(vec![b'a'; 3 << 20])
+        .send()
+        .ok()
+        .and_then(|reply| {
+            let status = reply.status().as_u16();
+            reply.bytes().ok().map(|body| (status, body.len()))
+        });
     let printed = server.stop_and_read_stdout()?;
     let window = (start, chrono::Utc::now());
     drop(server);
@@ -307,7 +309,7 @@ fn every_answer_is_one_line_whoever_gave_it() -> Result<()> {
         );
     }
     let lines = request_lines(&printed)?;
-    let [dossiered, refused, unread, wrong, large, lost, probed] = lines.as_slice() else {
+    let [dossiered, refused, unread, wrong, lost, probed, large] = lines.as_slice() else {
         anyhow::bail!("not one line per request: {text}");
     };
     let exit = |reply: &support::Reply| -> Result<String> {

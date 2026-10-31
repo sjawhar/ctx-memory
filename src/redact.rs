@@ -91,9 +91,9 @@ pub fn credentials_in(text: &str) -> Result<Vec<&'static str>> {
 /// The shape of an identity token, the signed JSON Web Token a caller of the ingress listener
 /// sends with every request: three base64url parts, the first `eyJ`, the encoding of `{"`. A
 /// log line never shows one, or the start of one, though a write is not refused for it: the
-/// shapes above are the ones a record may never carry.
-const IDENTITY_TOKEN: &str =
-    r"(?P<before>^|[^A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{8,}(?:\.[A-Za-z0-9_\-]*){0,2}";
+/// shapes above are the ones a record may never carry. It asks for nothing before it: a token
+/// glued to a word, such as a file name's `auth-` or `auth_`, still goes.
+const IDENTITY_TOKEN: &str = r"eyJ[A-Za-z0-9_\-]{8,}(?:\.[A-Za-z0-9_\-]*){0,2}";
 
 /// [`IDENTITY_TOKEN`], compiled once.
 static IDENTITY_TOKEN_SHAPE: LazyLock<Result<Regex, String>> =
@@ -189,6 +189,10 @@ mod tests {
             "decisions/[redacted].md"
         );
         assert_eq!(one_line(&format!("x/{start}")), "x/[redacted]");
+        for glued in [format!("auth-{token}.md"), format!("auth_{start}")] {
+            let shown = one_line(&glued);
+            assert!(!shown.contains("eyJ"), "{shown}");
+        }
         assert!(
             credentials_in(&token)?.is_empty(),
             "a write is refused for it"
