@@ -219,6 +219,64 @@ fn the_ingest_skill_closes_quoted_text_only_with_the_cycles_nonce() -> Result<()
     Ok(())
 }
 
+/// Six kinds of message made records nobody used: payment receipts, spend alerts, the fetch's
+/// own bookkeeping, mirrors of one pull request or issue, records closed when created, and
+/// records about the pipeline itself. The skill names each, and where a fact worth keeping in
+/// one goes instead, so the rule never drops what a person needs.
+#[test]
+fn the_ingest_skill_says_what_is_not_a_record() -> Result<()> {
+    let flat = skill("ctx-memory-ingest")?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "## Not a record",
+        "check the record against \"Not a record\"",
+        "no record per receipt",
+        "update it only when a receipt changes it",
+        "no record per alert",
+        "no record of any type, `gap` included",
+        "evidence a record lacks goes in that record's body",
+        "no project or ops record whose one source is a single pull request or issue",
+        "a decision and who made it, a named person's commitment",
+        "already answered, cancelled, closed, completed, done, resolved, superseded or withdrawn",
+        "Close the open record the source closes",
+        "The pipeline that builds this graph",
+        "A person's decision or commitment about it is still recorded",
+        "With no cycle log named, write no record about the cycle",
+    ] {
+        assert!(
+            flat.contains(expected),
+            "the ingest skill never says {expected:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A file the skill sends the session to read ships beside it: a pointer to a file that is not
+/// there leaves the session to guess what it held.
+#[test]
+fn every_file_the_ingest_skill_names_ships_with_it() -> Result<()> {
+    let text = skill("ctx-memory-ingest")?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/ctx-memory-ingest");
+    let named: Vec<&str> = text
+        .split("skill://ctx-memory-ingest/")
+        .skip(1)
+        .filter_map(|rest| rest.split(['`', ' ', ',', ')']).next())
+        .collect();
+    assert!(
+        named.iter().any(|path| path.starts_with("references/")),
+        "the ingest skill names no reference file, so this check reads nothing: {named:?}"
+    );
+    for path in named {
+        assert!(
+            root.join(path).is_file(),
+            "the ingest skill names skill://ctx-memory-ingest/{path}, which is not in the skill"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn the_reading_skill_names_remote_mode() -> Result<()> {
     let text = skill("ctx-memory")?;
