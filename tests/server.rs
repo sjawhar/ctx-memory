@@ -158,6 +158,452 @@ fn ingress_refuses_a_principal_outside_the_allow_list() -> Result<()> {
     Ok(())
 }
 
+/// Each request at either door is one JSON line on the server's standard output, written when
+/// its answer is ready, so who reads the graph, and how, can be counted: when, which door, who
+/// called, which command, the record a `record show` names, how it ended, the status, how long
+/// it took and how many bytes the answer held. A search is logged by the length of its query,
+/// never by its words, and no line carries what a record says or the caller's token.
+#[test]
+fn each_request_at_either_door_is_one_line_of_the_request_log() -> Result<()> {
+    let tree = fixture_tree("server-request-log")?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let mut server = ingress_server(&tree, &keys)?;
+    let ingress = server.ingress_address()?;
+    let agent = "cycle@example-project.iam.gserviceaccount.com";
+    let token = support::google_token(AUDIENCE, agent)?;
+    let bearer = format!("Bearer {token}");
+    let query = "quarterly zeppelin-7f3a";
+    let start = chrono::Utc::now();
+    let search = server.command(&["search", query])?;
+    let show = server.command(&["record", "show", "decisions/renewal.md"])?;
+    let open = server.post(
+        ingress,
+        "/v1/command",
+        &json!({ "argv": ["--json", "open"] }),
+        &[("Authorization", &bearer)],
+    )?;
+    let anonymous = server.post(
+        ingress,
+        "/v1/command",
+        &json!({ "argv": ["search", query] }),
+        &[],
+    )?;
+    let health = server.get(server.tailnet, "/healthz", &[])?;
+    let printed = server.stop_and_read_stdout()?;
+    let window = (start, chrono::Utc::now());
+    drop(server);
+    remove_fixture(&tree)?;
+
+    let statuses = [
+        search.status,
+        show.status,
+        open.status,
+        anonymous.status,
+        health.status,
+    ];
+    assert_eq!(statuses, [200, 200, 200, 401, 200], "unexpected answers");
+    let text = printed.join("\n");
+    for secret in [
+        "zeppelin",
+        "The vendor renewal keeps",
+        token.as_str(),
+        "Bearer",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "the request log holds {secret:?}: {text}"
+        );
+    }
+    let lines = request_lines(&printed)?;
+    let [searched, shown, opened, refused, probed] = lines.as_slice() else {
+        anyhow::bail!("not one line per request: {text}");
+    };
+    let expected = [
+        (
+            searched,
+            json!({
+                "severity": "INFO", "door": "tailnet", "caller": "ada@example.com",
+                "command": "search", "query_chars": query.chars().count(), "result": "ok",
+                "status": 200, "response_bytes": search.bytes,
+            }),
+        ),
+        (
+            shown,
+            json!({
+                "severity": "INFO", "door": "tailnet", "caller": "ada@example.com",
+                "command": "record show", "path": "decisions/renewal.md", "result": "ok",
+                "status": 200, "response_bytes": show.bytes,
+            }),
+        ),
+        (
+            opened,
+            json!({
+                "severity": "INFO", "door": "identity-token", "caller": agent,
+                "command": "open", "result": "ok", "status": 200, "response_bytes": open.bytes,
+            }),
+        ),
+        (
+            refused,
+            json!({
+                "severity": "WARNING", "door": "identity-token", "caller": null,
+                "command": null, "result": "unidentified", "status": 401,
+                "response_bytes": anonymous.bytes,
+            }),
+        ),
+        (
+            probed,
+            json!({
+                "severity": "INFO", "door": "tailnet", "caller": null, "command": "healthz",
+                "result": "ok", "status": 200, "response_bytes": health.bytes,
+            }),
+        ),
+    ];
+    for (line, expected) in expected {
+        assert_logged(line, &expected, window)?;
+    }
+    Ok(())
+}
+
+/// Every answer is one line of the request log, whoever gave it: a command clap refused, a body
+/// that is not a request, and the answers axum gives before any handler runs, for a method a
+/// route does not take, a body over its limit and a path no route has. A dossier is logged by
+/// the length of the entity it looks up, as a search is by its query's, and an answer to HEAD
+/// carries no body.
+#[test]
+fn every_answer_is_one_line_whoever_gave_it() -> Result<()> {
+    use reqwest::Method;
+    let tree = fixture_tree("server-request-log-answers")?;
+    let mut server = Server::start(&tree, &[])?;
+    let tailnet = server.tailnet;
+    let ada = [("Tailscale-User-Login", "ada@example.com")];
+    let entity = "Zebra Holdings";
+    let start = chrono::Utc::now();
+    let dossier = server.command(&["dossier", entity])?;
+    let rejected = server.command(&["record", "show", "decisions/renewal.md", "--bogus"])?;
+    let unreadable = server.post_as("ada@example.com", "/v1/command", &json!({ "argv": 5 }))?;
+    let wrong_method = server.raw(Method::GET, tailnet, "/v1/records/put", None, &ada)?;
+    let nowhere = server.raw(Method::GET, tailnet, "/nowhere", None, &[])?;
+    let probe = server.raw(Method::HEAD, tailnet, "/healthz", None, &[])?;
+    // Last, and on a connection of its own: axum may close it before the whole body is sent,
+    // and a client that reused it would fail the next request. The line is what is tested.
+    let too_large = reqwest::blocking::Client::new()
+        .post(format!("http://{tailnet}/v1/records/put"))
+        .header("Tailscale-User-Login", "ada@example.com")
+        .body(vec![b'a'; 3 << 20])
+        .send()
+        .ok()
+        .and_then(|reply| {
+            let status = reply.status().as_u16();
+            reply.bytes().ok().map(|body| (status, body.len()))
+        });
+    let printed = server.stop_and_read_stdout()?;
+    let window = (start, chrono::Utc::now());
+    drop(server);
+    remove_fixture(&tree)?;
+
+    let text = printed.join("\n");
+    for secret in [entity, "Zebra", "renewal", "bogus"] {
+        assert!(
+            !text.contains(secret),
+            "the request log holds {secret:?}: {text}"
+        );
+    }
+    let lines = request_lines(&printed)?;
+    let [dossiered, refused, unread, wrong, lost, probed, large] = lines.as_slice() else {
+        anyhow::bail!("not one line per request: {text}");
+    };
+    let exit = |reply: &support::Reply| -> Result<String> {
+        let code = reply.field("exit_code")?.as_u64().context("no exit code")?;
+        Ok(if code == 0 {
+            "ok".to_owned()
+        } else {
+            format!("exit-{code}")
+        })
+    };
+    let ada = "ada@example.com";
+    let expected = [
+        (
+            dossiered,
+            json!({
+                "severity": "INFO", "door": "tailnet", "caller": ada, "command": "dossier",
+                "query_chars": entity.chars().count(), "result": exit(&dossier)?, "status": 200,
+                "response_bytes": dossier.bytes,
+            }),
+        ),
+        (
+            refused,
+            json!({
+                "severity": "INFO", "door": "tailnet", "caller": ada, "command": "record show",
+                "result": exit(&rejected)?, "status": 200, "response_bytes": rejected.bytes,
+            }),
+        ),
+        (
+            unread,
+            json!({
+                "severity": "WARNING", "door": "tailnet", "caller": ada, "command": null,
+                "result": "bad-request", "status": 400, "response_bytes": unreadable.bytes,
+            }),
+        ),
+        (
+            wrong,
+            json!({
+                "severity": "WARNING", "door": "tailnet", "caller": null, "command": "record put",
+                "result": "method-not-allowed", "status": 405, "response_bytes": wrong_method.1,
+            }),
+        ),
+        (
+            lost,
+            json!({
+                "severity": "WARNING", "door": "tailnet", "caller": null, "command": null,
+                "result": "not-found", "status": 404, "response_bytes": nowhere.1,
+            }),
+        ),
+        (
+            probed,
+            json!({
+                "severity": "INFO", "door": "tailnet", "caller": null, "command": "healthz",
+                "result": "ok", "status": 200, "response_bytes": 0,
+            }),
+        ),
+    ];
+    assert_eq!(exit(&rejected)?, "exit-2", "clap did not refuse the argv");
+    assert_eq!([wrong_method.0, nowhere.0, probe.0], [405, 404, 200]);
+    assert_eq!(probe.1, 0, "an answer to HEAD carried a body");
+    for (line, expected) in expected {
+        assert_logged(line, &expected, window)?;
+    }
+    assert_too_large(large, too_large);
+    Ok(())
+}
+
+/// Asserts the line of a body over axum's limit, and when its caller read the answer before
+/// the connection closed, that the line counts that answer's bytes.
+fn assert_too_large(line: &Value, answer: Option<(u16, usize)>) {
+    for (field, value) in [
+        ("status", json!(413)),
+        ("result", json!("too-large")),
+        ("command", json!("record put")),
+        ("caller", Value::Null),
+    ] {
+        assert_eq!(line.get(field), Some(&value), "{line}");
+    }
+    if let Some((status, bytes)) = answer {
+        assert_eq!(status, 413, "{line}");
+        assert_eq!(line.get("response_bytes"), Some(&json!(bytes)), "{line}");
+    }
+}
+
+/// A log collector that stops reading costs lines of the request log, never answers: with the
+/// server's standard output full, every request is still answered, and standard error, which
+/// another collector reads, says once that lines are dropped.
+#[test]
+fn a_stalled_request_log_costs_lines_not_answers() -> Result<()> {
+    let stalled = stalled_server("server-request-log-stalled", Pipes::Apart)?;
+    stalled.assert_every_request_answered();
+    assert_eq!(
+        stalled
+            .stderr
+            .lines()
+            .filter(|line| line.starts_with("the request log is behind standard output"))
+            .count(),
+        1,
+        "{}",
+        stalled.stderr
+    );
+    Ok(())
+}
+
+/// Standard error can be the same full pipe as standard output, as when a runtime collects
+/// both streams together and stops reading: saying that lines are dropped must not stop a
+/// request either.
+#[test]
+fn a_stalled_pipe_both_streams_share_costs_no_answers() -> Result<()> {
+    stalled_server("server-request-log-stalled-shared", Pipes::Shared)?
+        .assert_every_request_answered();
+    Ok(())
+}
+
+/// More healthz lines than a pipe shrunk to one page and the request log's queue hold together.
+const STALLED_REQUESTS: usize = 1500;
+
+/// Where a stalled server's two streams go.
+#[derive(Clone, Copy)]
+enum Pipes {
+    /// Standard output and standard error each to a pipe of its own, neither read.
+    Apart,
+    /// Both to one pipe, not read.
+    Shared,
+}
+
+/// What a server whose standard output nobody read did with [`STALLED_REQUESTS`] requests.
+struct Stalled {
+    /// How many requests in a row it answered with success before the first that it did not.
+    answered: usize,
+    /// The first request it did not answer, and why.
+    failure: Option<String>,
+    /// Whether it stopped cleanly on SIGTERM within a minute.
+    stopped: Option<std::process::ExitStatus>,
+    /// Its standard error, read once it had stopped (empty when it shares standard output).
+    stderr: String,
+}
+
+impl Stalled {
+    fn assert_every_request_answered(&self) {
+        assert_eq!(
+            (self.answered, self.failure.as_deref()),
+            (STALLED_REQUESTS, None),
+            "{}",
+            self.stderr
+        );
+        assert!(
+            self.stopped.is_some_and(|status| status.success()),
+            "ctx serve did not stop cleanly ({:?}): {}",
+            self.stopped,
+            self.stderr
+        );
+    }
+}
+
+/// Starts a server whose output pipes nobody reads past its listener line, each shrunk to one
+/// page, asks it [`STALLED_REQUESTS`] health checks, stopping at the first it does not answer,
+/// and stops it.
+fn stalled_server(label: &str, pipes: Pipes) -> Result<Stalled> {
+    use std::io::{BufRead as _, Read as _};
+    let tree = fixture_tree(label)?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let (stdout, stdout_writer) = std::io::pipe()?;
+    let (stderr, stderr_writer) = match pipes {
+        Pipes::Apart => {
+            let (reader, writer) = std::io::pipe()?;
+            (Some(reader), writer)
+        }
+        Pipes::Shared => (None, stdout_writer.try_clone()?),
+    };
+    #[cfg(target_os = "linux")]
+    for reader in std::iter::once(&stdout).chain(stderr.as_ref()) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: the descriptor is this process's own open pipe; F_SETPIPE_SZ only resizes it.
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+    }
+    let mut command = support::binary();
+    command
+        .args(["--memory", tree_text, "serve", "--tailnet-listen"])
+        .args(["127.0.0.1:0", "--pull-interval", "3600"])
+        .envs(support::tree_env(&tree)?)
+        .stdout(stdout_writer)
+        .stderr(stderr_writer);
+    let mut child = command.spawn().context("starting ctx serve")?;
+    // The writing ends this process held went to the child; `command` holds them until dropped.
+    drop(command);
+    let mut stdout = std::io::BufReader::new(stdout);
+    // A shared pipe may carry a line of standard error before the listener line.
+    let mut address = None;
+    let mut printed = String::new();
+    for _ in 0..10 {
+        let mut line = String::new();
+        if stdout.read_line(&mut line)? == 0 {
+            break;
+        }
+        if let Some(bound) = line.trim().strip_prefix("tailnet-listen ") {
+            address = Some(bound.to_owned());
+            break;
+        }
+        printed.push_str(&line);
+    }
+    // Nobody reads the pipes from here on, as a collector that stopped would not.
+    let (answered, failure) = match address {
+        Some(address) => ask_health(&address, STALLED_REQUESTS),
+        None => (
+            0,
+            Some(format!("ctx serve printed no listener: {printed:?}")),
+        ),
+    };
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: the pid is this process's own child, which has not been waited for.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    // The server waits a moment for its last lines, then stops whatever the pipes hold.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let stopped = loop {
+        match child.try_wait()? {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let mut stderr_text = String::new();
+    if let Some(mut stderr) = stderr {
+        stderr.read_to_string(&mut stderr_text)?;
+    }
+    drop(stdout);
+    remove_fixture(&tree)?;
+    Ok(Stalled {
+        answered,
+        failure,
+        stopped,
+        stderr: stderr_text,
+    })
+}
+
+/// Asks `address` for `/healthz` up to `count` times, and stops at the first answer that is not
+/// a success: how many were, and what the first that was not did.
+fn ask_health(address: &str, count: usize) -> (usize, Option<String>) {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return (0, Some(error.to_string())),
+    };
+    for asked in 0..count {
+        match client.get(format!("http://{address}/healthz")).send() {
+            Ok(reply) if reply.status().is_success() => {}
+            Ok(reply) => return (asked, Some(format!("request {asked}: {}", reply.status()))),
+            Err(error) => return (asked, Some(format!("request {asked}: {error}"))),
+        }
+    }
+    (count, None)
+}
+
+/// The request log, one parsed line per line printed.
+fn request_lines(printed: &[String]) -> Result<Vec<Value>> {
+    printed
+        .iter()
+        .map(|line| serde_json::from_str(line).with_context(|| format!("{line:?}")))
+        .collect()
+}
+
+/// Asserts one request log line holds exactly `expected`, beside a time inside `window`, when
+/// its request was made, and a duration.
+fn assert_logged(
+    line: &Value,
+    expected: &Value,
+    (start, end): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+) -> Result<()> {
+    let mut fields = line.as_object().context("a line is not an object")?.clone();
+    let time = fields.remove("time").context("a line has no time")?;
+    let time = time.as_str().context("a line's time is not text")?;
+    let time = chrono::DateTime::parse_from_rfc3339(time).with_context(|| format!("{time:?}"))?;
+    // The line gives whole milliseconds.
+    let earliest = start - chrono::TimeDelta::milliseconds(1);
+    assert!(
+        earliest <= time && time <= end,
+        "{line} is outside {start}..{end}"
+    );
+    let duration = fields
+        .remove("duration_ms")
+        .context("a line has no duration")?;
+    assert!(duration.is_u64(), "{line}");
+    assert_eq!(&Value::Object(fields), expected, "{line}");
+    Ok(())
+}
+
 /// A server with no allow list would answer every Google account there is, so it does not
 /// start at all.
 #[test]

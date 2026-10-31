@@ -8,11 +8,13 @@ pub mod fake_github;
 pub mod fake_google;
 pub mod fake_http;
 
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -377,6 +379,8 @@ pub fn cited_record() -> String {
 pub struct Reply {
     pub status: u16,
     pub body: Value,
+    /// How many bytes the body held, as the request log counts them.
+    pub bytes: usize,
 }
 
 impl Reply {
@@ -399,6 +403,10 @@ pub struct Server {
     pub tailnet: SocketAddr,
     pub ingress: Option<SocketAddr>,
     client: reqwest::blocking::Client,
+    /// Every line the server prints on standard output after its listener lines. A thread
+    /// reads the pipe for the life of the server, so the server never writes into a pipe
+    /// nobody reads. Tests share a server across threads, so the lines are behind a lock.
+    stdout: Mutex<Receiver<String>>,
 }
 
 impl Server {
@@ -430,7 +438,8 @@ impl Server {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("ctx serve has no stdout"))?;
-        let (tailnet, ingress) = match read_listeners(stdout, extra.contains(&"--listen")) {
+        let stdout = read_lines(stdout);
+        let (tailnet, ingress) = match read_listeners(&stdout, extra.contains(&"--listen")) {
             Ok(addresses) => addresses,
             Err(error) => {
                 let _ = child.kill();
@@ -442,6 +451,7 @@ impl Server {
             child,
             tailnet,
             ingress,
+            stdout: Mutex::new(stdout),
             client: reqwest::blocking::Client::builder()
                 // Long enough to mean "the server is not answering" rather than "the box is
                 // busy". One write forks a dozen git processes, and on a shared machine under
@@ -484,6 +494,30 @@ impl Server {
         reply(response)
     }
 
+    /// Sends a request whatever its answer, which may not be JSON or may have no body, and
+    /// returns its status and how many bytes its body held.
+    pub fn raw(
+        &self,
+        method: reqwest::Method,
+        address: SocketAddr,
+        path: &str,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> Result<(u16, usize)> {
+        let mut request = self
+            .client
+            .request(method, format!("http://{address}{path}"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        let response = request.send().context("sending to ctx serve")?;
+        let status = response.status().as_u16();
+        Ok((status, response.bytes()?.len()))
+    }
+
     /// Runs one allowlisted command over `/v1/command` as a tailnet user.
     pub fn command(&self, argv: &[&str]) -> Result<Reply> {
         self.post_as("ada@example.com", "/v1/command", &json!({ "argv": argv }))
@@ -507,6 +541,18 @@ impl Server {
             bail!("ctx serve stopped with {status}");
         }
         Ok(())
+    }
+
+    /// Stops the server the way Cloud Run does, and returns every line it printed on standard
+    /// output after its listener lines: the request log, one line per request.
+    pub fn stop_and_read_stdout(&mut self) -> Result<Vec<String>> {
+        self.terminate()?;
+        // The pipe closes when the server exits, which ends the thread that reads it.
+        let stdout = self
+            .stdout
+            .get_mut()
+            .map_err(|_| anyhow!("a thread reading the server's output panicked"))?;
+        Ok(stdout.iter().collect())
     }
 }
 
@@ -532,18 +578,31 @@ fn reply(response: reqwest::blocking::Response) -> Result<Reply> {
     Ok(Reply {
         status,
         body: serde_json::from_str(&text).with_context(|| format!("decoding {text}"))?,
+        bytes: text.len(),
     })
+}
+
+/// Reads `pipe` line by line on a thread of its own until it closes, and hands each line on.
+pub fn read_lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
+    let (lines, read) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    read
 }
 
 /// Reads the listener lines `ctx serve` prints once it is bound.
 fn read_listeners(
-    stdout: ChildStdout,
+    stdout: &Receiver<String>,
     expect_ingress: bool,
 ) -> Result<(SocketAddr, Option<SocketAddr>)> {
     let mut tailnet = None;
     let mut ingress = None;
-    for line in BufReader::new(stdout).lines() {
-        let line = line.context("reading ctx serve output")?;
+    for line in stdout {
         if let Some(address) = line.strip_prefix("tailnet-listen ") {
             tailnet = Some(address.trim().parse()?);
         } else if let Some(address) = line.strip_prefix("listen ") {

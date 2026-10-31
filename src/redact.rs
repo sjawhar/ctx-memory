@@ -30,27 +30,27 @@ const CREDENTIALS: &[(&str, &str)] = &[
     ),
     (
         "a model gateway key (sk-…)",
-        r"(?:^|[^A-Za-z0-9])sk-[a-z0-9]{32,}",
+        r"(?P<before>^|[^A-Za-z0-9])sk-[a-z0-9]{32,}",
     ),
     (
         "a GitHub token (ghp_, gho_, ghs_, ghu_, ghr_…)",
-        r"(?:^|[^A-Za-z0-9])gh[oprsu]_[A-Za-z0-9]{20,}",
+        r"(?P<before>^|[^A-Za-z0-9])gh[oprsu]_[A-Za-z0-9]{20,}",
     ),
     (
         "a GitHub fine-grained token (github_pat_…)",
-        r"(?:^|[^A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}",
+        r"(?P<before>^|[^A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}",
     ),
     (
         "a Slack token (xoxb-, xoxp-, xoxe-, xoxe.…)",
-        r"(?:^|[^A-Za-z0-9])xox[a-z][\-.][A-Za-z0-9.\-]{10,}",
+        r"(?P<before>^|[^A-Za-z0-9])xox[a-z][\-.][A-Za-z0-9.\-]{10,}",
     ),
     (
         "a Google OAuth access token (ya29.…)",
-        r"(?:^|[^A-Za-z0-9])ya29\.[A-Za-z0-9_\-]{20,}",
+        r"(?P<before>^|[^A-Za-z0-9])ya29\.[A-Za-z0-9_\-]{20,}",
     ),
     (
         "a Google OAuth refresh token (1//…)",
-        r"(?:^|[^A-Za-z0-9])1//[A-Za-z0-9_\-]{20,}",
+        r"(?P<before>^|[^A-Za-z0-9])1//[A-Za-z0-9_\-]{20,}",
     ),
     (
         "a private key (-----BEGIN … PRIVATE KEY-----)",
@@ -88,16 +88,34 @@ pub fn credentials_in(text: &str) -> Result<Vec<&'static str>> {
         .collect())
 }
 
-/// `text` with every credential in it replaced by `[redacted]`.
+/// The shape of an identity token, the signed JSON Web Token a caller of the ingress listener
+/// sends with every request: three base64url parts, the first `eyJ`, the encoding of `{"`. A
+/// log line never shows one, or the start of one, though a write is not refused for it: the
+/// shapes above are the ones a record may never carry. It asks for nothing before it: a token
+/// glued to a word, such as a file name's `auth-` or `auth_`, still goes.
+const IDENTITY_TOKEN: &str = r"eyJ[A-Za-z0-9_\-]{8,}(?:\.[A-Za-z0-9_\-]*){0,2}";
+
+/// [`IDENTITY_TOKEN`], compiled once.
+static IDENTITY_TOKEN_SHAPE: LazyLock<Result<Regex, String>> =
+    LazyLock::new(|| Regex::new(IDENTITY_TOKEN).map_err(|error| error.to_string()));
+
+/// `text` with every credential and identity token in it replaced by `[redacted]`. A shape
+/// that asks for what stands before a credential, so a prefix inside a longer word is not one,
+/// names it `before`, and that stays.
 ///
 /// # Errors
 ///
 /// Returns an error when the credential shapes do not compile.
 pub fn redacted(text: &str) -> Result<String> {
+    let identity_token = IDENTITY_TOKEN_SHAPE
+        .as_ref()
+        .map_err(|error| anyhow!("compiling the identity token shape: {error}"))?;
     Ok(credential_shapes()?
         .iter()
-        .fold(text.to_owned(), |text, (_, shape)| {
-            shape.replace_all(&text, "[redacted]").into_owned()
+        .map(|(_, shape)| shape)
+        .chain(std::iter::once(identity_token))
+        .fold(text.to_owned(), |text, shape| {
+            shape.replace_all(&text, "${before}[redacted]").into_owned()
         }))
 }
 
@@ -134,4 +152,51 @@ pub fn one_line(text: &str) -> String {
         line.push('…');
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A credential goes, and what stood before it stays: a path that holds a token keeps the
+    /// slash in front of it.
+    #[test]
+    fn redaction_keeps_what_stands_before_a_credential() -> Result<()> {
+        let token = format!("ghs_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        let key = format!("sk-ant-{}", "api03-A1b2C3d4E5f6G7h8");
+        assert_eq!(
+            redacted(&format!("decisions/{token}.md"))?,
+            "decisions/[redacted].md"
+        );
+        assert_eq!(redacted(&format!("{token} leads"))?, "[redacted] leads");
+        assert_eq!(redacted(&format!("key={key}"))?, "key=[redacted]");
+        Ok(())
+    }
+
+    /// An identity token, or the start of one, never reaches a log line, though the write
+    /// checks, which only refuse what a record may never carry, do not look for one.
+    #[test]
+    fn a_log_line_shows_no_identity_token() -> Result<()> {
+        use base64::Engine as _;
+        // Built from parts, so the source holds nothing secret scanning reads as a token.
+        let part = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        let header = part(r#"{"alg":"RS256","kid":"k1"}"#);
+        let claims = part(r#"{"email":"ada@example.com","aud":"https://ctx.example"}"#);
+        let token = format!("{header}.{claims}.{}", part("signature"));
+        let start = format!("{header}.{}", claims.get(..12).unwrap_or_default());
+        assert_eq!(
+            redacted(&format!("decisions/{token}.md"))?,
+            "decisions/[redacted].md"
+        );
+        assert_eq!(one_line(&format!("x/{start}")), "x/[redacted]");
+        for glued in [format!("auth-{token}.md"), format!("auth_{start}")] {
+            let shown = one_line(&glued);
+            assert!(!shown.contains("eyJ"), "{shown}");
+        }
+        assert!(
+            credentials_in(&token)?.is_empty(),
+            "a write is refused for it"
+        );
+        Ok(())
+    }
 }

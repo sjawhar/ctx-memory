@@ -1,12 +1,17 @@
-//! The server's log lines: `write failed:`, the follow heartbeat, and a failed follow pass.
+//! The server's log lines: `write failed:`, the follow heartbeat, a failed follow pass, and the
+//! request log.
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde_json::{json, Value};
 
-use crate::fixtures::{good_record, put_body, refuse_every_push, within};
+use crate::fixtures::{
+    broken_zeppelin_record, good_record, install_hook, put_body, refuse_every_push, within,
+};
 use crate::support;
 use crate::support::{fetch_window, fixture_clone, remote_of, remove_fixture};
 
@@ -15,6 +20,8 @@ struct Logged {
     child: std::process::Child,
     tailnet: SocketAddr,
     client: reqwest::blocking::Client,
+    /// What the server prints on standard output after its listener line.
+    stdout: Receiver<String>,
 }
 
 impl Logged {
@@ -34,30 +41,89 @@ impl Logged {
             .stdout(std::process::Stdio::piped())
             .stderr(std::fs::File::create(log)?);
         let mut child = command.spawn().context("starting ctx serve")?;
-        let stdout = child.stdout.take().context("ctx serve has no stdout")?;
-        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
+        let stdout = support::read_lines(child.stdout.take().context("ctx serve has no stdout")?);
         let tailnet = loop {
-            let Some(line) = lines.next() else {
+            let Ok(line) = stdout.recv() else {
                 let _ = child.kill();
                 let _ = child.wait();
                 anyhow::bail!("ctx serve stopped before it listened");
             };
-            if let Some(address) = line?.strip_prefix("tailnet-listen ") {
+            if let Some(address) = line.strip_prefix("tailnet-listen ") {
                 break address.parse()?;
             }
         };
-        std::thread::spawn(move || lines.for_each(drop));
         Ok(Self {
             child,
             tailnet,
             client: reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()?,
+            stdout,
         })
+    }
+
+    /// The next line of the request log, as the server writes it, waiting up to a minute.
+    fn next_line(&self) -> Result<Value> {
+        let line = self
+            .stdout
+            .recv_timeout(Duration::from_secs(60))
+            .context("the server logged no request")?;
+        serde_json::from_str(&line).with_context(|| format!("{line:?}"))
+    }
+
+    /// Stops the server, then returns every line of its request log: all of them, so a line too
+    /// many fails a test as a line too few does.
+    fn stop_and_read_request_log(&mut self) -> Result<Vec<Value>> {
+        self.stop();
+        // The pipe closes when the server exits, which ends the thread that reads it.
+        self.stdout
+            .iter()
+            .map(|line| serde_json::from_str(&line).with_context(|| format!("{line:?}")))
+            .collect()
+    }
+
+    /// Stops the server as Cloud Run does, with SIGTERM, so it finishes the follow pass it is in
+    /// before it exits. ctx runs each git command in a process group of its own
+    /// (`src/proc.rs`), so a SIGKILL would leave a pass's git running in the fixture while the
+    /// test removes it, and the removal would fail. SIGKILL only if it has not stopped within a
+    /// minute.
+    fn stop(&mut self) {
+        // A child already waited for is not signalled again: its pid may be another process's.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            // SAFETY: the pid is this process's own child, which has not been waited for.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     /// Posts `body` to `path`, signed in as `user` when there is one, and returns the status.
     fn post(&self, user: Option<&str>, path: &str, body: &Value) -> Result<u16> {
+        Ok(self.send(user, path, body)?.status().as_u16())
+    }
+
+    /// Posts as [`Logged::post`] does, and returns the status and the answer.
+    fn post_reply(&self, user: Option<&str>, path: &str, body: &Value) -> Result<(u16, Value)> {
+        let response = self.send(user, path, body)?;
+        Ok((response.status().as_u16(), response.json()?))
+    }
+
+    fn send(
+        &self,
+        user: Option<&str>,
+        path: &str,
+        body: &Value,
+    ) -> Result<reqwest::blocking::Response> {
         let mut request = self
             .client
             .post(format!("http://{}{path}", self.tailnet))
@@ -65,36 +131,20 @@ impl Logged {
         if let Some(user) = user {
             request = request.header("Tailscale-User-Login", user);
         }
-        Ok(request.send()?.status().as_u16())
+        Ok(request.send()?)
     }
 }
 
 impl Drop for Logged {
-    /// Stops the server as Cloud Run does, with SIGTERM, so it finishes the follow pass it is in
-    /// before it exits. ctx runs each git command in a process group of its own
-    /// (`src/proc.rs`), so a SIGKILL would leave a pass's git running in the fixture while the
-    /// test removes it, and the removal would fail. SIGKILL only if it has not stopped within a
-    /// minute.
     fn drop(&mut self) {
-        if let Ok(pid) = i32::try_from(self.child.id()) {
-            // SAFETY: the pid is this process's own child, which has not been waited for.
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while std::time::Instant::now() < deadline {
-                if matches!(self.child.try_wait(), Ok(Some(_))) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 
 /// A write that did not happen says so on standard error in one fixed form an alert matches,
 /// `write failed: <route> <status> <reason>`, whatever route it came by and whatever stopped
-/// it. A write that arrives over the tailnet passes no request log but this one. The line
+/// it. Cloud Run's own request log never sees a write that arrives over the tailnet, and the
+/// server's request log is not a form an alert matches, so this line is the alert's. The line
 /// never carries what the write carried: no record text, no credential.
 #[test]
 fn every_write_that_fails_says_so_in_one_line_an_alert_matches() -> Result<()> {
@@ -185,6 +235,180 @@ fn every_write_that_fails_says_so_in_one_line_an_alert_matches() -> Result<()> {
         !logged.contains("Keep the echo cadence"),
         "the log repeats a record's text: {logged}"
     );
+    Ok(())
+}
+
+/// A refused write is one line of the request log too, with the codes of the findings that
+/// refused it, the path it named and the caller who sent it, and never the record it carried:
+/// no record text, no credential, wherever the caller put it. A path is one line of plain text
+/// there, as in a `write failed:` line, whatever control characters the caller put in it.
+#[test]
+fn a_refused_put_logs_its_refusal_codes_and_never_its_record() -> Result<()> {
+    let tree = fixture_clone("log-request-refused")?;
+    let root = tree.parent().context("the fixture has a root")?;
+    let log = root.join("serve.log");
+    let token = format!("ghs_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let user = Some("ada@example.com");
+    let mut server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
+    let (gap, gap_reply) = server.post_reply(
+        user,
+        "/v1/records/put",
+        &put_body("decisions/zeppelin.md", &broken_zeppelin_record(), "s"),
+    )?;
+    let (credential, credential_reply) = server.post_reply(
+        user,
+        "/v1/records/put",
+        &put_body(
+            &format!("decisions/{token}.md"),
+            &format!("{}\nThe key is {token}.\n", good_record()),
+            "s",
+        ),
+    )?;
+    let forged = server.post(
+        user,
+        "/v1/records/put",
+        &put_body("decisions/x\nforged\n\u{1b}[2J.md", &good_record(), "s"),
+    )?;
+    let logged = server.stop_and_read_request_log()?;
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert_eq!(
+        [gap, credential, forged],
+        [422, 422, 400],
+        "unexpected answers"
+    );
+    let text = serde_json::to_string(&logged)?;
+    for secret in [
+        token.as_str(),
+        "Zeppelin budget",
+        "a-record-that-does-not-exist",
+        "The stream confirmed the cadence",
+        "Keep the echo cadence",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "the request log holds {secret:?}: {text}"
+        );
+    }
+    let [gap_line, credential_line, forged_line] = logged.as_slice() else {
+        anyhow::bail!("not one line per request: {text}");
+    };
+    for (line, reply) in [(gap_line, &gap_reply), (credential_line, &credential_reply)] {
+        let codes: Vec<Value> = reply
+            .get("findings")
+            .and_then(Value::as_array)
+            .context("a 422 carries its findings")?
+            .iter()
+            .filter_map(|finding| finding.get("kind").cloned())
+            .collect();
+        assert!(!codes.is_empty(), "{reply}");
+        assert_eq!(line.get("refusals"), Some(&json!(codes)), "{line}");
+        assert_eq!(line.get("result"), Some(&json!("refused")), "{line}");
+        assert_eq!(line.get("status"), Some(&json!(422)), "{line}");
+        assert_eq!(line.get("command"), Some(&json!("record put")), "{line}");
+        assert_eq!(
+            line.get("caller"),
+            Some(&json!("ada@example.com")),
+            "{line}"
+        );
+        assert_eq!(line.get("door"), Some(&json!("tailnet")), "{line}");
+    }
+    assert_eq!(
+        gap_line.get("path"),
+        Some(&json!("decisions/zeppelin.md")),
+        "{gap_line}"
+    );
+    assert_eq!(
+        credential_line.get("path"),
+        Some(&json!("decisions/[redacted].md")),
+        "{credential_line}"
+    );
+    assert_eq!(
+        forged_line.get("result"),
+        Some(&json!("bad-request")),
+        "{forged_line}"
+    );
+    assert!(forged_line.get("refusals").is_none(), "{forged_line}");
+    assert_eq!(
+        forged_line.get("path"),
+        Some(&json!("decisions/x forged [2J.md")),
+        "{forged_line}"
+    );
+    Ok(())
+}
+
+/// A caller that hangs up before its answer is ready still has its line, at the moment it hung
+/// up: `unanswered`, with no status and no body, and everything the server had learned of it.
+/// The write runs on, and when it fails its `write failed:` line still comes: hyper drops the
+/// request, not the write, and an alert must not miss a failed write because nobody waited for
+/// it.
+///
+/// The remote's hook holds the push until the test has hung up and read the line, so no
+/// timing decides what is tested.
+#[test]
+fn a_caller_that_hangs_up_has_an_unanswered_line_and_its_failure_is_still_said() -> Result<()> {
+    use std::io::Write as _;
+    let tree = fixture_clone("log-request-hang-up")?;
+    // The record cites the echo fixture's message, which a fetched window stores.
+    fetch_window(&tree)?;
+    let root = tree.parent().context("the fixture has a root")?;
+    let log = root.join("serve.log");
+    let (reached, release) = (root.join("push-reached"), root.join("push-released"));
+    install_hook(
+        &remote_of(&tree)?,
+        "pre-receive",
+        &format!(
+            "#!/bin/sh\ntouch '{}'\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 1200 ]; do \
+             sleep 0.1; i=$((i + 1)); done\necho 'the remote refused this push' >&2\nexit 1\n",
+            reached.display(),
+            release.display()
+        ),
+    )?;
+    let mut server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
+    let body = put_body("decisions/patience.md", &good_record(), "s").to_string();
+    let mut caller = std::net::TcpStream::connect(server.tailnet)?;
+    write!(
+        caller,
+        "POST /v1/records/put HTTP/1.1\r\nHost: ctx\r\nTailscale-User-Login: ada@example.com\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )?;
+    let pushing = within(120, || Ok(reached.exists().then_some(())));
+    // The caller hangs up while its write's push is held.
+    caller.shutdown(std::net::Shutdown::Both)?;
+    drop(caller);
+    let line = server.next_line();
+    std::fs::write(&release, "")?;
+    let failed = within(120, || {
+        Ok(std::fs::read_to_string(&log)?
+            .lines()
+            .any(|line| line.starts_with("write failed: /v1/records/put 500 "))
+            .then_some(()))
+    });
+    let rest = server.stop_and_read_request_log()?;
+    drop(server);
+    let stderr = std::fs::read_to_string(&log)?;
+    remove_fixture(&tree)?;
+
+    pushing.context("the write never reached its push")?;
+    let line = line?;
+    for (field, value) in [
+        ("result", json!("unanswered")),
+        ("status", Value::Null),
+        ("response_bytes", Value::Null),
+        ("severity", json!("WARNING")),
+        ("command", json!("record put")),
+        ("caller", json!("ada@example.com")),
+        ("path", json!("decisions/patience.md")),
+    ] {
+        assert_eq!(line.get(field), Some(&value), "{line}");
+    }
+    assert!(
+        rest.is_empty(),
+        "more than one line for the request: {rest:?}"
+    );
+    failed.with_context(|| format!("no write failed: line after the caller hung up: {stderr}"))?;
     Ok(())
 }
 

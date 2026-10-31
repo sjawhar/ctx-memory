@@ -12,10 +12,12 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
+use serde::de::DeserializeOwned;
 
 use super::command;
 use super::identity::Caller;
+use super::request_log::Note;
 use super::{Listener, Shared};
 use crate::marker;
 use crate::protocol::{
@@ -77,38 +79,40 @@ impl Change {
 }
 
 /// Answers `POST /v1/records/put`.
-pub async fn put(State(listener): State<Listener>, headers: HeaderMap, body: Bytes) -> Response {
-    let shared = &listener.shared;
-    let caller = match listener.caller(&headers).await {
-        Ok(caller) => caller,
-        Err(error) => return unauthorized(shared, PUT_ROUTE, &error),
-    };
-    let request: PutRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(error) => return bad_request(shared, PUT_ROUTE, &format!("invalid request: {error}")),
-    };
+pub async fn put(
+    State(listener): State<Listener>,
+    Extension(note): Extension<Note>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (caller, request) =
+        match admit::<PutRequest>(&listener, PUT_ROUTE, &headers, &body, &note).await {
+            Ok(admitted) => admitted,
+            Err(refused) => return *refused,
+        };
+    note.path(&request.path);
     let change = Change::Put {
         path: request.path,
         content: request.content,
     };
-    write(listener, caller, change, request.session).await
+    write(listener, caller, change, request.session, &note).await
 }
 
 /// Answers `POST /v1/records/delete`.
-pub async fn delete(State(listener): State<Listener>, headers: HeaderMap, body: Bytes) -> Response {
-    let shared = &listener.shared;
-    let caller = match listener.caller(&headers).await {
-        Ok(caller) => caller,
-        Err(error) => return unauthorized(shared, DELETE_ROUTE, &error),
-    };
-    let request: DeleteRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(error) => {
-            return bad_request(shared, DELETE_ROUTE, &format!("invalid request: {error}"))
-        }
-    };
+pub async fn delete(
+    State(listener): State<Listener>,
+    Extension(note): Extension<Note>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (caller, request) =
+        match admit::<DeleteRequest>(&listener, DELETE_ROUTE, &headers, &body, &note).await {
+            Ok(admitted) => admitted,
+            Err(refused) => return *refused,
+        };
+    note.path(&request.path);
     let change = Change::Delete { path: request.path };
-    write(listener, caller, change, request.session).await
+    write(listener, caller, change, request.session, &note).await
 }
 
 /// Answers `POST /v1/marker/advance`.
@@ -120,20 +124,44 @@ pub async fn delete(State(listener): State<Listener>, headers: HeaderMap, body: 
 /// or write is its own trouble, answered 500.
 pub async fn marker_advance(
     State(listener): State<Listener>,
+    Extension(note): Extension<Note>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    match admit::<MarkerRequest>(&listener, MARKER_ROUTE, &headers, &body, &note).await {
+        Ok((caller, request)) => advance(&listener.shared, caller, request).await,
+        Err(refused) => *refused,
+    }
+}
+
+/// How each write route starts: the caller is identified and the body read, or the request is
+/// answered here. The caller goes in `note` for the request log.
+async fn admit<Body: DeserializeOwned>(
+    listener: &Listener,
+    route: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    note: &Note,
+) -> Result<(Caller, Body), Box<Response>> {
     let shared = &listener.shared;
-    let caller = match listener.caller(&headers).await {
+    let caller = match listener.caller(headers).await {
         Ok(caller) => caller,
-        Err(error) => return unauthorized(shared, MARKER_ROUTE, &error),
+        Err(error) => return Err(Box::new(unauthorized(shared, route, &error))),
     };
-    let request: MarkerRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(error) => {
-            return bad_request(shared, MARKER_ROUTE, &format!("invalid request: {error}"))
-        }
-    };
+    note.caller(&caller);
+    serde_json::from_slice(body)
+        .map(|request| (caller, request))
+        .map_err(|error| {
+            Box::new(bad_request(
+                shared,
+                route,
+                &format!("invalid request: {error}"),
+            ))
+        })
+}
+
+/// Moves the marker for a caller already identified, as [`marker_advance`] says.
+async fn advance(shared: &Arc<Shared>, caller: Caller, request: MarkerRequest) -> Response {
     // A local advance names the session that moved the marker; through the server the marker
     // names the signed-in caller and the session it says it is. The marker is on the share
     // every copy and the fetch job read, so a session holding a credential is refused as a
@@ -158,33 +186,44 @@ pub async fn marker_advance(
         Some(session) => format!("{} ({session})", caller.email),
         None => caller.email,
     };
+    // The answer, and the `write failed:` line of a marker that did not move, are made in the
+    // blocking task: hyper drops a request whose caller hung up, not the task, and the line
+    // must still come.
     let advancing = Arc::clone(shared);
-    let advanced = tokio::task::spawn_blocking(move || -> Result<Moved> {
-        let context = advancing.tree()?;
-        if let Err(error) = advancing.hold_lease() {
-            return Ok(Moved::Unheld(format!("{error:#}")));
-        }
-        Ok(Moved::Marker(marker::advance(
-            &context,
-            &request.window,
-            &by,
-        )?))
+    let answered = tokio::task::spawn_blocking(move || {
+        let moved = move_marker(&advancing, &request.window, &by);
+        answer_advance(&advancing, moved)
     })
     .await;
-    match advanced {
-        Ok(Ok(Moved::Marker(marker))) => {
-            (StatusCode::OK, Json(MarkerResponse { marker })).into_response()
-        }
-        Ok(Ok(Moved::Unheld(why))) => unheld(shared, MARKER_ROUTE, &why),
-        Ok(Err(error)) if error.downcast_ref::<marker::Refused>().is_some() => {
-            bad_request(shared, MARKER_ROUTE, &format!("{error:#}"))
-        }
-        Ok(Err(error)) => failed(shared, MARKER_ROUTE, &format!("{error:#}")),
-        Err(error) => failed(
+    answered.unwrap_or_else(|error| {
+        failed(
             shared,
             MARKER_ROUTE,
             &format!("advancing the marker failed: {error}"),
-        ),
+        )
+    })
+}
+
+/// Moves the marker to `window` under the write lease, once the tree is this request's.
+fn move_marker(shared: &Shared, window: &str, by: &str) -> Result<Moved> {
+    let context = shared.tree()?;
+    if let Err(error) = shared.hold_lease() {
+        return Ok(Moved::Unheld(format!("{error:#}")));
+    }
+    Ok(Moved::Marker(marker::advance(&context, window, by)?))
+}
+
+/// The answer to one marker advance, with its `write failed:` line when the marker did not move.
+fn answer_advance(shared: &Shared, moved: Result<Moved>) -> Response {
+    match moved {
+        Ok(Moved::Marker(marker)) => {
+            (StatusCode::OK, Json(MarkerResponse { marker })).into_response()
+        }
+        Ok(Moved::Unheld(why)) => unheld(shared, MARKER_ROUTE, &why),
+        Err(error) if error.downcast_ref::<marker::Refused>().is_some() => {
+            bad_request(shared, MARKER_ROUTE, &format!("{error:#}"))
+        }
+        Err(error) => failed(shared, MARKER_ROUTE, &format!("{error:#}")),
     }
 }
 
@@ -203,27 +242,48 @@ fn session_label(session: Option<&str>) -> Option<String> {
     (!label.is_empty()).then(|| label.to_owned())
 }
 
+/// Applies one write for a caller already identified.
+///
+/// The answer, its `write failed:` line and the refusal codes `note` carries to the request log
+/// are made in the blocking task: hyper drops a request whose caller hung up, not the task, and
+/// a write that fails after its caller left must still say so where an alert reads it.
 async fn write(
     listener: Listener,
     caller: Caller,
     change: Change,
     session: Option<String>,
+    note: &Note,
 ) -> Response {
     let shared = &listener.shared;
     let writing = Arc::clone(shared);
     let route = change.route();
     let session = session_label(session.as_deref()).unwrap_or_else(|| "unknown".to_owned());
-    let applied =
-        tokio::task::spawn_blocking(move || apply(&writing, &caller, &change, &session)).await;
+    let note = note.clone();
+    let answered = tokio::task::spawn_blocking(move || {
+        let applied = apply(&writing, &caller, &change, &session);
+        answer_write(&writing, route, applied, &note)
+    })
+    .await;
+    answered.unwrap_or_else(|error| failed(shared, route, &format!("the write failed: {error}")))
+}
+
+/// The answer to one write, with its `write failed:` line when it did not happen.
+fn answer_write(
+    shared: &Shared,
+    route: &str,
+    applied: Result<Applied, ApplyError>,
+    note: &Note,
+) -> Response {
     match applied {
-        Ok(Ok(Applied::Committed(commit))) => {
+        Ok(Applied::Committed(commit)) => {
             (StatusCode::OK, Json(Committed { commit })).into_response()
         }
-        Ok(Ok(Applied::Refused(findings))) => {
+        Ok(Applied::Refused(findings)) => {
             let kinds: Vec<&str> = findings
                 .iter()
                 .map(|finding| finding.kind.as_str())
                 .collect();
+            note.refused(kinds.iter().copied());
             log_failure(
                 route,
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -240,12 +300,12 @@ async fn write(
                 .collect();
             (StatusCode::UNPROCESSABLE_ENTITY, Json(Refused { findings })).into_response()
         }
-        Ok(Ok(Applied::Conflict(why))) => not_written(shared, route, StatusCode::CONFLICT, &why),
-        Ok(Ok(Applied::Unheld(why))) => unheld(shared, route, &why),
-        Ok(Err(ApplyError::Caller(error))) => bad_request(shared, route, &format!("{error:#}")),
-        Ok(Err(ApplyError::Server(error))) => failed(shared, route, &format!("{error:#}")),
-        Ok(Err(ApplyError::Unheld(error))) => unheld(shared, route, &format!("{error:#}")),
-        Ok(Err(ApplyError::Unknown(why))) => unheld(
+        Ok(Applied::Conflict(why)) => not_written(shared, route, StatusCode::CONFLICT, &why),
+        Ok(Applied::Unheld(why)) => unheld(shared, route, &why),
+        Err(ApplyError::Caller(error)) => bad_request(shared, route, &format!("{error:#}")),
+        Err(ApplyError::Server(error)) => failed(shared, route, &format!("{error:#}")),
+        Err(ApplyError::Unheld(error)) => unheld(shared, route, &format!("{error:#}")),
+        Err(ApplyError::Unknown(why)) => unheld(
             shared,
             route,
             &format!(
@@ -253,7 +313,6 @@ async fn write(
                  follow loop takes it within one pull interval; ask again before writing it twice"
             ),
         ),
-        Err(error) => failed(shared, route, &format!("the write failed: {error}")),
     }
 }
 

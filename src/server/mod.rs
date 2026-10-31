@@ -6,6 +6,7 @@
 
 pub mod command;
 pub mod identity;
+pub mod request_log;
 pub mod write;
 
 use std::future::IntoFuture as _;
@@ -540,13 +541,20 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     // Every connection is closed, so the lease this copy holds is given up here: the copy that
     // replaces it writes at once instead of waiting out the takeover window. A write whose
     // caller hung up may still be running, and the release waits for it. The release talks to
-    // Cloud Storage with a blocking client, so it runs off the runtime.
+    // Cloud Storage with a blocking client, so it runs off the runtime. The request log's last
+    // lines are written before the process exits.
     let releasing = Arc::clone(&shared);
-    tokio::task::spawn_blocking(move || releasing.release_lease())
-        .await
-        .context("releasing the write lease")?;
+    tokio::task::spawn_blocking(move || {
+        releasing.release_lease();
+        request_log::flush(LAST_LINES_WAIT);
+    })
+    .await
+    .context("releasing the write lease")?;
     Ok(())
 }
+
+/// The longest a stopping copy waits for the request log's last lines to reach standard output.
+const LAST_LINES_WAIT: Duration = Duration::from_secs(2);
 
 /// Resolves when the server is asked to stop.
 async fn stopped(mut stop: tokio::sync::watch::Receiver<bool>) {
@@ -728,8 +736,10 @@ fn announce(sink: &mut Sink<'_>, label: &str, address: SocketAddr) -> Result<()>
     Ok(())
 }
 
-/// The routes one listener answers. The listener decides how a caller is identified.
+/// The routes one listener answers. The listener decides how a caller is identified, and each
+/// request it answers is one line of the request log ([`request_log`]).
 fn router(shared: Arc<Shared>, identity: Identity) -> Router {
+    let door = identity.door();
     Router::new()
         .route("/healthz", get(command::healthz))
         .route(protocol::COMMAND_ROUTE, post(command::command))
@@ -737,6 +747,7 @@ fn router(shared: Arc<Shared>, identity: Identity) -> Router {
         .route(protocol::DELETE_ROUTE, post(write::delete))
         .route(protocol::MARKER_ROUTE, post(write::marker_advance))
         .with_state(Listener { shared, identity })
+        .layer(axum::middleware::from_fn_with_state(door, request_log::log))
 }
 
 /// How one listener identifies its callers.
@@ -746,6 +757,16 @@ pub enum Identity {
     Google(Arc<identity::Google>),
     /// The Tailscale sidecar on loopback: the login header it sets for a user device.
     Tailscale,
+}
+
+impl Identity {
+    /// The door of the request log this listener is.
+    const fn door(&self) -> request_log::Door {
+        match self {
+            Self::Google(_) => request_log::Door::IdentityToken,
+            Self::Tailscale => request_log::Door::Tailnet,
+        }
+    }
 }
 
 /// One listener's state: the shared tree and the identity rule of its port.
