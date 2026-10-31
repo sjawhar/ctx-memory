@@ -130,8 +130,8 @@ type Binding = (&'static str, &'static str);
 
 /// Every request names the caller's session in `X-Ctx-Session`, so the server's log can tell
 /// apart sessions that reach it under one identity: `CTX_SESSION` when it is set, else the id
-/// Oh My Pi gives every command its agent runs, else Claude Code's, else none. A variable that
-/// is empty or white space counts as unset, as a blank `CTX_SERVER` does.
+/// Oh My Pi gives every command its agent runs, else Claude Code's, else none. An empty
+/// variable counts as unset.
 #[test]
 fn every_request_names_the_caller_s_session() -> Result<()> {
     let omp = ("OMP_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000001");
@@ -145,7 +145,7 @@ fn every_request_names_the_caller_s_session() -> Result<()> {
             Some("ctx-agent-x7k2p"),
         ),
         (&[omp, claude], Some(omp.1)),
-        (&[("CTX_SESSION", " "), claude], Some(claude.1)),
+        (&[("CTX_SESSION", ""), claude], Some(claude.1)),
         (&[claude], Some(claude.1)),
         (&[], None),
     ];
@@ -158,26 +158,33 @@ fn every_request_names_the_caller_s_session() -> Result<()> {
     Ok(())
 }
 
-/// A session id the header cannot carry is not sent, and no later variable is sent in its
-/// place: the caller chose that name, so the command still runs, unnamed, and the caller is
-/// told which variable did not go.
+/// A session id the header cannot carry, white space included, is not sent, and no later
+/// variable is sent in its place: the caller chose that name, so the command still runs,
+/// unnamed, and the caller is told in one line which variable did not go.
 #[test]
 fn a_session_the_header_cannot_carry_is_not_sent_and_the_caller_is_told() -> Result<()> {
-    let (client, sent) = sessions_sent(&[
-        ("CTX_SESSION", "chief of staff"),
-        ("OMP_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000001"),
-    ])?;
-    assert_eq!(client.exit_code, 0, "{}", client.stderr);
-    assert_eq!(client.stdout, "answered\n");
-    assert_eq!(sent, [None::<String>]);
-    assert!(
-        client
-            .stderr
-            .starts_with("ctx: CTX_SESSION is not sent to the server as this session's id"),
-        "{}",
-        client.stderr
-    );
-    assert_eq!(client.stderr.lines().count(), 1, "{}", client.stderr);
+    for unfit in ["chief of staff", " "] {
+        let (client, sent) = sessions_sent(&[
+            ("CTX_SESSION", unfit),
+            ("OMP_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000001"),
+        ])?;
+        assert_eq!(client.exit_code, 0, "{unfit:?}: {}", client.stderr);
+        assert_eq!(client.stdout, "answered\n", "{unfit:?}");
+        assert_eq!(sent, [None::<String>], "{unfit:?}");
+        assert!(
+            client
+                .stderr
+                .starts_with("ctx: CTX_SESSION is not sent to the server as this session's id"),
+            "{unfit:?}: {}",
+            client.stderr
+        );
+        assert_eq!(
+            client.stderr.lines().count(),
+            1,
+            "{unfit:?}: {}",
+            client.stderr
+        );
+    }
     Ok(())
 }
 
