@@ -45,8 +45,27 @@ impl Verdict {
 pub(crate) const TIME_LIMIT: &str = "time limit";
 
 /// Runs what `run-cycle.sh` runs after its sessions, for an ingest cycle (`pass` is `None`) or a
-/// maintenance pass, where the sessions it starts end as `attempts` say, in order.
+/// maintenance pass, where the sessions it starts end as `attempts` say, in order, and the marker
+/// never moves.
 pub(crate) fn runner_verdict(pass: Option<&str>, attempts: &[Attempt<'_>]) -> Result<Verdict> {
+    verdict(pass, attempts, None)
+}
+
+/// [`runner_verdict`], where the marker has moved once session `moved_by` (1 for the first) has
+/// run, as a pass that ran `ctx marker advance` leaves it.
+fn runner_verdict_moving_marker(
+    pass: Option<&str>,
+    attempts: &[Attempt<'_>],
+    moved_by: usize,
+) -> Result<Verdict> {
+    verdict(pass, attempts, Some(moved_by))
+}
+
+fn verdict(
+    pass: Option<&str>,
+    attempts: &[Attempt<'_>],
+    moved_by: Option<usize>,
+) -> Result<Verdict> {
     let script = runner("run-cycle.sh")?;
     let lines: Vec<&str> = script.lines().collect();
     let launch = lines
@@ -67,7 +86,7 @@ pub(crate) fn runner_verdict(pass: Option<&str>, attempts: &[Attempt<'_>]) -> Re
         .context("run-cycle.sh sets no SESSION_MINUTES")?;
 
     let dir = scratch("verdict")?;
-    let outcome = run_after_launch(&dir, pass, minutes, &after_launch, attempts);
+    let outcome = run_after_launch(&dir, pass, minutes, &after_launch, attempts, moved_by);
     remove_scratch(&dir)?;
     outcome
 }
@@ -78,6 +97,7 @@ fn run_after_launch(
     minutes: &str,
     after_launch: &str,
     attempts: &[Attempt<'_>],
+    moved_by: Option<usize>,
 ) -> Result<Verdict> {
     for (index, attempt) in attempts.iter().enumerate() {
         std::fs::write(dir.join(format!("events-{}", index + 1)), attempt.events)?;
@@ -87,7 +107,8 @@ fn run_after_launch(
         )?;
     }
     // What the script holds when its sessions start, and stand-ins for what reaches past this
-    // machine: ctx-agent's checks pass, chown changes nothing, and the marker never moves.
+    // machine: ctx-agent's checks pass, chown changes nothing, and `ctx marker show` answers `m1`
+    // until session VERDICT_MARKER_MOVED_BY has run, `m2` after.
     let prelude = format!(
         r#"set -eu
 {refuse}
@@ -102,7 +123,14 @@ session_dir="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION"
 mkdir -p "$session_dir"
 as_agent_user() {{ :; }}
 chown() {{ :; }}
-ctx() {{ printf '%s\n' '{{"ok":true,"data":{{"marker":"m1"}}}}'; }}
+ctx() {{
+	marker=m1
+	if [ -n "${{VERDICT_MARKER_MOVED_BY:-}}" ] &&
+		[ "$(cat "$VERDICT_DIR/sessions" 2>/dev/null || echo 0)" -ge "$VERDICT_MARKER_MOVED_BY" ]; then
+		marker=m2
+	fi
+	printf '{{"ok":true,"data":{{"marker":"%s"}}}}\n' "$marker"
+}}
 run_session() {{
 	attempt=$(($(cat "$VERDICT_DIR/sessions" 2>/dev/null || echo 0) + 1))
 	echo "$attempt" >"$VERDICT_DIR/sessions"
@@ -119,10 +147,15 @@ run_session() {{
         complete = script_function("pass_complete_line")?,
         pass = pass.unwrap_or_default(),
     );
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(format!("{prelude}\n{after_launch}\n"))
-        .env("VERDICT_DIR", dir)
+        .env("VERDICT_DIR", dir);
+    if let Some(moved_by) = moved_by {
+        command.env("VERDICT_MARKER_MOVED_BY", moved_by.to_string());
+    }
+    let output = command
         .output()
         .context("running run-cycle.sh's post-session code")?;
     let sessions = std::fs::read_to_string(dir.join("sessions"))
@@ -424,8 +457,10 @@ fn a_window_quoting_a_finished_session_does_not_hide_the_time_limit() -> Result<
 /// omp exiting 0 is not enough: a session whose events hold no final answer from its model did
 /// not finish, and the runner fails it rather than read silence as success. That covers no
 /// message at all, no event at all, and an empty last message: the pinned omp exits 0 when the
-/// model keeps answering with nothing past its retries (`turn-recovery.ts:1081-1131`), and
-/// whitespace or unsigned reasoning is no answer either.
+/// model keeps answering with nothing past its retries (`turn-recovery.ts:1081-1131`). Blank is
+/// blank by JavaScript's `String.trim()`, as omp reads it (`messages.ts:530-583`): Unicode
+/// whitespace and U+FEFF are no answer, in text or as a reasoning signature, and neither is
+/// unsigned reasoning. A character `trim()` keeps, such as U+200B, is one.
 #[test]
 fn a_cycle_with_no_final_answer_fails() -> Result<()> {
     let no_message = events(&[prompt()]);
@@ -437,9 +472,16 @@ fn a_cycle_with_no_final_answer_fails() -> Result<()> {
             json!({"role": "assistant", "stopReason": "stop", "content": content}),
         ])
     };
+    let text = |text: &str| empty_turn(json!([{"type": "text", "text": text}]));
     let nothing = empty_turn(json!([]));
-    let whitespace = empty_turn(json!([{"type": "text", "text": " \n\t"}]));
+    let whitespace = text(" \n\t\u{b}\u{c}\r");
+    let byte_order_mark = text("\u{feff}");
+    let unicode_space =
+        text("\u{a0}\u{1680}\u{2000}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}");
     let unsigned = empty_turn(json!([{"type": "thinking", "thinking": "Done, I think."}]));
+    let blank_signature = empty_turn(json!([
+        {"type": "thinking", "thinking": "Done.", "thinkingSignature": "\u{feff} \u{a0}"}
+    ]));
     for (events, what) in [
         (no_message.as_str(), "the model sent no message"),
         ("", "omp wrote no event"),
@@ -449,8 +491,20 @@ fn a_cycle_with_no_final_answer_fails() -> Result<()> {
             "the model's last message is whitespace",
         ),
         (
+            byte_order_mark.as_str(),
+            "the model's last message is U+FEFF",
+        ),
+        (
+            unicode_space.as_str(),
+            "the model's last message is Unicode whitespace",
+        ),
+        (
             unsigned.as_str(),
             "the model's last message is unsigned reasoning",
+        ),
+        (
+            blank_signature.as_str(),
+            "the model's last message is reasoning with a blank signature",
         ),
     ] {
         let verdict = runner_verdict(None, &[Attempt { status: 0, events }])?;
@@ -460,7 +514,18 @@ fn a_cycle_with_no_final_answer_fails() -> Result<()> {
             &format!("omp exited 0 although {what}"),
         )?;
     }
-    Ok(())
+    let zero_width = text("\u{200b}");
+    let verdict = runner_verdict(
+        None,
+        &[Attempt {
+            status: 0,
+            events: &zero_width,
+        }],
+    )?;
+    ensure_succeeded(
+        &verdict,
+        "the model's last message is U+200B, which String.trim() keeps",
+    )
 }
 
 /// A maintenance pass is done when its last message is its report and the report ends with the
@@ -507,8 +572,8 @@ fn a_maintenance_pass_must_end_with_its_completion_report() -> Result<()> {
     Ok(())
 }
 
-/// The time limit fails a maintenance pass as it fails a cycle, with the same one line, and a
-/// refused pass is not retried.
+/// The time limit fails a maintenance pass as it fails a cycle, with the same one line, and a pass
+/// it stopped gets no retry, because it was not refused.
 #[test]
 fn a_maintenance_pass_its_time_limit_stopped_fails() -> Result<()> {
     let after_tool = stopped_after_a_tool_call();
@@ -524,21 +589,118 @@ fn a_maintenance_pass_its_time_limit_stopped_fails() -> Result<()> {
         TIME_LIMIT,
         "omp exited 0 after its time limit stopped the pass after a tool call",
     )?;
-    let refused = refused();
-    let verdict = runner_verdict(
-        Some("waiting-on"),
-        &[Attempt {
-            status: 1,
-            events: &refused,
-        }],
-    )?;
     ensure!(
-        !verdict.status.success() && verdict.sessions == 1,
-        "a refused pass was retried or reported done ({} sessions): {}",
-        verdict.sessions,
+        verdict.sessions == 1,
+        "the runner retried a pass that was stopped by its time limit, not refused: {}",
         verdict.stderr
     );
     Ok(())
+}
+
+/// A refused maintenance pass gets one fresh session, as a refused cycle does: a pass moves no
+/// marker, so running it again is safe. The fresh session is judged like the first, and the
+/// marker is read after it too: a pass that ends with its report succeeds; a second refusal, a
+/// report-less end or a moved marker fails the job. A pass whose first session moved the marker
+/// gets no fresh session.
+#[test]
+fn a_refused_maintenance_pass_gets_one_fresh_session_judged_like_the_first() -> Result<()> {
+    let pass = Some("waiting-on");
+    let refused = refused();
+    let done = finished(&report(Some(&pass_complete_line("waiting-on")?)));
+    let no_report = finished(&report(None));
+    let first_refused_then = |events: &str| -> Result<Verdict> {
+        runner_verdict(
+            pass,
+            &[
+                Attempt {
+                    status: 1,
+                    events: &refused,
+                },
+                Attempt { status: 0, events },
+            ],
+        )
+    };
+
+    let verdict = first_refused_then(&done)?;
+    ensure!(
+        verdict.sessions == 2,
+        "a refused pass did not get its fresh session ({} sessions): {}",
+        verdict.sessions,
+        verdict.stderr
+    );
+    ensure_succeeded(
+        &verdict,
+        "the refused pass's fresh session ended with its report",
+    )?;
+
+    let verdict = runner_verdict(
+        pass,
+        &[
+            Attempt {
+                status: 1,
+                events: &refused,
+            },
+            Attempt {
+                status: 1,
+                events: &refused,
+            },
+        ],
+    )?;
+    ensure!(
+        verdict.sessions == 2 && verdict.status.code() == Some(1),
+        "a pass refused twice did not fail with status 1 after two sessions ({} sessions, {}): {}",
+        verdict.sessions,
+        verdict.status,
+        verdict.stderr
+    );
+
+    let verdict = first_refused_then(&no_report)?;
+    ensure!(
+        verdict.sessions == 2,
+        "a refused pass did not get its fresh session ({} sessions): {}",
+        verdict.sessions,
+        verdict.stderr
+    );
+    ensure_failed_saying(
+        &verdict,
+        "completion report",
+        "the refused pass's fresh session ended without its report",
+    )?;
+
+    let attempts = [
+        Attempt {
+            status: 1,
+            events: &refused,
+        },
+        Attempt {
+            status: 0,
+            events: &done,
+        },
+    ];
+    let verdict = runner_verdict_moving_marker(pass, &attempts, 2)?;
+    ensure!(
+        verdict.sessions == 2,
+        "a refused pass did not get its fresh session ({} sessions): {}",
+        verdict.sessions,
+        verdict.stderr
+    );
+    ensure_failed_saying(
+        &verdict,
+        "moved the marker",
+        "the refused pass's fresh session moved the marker",
+    )?;
+
+    let verdict = runner_verdict_moving_marker(pass, &attempts, 1)?;
+    ensure!(
+        verdict.sessions == 1,
+        "the runner gave a fresh session to a refused pass that had moved the marker: {}",
+        verdict.stderr
+    );
+    ensure_failed_saying(
+        &verdict,
+        "moved the marker",
+        "the refused pass's first session moved the marker",
+    )
 }
 
 /// A refused cycle still gets its one fresh session, and only a refused one: the retry that
