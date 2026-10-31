@@ -1089,3 +1089,40 @@ fn a_live_session_its_time_limit_stops_while_the_model_answers_says_so() -> Resu
     );
     Ok(())
 }
+
+/// The pinned omp exits 0, too, when its model keeps answering with nothing: it asks again a few
+/// times, then ends the session on the empty answer (`turn-recovery.ts:1081-1131`). The runner
+/// reads that from omp's own events and fails the job.
+#[test]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
+fn a_live_session_whose_model_answers_with_nothing_fails_the_job() -> Result<()> {
+    let omp = pinned_omp()?;
+    let model = FakeModel::start(vec![json!({"text": ""})])?;
+    let root = scratch("live-empty-answer")?;
+    let end = run_omp(&omp, &root, &model, "Run the scripted probe.", &[], &[]);
+    remove_scratch(&root)?;
+    let end = end?;
+    ensure!(
+        end.status.code() == Some(0),
+        "the pinned omp no longer exits 0 when its model keeps answering with nothing (it exited \
+         with {}), so this probe no longer covers the case run-cycle.sh reads omp's events for: {}",
+        end.status,
+        end.stderr
+    );
+    let verdict = runner_verdict(
+        None,
+        &[Attempt {
+            status: 0,
+            events: &end.stdout,
+        }],
+    )?;
+    ensure!(
+        !verdict.status.success() && verdict.lines_saying("did not finish").len() == 1,
+        "the runner did not fail, with one line saying the session did not finish, a session whose \
+         model answered with nothing ({}): {}\nomp's events:\n{}",
+        verdict.status,
+        verdict.stderr,
+        end.stdout
+    );
+    Ok(())
+}

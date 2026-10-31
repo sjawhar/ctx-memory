@@ -70,7 +70,23 @@ impl Logged {
 }
 
 impl Drop for Logged {
+    /// Stops the server as Cloud Run does, with SIGTERM, so it finishes the follow pass it is in
+    /// before it exits. ctx runs each git command in a process group of its own
+    /// (`src/proc.rs`), so a SIGKILL would leave a pass's git running in the fixture while the
+    /// test removes it, and the removal would fail. SIGKILL only if it has not stopped within a
+    /// minute.
     fn drop(&mut self) {
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            // SAFETY: the pid is this process's own child, which has not been waited for.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

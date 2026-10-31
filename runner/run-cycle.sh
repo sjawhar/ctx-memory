@@ -533,12 +533,15 @@ last_model_message() {
 # line on standard error says why. omp's status alone does not say it: when the time limit
 # (--max-time) passes while a tool runs, the pinned omp aborts the tool, ends the session without
 # the model's final answer and exits 0 (agent-loop.ts:1762-1765, print-mode.ts:313-318 and 394 at
-# the pinned release). So the session finished only when the model's last message is a final
-# answer, stop reason "stop" and no tool call, and a maintenance pass only when that message also
-# ends with the pass's completion line; the line may carry Markdown emphasis. The time limit is
-# named by the two ways omp records it: a last message that still asks for a tool (omp's own test
-# for a run that ended mid-tool-use, agent-session.ts:4780-4789) in a session omp reports as a
-# success, or one aborted with "Deadline exceeded" while the model answered, where omp exits 1.
+# the pinned release), and it exits 0 as well when the model keeps answering with nothing past
+# omp's retries (session/turn-recovery.ts:1081-1131). So the session finished only when the
+# model's last message is a final answer: stop reason "stop", no tool call, and output omp itself
+# counts as an answer rather than an empty stop (session/messages.ts:545-583). A maintenance pass
+# finished only when that message also ends with the pass's completion line; the line may carry
+# Markdown emphasis. The time limit is named by the two ways omp records it: a last message that
+# still asks for a tool (omp's own test for a run that ended mid-tool-use,
+# agent-session.ts:4780-4789) in a session omp reports as a success, or one aborted with "Deadline
+# exceeded" while the model answered, where omp exits 1.
 judge_session() {
 	message="$(last_model_message "$session_dir.events.json")" || message=null
 	stop="$(printf '%s' "$message" | jq -r '.stopReason // ""')" || stop=
@@ -553,7 +556,18 @@ judge_session() {
 	# Any other non-zero status is omp's own failure, which its status already reports.
 	[ "$status" -eq 0 ] || return 0
 	case "$stop" in
-	stop) ;;
+	stop)
+		answered="$(printf '%s' "$message" | jq 'any(.content[]?;
+			(.type? == "text" and (.text | type == "string" and test("\\S")))
+			or (.type? == "thinking" and (.thinkingSignature | type == "string" and test("\\S")))
+			or .type? == "image" or .type? == "redactedThinking" or .type? == "anthropicServerTool")')" ||
+			answered=false
+		if [ "$answered" != true ]; then
+			echo "run-cycle: the session exited 0 but did not finish: the model's last message is empty" >&2
+			status=1
+			return
+		fi
+		;;
 	"")
 		echo "run-cycle: the session exited 0 but did not finish: the model sent no message" >&2
 		status=1

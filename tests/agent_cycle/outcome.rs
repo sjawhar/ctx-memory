@@ -355,7 +355,8 @@ fn a_cycle_its_time_limit_stopped_while_the_model_answered_says_so() -> Result<(
 
 /// A session that ended on its model's final answer is a finished cycle, and exits 0, even when
 /// a window it read quotes the events of another session, finished or cut short: those reach
-/// omp's stdout as text inside a tool result, not as events of their own.
+/// omp's stdout as text inside a tool result, not as events of their own. A last message that
+/// holds only signed reasoning is an answer too, as omp counts one (`messages.ts:545-583`).
 #[test]
 fn a_cycle_that_finished_exits_0() -> Result<()> {
     let plain = finished("Handled 2 windows.");
@@ -369,11 +370,24 @@ fn a_cycle_that_finished_exits_0() -> Result<()> {
         ),
         answer("Handled 1 window."),
     ]);
+    let reasoning = events(&[
+        prompt(),
+        tool_call("toolu_0"),
+        tool_result("toolu_0", "Tree rules", false),
+        json!({
+            "role": "assistant", "stopReason": "stop",
+            "content": [{"type": "thinking", "thinking": "All done.", "thinkingSignature": "c2ln"}]
+        }),
+    ]);
     for (events, what) in [
         (&plain, "the cycle's session finished"),
         (
             &quoting,
             "the cycle's session finished after reading a window that quotes other sessions",
+        ),
+        (
+            &reasoning,
+            "the cycle's session finished on signed reasoning",
         ),
     ] {
         let verdict = runner_verdict(None, &[Attempt { status: 0, events }])?;
@@ -407,31 +421,46 @@ fn a_window_quoting_a_finished_session_does_not_hide_the_time_limit() -> Result<
     )
 }
 
-/// omp exiting 0 is not enough: a session whose events hold no final answer from its model, here
-/// none at all, did not finish, and the runner fails it rather than read silence as success.
+/// omp exiting 0 is not enough: a session whose events hold no final answer from its model did
+/// not finish, and the runner fails it rather than read silence as success. That covers no
+/// message at all, no event at all, and an empty last message: the pinned omp exits 0 when the
+/// model keeps answering with nothing past its retries (`turn-recovery.ts:1081-1131`), and
+/// whitespace or unsigned reasoning is no answer either.
 #[test]
 fn a_cycle_with_no_final_answer_fails() -> Result<()> {
-    let no_answer = events(&[prompt()]);
-    let verdict = runner_verdict(
-        None,
-        &[Attempt {
-            status: 0,
-            events: &no_answer,
-        }],
-    )?;
-    ensure_failed_saying(
-        &verdict,
-        "did not finish",
-        "omp exited 0 although its model gave no final answer",
-    )?;
-    let empty = runner_verdict(
-        None,
-        &[Attempt {
-            status: 0,
-            events: "",
-        }],
-    )?;
-    ensure_failed_saying(&empty, "did not finish", "omp exited 0 and wrote no event")
+    let no_message = events(&[prompt()]);
+    let empty_turn = |content: Value| {
+        events(&[
+            prompt(),
+            tool_call("toolu_0"),
+            tool_result("toolu_0", "Tree rules", false),
+            json!({"role": "assistant", "stopReason": "stop", "content": content}),
+        ])
+    };
+    let nothing = empty_turn(json!([]));
+    let whitespace = empty_turn(json!([{"type": "text", "text": " \n\t"}]));
+    let unsigned = empty_turn(json!([{"type": "thinking", "thinking": "Done, I think."}]));
+    for (events, what) in [
+        (no_message.as_str(), "the model sent no message"),
+        ("", "omp wrote no event"),
+        (nothing.as_str(), "the model's last message is empty"),
+        (
+            whitespace.as_str(),
+            "the model's last message is whitespace",
+        ),
+        (
+            unsigned.as_str(),
+            "the model's last message is unsigned reasoning",
+        ),
+    ] {
+        let verdict = runner_verdict(None, &[Attempt { status: 0, events }])?;
+        ensure_failed_saying(
+            &verdict,
+            "did not finish",
+            &format!("omp exited 0 although {what}"),
+        )?;
+    }
+    Ok(())
 }
 
 /// A maintenance pass is done when its last message is its report and the report ends with the
