@@ -183,6 +183,28 @@ fn the_ingest_skill_writes_through_the_server() -> Result<()> {
     Ok(())
 }
 
+/// Two new records that link each other can never be written one at a time: the first links a
+/// file that does not exist yet, and the server refuses it. The skill sends them in one call of
+/// the record tool, which the server checks and commits as one batch.
+#[test]
+fn the_ingest_skill_writes_records_that_link_each_other_in_one_call() -> Result<()> {
+    let flat = skill("ctx-memory-ingest")?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "its `records` list holds each record's tree path and the whole record",
+        "New records that link each other go in one call, since neither can be written first",
+        "commits all of them or none",
+    ] {
+        assert!(
+            flat.contains(expected),
+            "the ingest skill never says {expected:?}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn the_ingest_skill_fences_the_text_outside_parties_wrote() -> Result<()> {
     let text = skill("ctx-memory-ingest")?;

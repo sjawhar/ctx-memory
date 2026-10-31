@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use super::response::failure_line;
 use super::validation::{credential_findings, inside_the_tree, is_rules_page};
 use super::Change;
+use crate::protocol::RecordFile;
 use crate::tree::record_path;
 
 /// Slack's token prefix. Each Slack test token is built from it, so the source holds no literal
@@ -27,20 +28,17 @@ fn a_token_after_an_underscore_or_a_dot_is_refused() -> Result<()> {
         format!("decisions/x_ya29.a0AfB_{body}.md"),
         format!("decisions/x_1//0gLm{body}.md"),
     ] {
-        let change = Change::Put {
-            path: path.clone(),
-            content: "---\ntype: decision\nstatus: open\n---\nPlain.\n".to_owned(),
-        };
+        let change = put_at(&path, "---\ntype: decision\nstatus: open\n---\nPlain.\n");
         let findings = credential_findings(&change, "session")?;
         assert!(
             findings.iter().any(|finding| finding.kind == "credential"),
             "{path} passed: {findings:?}"
         );
     }
-    let prose = Change::Put {
-        path: "decisions/aghp_and_ya29_prefixes.md".to_owned(),
-        content: "---\ntype: decision\nstatus: open\n---\nPlain.\n".to_owned(),
-    };
+    let prose = put_at(
+        "decisions/aghp_and_ya29_prefixes.md",
+        "---\ntype: decision\nstatus: open\n---\nPlain.\n",
+    );
     assert!(credential_findings(&prose, "session")?.is_empty());
     Ok(())
 }
@@ -91,18 +89,50 @@ fn holding(secret: &str) -> String {
     format!("---\ntype: decision\nstatus: open\n---\nThe key is {secret} for now.\n")
 }
 
+/// A put of one record, `content` at `path`.
+fn put_at(path: &str, content: &str) -> Change {
+    Change::Put(vec![RecordFile {
+        path: path.to_owned(),
+        content: content.to_owned(),
+    }])
+}
+
 /// A put of `content` to an ordinary path.
-fn put(content: String) -> Change {
-    Change::Put {
-        path: "decisions/leak.md".to_owned(),
-        content,
-    }
+fn put(content: &str) -> Change {
+    put_at("decisions/leak.md", content)
+}
+
+/// Every record of a batch is a place a credential would be stored, not only the first, and
+/// the finding names the record that holds it.
+#[test]
+fn a_credential_in_any_record_of_a_batch_is_refused_by_that_record_s_path() -> Result<()> {
+    let plain = "---\ntype: decision\nstatus: open\n---\nPlain.\n".to_owned();
+    let batch = Change::Put(vec![
+        RecordFile {
+            path: "decisions/plain.md".to_owned(),
+            content: plain,
+        },
+        RecordFile {
+            path: "decisions/leak.md".to_owned(),
+            content: holding(&format!("ghp_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")),
+        },
+    ]);
+    let findings = credential_findings(&batch, "session")?;
+    assert_eq!(
+        findings
+            .iter()
+            .map(|finding| (finding.kind.as_str(), finding.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("credential", "decisions/leak.md")],
+        "{findings:?}"
+    );
+    Ok(())
 }
 
 /// Asserts each secret is refused by a finding that names its kind and never repeats it.
 fn refused(secrets: &[String], kind: &str) -> Result<()> {
     for secret in secrets {
-        let findings = credential_findings(&put(holding(secret)), "session")?;
+        let findings = credential_findings(&put(&holding(secret)), "session")?;
         assert_eq!(
             findings.len(),
             1,
@@ -192,7 +222,7 @@ fn ordinary_prose_is_not_a_credential() -> Result<()> {
              1/2 of the 1//2 split are re-reviewed, and the -----BEGIN PUBLIC KEY----- block is \
              public",
     );
-    assert_eq!(credential_findings(&put(prose), "session")?.len(), 0);
+    assert_eq!(credential_findings(&put(&prose), "session")?.len(), 0);
     Ok(())
 }
 

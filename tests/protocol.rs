@@ -7,7 +7,8 @@ use chrono::{TimeZone, Utc};
 use ctx_memory::marker::Marker;
 use ctx_memory::protocol::{
     Captured, CommandRequest, Committed, DeleteRequest, Draft, Finding, MarkerRequest,
-    MarkerResponse, PutRequest, Refused, COMMAND_ROUTE, DELETE_ROUTE, MARKER_ROUTE, PUT_ROUTE,
+    MarkerResponse, PutBatchRequest, PutRequest, RecordFile, Refused, COMMAND_ROUTE, DELETE_ROUTE,
+    MARKER_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -59,6 +60,32 @@ fn the_routes_are_the_paths_the_server_has_always_answered() {
     assert_eq!(PUT_ROUTE, "/v1/records/put");
     assert_eq!(DELETE_ROUTE, "/v1/records/delete");
     assert_eq!(MARKER_ROUTE, "/v1/marker/advance");
+}
+
+/// The batch route is newer than the shared module: its path and body are pinned so a client
+/// and a server of different releases agree on them.
+#[test]
+fn a_batch_put_request_keeps_its_route_and_bytes() -> Result<()> {
+    assert_eq!(PUT_BATCH_ROUTE, "/v1/records/put-batch");
+    same_bytes(
+        &PutBatchRequest {
+            records: vec![
+                RecordFile {
+                    path: "decisions/a.md".to_owned(),
+                    content: "A".to_owned(),
+                },
+                RecordFile {
+                    path: "decisions/b.md".to_owned(),
+                    content: "B".to_owned(),
+                },
+            ],
+            session: Some("session-7".to_owned()),
+        },
+        r#"{"records":[{"content":"A","path":"decisions/a.md"},{"content":"B","path":"decisions/b.md"}],"session":"session-7"}"#,
+    )?;
+    let bare: PutBatchRequest = serde_json::from_str(r#"{"records":[]}"#)?;
+    assert!(bare.records.is_empty() && bare.session.is_none());
+    Ok(())
 }
 
 /// The client wrote `json!({ "argv": argv, "drafts": drafts })`.

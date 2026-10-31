@@ -338,6 +338,70 @@ fn a_refused_put_logs_its_refusal_codes_and_never_its_record() -> Result<()> {
     Ok(())
 }
 
+/// A batch put is one line of the request log, under the command a single put has, naming
+/// each record it wrote in `paths`: one line of plain text each, with any credential taken out.
+#[test]
+fn a_batch_put_logs_each_record_it_names() -> Result<()> {
+    let tree = fixture_clone("log-request-batch")?;
+    fetch_window(&tree)?;
+    let root = tree.parent().context("the fixture has a root")?;
+    let log = root.join("serve.log");
+    let token = format!("ghs_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let user = Some("ada@example.com");
+    let batch = |paths: &[&str]| {
+        let records: Vec<Value> = paths
+            .iter()
+            .map(|path| json!({ "path": path, "content": good_record() }))
+            .collect();
+        json!({ "records": records, "session": "s" })
+    };
+    let mut server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
+    let written = server.post(
+        user,
+        "/v1/records/put-batch",
+        &batch(&["decisions/one.md", "decisions/two.md"]),
+    )?;
+    let leaky = format!("decisions/{token}.md");
+    let refused = server.post(
+        user,
+        "/v1/records/put-batch",
+        &batch(&["decisions/three.md", &leaky]),
+    )?;
+    let logged = server.stop_and_read_request_log()?;
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert_eq!([written, refused], [200, 422], "unexpected answers");
+    let text = serde_json::to_string(&logged)?;
+    assert!(
+        !text.contains(&token),
+        "the request log holds the token: {text}"
+    );
+    let [written_line, refused_line] = logged.as_slice() else {
+        anyhow::bail!("not one line per request: {text}");
+    };
+    for line in [written_line, refused_line] {
+        assert_eq!(line.get("command"), Some(&json!("record put")), "{line}");
+        assert!(line.get("path").is_none(), "{line}");
+    }
+    assert_eq!(
+        written_line.get("paths"),
+        Some(&json!(["decisions/one.md", "decisions/two.md"])),
+        "{written_line}"
+    );
+    assert_eq!(
+        refused_line.get("paths"),
+        Some(&json!(["decisions/three.md", "decisions/[redacted].md"])),
+        "{refused_line}"
+    );
+    assert_eq!(
+        refused_line.get("refusals"),
+        Some(&json!(["credential"])),
+        "{refused_line}"
+    );
+    Ok(())
+}
+
 /// A caller that hangs up before its answer is ready still has its line, at the moment it hung
 /// up: `unanswered`, with no status and no body, and everything the server had learned of it.
 /// The write runs on, and when it fails its `write failed:` line still comes: hyper drops the

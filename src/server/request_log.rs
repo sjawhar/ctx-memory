@@ -31,7 +31,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 
 use super::identity::Caller;
-use crate::protocol::{DELETE_ROUTE, MARKER_ROUTE, PUT_ROUTE};
+use crate::protocol::{DELETE_ROUTE, MARKER_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE};
 use crate::redact::one_line;
 
 /// The door a request came through.
@@ -58,6 +58,7 @@ struct Facts {
     caller: Option<String>,
     command: Option<String>,
     path: Option<String>,
+    paths: Vec<String>,
     query_chars: Option<usize>,
     exit_code: Option<u8>,
     refusals: Vec<String>,
@@ -77,6 +78,11 @@ impl Note {
     /// The record the request names.
     pub fn path(&self, path: &str) {
         self.facts().path = Some(one_line(path));
+    }
+
+    /// The records a batch names, each as [`Note::path`] gives one.
+    pub fn paths<'path>(&self, paths: impl IntoIterator<Item = &'path str>) {
+        self.facts().paths = paths.into_iter().map(one_line).collect();
     }
 
     /// The text a search looks for, of which a line carries only the length.
@@ -110,6 +116,8 @@ struct Line<'facts> {
     command: Option<&'facts str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<&'facts str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paths: Option<&'facts [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     query_chars: Option<usize>,
     result: String,
@@ -180,7 +188,7 @@ impl Drop for Pending {
 fn route_command(path: &str) -> Option<&'static str> {
     match path {
         "/healthz" => Some("healthz"),
-        PUT_ROUTE => Some("record put"),
+        PUT_ROUTE | PUT_BATCH_ROUTE => Some("record put"),
         DELETE_ROUTE => Some("record rm"),
         MARKER_ROUTE => Some("marker advance"),
         _ => None,
@@ -202,6 +210,7 @@ fn line<'facts>(
         caller: facts.caller.as_deref(),
         command: facts.command.as_deref().or(route),
         path: facts.path.as_deref(),
+        paths: (!facts.paths.is_empty()).then_some(facts.paths.as_slice()),
         query_chars: facts.query_chars,
         result: status.map_or_else(
             || "unanswered".to_owned(),
@@ -441,6 +450,32 @@ mod tests {
         assert_eq!(line.get("command"), Some(&serde_json::json!("record put")));
         assert_eq!(line.get("door"), Some(&serde_json::json!("identity-token")));
         assert_eq!(line.get("severity"), Some(&serde_json::json!("WARNING")));
+    }
+
+    /// A batch put names each of its records, each as one line with any credential taken out,
+    /// under the command a single put has.
+    #[test]
+    fn a_batch_names_each_record() {
+        let token = format!("ghs_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        let leaky = format!("decisions/{token}.md");
+        let note = Note::default();
+        note.paths(["decisions/a.md", leaky.as_str()]);
+        let line = printed(&line(
+            Door::Tailnet,
+            &facts(&note),
+            route_command(PUT_BATCH_ROUTE),
+            Some((StatusCode::OK, Some(2))),
+            0,
+        ));
+        assert_eq!(
+            line.get("paths"),
+            Some(&serde_json::json!([
+                "decisions/a.md",
+                "decisions/[redacted].md"
+            ]))
+        );
+        assert_eq!(line.get("path"), None);
+        assert_eq!(line.get("command"), Some(&serde_json::json!("record put")));
     }
 
     /// A refused write gives its refusal codes; a command that ran and failed gives its exit

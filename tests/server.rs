@@ -1043,6 +1043,162 @@ fn record_put_reads_stdin() -> Result<()> {
     Ok(())
 }
 
+/// `ctx record put --batch -` reads a JSON list of records and writes them in one commit, so
+/// two new records that link each other land together; a batch the server refuses prints each
+/// finding with the record it is about, exits 1, and writes nothing.
+#[test]
+fn record_put_batch_writes_records_that_link_each_other_in_one_commit() -> Result<()> {
+    let tree = support::fixture_clone("remote-record-put-batch")?;
+    support::fetch_window(&tree)?;
+    let bare = support::remote_of(&tree)?;
+    let start = support::git(&bare, &["rev-parse", "main"])?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let server = ingress_server(&tree, &keys)?;
+    let metadata = metadata_identity("ada@example.com")?;
+    let mut environment = cloud_env(&server, &metadata)?;
+    environment.push(("CTX_SESSION".to_owned(), "session-batch".to_owned()));
+    let elsewhere = support::scratch("remote-record-put-batch-cwd")?;
+    let linking = |title: &str, target: &str| {
+        support::cited_record().replace("Keep the echo cadence", title)
+            + &format!("\nSee [[{target}]].\n")
+    };
+    let pair = json!([
+        {"path": "decisions/left.md", "content": linking("The left of a pair", "decisions/right")},
+        {"path": "decisions/right.md", "content": linking("The right of a pair", "decisions/left")},
+    ])
+    .to_string();
+    let dangling = json!([
+        {"path": "decisions/fine.md", "content": support::cited_record()},
+        {"path": "decisions/dangling.md", "content": linking("A dangling link", "decisions/gone")},
+    ])
+    .to_string();
+    let run = |stdin: &str| {
+        support::ctx_remote(
+            &elsewhere,
+            &borrowed(&environment),
+            &["record", "put", "--batch", "-"],
+            Some(stdin),
+        )
+    };
+    let written = run(&pair);
+    let refused = run(&dangling);
+    drop(server);
+    let (written, refused) = (written?, refused?);
+    let head = support::git(&bare, &["rev-parse", "main"])?;
+    let parent = support::git(&bare, &["rev-parse", "main~1"])?;
+    let changed = support::git(&bare, &["show", "--name-only", "--format=", "main"])?;
+    let message = support::git(&bare, &["log", "-1", "--format=%B", "main"])?;
+    support::remove_scratch(&elsewhere)?;
+    remove_fixture(&tree)?;
+
+    assert_eq!(written.exit_code, 0, "{}{}", written.stdout, written.stderr);
+    assert_eq!(
+        written.stdout,
+        format!("{head} decisions/left.md\n{head} decisions/right.md\n")
+    );
+    assert_eq!(parent, start, "the batch is not one commit on top of main");
+    assert_eq!(
+        changed.lines().collect::<Vec<_>>(),
+        vec!["decisions/left.md", "decisions/right.md"]
+    );
+    assert!(
+        message.contains("Session: session-batch"),
+        "the commit lost the session: {message}"
+    );
+    assert_eq!(refused.exit_code, 1, "{}{}", refused.stdout, refused.stderr);
+    assert!(
+        refused
+            .stdout
+            .starts_with("refused 2 records; none was written\n")
+            && refused
+                .stdout
+                .contains("  decisions/dangling.md: gap — the link decisions/gone has no file"),
+        "{}",
+        refused.stdout
+    );
+    Ok(())
+}
+
+/// A record path that holds a credential is refused by the server, which shows it redacted; the
+/// client's own refusal output, text or JSON, shows the paths it sent redacted too, single put
+/// and batch alike. A batch that is not a list of records is refused before anything is sent,
+/// and the error says where it went wrong without quoting the value it could not read.
+#[test]
+fn record_put_never_repeats_a_credential_the_caller_gave_it() -> Result<()> {
+    let tree = support::fixture_clone("remote-record-put-credential")?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let server = ingress_server(&tree, &keys)?;
+    let metadata = metadata_identity("ada@example.com")?;
+    let environment = cloud_env(&server, &metadata)?;
+    let elsewhere = support::scratch("remote-record-put-credential-cwd")?;
+    let token = format!("ghp_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let leaky = format!("decisions/{token}.md");
+    let batch = json!([
+        {"path": "decisions/plain.md", "content": support::cited_record()},
+        {"path": leaky, "content": support::cited_record()},
+    ])
+    .to_string();
+    let not_records = json!([token]).to_string();
+    let run = |arguments: &[&str], stdin: &str| {
+        support::ctx_remote(&elsewhere, &borrowed(&environment), arguments, Some(stdin))
+    };
+    let outcome = (|| -> Result<_> {
+        Ok([
+            run(&["record", "put", "--batch", "-"], &batch)?,
+            run(&["--json", "record", "put", "--batch", "-"], &batch)?,
+            run(&["record", "put", &leaky, "-"], &support::cited_record())?,
+            run(
+                &["--json", "record", "put", &leaky, "-"],
+                &support::cited_record(),
+            )?,
+            run(&["record", "put", "--batch", "-"], &not_records)?,
+        ])
+    })();
+    drop(server);
+    support::remove_scratch(&elsewhere)?;
+    remove_fixture(&tree)?;
+    let [batch_text, batch_json, single_text, single_json, malformed] = outcome?;
+
+    for (label, run) in [
+        ("batch", &batch_text),
+        ("batch --json", &batch_json),
+        ("single", &single_text),
+        ("single --json", &single_json),
+    ] {
+        assert_eq!(run.exit_code, 1, "{label}: {}{}", run.stdout, run.stderr);
+        assert!(
+            run.stdout.contains("credential") && run.stdout.contains("[redacted]"),
+            "{label}: {}",
+            run.stdout
+        );
+    }
+    assert_eq!(
+        malformed.exit_code, 2,
+        "{}{}",
+        malformed.stdout, malformed.stderr
+    );
+    assert!(
+        malformed.stderr.contains("line 1, column"),
+        "{}",
+        malformed.stderr
+    );
+    for run in [
+        &batch_text,
+        &batch_json,
+        &single_text,
+        &single_json,
+        &malformed,
+    ] {
+        assert!(
+            !run.stdout.contains(&token) && !run.stderr.contains(&token),
+            "the client repeated the credential: {}{}",
+            run.stdout,
+            run.stderr
+        );
+    }
+    Ok(())
+}
+
 /// `ctx record show` through the server prints what a local run prints, from the server's own
 /// committed tree, and changes nothing: no commit, no marker, no cursor. A path that names no
 /// record, or one outside the tree, fails as it does locally, and the file outside is never sent.
@@ -1170,13 +1326,14 @@ fn record_writes_are_not_read_commands() -> Result<()> {
     let tree = fixture_tree("server-record-write-door")?;
     let server = Server::start(&tree, &[])?;
     let put = server.command(&["record", "put", "decisions/renewal.md", "-"])?;
+    let batch = server.command(&["record", "put", "--batch", "-"])?;
     let rm = server.command(&["record", "rm", "decisions/renewal.md"])?;
     let show = server.command(&["record", "show", "decisions/renewal.md"])?;
     drop(server);
     let still_there = tree.join("decisions/renewal.md").exists();
     remove_fixture(&tree)?;
 
-    for reply in [&put, &rm] {
+    for reply in [&put, &batch, &rm] {
         assert_eq!(reply.status, 400, "unexpected body: {}", reply.body);
         assert!(
             reply.text("error")?.contains("own endpoint"),

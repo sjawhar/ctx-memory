@@ -651,12 +651,34 @@ fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
     Ok(())
 }
 
+/// The arguments and standard input of each call the stand-in `ctx` kept, one directory per
+/// call under `calls`. A batch is a JSON list, compared by value: the order of keys in an object
+/// is the writer's.
+fn calls_received(calls: &Path) -> Vec<(Vec<String>, Option<String>)> {
+    let mut received = Vec::new();
+    for call in 0..std::fs::read_dir(calls).map_or(0, Iterator::count) {
+        let dir = calls.join(call.to_string());
+        let mut arguments = Vec::new();
+        while let Ok(argument) = std::fs::read_to_string(dir.join(arguments.len().to_string())) {
+            arguments.push(argument);
+        }
+        let stdin = std::fs::read_to_string(dir.join("stdin")).ok().map(|text| {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .filter(serde_json::Value::is_array)
+                .map_or(text, |batch| batch.to_string())
+        });
+        received.push((arguments, stdin));
+    }
+    received
+}
+
 /// The session writes no file, so a record reaches the server through `ctx_record_put`, the
-/// tool runner/ctx-record.ts adds: the record goes to `ctx record put -- <path> -` on
-/// standard input and no shell runs, so no text in it is refused or read as shell, nested
-/// bullets, ` - ` and `reboot` among them. A stand-in `ctx` keeps the arguments and standard
-/// input of each call; it refuses a record that holds `REFUSE`, as the server refuses one.
-/// No model is called.
+/// tool runner/ctx-record.ts adds: one record goes to `ctx record put -- <path> -` on standard
+/// input, several go to `ctx record put --batch -` as one JSON list, and no shell runs, so no
+/// text in a record is refused or read as shell, nested bullets, ` - ` and `reboot` among them.
+/// A stand-in `ctx` keeps the arguments and standard input of each call; it refuses a record
+/// that holds `REFUSE`, as the server refuses one. No model is called.
 #[test]
 #[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
 fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
@@ -679,9 +701,14 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
         - a top-level bullet\n  - one nested bullet\n* a starred bullet\n\
         Ada - CEO said we had to reboot the host; see -e and -c.\n\
         It's \"quoted\" and 'single-quoted'.\n";
+    let pair = json!([
+        {"path": "decisions/left.md", "content": "Left, see [[decisions/right]].\n"},
+        {"path": "decisions/right.md", "content": "Right, see [[decisions/left]].\n"},
+    ]);
     let model = FakeModel::start(vec![
-        json!({"tool": "ctx_record_put", "input": {"path": "decisions/probe.md", "content": record}}),
-        json!({"tool": "ctx_record_put", "input": {"path": "--help", "content": "REFUSE this one"}}),
+        json!({"tool": "ctx_record_put", "input": {"records": [{"path": "decisions/probe.md", "content": record}]}}),
+        json!({"tool": "ctx_record_put", "input": {"records": [{"path": "--help", "content": "REFUSE this one"}]}}),
+        json!({"tool": "ctx_record_put", "input": {"records": pair}}),
         json!({"tool": "ctx_record_rm", "input": {"path": "decisions/probe.md"}}),
     ])?;
     let path = std::env::var("PATH").unwrap_or_default();
@@ -693,16 +720,7 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
         &[("PATH", &format!("{}:{path}", bin.display()))],
         &[],
     );
-    let mut received = Vec::new();
-    for call in 0..std::fs::read_dir(&calls).map_or(0, Iterator::count) {
-        let dir = calls.join(call.to_string());
-        let mut arguments = Vec::new();
-        while let Ok(argument) = std::fs::read_to_string(dir.join(arguments.len().to_string())) {
-            arguments.push(argument);
-        }
-        let stdin = std::fs::read_to_string(dir.join("stdin")).ok();
-        received.push((arguments, stdin));
-    }
+    let received = calls_received(&calls);
     remove_scratch(&root)?;
     outcome?;
 
@@ -730,6 +748,10 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
             words(&["record", "put", "--", "--help", "-"]),
             Some("REFUSE this one".to_owned()),
         ),
+        (
+            words(&["record", "put", "--batch", "-"]),
+            Some(pair.to_string()),
+        ),
         (words(&["record", "rm", "--", "decisions/probe.md"]), None),
     ];
     ensure!(
@@ -744,6 +766,11 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
         "a refused put did not fail with ctx's findings: {text}"
     );
     let (error, text) = result(2)?;
+    ensure!(
+        !error && text.contains("stored"),
+        "the batch put failed: {text}"
+    );
+    let (error, text) = result(3)?;
     ensure!(!error && text.contains("stored"), "the rm failed: {text}");
     Ok(())
 }

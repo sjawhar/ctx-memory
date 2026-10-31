@@ -1,12 +1,13 @@
 //! The serialized write transaction and rollback protocol.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context as _, Result};
 
 use crate::config::RULES_FILE;
 use crate::context::Context;
 use crate::git::{Access, Author, Push, Repo};
+use crate::protocol::Finding;
 use crate::redact::one_line;
 use crate::tree::record_path;
 
@@ -15,7 +16,7 @@ use super::validation::{
     check, credential_findings, in_the_way, inside_the_tree, instruction_file, is_rules_page,
     too_long, unloaded,
 };
-use super::{Applied, Change, Shared};
+use super::{Applied, Change, Edit, Shared};
 
 /// Why one write did not happen.
 ///
@@ -63,31 +64,9 @@ pub(super) fn apply(
     if !credentials.is_empty() {
         return Ok(Applied::Refused(credentials));
     }
-    let path = record_path(change.path()).map_err(ApplyError::Caller)?;
-    // The rules page binds every cycle, so a write that rewrote it would steer every later
-    // one. It changes only through a reviewed pull request on GitHub, which the follow loop
-    // pulls.
-    if is_rules_page(&path) {
-        return Err(ApplyError::Caller(anyhow!(
-            "{RULES_FILE} is the rules page, which binds every cycle: it changes only through \
-             a reviewed pull request on GitHub, never through this server"
-        )));
-    }
-    // A person who clones the graph and runs an agent there hands it these files as its
-    // instructions, from wherever they are in the tree. Like the rules page, they change only
-    // through review.
-    if let Some(name) = instruction_file(&path) {
-        return Err(ApplyError::Caller(anyhow!(
-            "{path} is named {name}, which an agent run in a clone of the graph reads as its \
-             instructions: such a file changes only through a reviewed pull request on GitHub, \
-             never through this server"
-        )));
-    }
-    // A name the file system cannot hold fails at the disk with the server's own path in the
-    // error; it is the caller's path that is wrong, so it is refused here, before the tree is
-    // touched.
-    if let Some(finding) = too_long(&path) {
-        return Ok(Applied::Refused(vec![finding]));
+    let (edits, refused) = edits(change)?;
+    if !refused.is_empty() {
+        return Ok(Applied::Refused(refused));
     }
     let mut tree = shared.tree()?;
     // The lease is checked once the tree is this write's, and before the clone is touched: a
@@ -139,7 +118,7 @@ pub(super) fn apply(
     let before = repo.head()?;
 
     let outcome = attempt(
-        shared, &repo, &mut tree, &root, &path, caller, change, &before, session,
+        shared, &repo, &mut tree, &root, &edits, caller, change, &before, session,
     );
     if outcome.is_err() {
         // A clone that cannot be put back is wedged: `/healthz` says so, and the next write or
@@ -162,6 +141,57 @@ pub(super) fn apply(
     outcome
 }
 
+/// The files `change` writes, each path made a record path, and the findings that refuse a
+/// path no file can have. A path this server never writes, a batch that names one path twice
+/// and a batch that names none are the caller's error.
+fn edits(change: &Change) -> Result<(Vec<Edit<'_>>, Vec<Finding>), ApplyError> {
+    let named = change.files();
+    if named.is_empty() {
+        return Err(ApplyError::Caller(anyhow!(
+            "the batch names no record; a write changes at least one"
+        )));
+    }
+    let mut edits: Vec<Edit<'_>> = Vec::with_capacity(named.len());
+    let mut refused = Vec::new();
+    for (named, content) in named {
+        let path = record_path(named).map_err(ApplyError::Caller)?;
+        // The rules page binds every cycle, so a write that rewrote it would steer every later
+        // one. It changes only through a reviewed pull request on GitHub, which the follow loop
+        // pulls.
+        if is_rules_page(&path) {
+            return Err(ApplyError::Caller(anyhow!(
+                "{RULES_FILE} is the rules page, which binds every cycle: it changes only \
+                 through a reviewed pull request on GitHub, never through this server"
+            )));
+        }
+        // A person who clones the graph and runs an agent there hands it these files as its
+        // instructions, from wherever they are in the tree. Like the rules page, they change
+        // only through review.
+        if let Some(name) = instruction_file(&path) {
+            return Err(ApplyError::Caller(anyhow!(
+                "{path} is named {name}, which an agent run in a clone of the graph reads as its \
+                 instructions: such a file changes only through a reviewed pull request on \
+                 GitHub, never through this server"
+            )));
+        }
+        // One commit cannot put two texts at one path, and whichever won would be a record its
+        // caller never saw checked.
+        if edits.iter().any(|edit| edit.path == path) {
+            return Err(ApplyError::Caller(anyhow!(
+                "{path} is named twice in one batch; a batch writes each record once"
+            )));
+        }
+        // A name the file system cannot hold fails at the disk with the server's own path in
+        // the error; it is the caller's path that is wrong, so it is refused here, before the
+        // tree is touched.
+        if let Some(finding) = too_long(&path) {
+            refused.push(finding);
+        }
+        edits.push(Edit { path, content });
+    }
+    Ok((edits, refused))
+}
+
 /// The body of one write, from the first change on disk to the push that publishes it.
 ///
 /// The tree with this write in it is a candidate until the write is published, and the server
@@ -177,7 +207,7 @@ fn attempt(
     repo: &Repo,
     tree: &mut Context,
     root: &Path,
-    path: &str,
+    edits: &[Edit<'_>],
     caller: &Caller,
     change: &Change,
     before: &str,
@@ -185,40 +215,56 @@ fn attempt(
 ) -> Result<Applied, ApplyError> {
     // A path through a symbolic link is refused before git is asked anything about it: git
     // will not answer for a path beyond a link.
-    let absolute = inside_the_tree(root, path).map_err(ApplyError::Caller)?;
+    let absolutes = edits
+        .iter()
+        .map(|edit| inside_the_tree(root, &edit.path).map_err(ApplyError::Caller))
+        .collect::<Result<Vec<PathBuf>, ApplyError>>()?;
+    let paths: Vec<String> = edits.iter().map(|edit| edit.path.clone()).collect();
     // A put below a file, or onto a directory, would fail at the disk the same way. The parts
-    // of the path that exist decide it, before anything is written.
-    if let Change::Put { .. } = change {
-        if let Some(finding) = in_the_way(root, path) {
-            *tree = Context::open(root)?;
-            return Ok(Applied::Refused(vec![finding]));
-        }
+    // of the path that exist decide it, and so do the other records of the batch, before
+    // anything is written.
+    let blocked: Vec<Finding> = edits
+        .iter()
+        .filter(|edit| edit.content.is_some())
+        .filter_map(|edit| in_the_way(root, &edit.path, &paths))
+        .collect();
+    if !blocked.is_empty() {
+        *tree = Context::open(root)?;
+        return Ok(Applied::Refused(blocked));
     }
     // No commit takes a file at a path git ignores, no rollback removes it, and the tree does
     // not load it, so nothing would check it. Such a path is refused before it is written,
     // which also leaves alone any file somebody keeps there.
-    if repo.ignores(path)? {
-        return match change {
-            Change::Put { .. } => {
-                *tree = Context::open(root)?;
-                Ok(Applied::Refused(vec![unloaded(path)]))
-            }
-            Change::Delete { .. } => Err(ApplyError::Caller(anyhow!(
-                "{path} is not a record in this tree: git ignores it"
-            ))),
-        };
+    let mut ignored = Vec::new();
+    for edit in edits {
+        if !repo.ignores(&edit.path)? {
+            continue;
+        }
+        if edit.content.is_none() {
+            return Err(ApplyError::Caller(anyhow!(
+                "{} is not a record in this tree: git ignores it",
+                edit.path
+            )));
+        }
+        ignored.push(unloaded(&edit.path));
     }
-    apply_to_disk(&absolute, path, change)?;
+    if !ignored.is_empty() {
+        *tree = Context::open(root)?;
+        return Ok(Applied::Refused(ignored));
+    }
+    for (edit, absolute) in edits.iter().zip(&absolutes) {
+        apply_to_disk(absolute, edit)?;
+    }
     let mut candidate = Context::open(root)?;
 
-    let findings = check(&candidate, path, change)?;
+    let findings = check(&candidate, edits)?;
     if !findings.is_empty() {
         repo.reset_to(before)?;
         *tree = Context::open(root)?;
         return Ok(Applied::Refused(findings));
     }
-    // A put that leaves the file as `main` has it — the retry of a write whose answer was
-    // lost, or was "unknown" — has nothing to commit: its record is already published, in
+    // A put that leaves each file as `main` has it — the retry of a write whose answer was
+    // lost, or was "unknown" — has nothing to commit: its records are already published, in
     // the commit the clone is on.
     if repo.uncommitted()?.is_empty() {
         *tree = candidate;
@@ -229,8 +275,8 @@ fn attempt(
         name: caller.name.clone(),
         email: caller.email.clone(),
     };
-    let message = format!("{} {path}\n\nSession: {session}", change.verb());
-    let mut commit = repo.commit(&[path.to_owned()], &message, &author)?;
+    let message = commit_message(change, &paths, session);
+    let mut commit = repo.commit(&paths, &message, &author)?;
 
     // The lease is checked once more right before each push: another copy may take it over
     // 30 seconds after the last check this copy passed, and a push is bounded to less than
@@ -259,7 +305,7 @@ fn attempt(
             return Ok(Applied::Conflict(why));
         }
         candidate = Context::open(root)?;
-        let findings = check(&candidate, path, change)?;
+        let findings = check(&candidate, edits)?;
         if !findings.is_empty() {
             // The rebase put this write on a tree it no longer fits. Leave `main` as the
             // remote has it and tell the caller what broke.
@@ -275,10 +321,25 @@ fn attempt(
             return Ok(Applied::Conflict(why));
         }
     }
-    // The candidate is the published commit's tree: the write changed one file, and the clone
-    // held nothing else the remote lacks.
+    // The candidate is the published commit's tree: the write changed only the files it names,
+    // and the clone held nothing else the remote lacks.
     *tree = candidate;
     Ok(Applied::Committed(commit))
+}
+
+/// The message of the commit that publishes a write. Its subject names the one record it
+/// changes, or how many records a batch puts, which the body lists; the session is the last
+/// paragraph, a trailer.
+fn commit_message(change: &Change, paths: &[String], session: &str) -> String {
+    match paths {
+        [path] => format!("{} {path}\n\nSession: {session}", change.verb()),
+        _ => format!(
+            "{} {} records\n\n{}\n\nSession: {session}",
+            change.verb(),
+            paths.len(),
+            paths.join("\n")
+        ),
+    }
 }
 
 /// Pushes, and returns the remote's refusal when it moved on.
@@ -295,26 +356,23 @@ fn publish(repo: &Repo) -> Result<Option<String>, ApplyError> {
 }
 
 /// Writes or removes one record file, at `absolute`, which [`inside_the_tree`] returned for
-/// `path`.
-fn apply_to_disk(absolute: &Path, path: &str, change: &Change) -> Result<(), ApplyError> {
-    match change {
-        Change::Put { content, .. } => {
-            if let Some(parent) = absolute.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            std::fs::write(absolute, content)
-                .with_context(|| format!("writing {}", absolute.display()))?;
+/// the edit's path.
+fn apply_to_disk(absolute: &Path, edit: &Edit<'_>) -> Result<(), ApplyError> {
+    if let Some(content) = edit.content {
+        if let Some(parent) = absolute.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
-        Change::Delete { .. } => {
-            if !absolute.is_file() {
-                return Err(ApplyError::Caller(anyhow!(
-                    "{path} is not a record in this tree"
-                )));
-            }
-            std::fs::remove_file(absolute)
-                .with_context(|| format!("removing {}", absolute.display()))?;
-        }
+        std::fs::write(absolute, content)
+            .with_context(|| format!("writing {}", absolute.display()))?;
+        return Ok(());
     }
+    if !absolute.is_file() {
+        return Err(ApplyError::Caller(anyhow!(
+            "{} is not a record in this tree",
+            edit.path
+        )));
+    }
+    std::fs::remove_file(absolute).with_context(|| format!("removing {}", absolute.display()))?;
     Ok(())
 }

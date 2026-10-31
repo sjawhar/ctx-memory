@@ -142,7 +142,9 @@ fn describe(argv: &[String], parsed: Option<&cli::Cli>, note: &Note) {
                 cli::Command::Record {
                     command:
                         cli::RecordCommand::Show { path }
-                        | cli::RecordCommand::Put { path, .. }
+                        | cli::RecordCommand::Put {
+                            path: Some(path), ..
+                        }
                         | cli::RecordCommand::Rm { path },
                 } => note.path(path),
                 _ => {}
@@ -348,9 +350,12 @@ fn allowed(argv: &[String], parsed: Option<&cli::Cli>) -> Result<(), String> {
     };
     match parsed.command.remote() {
         Remote::Forward => Ok(()),
-        Remote::Put { .. } | Remote::Rm { .. } | Remote::MarkerAdvance { .. } => Err(format!(
-            "{} writes, and has its own endpoint: records go to /v1/records/put and \
-             /v1/records/delete, the marker to /v1/marker/advance",
+        Remote::Put { .. }
+        | Remote::PutBatch { .. }
+        | Remote::Rm { .. }
+        | Remote::MarkerAdvance { .. } => Err(format!(
+            "{} writes, and has its own endpoint: records go to /v1/records/put, \
+             /v1/records/put-batch and /v1/records/delete, the marker to /v1/marker/advance",
             parsed.command.name()
         )),
         Remote::Local => Err(format!(
