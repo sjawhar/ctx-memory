@@ -6,6 +6,7 @@
 
 pub mod command;
 pub mod identity;
+mod request_log;
 pub mod write;
 
 use std::future::IntoFuture as _;
@@ -728,8 +729,10 @@ fn announce(sink: &mut Sink<'_>, label: &str, address: SocketAddr) -> Result<()>
     Ok(())
 }
 
-/// The routes one listener answers. The listener decides how a caller is identified.
+/// The routes one listener answers. The listener decides how a caller is identified, and each
+/// request it answers is one line of the request log ([`request_log`]).
 fn router(shared: Arc<Shared>, identity: Identity) -> Router {
+    let door = identity.door();
     Router::new()
         .route("/healthz", get(command::healthz))
         .route(protocol::COMMAND_ROUTE, post(command::command))
@@ -737,6 +740,7 @@ fn router(shared: Arc<Shared>, identity: Identity) -> Router {
         .route(protocol::DELETE_ROUTE, post(write::delete))
         .route(protocol::MARKER_ROUTE, post(write::marker_advance))
         .with_state(Listener { shared, identity })
+        .layer(axum::middleware::from_fn_with_state(door, request_log::log))
 }
 
 /// How one listener identifies its callers.
@@ -746,6 +750,16 @@ pub enum Identity {
     Google(Arc<identity::Google>),
     /// The Tailscale sidecar on loopback: the login header it sets for a user device.
     Tailscale,
+}
+
+impl Identity {
+    /// The door of the request log this listener is.
+    const fn door(&self) -> request_log::Door {
+        match self {
+            Self::Google(_) => request_log::Door::IdentityToken,
+            Self::Tailscale => request_log::Door::Tailnet,
+        }
+    }
 }
 
 /// One listener's state: the shared tree and the identity rule of its port.

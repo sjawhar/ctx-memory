@@ -46,8 +46,8 @@ pub(super) fn not_written(
 const WRITE_FAILED: &str = "write failed: ";
 
 /// Says on standard error that a write did not happen, in the one form an alert matches:
-/// `write failed: <route> <status> <reason>`. A write that arrives over the tailnet passes no
-/// request log but this line.
+/// `write failed: <route> <status> <reason>`. The request log on standard output records every
+/// request too, but as data to count, not as a line an alert matches.
 pub(super) fn log_failure(route: &str, status: StatusCode, reason: &str) {
     eprintln!("{}", failure_line(route, status, reason));
 }

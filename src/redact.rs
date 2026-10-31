@@ -30,27 +30,27 @@ const CREDENTIALS: &[(&str, &str)] = &[
     ),
     (
         "a model gateway key (sk-…)",
-        r"(?:^|[^A-Za-z0-9])sk-[a-z0-9]{32,}",
+        r"(?P<before>^|[^A-Za-z0-9])sk-[a-z0-9]{32,}",
     ),
     (
         "a GitHub token (ghp_, gho_, ghs_, ghu_, ghr_…)",
-        r"(?:^|[^A-Za-z0-9])gh[oprsu]_[A-Za-z0-9]{20,}",
+        r"(?P<before>^|[^A-Za-z0-9])gh[oprsu]_[A-Za-z0-9]{20,}",
     ),
     (
         "a GitHub fine-grained token (github_pat_…)",
-        r"(?:^|[^A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}",
+        r"(?P<before>^|[^A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}",
     ),
     (
         "a Slack token (xoxb-, xoxp-, xoxe-, xoxe.…)",
-        r"(?:^|[^A-Za-z0-9])xox[a-z][\-.][A-Za-z0-9.\-]{10,}",
+        r"(?P<before>^|[^A-Za-z0-9])xox[a-z][\-.][A-Za-z0-9.\-]{10,}",
     ),
     (
         "a Google OAuth access token (ya29.…)",
-        r"(?:^|[^A-Za-z0-9])ya29\.[A-Za-z0-9_\-]{20,}",
+        r"(?P<before>^|[^A-Za-z0-9])ya29\.[A-Za-z0-9_\-]{20,}",
     ),
     (
         "a Google OAuth refresh token (1//…)",
-        r"(?:^|[^A-Za-z0-9])1//[A-Za-z0-9_\-]{20,}",
+        r"(?P<before>^|[^A-Za-z0-9])1//[A-Za-z0-9_\-]{20,}",
     ),
     (
         "a private key (-----BEGIN … PRIVATE KEY-----)",
@@ -88,7 +88,9 @@ pub fn credentials_in(text: &str) -> Result<Vec<&'static str>> {
         .collect())
 }
 
-/// `text` with every credential in it replaced by `[redacted]`.
+/// `text` with every credential in it replaced by `[redacted]`. A shape that asks for what
+/// stands before a credential, so a prefix inside a longer word is not one, names it `before`,
+/// and that stays.
 ///
 /// # Errors
 ///
@@ -97,7 +99,7 @@ pub fn redacted(text: &str) -> Result<String> {
     Ok(credential_shapes()?
         .iter()
         .fold(text.to_owned(), |text, (_, shape)| {
-            shape.replace_all(&text, "[redacted]").into_owned()
+            shape.replace_all(&text, "${before}[redacted]").into_owned()
         }))
 }
 
@@ -134,4 +136,24 @@ pub fn one_line(text: &str) -> String {
         line.push('…');
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A credential goes, and what stood before it stays: a path that holds a token keeps the
+    /// slash in front of it.
+    #[test]
+    fn redaction_keeps_what_stands_before_a_credential() -> Result<()> {
+        let token = format!("ghs_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        let key = format!("sk-ant-{}", "api03-A1b2C3d4E5f6G7h8");
+        assert_eq!(
+            redacted(&format!("decisions/{token}.md"))?,
+            "decisions/[redacted].md"
+        );
+        assert_eq!(redacted(&format!("{token} leads"))?, "[redacted] leads");
+        assert_eq!(redacted(&format!("key={key}"))?, "key=[redacted]");
+        Ok(())
+    }
 }

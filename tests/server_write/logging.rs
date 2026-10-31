@@ -1,12 +1,15 @@
-//! The server's log lines: `write failed:`, the follow heartbeat, and a failed follow pass.
+//! The server's log lines: `write failed:`, the follow heartbeat, a failed follow pass, and the
+//! request log.
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde_json::{json, Value};
 
-use crate::fixtures::{good_record, put_body, refuse_every_push, within};
+use crate::fixtures::{broken_zeppelin_record, good_record, put_body, refuse_every_push, within};
 use crate::support;
 use crate::support::{fetch_window, fixture_clone, remote_of, remove_fixture};
 
@@ -15,6 +18,8 @@ struct Logged {
     child: std::process::Child,
     tailnet: SocketAddr,
     client: reqwest::blocking::Client,
+    /// What the server prints on standard output after its listener line.
+    stdout: Receiver<String>,
 }
 
 impl Logged {
@@ -34,30 +39,59 @@ impl Logged {
             .stdout(std::process::Stdio::piped())
             .stderr(std::fs::File::create(log)?);
         let mut child = command.spawn().context("starting ctx serve")?;
-        let stdout = child.stdout.take().context("ctx serve has no stdout")?;
-        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
+        let stdout = support::read_lines(child.stdout.take().context("ctx serve has no stdout")?);
         let tailnet = loop {
-            let Some(line) = lines.next() else {
+            let Ok(line) = stdout.recv() else {
                 let _ = child.kill();
                 let _ = child.wait();
                 anyhow::bail!("ctx serve stopped before it listened");
             };
-            if let Some(address) = line?.strip_prefix("tailnet-listen ") {
+            if let Some(address) = line.strip_prefix("tailnet-listen ") {
                 break address.parse()?;
             }
         };
-        std::thread::spawn(move || lines.for_each(drop));
         Ok(Self {
             child,
             tailnet,
             client: reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()?,
+            stdout,
         })
+    }
+
+    /// The next `count` lines of the request log, waiting up to a minute for them.
+    fn request_log(&self, count: usize) -> Result<Vec<Value>> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut lines = Vec::with_capacity(count);
+        while lines.len() < count {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let line = self
+                .stdout
+                .recv_timeout(left)
+                .context("the server did not log every request")?;
+            lines.push(serde_json::from_str(&line).with_context(|| format!("{line:?}"))?);
+        }
+        Ok(lines)
     }
 
     /// Posts `body` to `path`, signed in as `user` when there is one, and returns the status.
     fn post(&self, user: Option<&str>, path: &str, body: &Value) -> Result<u16> {
+        Ok(self.send(user, path, body)?.status().as_u16())
+    }
+
+    /// Posts as [`Logged::post`] does, and returns the status and the answer.
+    fn post_reply(&self, user: Option<&str>, path: &str, body: &Value) -> Result<(u16, Value)> {
+        let response = self.send(user, path, body)?;
+        Ok((response.status().as_u16(), response.json()?))
+    }
+
+    fn send(
+        &self,
+        user: Option<&str>,
+        path: &str,
+        body: &Value,
+    ) -> Result<reqwest::blocking::Response> {
         let mut request = self
             .client
             .post(format!("http://{}{path}", self.tailnet))
@@ -65,7 +99,7 @@ impl Logged {
         if let Some(user) = user {
             request = request.header("Tailscale-User-Login", user);
         }
-        Ok(request.send()?.status().as_u16())
+        Ok(request.send()?)
     }
 }
 
@@ -94,7 +128,8 @@ impl Drop for Logged {
 
 /// A write that did not happen says so on standard error in one fixed form an alert matches,
 /// `write failed: <route> <status> <reason>`, whatever route it came by and whatever stopped
-/// it. A write that arrives over the tailnet passes no request log but this one. The line
+/// it. Cloud Run's own request log never sees a write that arrives over the tailnet, and the
+/// server's request log is not a form an alert matches, so this line is the alert's. The line
 /// never carries what the write carried: no record text, no credential.
 #[test]
 fn every_write_that_fails_says_so_in_one_line_an_alert_matches() -> Result<()> {
@@ -184,6 +219,106 @@ fn every_write_that_fails_says_so_in_one_line_an_alert_matches() -> Result<()> {
     assert!(
         !logged.contains("Keep the echo cadence"),
         "the log repeats a record's text: {logged}"
+    );
+    Ok(())
+}
+
+/// A refused write is one line of the request log too, with the codes of the findings that
+/// refused it, the path it named and the caller who sent it, and never the record it carried:
+/// no record text, no credential, wherever the caller put it. A path is one line of plain text
+/// there, as in a `write failed:` line, whatever control characters the caller put in it.
+#[test]
+fn a_refused_put_logs_its_refusal_codes_and_never_its_record() -> Result<()> {
+    let tree = fixture_clone("log-request-refused")?;
+    let root = tree.parent().context("the fixture has a root")?;
+    let log = root.join("serve.log");
+    let token = format!("ghs_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let user = Some("ada@example.com");
+    let server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
+    let (gap, gap_reply) = server.post_reply(
+        user,
+        "/v1/records/put",
+        &put_body("decisions/zeppelin.md", &broken_zeppelin_record(), "s"),
+    )?;
+    let (credential, credential_reply) = server.post_reply(
+        user,
+        "/v1/records/put",
+        &put_body(
+            &format!("decisions/{token}.md"),
+            &format!("{}\nThe key is {token}.\n", good_record()),
+            "s",
+        ),
+    )?;
+    let forged = server.post(
+        user,
+        "/v1/records/put",
+        &put_body("decisions/x\nforged\n\u{1b}[2J.md", &good_record(), "s"),
+    )?;
+    let logged = server.request_log(3)?;
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert_eq!(
+        [gap, credential, forged],
+        [422, 422, 400],
+        "unexpected answers"
+    );
+    let text = serde_json::to_string(&logged)?;
+    for secret in [
+        token.as_str(),
+        "Zeppelin budget",
+        "a-record-that-does-not-exist",
+        "The stream confirmed the cadence",
+        "Keep the echo cadence",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "the request log holds {secret:?}: {text}"
+        );
+    }
+    let [gap_line, credential_line, forged_line] = logged.as_slice() else {
+        anyhow::bail!("not one line per request: {text}");
+    };
+    for (line, reply) in [(gap_line, &gap_reply), (credential_line, &credential_reply)] {
+        let codes: Vec<Value> = reply
+            .get("findings")
+            .and_then(Value::as_array)
+            .context("a 422 carries its findings")?
+            .iter()
+            .filter_map(|finding| finding.get("kind").cloned())
+            .collect();
+        assert!(!codes.is_empty(), "{reply}");
+        assert_eq!(line.get("refusals"), Some(&json!(codes)), "{line}");
+        assert_eq!(line.get("result"), Some(&json!("refused")), "{line}");
+        assert_eq!(line.get("status"), Some(&json!(422)), "{line}");
+        assert_eq!(line.get("command"), Some(&json!("record put")), "{line}");
+        assert_eq!(
+            line.get("caller"),
+            Some(&json!("ada@example.com")),
+            "{line}"
+        );
+        assert_eq!(line.get("door"), Some(&json!("tailnet")), "{line}");
+    }
+    assert_eq!(
+        gap_line.get("path"),
+        Some(&json!("decisions/zeppelin.md")),
+        "{gap_line}"
+    );
+    assert_eq!(
+        credential_line.get("path"),
+        Some(&json!("decisions/[redacted].md")),
+        "{credential_line}"
+    );
+    assert_eq!(
+        forged_line.get("result"),
+        Some(&json!("bad-request")),
+        "{forged_line}"
+    );
+    assert!(forged_line.get("refusals").is_none(), "{forged_line}");
+    assert_eq!(
+        forged_line.get("path"),
+        Some(&json!("decisions/x forged [2J.md")),
+        "{forged_line}"
     );
     Ok(())
 }

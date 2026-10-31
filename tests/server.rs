@@ -158,6 +158,127 @@ fn ingress_refuses_a_principal_outside_the_allow_list() -> Result<()> {
     Ok(())
 }
 
+/// Each request at either door is one JSON line on the server's standard output, written when
+/// its answer is ready, so who reads the graph, and how, can be counted: when, which door, who
+/// called, which command, the record a `record show` names, how it ended, the status, how long
+/// it took and how many bytes the answer held. A search is logged by the length of its query,
+/// never by its words, and no line carries what a record says or the caller's token.
+#[test]
+fn each_request_at_either_door_is_one_line_of_the_request_log() -> Result<()> {
+    let tree = fixture_tree("server-request-log")?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let mut server = ingress_server(&tree, &keys)?;
+    let ingress = server.ingress_address()?;
+    let agent = "cycle@example-project.iam.gserviceaccount.com";
+    let token = support::google_token(AUDIENCE, agent)?;
+    let bearer = format!("Bearer {token}");
+    let query = "quarterly zeppelin-7f3a";
+    let search = server.command(&["search", query])?;
+    let show = server.command(&["record", "show", "decisions/renewal.md"])?;
+    let open = server.post(
+        ingress,
+        "/v1/command",
+        &json!({ "argv": ["--json", "open"] }),
+        &[("Authorization", &bearer)],
+    )?;
+    let anonymous = server.post(
+        ingress,
+        "/v1/command",
+        &json!({ "argv": ["search", query] }),
+        &[],
+    )?;
+    let health = server.get(server.tailnet, "/healthz", &[])?;
+    let printed = server.stop_and_read_stdout()?;
+    drop(server);
+    remove_fixture(&tree)?;
+
+    let statuses = [
+        search.status,
+        show.status,
+        open.status,
+        anonymous.status,
+        health.status,
+    ];
+    assert_eq!(statuses, [200, 200, 200, 401, 200], "unexpected answers");
+    let text = printed.join("\n");
+    for secret in [
+        "zeppelin",
+        "The vendor renewal keeps",
+        token.as_str(),
+        "Bearer",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "the request log holds {secret:?}: {text}"
+        );
+    }
+    let lines = printed
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).with_context(|| format!("{line:?}")))
+        .collect::<Result<Vec<_>>>()?;
+    let [searched, shown, opened, refused, probed] = lines.as_slice() else {
+        anyhow::bail!("not one line per request: {text}");
+    };
+    let expected = [
+        (
+            searched,
+            json!({
+                "severity": "INFO", "door": "tailnet", "caller": "ada@example.com",
+                "command": "search", "query_chars": query.chars().count(), "result": "ok",
+                "status": 200, "response_bytes": search.bytes,
+            }),
+        ),
+        (
+            shown,
+            json!({
+                "severity": "INFO", "door": "tailnet", "caller": "ada@example.com",
+                "command": "record show", "path": "decisions/renewal.md", "result": "ok",
+                "status": 200, "response_bytes": show.bytes,
+            }),
+        ),
+        (
+            opened,
+            json!({
+                "severity": "INFO", "door": "identity-token", "caller": agent,
+                "command": "open", "result": "ok", "status": 200, "response_bytes": open.bytes,
+            }),
+        ),
+        (
+            refused,
+            json!({
+                "severity": "WARNING", "door": "identity-token", "caller": null,
+                "command": null, "result": "unidentified", "status": 401,
+                "response_bytes": anonymous.bytes,
+            }),
+        ),
+        (
+            probed,
+            json!({
+                "severity": "INFO", "door": "tailnet", "caller": null, "command": "healthz",
+                "result": "ok", "status": 200, "response_bytes": health.bytes,
+            }),
+        ),
+    ];
+    for (line, expected) in expected {
+        assert_logged(line, &expected)?;
+    }
+    Ok(())
+}
+
+/// Asserts one request log line holds exactly `expected`, beside its time and its duration.
+fn assert_logged(line: &Value, expected: &Value) -> Result<()> {
+    let mut fields = line.as_object().context("a line is not an object")?.clone();
+    let time = fields.remove("time").context("a line has no time")?;
+    let time = time.as_str().context("a line's time is not text")?;
+    chrono::DateTime::parse_from_rfc3339(time).with_context(|| format!("time {time:?}"))?;
+    let duration = fields
+        .remove("duration_ms")
+        .context("a line has no duration")?;
+    assert!(duration.is_u64(), "{line}");
+    assert_eq!(&Value::Object(fields), expected, "{line}");
+    Ok(())
+}
+
 /// A server with no allow list would answer every Google account there is, so it does not
 /// start at all.
 #[test]

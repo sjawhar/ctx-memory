@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
+use super::request_log::Facts;
 use super::{window_count, Following, Listener, Shared};
 use crate::cli::{self, Remote};
 use crate::context::Context;
@@ -61,11 +62,26 @@ pub async fn command(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let mut facts = Facts::default();
+    let response = answer(&listener, &headers, &body, &mut facts).await;
+    facts.on(response)
+}
+
+/// The answer to one `POST /v1/command`, with what the request log says of it in `facts`.
+async fn answer(
+    listener: &Listener,
+    headers: &HeaderMap,
+    body: &[u8],
+    facts: &mut Facts,
+) -> Response {
     let shared = &listener.shared;
-    if let Err(error) = listener.caller(&headers).await {
-        return error_response(shared, StatusCode::UNAUTHORIZED, &format!("{error:#}"));
+    match listener.caller(headers).await {
+        Ok(caller) => facts.caller(&caller),
+        Err(error) => {
+            return error_response(shared, StatusCode::UNAUTHORIZED, &format!("{error:#}"))
+        }
     }
-    let request: CommandRequest = match serde_json::from_slice(&body) {
+    let request: CommandRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => {
             return error_response(
@@ -75,10 +91,12 @@ pub async fn command(
             )
         }
     };
-    if let Err(message) = allowed(&request.argv) {
+    let parsed = cli::parse_argv(&request.argv).ok();
+    describe(&request.argv, parsed.as_ref(), facts);
+    if let Err(message) = allowed(&request.argv, parsed.as_ref()) {
         return error_response(shared, StatusCode::BAD_REQUEST, &message);
     }
-    let record_text = shows_a_record(&request.argv);
+    let record_text = parsed.as_ref().is_some_and(shows_a_record);
     let running = Arc::clone(shared);
     let captured = tokio::task::spawn_blocking(move || {
         let context = running.tree()?;
@@ -91,19 +109,22 @@ pub async fn command(
         // exception is what a `record show` that succeeded printed: that is a record of the
         // tree, which a cycle writes back whole, so a placeholder in it would change the
         // record. It names nothing the tree does not already hold.
-        Ok(Ok(captured)) => (
-            StatusCode::OK,
-            Json(Captured {
-                stdout: if record_text && captured.exit_code == 0 {
-                    captured.stdout
-                } else {
-                    shared.hide_paths(&captured.stdout)
-                },
-                stderr: shared.hide_paths(&captured.stderr),
-                exit_code: captured.exit_code,
-            }),
-        )
-            .into_response(),
+        Ok(Ok(captured)) => {
+            facts.exit_code(captured.exit_code);
+            (
+                StatusCode::OK,
+                Json(Captured {
+                    stdout: if record_text && captured.exit_code == 0 {
+                        captured.stdout
+                    } else {
+                        shared.hide_paths(&captured.stdout)
+                    },
+                    stderr: shared.hide_paths(&captured.stderr),
+                    exit_code: captured.exit_code,
+                }),
+            )
+                .into_response()
+        }
         Ok(Err(error)) => error_response(
             shared,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -117,16 +138,42 @@ pub async fn command(
     }
 }
 
-/// Whether `argv` is a `record show`, whose output, when it succeeds, is a record of the tree.
-fn shows_a_record(argv: &[String]) -> bool {
-    cli::parse_argv(argv).is_ok_and(|parsed| {
-        matches!(
-            parsed.command,
-            cli::Command::Record {
-                command: cli::RecordCommand::Show { .. }
+/// What the request log says of a command: its name, the record a `record show` names, and
+/// the length of what a search looks for, never its words. A command clap refuses is named by
+/// its first word when that is one a remote caller may use; any other first word is the
+/// caller's own text, and is not logged.
+fn describe(argv: &[String], parsed: Option<&cli::Cli>, facts: &mut Facts) {
+    match parsed.map(|parsed| &parsed.command) {
+        // An external subcommand's name is whatever the caller wrote.
+        Some(cli::Command::External(_)) => {}
+        Some(command) => {
+            facts.command(command.name());
+            match command {
+                cli::Command::Search { query, .. } => facts.query(query),
+                cli::Command::Dossier { entity } => facts.query(entity),
+                cli::Command::Record {
+                    command: cli::RecordCommand::Show { path },
+                } => facts.path(path),
+                _ => {}
             }
-        )
-    })
+        }
+        None => {
+            if let Some(name) = command_name(argv).filter(|name| ALLOWED.contains(name)) {
+                facts.command(name.to_owned());
+            }
+        }
+    }
+}
+
+/// Whether a parsed command is a `record show`, whose output, when it succeeds, is a record of
+/// the tree.
+fn shows_a_record(parsed: &cli::Cli) -> bool {
+    matches!(
+        parsed.command,
+        cli::Command::Record {
+            command: cli::RecordCommand::Show { .. }
+        }
+    )
 }
 
 /// What `/healthz` answers with.
@@ -262,7 +309,8 @@ pub(super) fn check_health(context: &Context) -> anyhow::Result<Health> {
     })
 }
 
-/// Checks a command is one a remote caller may run, before the tree is touched.
+/// Checks a command is one a remote caller may run, before the tree is touched. `parsed` is
+/// what clap made of `argv`, when it parses.
 ///
 /// A command that does not parse passes this check: `run_captured` reports the parse error
 /// the way the command line does, with the same text and the same exit code.
@@ -271,10 +319,7 @@ pub(super) fn check_health(context: &Context) -> anyhow::Result<Health> {
 /// owns none of the files a write touches, so only a command [`cli::Command::remote`] calls a
 /// read runs here: `delta` reads, `delta --write` replaces the newest window's files and is
 /// refused.
-///
-/// A global flag may stand before the command name — `ctx --json pending` is what a caller
-/// writes — so the name is the first argument that is not one.
-fn allowed(argv: &[String]) -> Result<(), String> {
+fn allowed(argv: &[String], parsed: Option<&cli::Cli>) -> Result<(), String> {
     if argv.is_empty() {
         return Err("argv is empty".to_owned());
     }
@@ -284,15 +329,11 @@ fn allowed(argv: &[String]) -> Result<(), String> {
     {
         return Err("--memory names the server's own tree and cannot be set remotely".to_owned());
     }
-    let first = argv
-        .iter()
-        .find(|argument| global_flag(argument).is_none())
-        .ok_or_else(|| "argv names no command".to_owned())?
-        .as_str();
+    let first = command_name(argv).ok_or_else(|| "argv names no command".to_owned())?;
     if !ALLOWED.contains(&first) {
         return Err(format!("{first} is not a remote command"));
     }
-    let Ok(parsed) = cli::parse_argv(argv) else {
+    let Some(parsed) = parsed else {
         return Ok(());
     };
     match parsed.command.remote() {
@@ -308,6 +349,14 @@ fn allowed(argv: &[String]) -> Result<(), String> {
             argv.join(" ")
         )),
     }
+}
+
+/// The command's first word. A global flag may stand before it — `ctx --json pending` is what
+/// a caller writes — so it is the first argument that is not one.
+fn command_name(argv: &[String]) -> Option<&str> {
+    argv.iter()
+        .find(|argument| global_flag(argument).is_none())
+        .map(String::as_str)
 }
 
 /// The body of every error answer the server gives: `{"error": <message>}`, with the server's
