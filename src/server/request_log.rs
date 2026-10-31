@@ -9,8 +9,9 @@
 //! A line says who called, which command and how it ended, never what the request carried: no
 //! search query (only its length), no record text, no quote, no identity token. A record path
 //! is the one thing a caller wrote that a line carries, as one line of plain text with any
-//! credential of a shape the server refuses taken out. Standard error keeps the lines an alert
-//! matches.
+//! credential of a shape the server refuses taken out, beside the session id the caller says it
+//! is, which is only the caller's word ([`crate::session_id`]). Standard error keeps the lines
+//! an alert matches.
 //!
 //! A request is logged when its answer is ready, or, when hyper drops it unanswered because
 //! its caller hung up, at that moment. A request never waits for standard output: a thread of
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::HttpBody as _;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use chrono::{SecondsFormat, Utc};
@@ -33,6 +34,7 @@ use serde::Serialize;
 use super::identity::Caller;
 use crate::protocol::{DELETE_ROUTE, MARKER_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE};
 use crate::redact::one_line;
+use crate::session_id;
 
 /// The door a request came through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -56,6 +58,7 @@ pub struct Note(Arc<Mutex<Facts>>);
 #[derive(Debug, Default)]
 struct Facts {
     caller: Option<String>,
+    session: Option<String>,
     command: Option<String>,
     path: Option<String>,
     paths: Vec<String>,
@@ -68,6 +71,23 @@ impl Note {
     /// The caller, once identified.
     pub fn caller(&self, caller: &Caller) {
         self.facts().caller = Some(caller.email.clone());
+    }
+
+    /// The session the caller says it is, from [`session_id::HEADER`]: one value that
+    /// [fits](session_id::fits) it, with any credential taken out as a path's is. A request
+    /// without one, with several, or with one that does not fit names none. Nothing but the
+    /// line reads it: it is the caller's word, and decides nothing.
+    fn session(&self, headers: &HeaderMap) {
+        let mut values = headers.get_all(session_id::HEADER).iter();
+        let session = match (values.next(), values.next()) {
+            (Some(value), None) => value
+                .to_str()
+                .ok()
+                .filter(|session| session_id::fits(session))
+                .map(one_line),
+            _ => None,
+        };
+        self.facts().session = session;
     }
 
     /// The ctx command the request runs, by its fixed name, never by text the caller wrote.
@@ -113,6 +133,8 @@ struct Line<'facts> {
     severity: &'static str,
     door: Door,
     caller: Option<&'facts str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<&'facts str>,
     command: Option<&'facts str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<&'facts str>,
@@ -134,6 +156,7 @@ type Answer = (StatusCode, Option<u64>);
 /// Times one request, lets it be answered, and logs it.
 pub async fn log(State(door): State<Door>, mut request: Request, next: Next) -> Response {
     let note = Note::default();
+    note.session(request.headers());
     request.extensions_mut().insert(note.clone());
     let mut pending = Pending {
         door,
@@ -208,6 +231,7 @@ fn line<'facts>(
         severity: status.map_or("WARNING", severity),
         door,
         caller: facts.caller.as_deref(),
+        session: facts.session.as_deref(),
         command: facts.command.as_deref().or(route),
         path: facts.path.as_deref(),
         paths: (!facts.paths.is_empty()).then_some(facts.paths.as_slice()),
@@ -427,6 +451,53 @@ mod tests {
             })
         );
         assert!(!line.to_string().contains("renewal"), "{line}");
+    }
+
+    /// A line names the session the caller says it is, from its one `X-Ctx-Session` value,
+    /// with any credential taken out as a path's is. A value that does not fit the header's
+    /// shape, or a second value beside the first, names none.
+    #[test]
+    fn a_line_names_the_session_the_caller_says_it_is() -> anyhow::Result<()> {
+        use axum::http::HeaderValue;
+        let session_of = |values: &[HeaderValue]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(session_id::HEADER, value.clone());
+            }
+            let note = Note::default();
+            note.session(&headers);
+            let line = printed(&line(
+                Door::Tailnet,
+                &facts(&note),
+                Some("healthz"),
+                Some((StatusCode::OK, Some(0))),
+                0,
+            ));
+            line.get("session").cloned()
+        };
+        let omp = HeaderValue::from_static("01a1b2c3-0000-7000-8000-000000000001");
+        assert_eq!(
+            session_of(&[omp.clone()]),
+            Some(serde_json::json!("01a1b2c3-0000-7000-8000-000000000001"))
+        );
+        let token = format!("ghs_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        assert_eq!(
+            session_of(&[HeaderValue::from_str(&token)?]),
+            Some(serde_json::json!("[redacted]"))
+        );
+        for values in [
+            vec![],
+            vec![omp, HeaderValue::from_static("ctx-agent-x7k2p")],
+            vec![HeaderValue::from_str("two words")?],
+            vec![HeaderValue::from_str("line\tbreak")?],
+            vec![HeaderValue::from_str(
+                &"a".repeat(session_id::MAX_CHARS + 1),
+            )?],
+            vec![HeaderValue::from_bytes(b"caf\xe9")?],
+        ] {
+            assert_eq!(session_of(&values), None, "{values:?}");
+        }
+        Ok(())
     }
 
     /// A record path is one line of plain text with any credential taken out, as a

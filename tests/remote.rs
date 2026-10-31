@@ -46,6 +46,9 @@ fn search(environment: &[(&str, &str)]) -> Result<Local> {
         "CTX_IMPERSONATE_SA",
         "GCE_METADATA_HOST",
         "CTX_IAM_CREDENTIALS_URL",
+        "CTX_SESSION",
+        "OMP_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID",
         "HTTP_PROXY",
         "http_proxy",
         "HTTPS_PROXY",
@@ -103,6 +106,71 @@ fn a_token_is_minted_for_the_server_it_is_sent_to() -> Result<()> {
             .and_then(|request| request.headers.get("authorization"))
             .map(String::as_str),
         Some("Bearer token-for-this-server")
+    );
+    Ok(())
+}
+
+/// Runs `ctx search quarterly` against a stand-in server in `environment`, and returns what the
+/// client printed and the session header of each request the server got.
+fn sessions_sent(environment: &[(&str, &str)]) -> Result<(Local, Vec<Option<String>>)> {
+    let server = FakeHttp::start()?;
+    server.json("/v1/command", 200, &answered())?;
+    let origin = server.url("");
+    let client = search(&[&[("CTX_SERVER", origin.as_str())][..], environment].concat())?;
+    let sent = server
+        .requests()?
+        .into_iter()
+        .map(|request| request.headers.get("x-ctx-session").cloned())
+        .collect();
+    Ok((client, sent))
+}
+
+/// Every request names the caller's session in `X-Ctx-Session`, so the server's log can tell
+/// apart sessions that reach it under one identity: `CTX_SESSION` when it is set, else the id
+/// Oh My Pi gives every command its agent runs, else Claude Code's, else none.
+#[test]
+fn every_request_names_the_caller_s_session() -> Result<()> {
+    let omp = ("OMP_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000001");
+    let claude = (
+        "CLAUDE_CODE_SESSION_ID",
+        "5f0c7d1e-2222-4333-8444-555566667777",
+    );
+    let cases: [(&[(&str, &str)], Option<&str>); 4] = [
+        (
+            &[("CTX_SESSION", "ctx-agent-x7k2p"), omp, claude],
+            Some("ctx-agent-x7k2p"),
+        ),
+        (&[omp, claude], Some(omp.1)),
+        (&[claude], Some(claude.1)),
+        (&[], None),
+    ];
+    for (environment, expected) in cases {
+        let (client, sent) = sessions_sent(environment)?;
+        assert_eq!(client.exit_code, 0, "{}", client.stderr);
+        assert_eq!(client.stderr, "", "{environment:?}");
+        assert_eq!(sent, [expected.map(str::to_owned)], "{environment:?}");
+    }
+    Ok(())
+}
+
+/// A session id the header cannot carry is not sent, and no later variable is sent in its
+/// place: the caller chose that name, so the command still runs, unnamed, and the caller is
+/// told which variable did not go.
+#[test]
+fn a_session_the_header_cannot_carry_is_not_sent_and_the_caller_is_told() -> Result<()> {
+    let (client, sent) = sessions_sent(&[
+        ("CTX_SESSION", "chief of staff"),
+        ("OMP_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000001"),
+    ])?;
+    assert_eq!(client.exit_code, 0, "{}", client.stderr);
+    assert_eq!(client.stdout, "answered\n");
+    assert_eq!(sent, [None::<String>]);
+    assert!(
+        client
+            .stderr
+            .starts_with("ctx: CTX_SESSION is not sent to the server as this session's id"),
+        "{}",
+        client.stderr
     );
     Ok(())
 }

@@ -30,6 +30,7 @@ use crate::resolve::{self, Resolved};
 use crate::schema::today_utc;
 use crate::search;
 use crate::server;
+use crate::session_id;
 use crate::slack_login;
 use crate::source::slack::{slack_schemes, Mentions};
 use crate::source::{
@@ -951,7 +952,7 @@ fn run_marker(run: &mut Run<'_, '_>, command: &MarkerCommand) -> Result<Outcome>
             let lease = lease::for_role("server").context(
                 "ctx marker advance moves the marker the server moves, so it takes the server lease",
             )?;
-            let moved = marker::advance(run.context, window, &marker::caller());
+            let moved = marker::advance(run.context, window, &session_id::caller());
             give_back(lease, run.sink.err);
             let payload = MarkerShowPayload {
                 marker: Some(moved?),

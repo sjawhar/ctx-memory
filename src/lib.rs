@@ -30,6 +30,7 @@ pub mod resolve;
 pub mod schema;
 pub mod search;
 pub mod server;
+pub mod session_id;
 pub mod slack_login;
 pub mod source;
 pub mod store;

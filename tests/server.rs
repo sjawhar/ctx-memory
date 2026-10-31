@@ -1043,6 +1043,63 @@ fn record_put_reads_stdin() -> Result<()> {
     Ok(())
 }
 
+/// With no `CTX_SESSION` set, the id Oh My Pi gives every command its agent runs names the
+/// session: the server's request log names it on each request, a read's and a write's alike,
+/// and the write's commit carries it in its `Session:` line.
+#[test]
+fn the_session_an_agent_runs_in_names_its_requests_and_its_commits() -> Result<()> {
+    let tree = support::fixture_clone("remote-session-omp")?;
+    support::fetch_window(&tree)?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let mut server = ingress_server(&tree, &keys)?;
+    let metadata = metadata_identity("ada@example.com")?;
+    let omp = "01a1b2c3-0000-7000-8000-000000000001";
+    let mut environment = cloud_env(&server, &metadata)?;
+    environment.push(("OMP_SESSION_ID".to_owned(), omp.to_owned()));
+    let elsewhere = support::scratch("remote-session-omp-cwd")?;
+    let put = support::ctx_remote(
+        &elsewhere,
+        &borrowed(&environment),
+        &["record", "put", "decisions/session.md", "-"],
+        Some(&support::cited_record()),
+    );
+    let open = support::ctx_remote(
+        &elsewhere,
+        &borrowed(&environment),
+        &["--json", "open"],
+        None,
+    );
+    let printed = server.stop_and_read_stdout();
+    drop(server);
+    let message = support::remote_of(&tree)
+        .and_then(|bare| support::git(&bare, &["log", "-1", "--format=%B", "main"]));
+    support::remove_scratch(&elsewhere)?;
+    remove_fixture(&tree)?;
+
+    let (put, open, printed, message) = (put?, open?, printed?, message?);
+    assert_eq!(put.exit_code, 0, "{}{}", put.stdout, put.stderr);
+    assert_eq!(open.exit_code, 0, "{}{}", open.stdout, open.stderr);
+    assert!(
+        message
+            .lines()
+            .any(|line| line == format!("Session: {omp}")),
+        "the commit does not name the session: {message}"
+    );
+    let named: Vec<(Option<Value>, Option<Value>)> = request_lines(&printed)?
+        .iter()
+        .map(|line| (line.get("command").cloned(), line.get("session").cloned()))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            (Some(json!("record put")), Some(json!(omp))),
+            (Some(json!("open")), Some(json!(omp))),
+        ],
+        "{printed:?}"
+    );
+    Ok(())
+}
+
 /// `ctx record put --batch -` reads a JSON list of records and writes them in one commit, so
 /// two new records that link each other land together; a batch the server refuses prints each
 /// finding with the record it is about, exits 1, and writes nothing.
