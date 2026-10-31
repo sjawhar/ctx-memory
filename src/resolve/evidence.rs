@@ -1,11 +1,13 @@
 //! Evidence models and operations shared by provenance and quote judgment.
 
+use std::collections::BTreeSet;
+
 use anyhow::Result;
 use serde_json::Value;
 
 use crate::pointer::{self, Pointer, Schemes};
 use crate::record::Record;
-use crate::source::slack::Mentions;
+use crate::source::slack::{Mentions, Spelled};
 use crate::store::Store;
 use crate::tree::{Doc, Tier};
 
@@ -70,20 +72,19 @@ pub(super) enum Provenance<'a> {
     /// The claim names no pointer at all, which only a summary or a secondhand account may do.
     Untraceable { start: usize, pointer: String },
 }
-/// The text a cited pointer resolves to, with the other texts a quote may have been taken
-/// from: the stored text, earlier versions of its records, the source's own text of each, and
-/// the text ctx served for each.
+/// The text a cited pointer resolves to, and every other text a quote may have been taken
+/// from, as readings a quote is checked against: for each version of each of its records, the
+/// stored text, the source's own text, the text ctx serves, and, for a Slack message, its
+/// text with each mention spelled every way that names that one person ([`Mentions::spelled`]).
 pub(super) struct QuoteSource {
     pub(super) pointer: Pointer,
     pub(super) start: usize,
-    text: String,
-    older: Vec<String>,
+    readings: Vec<Reading>,
 }
 
 impl QuoteSource {
-    /// Reads the text `ctx resolve --thread` serves for a pointer, with the stored text of each
-    /// record, every earlier version of its records, and the source's own text and the served
-    /// text of each.
+    /// Reads the thread of a pointer as `ctx resolve --thread` serves it, with every earlier
+    /// version of its records.
     pub(super) fn load(
         store: &Store,
         schemes: &Schemes,
@@ -92,61 +93,240 @@ impl QuoteSource {
         start: usize,
     ) -> Result<Self> {
         let records = local_records(store, schemes, &pointer, true)?;
-        let served = records
-            .iter()
-            .map(|record| {
-                Ok(mentions
-                    .text(record)?
-                    .unwrap_or_else(|| record.text.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let text = served.join("\n");
-        let mut older = Vec::new();
-        let mut keep = |current: &str, candidate: &str| {
-            if candidate != current && !older.iter().any(|kept| kept == candidate) {
-                older.push(candidate.to_owned());
+        let mut seen = BTreeSet::new();
+        let mut thread = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            if index > 0 {
+                thread.push(Form::Text("\n".to_owned()));
             }
-        };
-        for (record, current) in records.iter().zip(&served) {
-            keep(current, &record.text);
-            if let Some(own) = source_text(record) {
-                keep(current, own);
-            }
+            seen.insert(version_key(record));
+            thread.push(Form::Either(readings_of(record, mentions)?));
+        }
+        let mut readings = vec![Reading::new(&thread)];
+        for record in &records {
             let Some(parsed) = schemes.parse(&record.pointer) else {
                 continue;
             };
             for (_, version) in store.versions(&parsed)? {
-                keep(current, &version.text);
-                if let Some(own) = source_text(&version) {
-                    keep(current, own);
-                }
-                if let Some(version_served) = mentions.text(&version)? {
-                    keep(current, &version_served);
+                if seen.insert(version_key(&version)) {
+                    readings.push(Reading::new(&[Form::Either(readings_of(
+                        &version, mentions,
+                    )?)]));
                 }
             }
         }
         Ok(Self {
             pointer,
             start,
-            text,
-            older,
+            readings,
         })
     }
 
-    /// Reports whether the quote appears in the current text or in one of the other texts it
-    /// may have been taken from. A quote taken before an edit stays verifiable, and so do one
-    /// taken while a Slack mention read as its id and one taken from what ctx served when it
-    /// named that mention.
+    /// Reports whether the quote reads in the thread as served, or in one of the other texts
+    /// it may have been taken from. A quote taken before an edit stays verifiable, and so do
+    /// one taken while a Slack mention read as its id, one taken from what ctx served when it
+    /// named that mention, and one taken before that person's name changed. A mention in the
+    /// quote holds only as a spelling of the person the message mentions there.
     pub(super) fn holds(&self, quote: &str) -> bool {
-        quote_matches(&self.text, quote) || self.older.iter().any(|text| quote_matches(text, quote))
+        let quote = normalise_quote_text(quote);
+        let fragments = fragments(&quote)
+            .map(|fragment| fragment.chars().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        !fragments.is_empty()
+            && self
+                .readings
+                .iter()
+                .any(|reading| reading.holds(&fragments))
     }
 }
 
+/// What tells one stored version of a record from another for a quote: its text and the
+/// source's own text.
+fn version_key(record: &Record) -> (String, Option<String>) {
+    (record.text.clone(), source_text(record).map(str::to_owned))
+}
+
+/// Each way a reader may have read `record`: its stored text, the source's own text, the text
+/// ctx serves for it, and its mentions each spelled every way that names that person.
+fn readings_of(record: &Record, mentions: &Mentions<'_>) -> Result<Vec<Vec<Form>>> {
+    let mut readings = vec![vec![Form::Text(record.text.clone())]];
+    if let Some(own) = source_text(record) {
+        readings.push(vec![Form::Text(own.to_owned())]);
+    }
+    if let Some(served) = mentions.text(record)? {
+        readings.push(vec![Form::Text(served)]);
+    }
+    if let Some(spelled) = mentions.spelled(record)? {
+        readings.push(
+            spelled
+                .into_iter()
+                .map(|part| match part {
+                    Spelled::Text(text) => Form::Text(text),
+                    Spelled::OneOf(spellings) => Form::Either(
+                        spellings
+                            .into_iter()
+                            .map(|spelling| vec![Form::Text(spelling)])
+                            .collect(),
+                    ),
+                })
+                .collect(),
+        );
+    }
+    Ok(readings)
+}
+
 /// The source's own text of a record, as its `raw` keeps it: for Slack, the message as Slack
-/// sent it, each mention still the id that normalising strips (`strip_mentions`), where the
-/// record's text names the person.
+/// sent it, each mention still its id, where the record's text names the person.
 fn source_text(record: &Record) -> Option<&str> {
     record.raw.get("text").and_then(Value::as_str)
+}
+
+/// A text a quote is compared against: plain text, and places it reads one of several ways.
+enum Form {
+    Text(String),
+    Either(Vec<Vec<Form>>),
+}
+
+/// The texts a [`Form`] reads as, normalised as a quote is, as one graph of characters: each
+/// character leads to those that may follow it, and the index past the last character is the
+/// end. A character only ever leads to a later one.
+struct Reading {
+    characters: Vec<char>,
+    next: Vec<Vec<usize>>,
+}
+
+impl Reading {
+    fn new(forms: &[Form]) -> Self {
+        let mut reading = ReadingBuilder::default();
+        reading.add(forms);
+        reading.finish()
+    }
+
+    /// Whether each of `fragments` reads along the graph, each starting where the one before
+    /// it ended or later, the first anywhere.
+    fn holds(&self, fragments: &[Vec<char>]) -> bool {
+        let end = self.characters.len();
+        let mut from = vec![true; end + 1];
+        for (index, fragment) in fragments.iter().enumerate() {
+            let mut at = (0..=end)
+                .filter(|position| from.get(*position) == Some(&true))
+                .collect::<Vec<_>>();
+            for character in fragment {
+                let mut after = Vec::new();
+                for position in at {
+                    if self.characters.get(position) == Some(character) {
+                        after.extend(self.next.get(position).into_iter().flatten().copied());
+                    }
+                }
+                after.sort_unstable();
+                after.dedup();
+                if after.is_empty() {
+                    return false;
+                }
+                at = after;
+            }
+            if index + 1 < fragments.len() {
+                from = vec![false; end + 1];
+                for position in at {
+                    if let Some(reached) = from.get_mut(position) {
+                        *reached = true;
+                    }
+                }
+                for position in 0..end {
+                    if from.get(position) != Some(&true) {
+                        continue;
+                    }
+                    for following in self.next.get(position).into_iter().flatten() {
+                        if let Some(reached) = from.get_mut(*following) {
+                            *reached = true;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Builds a [`Reading`]: `open` holds the characters that lead to whichever comes next.
+#[derive(Default)]
+struct ReadingBuilder {
+    characters: Vec<char>,
+    next: Vec<Vec<usize>>,
+    open: Vec<usize>,
+}
+
+impl ReadingBuilder {
+    fn add(&mut self, forms: &[Form]) {
+        for form in forms {
+            match form {
+                Form::Text(text) => {
+                    for character in normalise_piece(text).chars() {
+                        self.push(character);
+                    }
+                }
+                Form::Either(branches) => {
+                    let incoming = std::mem::take(&mut self.open);
+                    let mut outgoing = Vec::new();
+                    for branch in branches {
+                        self.open.clone_from(&incoming);
+                        self.add(branch);
+                        outgoing.append(&mut self.open);
+                    }
+                    outgoing.sort_unstable();
+                    outgoing.dedup();
+                    self.open = outgoing;
+                }
+            }
+        }
+    }
+
+    fn push(&mut self, character: char) {
+        let node = self.characters.len();
+        self.characters.push(character);
+        self.next.push(Vec::new());
+        for open in std::mem::replace(&mut self.open, vec![node]) {
+            if let Some(next) = self.next.get_mut(open) {
+                next.push(node);
+            }
+        }
+    }
+
+    /// Ends the graph, and lets a space that leads to another space lead past it instead, so
+    /// texts read on as one normalised text, with no run of two spaces.
+    fn finish(mut self) -> Reading {
+        let end = self.characters.len();
+        for open in std::mem::take(&mut self.open) {
+            if let Some(next) = self.next.get_mut(open) {
+                next.push(end);
+            }
+        }
+        for node in (0..end).rev() {
+            if self.characters.get(node) != Some(&' ') {
+                continue;
+            }
+            let Some(following) = self.next.get_mut(node).map(std::mem::take) else {
+                continue;
+            };
+            let mut collapsed = Vec::with_capacity(following.len());
+            for successor in following {
+                if self.characters.get(successor) == Some(&' ') {
+                    collapsed.extend(self.next.get(successor).into_iter().flatten().copied());
+                } else {
+                    collapsed.push(successor);
+                }
+            }
+            collapsed.sort_unstable();
+            collapsed.dedup();
+            if let Some(next) = self.next.get_mut(node) {
+                *next = collapsed;
+            }
+        }
+        Reading {
+            characters: self.characters,
+            next: self.next,
+        }
+    }
 }
 
 /// One quoted claim to verify: the quote, the source text the record wrote beside it, and the
@@ -434,24 +614,6 @@ fn collect_source_pointers(value: &Value, schemes: &Schemes, pointers: &mut Vec<
     }
 }
 
-fn quote_matches(text: &str, quote: &str) -> bool {
-    let text = normalise_quote_text(text);
-    let quote = normalise_quote_text(quote);
-    let mut cursor = 0;
-    let mut matched_fragment = false;
-    for fragment in fragments(&quote) {
-        let Some(relative) = text
-            .get(cursor..)
-            .and_then(|remaining| remaining.find(fragment))
-        else {
-            return false;
-        };
-        matched_fragment = true;
-        cursor += relative + fragment.len();
-    }
-    matched_fragment
-}
-
 /// The parts of a normalised quote between its ellipses, each of which must appear in the
 /// source, in order.
 fn fragments(normalised: &str) -> impl Iterator<Item = &str> {
@@ -480,23 +642,28 @@ pub(super) fn long_enough(quote: &str) -> bool {
     long
 }
 
+/// `text` as a quote is compared: trimmed, and read as [`normalise_piece`] reads it.
 fn normalise_quote_text(text: &str) -> String {
-    let text = strip_mentions(&unwrap_slack_links(text));
-    let mut normalised = String::new();
-    let mut whitespace = false;
+    normalise_piece(text).trim().to_owned()
+}
+
+/// `text` as a quote and its source are compared: a Slack link reads as its label, emphasis
+/// marks drop out, curly quotes, dashes and the ellipsis read as plain ones, letters read in
+/// lower case, and each run of whitespace reads as one space, kept at either end so that the
+/// pieces of a [`Reading`] read on together. A mention reads as it is written: whom it names
+/// is a matter for the reading's spellings, never for dropping it.
+fn normalise_piece(text: &str) -> String {
+    let text = unwrap_slack_links(text);
+    let mut normalised = String::with_capacity(text.len());
     for character in text.chars() {
         if character.is_whitespace() {
-            whitespace = !normalised.is_empty();
+            if !normalised.ends_with(' ') {
+                normalised.push(' ');
+            }
             continue;
-        }
-        if matches!(character, '*' | '_' | '~' | '`') {
-            continue;
-        }
-        if whitespace {
-            normalised.push(' ');
-            whitespace = false;
         }
         match character {
+            '*' | '_' | '~' | '`' => {}
             '‘' | '’' | 'ʼ' => normalised.push('\''),
             '“' | '”' => normalised.push('"'),
             '–' | '—' | '−' => normalised.push('-'),
@@ -540,62 +707,4 @@ fn unwrap_slack_links(text: &str) -> String {
     }
     unwrapped.push_str(remaining);
     unwrapped
-}
-
-fn strip_mentions(text: &str) -> String {
-    let mut stripped = String::new();
-    let mut remaining = text;
-    while let Some(character) = remaining.chars().next() {
-        if let Some(after) = remaining.strip_prefix("<@") {
-            if let Some(close) = after.find('>') {
-                let identifier = after.get(..close);
-                if identifier.is_some_and(|identifier| identifier.starts_with('U')) {
-                    let Some(after_mention) = after.get(close + '>'.len_utf8()..) else {
-                        break;
-                    };
-                    remaining = after_mention;
-                    continue;
-                }
-            }
-        }
-        let mention_boundary = stripped.chars().next_back().is_none_or(|previous| {
-            !previous.is_alphanumeric() && previous != '_' && previous != '-'
-        });
-        if character == '@' && mention_boundary {
-            let Some(after) = remaining.get(character.len_utf8()..) else {
-                break;
-            };
-            let name_end = mention_name_end(after);
-            if name_end > 0 {
-                let Some(mut after_mention) = after.get(name_end..) else {
-                    break;
-                };
-                // A labelled Slack mention, `<@U…|label>`, once read as `@U…|label`.
-                if let Some(label) = after_mention.strip_prefix('|') {
-                    let label_end = mention_name_end(label);
-                    if let Some(after_label) = label.get(label_end..).filter(|_| label_end > 0) {
-                        after_mention = after_label;
-                    }
-                }
-                remaining = after_mention;
-                continue;
-            }
-        }
-        stripped.push(character);
-        let Some(after_character) = remaining.get(character.len_utf8()..) else {
-            break;
-        };
-        remaining = after_character;
-    }
-    stripped
-}
-
-/// Where the name of a mention that `text` starts with ends: the first character that is not
-/// a letter, a digit, `_` or `-`.
-fn mention_name_end(text: &str) -> usize {
-    text.char_indices()
-        .find_map(|(offset, character)| {
-            (!character.is_alphanumeric() && character != '_' && character != '-').then_some(offset)
-        })
-        .unwrap_or(text.len())
 }

@@ -10,7 +10,8 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context as _, Result};
-use ctx_memory::{pointer::Pointer, store::Store};
+use chrono::{DateTime, Utc};
+use ctx_memory::{pointer::Pointer, record::Record, store::Store};
 use serde_json::{json, Value};
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -128,8 +129,9 @@ fn fixture(root: &Path, full_name: Option<&str>, claims: &[&str]) -> Result<()> 
     write_delta(&dir)
 }
 
-/// The tree: its configuration, with one Slack source, and an open question whose quotes are
-/// `claims`, each citing the asked message.
+/// The tree: its configuration, with one Slack source, an open question the window's delta
+/// matches, and one more open question for each of `claims`, `questions/quote-<n>.md`, whose
+/// one quote is that claim, citing the asked message.
 fn write_tree(root: &Path, claims: &[&str]) -> Result<()> {
     let tree = root.join("tree");
     write(
@@ -139,22 +141,21 @@ fn write_tree(root: &Path, claims: &[&str]) -> Result<()> {
             root.join("data").display().to_string()
         ),
     )?;
-    let mut provenance = String::new();
-    if !claims.is_empty() {
-        provenance.push_str("tier: 2\nquotes:\n");
-        for claim in claims {
-            writeln!(
-                provenance,
-                "  - quote: {claim:?}\n    source: \"{ASKED}\"\n    tier: 2"
-            )?;
-        }
-    }
     write(
         &tree.join("questions/hire.md"),
-        &format!(
-            "---\ntype: question\nstatus: open\nrevisit_by: 2026-12-01\n{provenance}---\nWho knows the candidate.\n"
-        ),
-    )
+        "---\ntype: question\nstatus: open\nrevisit_by: 2026-12-01\n---\nWho knows the candidate.\n",
+    )?;
+    for (index, claim) in claims.iter().enumerate() {
+        let mut question = String::from(
+            "---\ntype: question\nstatus: open\nrevisit_by: 2026-12-01\ntier: 2\nquotes:\n",
+        );
+        writeln!(
+            question,
+            "  - quote: {claim:?}\n    source: \"{ASKED}\"\n    tier: 2\n---\nWho knows the candidate."
+        )?;
+        write(&tree.join(format!("questions/quote-{index}.md")), &question)?;
+    }
+    Ok(())
 }
 
 /// The window's delta, as a fetch wrote it: each message's excerpt cut from its stored text.
@@ -236,21 +237,60 @@ fn text_at<'v>(value: &'v Value, pointer: &str) -> Result<&'v str> {
         .with_context(|| format!("{pointer} in {value}"))
 }
 
-/// The stored text of `pointer`, read straight from the store.
-fn stored(root: &Path, pointer: &str) -> Result<String> {
-    let (scheme, locator) = pointer.split_once(':').context("a canonical pointer")?;
-    let store = Store::open(
+/// The store `ctx` keeps for the fixture tree under `root`.
+fn open_store(root: &Path) -> Result<Store> {
+    Store::open(
         &root.join("state/example/store.sqlite3"),
         &root.join("data/sources.json"),
         &root.join("state/example/resolved"),
-    )?;
-    let record = store
+    )
+}
+
+/// The stored record of `pointer`, read straight from the store.
+fn stored_record(root: &Path, pointer: &str) -> Result<Record> {
+    let (scheme, locator) = pointer.split_once(':').context("a canonical pointer")?;
+    open_store(root)?
         .get(&Pointer {
             scheme: scheme.to_owned(),
             locator: locator.to_owned(),
         })?
-        .context("the store holds the message")?;
-    Ok(record.text)
+        .context("the store holds the message")
+}
+
+/// The stored text of `pointer`, read straight from the store.
+fn stored(root: &Path, pointer: &str) -> Result<String> {
+    Ok(stored_record(root, pointer)?.text)
+}
+
+/// Stores `records`, each a line as [`record`] writes it, as a fetch at `fetched_at` would.
+fn put(root: &Path, records: &[Value], fetched_at: &str) -> Result<()> {
+    let records = records
+        .iter()
+        .map(|line| {
+            serde_json::from_value::<Record>(line.get("record").cloned().unwrap_or_default())
+                .context("decoding a test record")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fetched_at = DateTime::parse_from_rfc3339(fetched_at)?.with_timezone(&Utc);
+    open_store(root)?.put_all("slack", &records, fetched_at)?;
+    Ok(())
+}
+
+/// Runs `ctx cite verify` on the fixture tree under `root` and returns the files it reports a
+/// broken quote in.
+fn broken_quotes(root: &Path) -> Result<Vec<String>> {
+    let verified = data(&ctx(root, &["cite", "verify"])?)?;
+    let mut files = verified
+        .get("broken")
+        .and_then(Value::as_array)
+        .with_context(|| format!("cite verify lists broken quotes: {verified}"))?
+        .iter()
+        .filter_map(|broken| broken.get("file").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 /// Everything ctx serves for the asked message names the person it asks, by the full name a
@@ -317,43 +357,165 @@ fn a_message_stored_before_mentions_were_named_is_served_with_the_name() -> Resu
     Ok(())
 }
 
-/// A quote taken from what `ctx resolve` served verifies against the stored message, and so
-/// does one taken while the mention read as its id; a quote that names someone else does not.
+/// A quote's mention holds only as a spelling of the person the message mentions there: as
+/// ctx served it, by a name the store holds for that id, by the id, or as Slack wrote it. A
+/// quote that changes only the id, or only the first name, of the person does not hold.
 #[test]
-fn a_quote_from_the_served_or_the_stored_text_verifies() -> Result<()> {
-    let served = "cc @Kim Lee looks like you reviewed his PRs";
-    let old = "cc @U0EXAMPLEA looks like you reviewed his PRs";
+fn a_quote_holds_only_where_its_mention_names_that_person() -> Result<()> {
     let root = scratch("quotes")?;
-    fixture(&root, Some("Kim Lee"), &[served, old])?;
-    let verified = ctx(&root, &["cite", "verify"])?;
-    let other = scratch("quotes-other")?;
     fixture(
-        &other,
+        &root,
         Some("Kim Lee"),
-        &["cc @Ada Smith looks like you reviewed his PRs"],
+        &[
+            "cc @Kim Lee looks like you reviewed his PRs",
+            "cc @Kim looks like you reviewed his PRs",
+            "cc @U0EXAMPLEA looks like you reviewed his PRs",
+            "cc <@U0EXAMPLEA> looks like you reviewed his PRs",
+            "cc @U0EXAMPLED Lee looks like you reviewed his PRs",
+            "cc @U0EXAMPLED looks like you reviewed his PRs",
+            "cc @Ada Lee looks like you reviewed his PRs",
+        ],
     )?;
-    let refused = ctx(&other, &["cite", "verify"])?;
+    let broken = broken_quotes(&root)?;
     remove_scratch(&root)?;
-    remove_scratch(&other)?;
 
-    let verified_data = data(&verified)?;
     assert_eq!(
-        verified_data
-            .get("broken")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(0),
-        "{verified_data}"
+        broken,
+        [
+            "questions/quote-4.md",
+            "questions/quote-5.md",
+            "questions/quote-6.md"
+        ],
+        "only the quotes that put another id or another name in the mention are broken"
     );
-    assert_eq!(verified.status.code(), Some(0), "{verified_data}");
-    let refused_data = data(&refused)?;
+    Ok(())
+}
+
+/// A quote taken from what ctx served still holds once the person's name changes, and the
+/// message itself is not edited: the store holds both names for that person's id. A name the
+/// store held for nobody does not hold until it does.
+#[test]
+fn a_quote_holds_after_the_person_s_name_changes() -> Result<()> {
+    let root = scratch("renamed")?;
+    fixture(
+        &root,
+        Some("Kim Lee"),
+        &[
+            "cc @Kim Lee looks like you reviewed his PRs",
+            "cc @Kimberly Lee looks like you reviewed his PRs",
+        ],
+    )?;
+    let before = broken_quotes(&root)?;
+    put(
+        &root,
+        &[record(
+            "slack:C0EXAMPLE01/1792952100.000500",
+            "2026-10-26T09:00:00Z",
+            ("U0EXAMPLEA", "Kim"),
+            "Back from leave.",
+            &json!({
+                "ts": "1792952100.000500",
+                "user": "U0EXAMPLEA",
+                "text": "Back from leave.",
+                "user_profile": {"real_name": "Kimberly Lee", "display_name": "Kim"},
+            }),
+        )],
+        "2026-10-26T09:05:00Z",
+    )?;
+    let after = broken_quotes(&root)?;
+    let resolved = data(&ctx(&root, &["resolve", ASKED])?)?;
+    let stored_after = stored(&root, ASKED)?;
+    remove_scratch(&root)?;
+
+    assert_eq!(before, ["questions/quote-1.md"]);
     assert_eq!(
-        refused_data
-            .get("broken")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(1),
-        "{refused_data}"
+        after,
+        Vec::<String>::new(),
+        "both names hold after the change"
+    );
+    let text = text_at(&resolved, "/results/0/text")?;
+    assert!(
+        text.contains("cc @Kimberly Lee looks like you reviewed his PRs"),
+        "ctx resolve serves the newest full name: {text}"
+    );
+    assert_eq!(stored_after, ASKED_STORED, "the message was not edited");
+    Ok(())
+}
+
+/// An edit that moves a mention to another person whom the fetch named alike leaves the
+/// message's stored text as it was, so the store keeps the `raw` of the first version. A
+/// record whose stored text names every person is served as stored, so ctx never names the
+/// person that stale `raw` points at.
+#[test]
+fn a_record_that_names_every_person_is_served_as_stored() -> Result<()> {
+    const EDITED: &str = "slack:C0EXAMPLE01/1792952000.000400";
+    let root = scratch("retarget")?;
+    write_tree(&root, &[])?;
+    fs::create_dir_all(root.join("data"))?;
+    let message = |mentioned: &str| {
+        record(
+            EDITED,
+            "2026-10-25T12:20:00Z",
+            ("U0EXAMPLEB", "Grace Hopper"),
+            "@Kim please review the plan",
+            &json!({
+                "ts": "1792952000.000400",
+                "user": "U0EXAMPLEB",
+                "text": format!("<@{mentioned}> please review the plan"),
+            }),
+        )
+    };
+    let own = |pointer: &str, ts: &str, id: &str, full_name: &str| {
+        record(
+            pointer,
+            "2026-10-25T12:00:00Z",
+            (id, "Kim"),
+            "Here.",
+            &json!({
+                "ts": ts,
+                "user": id,
+                "text": "Here.",
+                "user_profile": {"real_name": full_name, "display_name": "Kim"},
+            }),
+        )
+    };
+    put(
+        &root,
+        &[
+            message("U0EXAMPLEA"),
+            own(
+                "slack:C0EXAMPLE01/1792951000.000010",
+                "1792951000.000010",
+                "U0EXAMPLEA",
+                "Kim Lee",
+            ),
+            own(
+                "slack:C0EXAMPLE01/1792951000.000020",
+                "1792951000.000020",
+                "U0EXAMPLED",
+                "Kim Park",
+            ),
+        ],
+        "2026-10-25T13:00:00Z",
+    )?;
+    put(&root, &[message("U0EXAMPLED")], "2026-10-25T14:00:00Z")?;
+    let kept = stored_record(&root, EDITED)?;
+    let resolved = data(&ctx(&root, &["resolve", EDITED])?)?;
+    remove_scratch(&root)?;
+
+    assert_eq!(
+        kept.raw.get("text").and_then(Value::as_str),
+        Some("<@U0EXAMPLEA> please review the plan"),
+        "the store keeps the first version's raw text"
+    );
+    let text = text_at(&resolved, "/results/0/text")?;
+    assert!(
+        text.ends_with("\n@Kim please review the plan"),
+        "ctx resolve serves the stored text: {text}"
+    );
+    assert!(
+        !text.contains("Kim Lee") && !text.contains("Kim Park"),
+        "{text}"
     );
     Ok(())
 }

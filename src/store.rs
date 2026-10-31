@@ -632,7 +632,10 @@ impl Store {
         }
         let mut statement = self
             .conn
-            .prepare(&authored_query(schemes.len()))
+            .prepare(&authored_query(
+                schemes.len(),
+                "ORDER BY ts DESC, rowid DESC LIMIT 1",
+            ))
             .context("preparing the author name lookup")?;
         let parameters = [author_id, path]
             .into_iter()
@@ -643,12 +646,53 @@ impl Store {
             .with_context(|| format!("reading what {author_id}'s records hold at {path}"))?;
         Ok(value.map(|value| value.trim().to_owned()))
     }
+
+    /// Every text the records `author_id` wrote, under one of `schemes`, hold at `path`, as
+    /// [`Store::authored`] reads one: each distinct one that is neither empty nor the author's
+    /// id, in no particular order. The index on `author_id` answers it from that author's own
+    /// records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read the records.
+    pub fn authored_all(
+        &self,
+        schemes: &[String],
+        author_id: &str,
+        path: &str,
+    ) -> Result<Vec<String>> {
+        if schemes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .conn
+            .prepare(&authored_query(schemes.len(), ""))
+            .context("preparing the author names lookup")?;
+        let parameters = [author_id, path]
+            .into_iter()
+            .chain(schemes.iter().map(String::as_str));
+        let values = statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                row.get::<_, String>(0)
+            })
+            .with_context(|| format!("reading what {author_id}'s records hold at {path}"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| format!("collecting what {author_id}'s records hold at {path}"))?;
+        let mut values = values
+            .into_iter()
+            .map(|value| value.trim().to_owned())
+            .collect::<Vec<_>>();
+        values.sort();
+        values.dedup();
+        Ok(values)
+    }
 }
 
-/// [`Store::authored`]'s query for `schemes` schemes: `?1` the author's id, `?2` the JSON path,
-/// and `?3` onward the schemes. It names `author_id` exactly as the `record_author` index does,
-/// which is what lets SQLite answer it from that index.
-fn authored_query(schemes: usize) -> String {
+/// The query [`Store::authored`] and [`Store::authored_all`] run for `schemes` schemes, with
+/// `order` after its conditions: `?1` the author's id, `?2` the JSON path, and `?3` onward the
+/// schemes. It names `author_id` exactly as the `record_author` index does, which is what lets
+/// SQLite answer it from that index.
+fn authored_query(schemes: usize, order: &str) -> String {
     let in_schemes = (0..schemes)
         .map(|index| format!("?{}", index + 3))
         .collect::<Vec<_>>()
@@ -659,8 +703,7 @@ fn authored_query(schemes: usize) -> String {
            AND scheme IN ({in_schemes})
            AND typeof(json_extract(json, ?2)) = 'text'
            AND trim(json_extract(json, ?2)) NOT IN ('', ?1)
-         ORDER BY ts DESC, rowid DESC
-         LIMIT 1"
+         {order}"
     )
 }
 
@@ -1446,9 +1489,10 @@ mod tests {
         Ok(())
     }
 
-    /// A person's name is read from the records they wrote, newest first: a record whose text
-    /// at the path is empty or the author's own id names nobody, and a record of a scheme not
-    /// asked about is not read. SQLite answers through the index on `author_id`.
+    /// A person's name is read from the records they wrote, newest first, and so is every name
+    /// those records hold: a record whose text at the path is empty or the author's own id
+    /// names nobody, and a record of a scheme not asked about is not read. SQLite answers
+    /// through the index on `author_id`.
     #[test]
     fn an_authors_name_comes_from_their_newest_record_through_the_author_index() -> Result<()> {
         let root = scratch("authored")?;
@@ -1491,11 +1535,12 @@ mod tests {
         let author = store.authored(&slack, "U0EXAMPLEA", "$.author")?;
         let nobody = store.authored(&slack, "U0EXAMPLEB", "$.author")?;
         let no_scheme = store.authored(&[], "U0EXAMPLEA", "$.author")?;
+        let every_author = store.authored_all(&slack, "U0EXAMPLEA", "$.author")?;
         let plan = store
             .conn
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN {}",
-                authored_query(slack.len())
+                authored_query(slack.len(), "")
             ))?
             .query_map(
                 rusqlite::params!["U0EXAMPLEA", "$.author", "slack"],
@@ -1509,6 +1554,7 @@ mod tests {
         assert_eq!(author.as_deref(), Some("Kim"));
         assert_eq!(nobody, None);
         assert_eq!(no_scheme, None);
+        assert_eq!(every_author, ["Kim", "Kimberly"]);
         assert!(
             plan.iter()
                 .any(|step| step.contains("USING INDEX record_author")),
