@@ -548,6 +548,77 @@ fn a_quote_copied_from_resolve_or_from_slack_s_own_text_holds() -> Result<()> {
     Ok(())
 }
 
+/// A quote copied across messages from what `ctx resolve --thread` prints holds, even where
+/// the parent is served as stored because its stored text does not read as Slack's; a quote
+/// that starts inside the parent's mention does not.
+#[test]
+fn a_quote_across_a_thread_as_resolve_prints_it_holds() -> Result<()> {
+    const PARENT: &str = "slack:C0EXAMPLE01/1792952400.000800";
+    const REPLY: &str = "slack:C0EXAMPLE01/1792952460.000900";
+    let root = scratch("thread")?;
+    write_tree(&root, &[])?;
+    write_quotes(
+        &root,
+        "thread",
+        PARENT,
+        &[
+            "please review the new plan ... I will review the new plan",
+            "@U0EXAMPLEA please review the new plan. I will review the new plan.",
+            "0EXAMPLEA please review the new plan ... I will review the new plan",
+        ],
+    )?;
+    fs::create_dir_all(root.join("data"))?;
+    let mut reply = record(
+        REPLY,
+        "2026-10-25T12:41:00Z",
+        ("U0EXAMPLEA", "Kim"),
+        "I will review the new plan.",
+        &json!({
+            "ts": "1792952460.000900",
+            "thread_ts": "1792952400.000800",
+            "user": "U0EXAMPLEA",
+            "text": "I will review the new plan.",
+        }),
+    );
+    if let Some(fields) = reply.get_mut("record").and_then(Value::as_object_mut) {
+        fields.insert("thread".to_owned(), json!(PARENT));
+    }
+    put(
+        &root,
+        &[
+            record(
+                PARENT,
+                "2026-10-25T12:40:00Z",
+                ("U0EXAMPLEB", "Grace Hopper"),
+                "@U0EXAMPLEA please review the new plan.",
+                &json!({
+                    "ts": "1792952400.000800",
+                    "user": "U0EXAMPLEB",
+                    "text": "<@U0EXAMPLEA> please review the plan.",
+                }),
+            ),
+            reply,
+        ],
+        "2026-10-25T13:00:00Z",
+    )?;
+    let resolved = data(&ctx(&root, &["resolve", "--thread", PARENT])?)?;
+    let broken = broken_quotes(&root)?;
+    remove_scratch(&root)?;
+
+    let text = text_at(&resolved, "/results/0/text")?;
+    assert!(
+        text.contains("\n@U0EXAMPLEA please review the new plan.\n\n")
+            && text.ends_with("\nI will review the new plan."),
+        "ctx resolve --thread prints the parent as stored, then the reply: {text}"
+    );
+    assert_eq!(
+        broken,
+        ["questions/thread-2.md"],
+        "a quote across the thread as served holds, and none that starts inside a mention"
+    );
+    Ok(())
+}
+
 /// A quote taken from what ctx served still holds once the person's name changes, and the
 /// message itself is not edited: the store holds both names for that person's id. A name the
 /// store held for nobody does not hold until it does.

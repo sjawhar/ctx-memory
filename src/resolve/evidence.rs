@@ -88,6 +88,11 @@ pub(super) struct QuoteSource {
 impl QuoteSource {
     /// Reads the thread of a pointer as `ctx resolve --thread` serves it, with every earlier
     /// version of its records.
+    ///
+    /// The thread is read twice when a message in it mentions anyone: with each message's
+    /// mentions spelled, and exactly as `ctx resolve --thread` prints it, each message's served
+    /// text in order, so a quote copied across messages from that output holds even where a
+    /// served text is the stored one that does not read as Slack's.
     pub(super) fn load(
         store: &Store,
         schemes: &Schemes,
@@ -99,18 +104,30 @@ impl QuoteSource {
         let slack = mentions.is_slack_scheme(&pointer.scheme);
         let mut seen = BTreeSet::new();
         let mut thread = Vec::new();
+        let mut served = Vec::new();
+        let mut spelled = false;
         let mut others = Vec::new();
         for (index, record) in records.iter().enumerate() {
             if index > 0 {
                 thread.push(Part::Text(Cow::Borrowed("\n")));
+                served.push(Part::Text(Cow::Borrowed("\n")));
             }
             seen.insert(version_key(record));
             let (primary, alternatives) = record_parts(record, mentions)?;
+            spelled |= primary.iter().any(|part| matches!(part, Part::Mention(_)));
             thread.extend(primary);
             others.extend(alternatives);
+            served.push(Part::Text(match mentions.text(record)? {
+                Some(text) => Cow::Owned(text),
+                None => Cow::Borrowed(record.text.as_str()),
+            }));
         }
         let mut readings = Vec::new();
         add_reading(&mut readings, thread, slack);
+        // With no message spelled, the thread as read above is the thread as served.
+        if spelled {
+            add_reading(&mut readings, served, slack);
+        }
         for parts in others {
             add_reading(&mut readings, parts, slack);
         }
