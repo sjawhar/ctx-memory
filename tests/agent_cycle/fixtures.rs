@@ -20,6 +20,28 @@ pub(super) fn runner(name: &str) -> Result<String> {
     std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
 }
 
+/// The shell function `name` of `runner/run-cycle.sh`, from its `name() {` line to the first line
+/// that is `}`, so a test can run the script's own code with `sh`.
+pub(super) fn script_function(name: &str) -> Result<String> {
+    let script = runner("run-cycle.sh")?;
+    let opening = format!("{name}() {{");
+    let mut function = Vec::new();
+    for line in script
+        .lines()
+        .skip_while(|line| !line.starts_with(&opening))
+    {
+        function.push(line);
+        if line == "}" {
+            break;
+        }
+    }
+    ensure!(
+        function.last() == Some(&"}"),
+        "run-cycle.sh has no {name} function"
+    );
+    Ok(function.join("\n"))
+}
+
 /// The maintenance passes `runner/run-cycle.sh` runs, as its `MAINTENANCE_PASSES` names them.
 pub(super) fn maintenance_passes() -> Result<Vec<String>> {
     let script = runner("run-cycle.sh")?;

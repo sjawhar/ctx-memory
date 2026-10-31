@@ -33,5 +33,6 @@ The pass reads no window, mints no record and never moves the marker.
 3. Run `ctx sweep` once every write is done. Fix a finding one of your writes caused with
    another write; report any other.
 4. Report how many open records you checked and how many you changed, and for each change
-   its path, the old and the new `waiting_on`, and the pointer that settled it. Then stop:
-   do not run `ctx marker advance`.
+   its path, the old and the new `waiting_on`, and the pointer that settled it. End the report
+   with the completion line your prompt names: the runner fails a pass whose last message does
+   not end with it. Then stop: do not run `ctx marker advance`.

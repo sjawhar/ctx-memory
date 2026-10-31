@@ -14,7 +14,8 @@ use serde_json::{json, Value};
 use crate::fixtures::{
     remove_scratch, repo, runner, scratch, write_executable, EXAMPLE_MODEL, EXAMPLE_MODEL_ID,
 };
-use crate::policy::maintenance_prompt;
+use crate::outcome::{runner_verdict, Attempt, TIME_LIMIT};
+use crate::policy::{maintenance_prompt, pass_complete_line};
 
 /// The arguments `run-cycle.sh` starts omp with, read from the script itself so this test
 /// cannot drift from it, with the container's paths replaced by this machine's.
@@ -74,7 +75,8 @@ const MODEL_KEY: &str = "live-probe-model-key";
 
 /// A scripted stand-in for the model API, an Anthropic Messages API. The answer to a request is
 /// the step at the index of the number of tool results the request carries, so a retry or a side
-/// request (omp asks for skill summaries) never advances the script.
+/// request (omp asks for skill summaries) never advances the script. A step with `delay_ms` holds
+/// its answer back that long, as a slow model does.
 struct FakeModel {
     port: u16,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -358,6 +360,9 @@ fn serve_one(
     }));
     events.push(json!({"type": "message_stop"}));
 
+    if let Some(delay) = answer.get("delay_ms").and_then(Value::as_u64) {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
     stream.write_all(
         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
     )?;
@@ -424,12 +429,20 @@ fn pinned_omp() -> Result<std::ffi::OsString> {
     Ok(omp)
 }
 
+/// How one omp session ended: its exit status, and its standard output, the event stream
+/// `run-cycle.sh` captures and reads after the session.
+struct SessionEnd {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
 /// Runs omp in `root/workspace` with `root/home` as its `HOME`: the repository's skills, and
 /// `runner/models.example.yml` as `run-cycle.sh` writes it, with `model`'s address for the
 /// placeholder and [`MODEL_KEY`] in the file it names. `env` is added to the session's otherwise
 /// fixed environment, and `extra` after the cycle's own omp arguments, where a repeated flag wins
 /// (`cli/flag-tables.ts:209-219`), so a probe can widen what the cycle allows. Every call the
-/// session made must have reached `model` as models.yml routes it.
+/// session made must have reached `model` as models.yml routes it, and omp must have exited 0.
 fn run_session(
     omp: &std::ffi::OsStr,
     root: &Path,
@@ -438,6 +451,25 @@ fn run_session(
     env: &[(&str, &str)],
     extra: &[&str],
 ) -> Result<()> {
+    let end = run_omp(omp, root, model, prompt, env, extra)?;
+    ensure!(
+        end.status.success(),
+        "omp exited with {}: {}",
+        end.status,
+        end.stderr
+    );
+    model.check_gateway_route()
+}
+
+/// [`run_session`], whatever omp's exit status: how the session ended.
+fn run_omp(
+    omp: &std::ffi::OsStr,
+    root: &Path,
+    model: &FakeModel,
+    prompt: &str,
+    env: &[(&str, &str)],
+    extra: &[&str],
+) -> Result<SessionEnd> {
     let home = root.join("home");
     let workspace = root.join("workspace");
     let sessions = root.join("sessions");
@@ -482,7 +514,8 @@ fn run_session(
     let ctx_dir = Path::new(env!("CARGO_BIN_EXE_ctx"))
         .parent()
         .context("locating the ctx binary's directory")?;
-    let stdout = std::fs::File::create(root.join("omp.stdout"))?;
+    let stdout_path = root.join("omp.stdout");
+    let stdout = std::fs::File::create(&stdout_path)?;
     let stderr_path = root.join("omp.stderr");
     let stderr = std::fs::File::create(&stderr_path)?;
     let mut child = Command::new(omp)
@@ -510,12 +543,11 @@ fn run_session(
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    ensure!(
-        status.success(),
-        "omp exited with {status}: {}",
-        std::fs::read_to_string(&stderr_path).unwrap_or_default()
-    );
-    model.check_gateway_route()
+    Ok(SessionEnd {
+        status,
+        stdout: std::fs::read_to_string(&stdout_path)?,
+        stderr: std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+    })
 }
 
 /// One live session under `run-cycle.sh`'s own flags and `policy.yml`, against the omp
@@ -874,22 +906,36 @@ fn a_live_session_starts_no_mcp_server_its_directory_names() -> Result<()> {
 /// waiting-on` gives it: the session reads the pass's instructions where the prompt sends it,
 /// and every command those instructions name runs under the cycle's policy. The scripted model
 /// reads the instructions, lists the open records, shows one and resolves a pointer with its
-/// thread; none of them is stopped at the approval gate. No model is called.
+/// thread; none of them is stopped at the approval gate. It ends with its report and the
+/// completion line, and the runner reads omp's own events of that as a finished pass. No model
+/// is called.
 #[test]
 #[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
 fn a_live_maintenance_session_reads_its_pass_and_runs_its_commands() -> Result<()> {
     let omp = pinned_omp()?;
     let prompt = maintenance_prompt("waiting-on", "0123456789abcdef0123456789abcdef")?;
+    let report = format!(
+        "Checked 1 open record; changed none.\n\n{}",
+        pass_complete_line("waiting-on")?
+    );
     let model = FakeModel::start(vec![
         json!({"tool": "read", "input": {"path": "skill://ctx-memory-ingest/maintenance/waiting-on.md"}}),
         json!({"tool": "bash", "input": {"command": "ctx open --json"}}),
         json!({"tool": "bash", "input": {"command": "ctx record show decisions/record-provenance.md"}}),
         json!({"tool": "bash", "input": {"command": "ctx resolve --thread slack:C0EXAMPLE01/1700000000.000001"}}),
+        json!({"text": report}),
     ])?;
     let root = scratch("live-maintain")?;
-    let outcome = run_session(&omp, &root, &model, &prompt, &[], &[]);
+    let end = run_omp(&omp, &root, &model, &prompt, &[], &[]);
     remove_scratch(&root)?;
-    outcome?;
+    let end = end?;
+    ensure!(
+        end.status.success(),
+        "omp exited with {}: {}",
+        end.status,
+        end.stderr
+    );
+    model.check_gateway_route()?;
 
     let results = model.tool_results()?;
     let result = |step: usize| -> Result<(bool, String)> {
@@ -920,6 +966,126 @@ fn a_live_maintenance_session_reads_its_pass_and_runs_its_commands() -> Result<(
     ensure!(
         !text.contains("requires approval"),
         "`ctx resolve --thread` was stopped at the approval gate: {text}"
+    );
+    let verdict = runner_verdict(
+        Some("waiting-on"),
+        &[Attempt {
+            status: 0,
+            events: &end.stdout,
+        }],
+    )?;
+    ensure!(
+        verdict.status.success(),
+        "the runner failed a pass that ended with its completion report ({}): {}",
+        verdict.status,
+        verdict.stderr
+    );
+    Ok(())
+}
+
+/// The time limit a live probe gives its session in place of the cycle's: long enough for omp to
+/// start and send its first request on a loaded machine, where the live probes run side by side,
+/// and short against the probe's slow step, [`SLOW_STEP_SECONDS`].
+const PROBE_TIME_LIMIT: &str = "30s";
+/// How long the probe's slow step takes: far past [`PROBE_TIME_LIMIT`]. omp stops waiting for it
+/// at the time limit, so it does not lengthen the probe.
+const SLOW_STEP_SECONDS: u32 = 300;
+
+/// A session under `run-cycle.sh`'s flags with [`PROBE_TIME_LIMIT`] in place of the cycle's, whose
+/// `ctx` takes `ctx_seconds` to answer, against a model scripted with `steps`.
+fn run_timed_session(label: &str, steps: Vec<Value>, ctx_seconds: u32) -> Result<SessionEnd> {
+    let omp = pinned_omp()?;
+    let root = scratch(label)?;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    write_executable(
+        &bin.join("ctx"),
+        &format!("#!/bin/sh\nsleep {ctx_seconds}\necho 'Tree rules'\n"),
+    )?;
+    let model = FakeModel::start(steps)?;
+    let path = std::env::var("PATH").unwrap_or_default();
+    let end = run_omp(
+        &omp,
+        &root,
+        &model,
+        "Run the scripted probe.",
+        &[("PATH", &format!("{}:{path}", bin.display()))],
+        &["--max-time", PROBE_TIME_LIMIT],
+    );
+    remove_scratch(&root)?;
+    end
+}
+
+/// The pinned omp's time limit (`--max-time`, which `run-cycle.sh` passes) stops a session at the
+/// next turn boundary. When it passes while a tool runs, omp aborts the tool, ends the session
+/// without the model's final answer and still exits 0 (`agent-loop.ts:1762-1765`,
+/// `print-mode.ts:313-318,394` at the pinned release). The runner reads that from omp's own
+/// events and fails the job with one line naming the time limit.
+#[test]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
+fn a_live_session_its_time_limit_stops_after_a_tool_call_fails_the_job() -> Result<()> {
+    let end = run_timed_session(
+        "live-time-limit-tool",
+        vec![json!({"tool": "bash", "input": {"command": "ctx rules"}})],
+        SLOW_STEP_SECONDS,
+    )?;
+    ensure!(
+        end.status.code() == Some(0),
+        "the pinned omp no longer exits 0 when its time limit stops a session after a tool call \
+         (it exited with {}), so this probe no longer covers the case run-cycle.sh reads omp's \
+         events for: {}",
+        end.status,
+        end.stderr
+    );
+    let verdict = runner_verdict(
+        None,
+        &[Attempt {
+            status: 0,
+            events: &end.stdout,
+        }],
+    )?;
+    ensure!(
+        !verdict.status.success() && verdict.lines_saying(TIME_LIMIT).len() == 1,
+        "the runner did not fail, with one line naming the time limit, a session its time limit \
+         stopped after a tool call ({}): {}\nomp's events:\n{}",
+        verdict.status,
+        verdict.stderr,
+        end.stdout
+    );
+    Ok(())
+}
+
+/// When the time limit passes while the model is still answering, the pinned omp aborts the
+/// request and exits 1; the runner names the time limit as the reason, in one line.
+#[test]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
+fn a_live_session_its_time_limit_stops_while_the_model_answers_says_so() -> Result<()> {
+    let end = run_timed_session(
+        "live-time-limit-model",
+        vec![json!({"text": "A slow answer.", "delay_ms": u64::from(SLOW_STEP_SECONDS) * 1000})],
+        0,
+    )?;
+    ensure!(
+        end.status.code() == Some(1),
+        "the pinned omp did not exit 1 when its time limit passed while the model answered \
+         (it exited with {}): {}",
+        end.status,
+        end.stderr
+    );
+    let verdict = runner_verdict(
+        None,
+        &[Attempt {
+            status: 1,
+            events: &end.stdout,
+        }],
+    )?;
+    ensure!(
+        verdict.status.code() == Some(1) && verdict.lines_saying(TIME_LIMIT).len() == 1,
+        "the runner did not fail with omp's status and one line naming the time limit ({}): \
+         {}\nomp's events:\n{}",
+        verdict.status,
+        verdict.stderr,
+        end.stdout
     );
     Ok(())
 }

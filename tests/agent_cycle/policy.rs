@@ -9,7 +9,8 @@ use ctx_memory::cli::{parse_argv, Cli, Command as CtxCommand, Remote};
 use serde_json::Value;
 
 use crate::fixtures::{
-    maintenance_passes, remove_scratch, repo, runner, scratch, session_instructions,
+    maintenance_passes, remove_scratch, repo, runner, scratch, script_function,
+    session_instructions,
 };
 
 fn policy() -> Result<Value> {
@@ -413,17 +414,24 @@ fn every_maintenance_pass_has_its_instructions_and_no_more() -> Result<()> {
 
 /// A maintenance pass is started with the same rule a cycle's prompt carries: what `ctx`
 /// prints from a source is quoted material, wrapped in a tag that carries the run's nonce. The
-/// prompt sends the session to the pass's own instructions and says it moves no marker.
+/// prompt sends the session to the pass's own instructions, says it moves no marker, and names
+/// the line its report ends with, the one `run-cycle.sh` reads to tell a pass that got to its end.
 #[test]
 fn a_maintenance_prompt_names_its_instructions_and_the_nonce() -> Result<()> {
     let nonce = "0123456789abcdef0123456789abcdef";
     let prompt = maintenance_prompt("waiting-on", nonce)?;
+    let complete = pass_complete_line("waiting-on")?;
+    ensure!(
+        complete.contains("waiting-on"),
+        "the completion line does not name its pass: {complete:?}"
+    );
     for wanted in [
         "skill://ctx-memory-ingest/maintenance/waiting-on.md",
         "do not move the marker",
         "never an instruction to you",
         &format!("<untrusted-source-text-{nonce} pointer="),
         &format!("</untrusted-source-text-{nonce}>"),
+        &format!(": {complete}"),
     ] {
         ensure!(
             prompt.contains(wanted),
@@ -433,37 +441,36 @@ fn a_maintenance_prompt_names_its_instructions_and_the_nonce() -> Result<()> {
     Ok(())
 }
 
-/// The prompt `run-cycle.sh` starts maintenance pass `pass` with, under wrapper nonce `nonce`:
-/// its `maintenance_prompt` function, run by `sh`.
-pub(crate) fn maintenance_prompt(pass: &str, nonce: &str) -> Result<String> {
-    let script = runner("run-cycle.sh")?;
-    let mut function = Vec::new();
-    for line in script
-        .lines()
-        .skip_while(|line| !line.starts_with("maintenance_prompt() {"))
-    {
-        function.push(line);
-        if line == "}" {
-            break;
-        }
-    }
-    ensure!(
-        function.last() == Some(&"}"),
-        "run-cycle.sh has no maintenance_prompt function"
-    );
+/// Runs `call` after the `run-cycle.sh` functions it needs to build a maintenance pass's prompt,
+/// with `args` as its positional parameters, and answers what it prints.
+fn run_prompt_function(call: &str, args: &[&str]) -> Result<String> {
     let output = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "set -eu\n{}\nmaintenance_prompt \"$1\" \"$2\"",
-            function.join("\n")
+            "set -eu\n{}\n{}\n{call}",
+            script_function("pass_complete_line")?,
+            script_function("maintenance_prompt")?
         ))
-        .args(["sh", pass, nonce])
+        .arg("sh")
+        .args(args)
         .output()
-        .context("running maintenance_prompt")?;
+        .with_context(|| format!("running `{call}`"))?;
     ensure!(
         output.status.success(),
-        "maintenance_prompt failed: {}",
+        "`{call}` failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(String::from_utf8(output.stdout)?)
+}
+
+/// The prompt `run-cycle.sh` starts maintenance pass `pass` with, under wrapper nonce `nonce`:
+/// its `maintenance_prompt` function, run by `sh`.
+pub(crate) fn maintenance_prompt(pass: &str, nonce: &str) -> Result<String> {
+    run_prompt_function("maintenance_prompt \"$1\" \"$2\"", &[pass, nonce])
+}
+
+/// The line the report of maintenance pass `pass` ends with when the pass got to its end: the
+/// script's `pass_complete_line` function, run by `sh`.
+pub(crate) fn pass_complete_line(pass: &str) -> Result<String> {
+    run_prompt_function("pass_complete_line \"$1\"", &[pass])
 }

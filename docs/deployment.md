@@ -75,6 +75,18 @@ The cycle reads text that people outside the deployment wrote, so its session ru
 
 - `waiting-on` re-checks `waiting_on` on every open record against the sources it cites, by the ingest skill's rule, for a tree whose records were written before that rule. Run it once after upgrading to a release that has it.
 
+### What the exit status means
+
+An execution that exits 0 finished its work: a cycle found no pending window, or its session ended on the model's final answer and omp reported success. A maintenance pass exits 0 only when, beyond that, its last message ends with the pass's completion line, `<pass> pass complete`, which its prompt tells the session to end its report with, and the marker is where the pass found it; a deploy step that waits on a pass can take the execution's success as the pass done. Every other end exits non-zero, with a line that says why:
+
+- `run-cycle: refusing to start the session: …` on standard error, status 1: a check before the session failed, and no session ran.
+- `run-cycle: ctx pending failed (exit N)`, or `run-cycle: ctx marker show failed before the <pass> pass (exit N)` (or `after`), on standard error, status N: a read around the session failed.
+- `run-cycle: the session stopped at its 50-minute time limit before it finished` on standard error, status 1: omp's time limit stopped the session. When the limit passes while a tool runs, the pinned omp ends the session and exits 0, so the runner reads how the session ended from omp's own events. The records the session wrote and the windows it moved the marker past stand, so the next cycle starts where it stopped; run a maintenance pass stopped this way again.
+- `run-cycle: the session exited 0 but did not finish: …` on standard error, status 1: omp reported success, but the model's last message is not a final answer.
+- `run-cycle: the <pass> maintenance pass ended without its completion report: …` on standard error, status 1.
+- `run-cycle: the <pass> maintenance pass moved the marker, which it must not do` on standard error, status 1 unless omp already failed.
+- Any other status is omp's own, after `run-cycle: the session exited with status N; …` on standard output: the session failed in omp, with a model error or a signal among the causes. A cycle whose session the model refused first runs one fresh session, and exits with that session's outcome, judged as above.
+
 ### Checking an image
 
-The runner's own tests (`tests/agent_cycle/`) check the policy against every `ctx` command the skills name, run `run-cycle.sh` against stand-ins for each refusal, and drive live sessions of the pinned omp. What holds only in a built image — that the session runs as `ctx-agent` with no new privileges, that its model calls reach `CTX_MODEL_BASE_URL` with the job's key as the bearer token, that a `SIGTERM` reaches the session and the transcript is sealed, that no file the session tries to write lands — is the deployment's to check, by running the image as its job runs it, as root with a share mounted, against a stand-in for the server and the model API.
+The runner's own tests (`tests/agent_cycle/`) check the policy against every `ctx` command the skills name, run `run-cycle.sh` against stand-ins for each refusal, run what it does after a session against omp's events, and drive live sessions of the pinned omp. What holds only in a built image — that the session runs as `ctx-agent` with no new privileges, that its model calls reach `CTX_MODEL_BASE_URL` with the job's key as the bearer token, that a `SIGTERM` reaches the session and the transcript is sealed, that no file the session tries to write lands — is the deployment's to check, by running the image as its job runs it, as root with a share mounted, against a stand-in for the server and the model API.
