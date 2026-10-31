@@ -14,14 +14,15 @@ use crate::delta::{Delta, NewMessage, OpenFlag, ReplyRef};
 use crate::exclude::Exclusion;
 use crate::windows::{Manifest, Status};
 
-/// [`super::pending_in`] with no window cap, which these tests do not exercise.
+/// [`super::pending_in`] with no window cap and no Slack source, which these tests do not
+/// exercise.
 fn pending_in(
     data: &DataDir,
     exclusion: &Exclusion,
     budget: usize,
     offset: usize,
 ) -> Result<Pending> {
-    super::pending_in(data, None, exclusion, budget, offset)
+    super::pending_in(data, None, exclusion, budget, offset, None)
 }
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);

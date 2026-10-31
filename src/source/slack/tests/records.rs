@@ -93,6 +93,109 @@ fn typed_angle_brackets_are_not_mentions_and_links_stay() -> Result<()> {
     Ok(())
 }
 
+/// What [`served_text`] serves when the store holds `names`, by Slack id.
+fn served(text: &str, stored: &str, names: &[(&str, &str)]) -> Result<Option<String>> {
+    served_text(text, stored, &mut |id| {
+        Ok(names
+            .iter()
+            .find(|(known, _)| *known == id)
+            .map(|(_, name)| (*name).to_owned()))
+    })
+}
+
+/// A message stored before mentions were named shows a person as the bare id; served, it
+/// reads with the name the store holds, as a fetch writes it now.
+#[test]
+fn a_message_stored_with_a_bare_id_is_served_with_the_name() -> Result<()> {
+    let served = served(
+        "cc <@U0EXAMPLEA> looks like you reviewed his PRs. Any thoughts?",
+        "cc @U0EXAMPLEA looks like you reviewed his PRs. Any thoughts?",
+        &[("U0EXAMPLEA", "Kim Lee")],
+    )?;
+
+    assert_eq!(
+        served.as_deref(),
+        Some("cc @Kim Lee looks like you reviewed his PRs. Any thoughts?")
+    );
+    Ok(())
+}
+
+/// A person the store holds no name for reads as the label Slack wrote into the mention, else
+/// the id, as a fetch writes it now: no longer as the `@U…|label` an earlier renderer wrote.
+#[test]
+fn a_mention_no_name_is_known_for_is_served_as_its_label_or_its_id() -> Result<()> {
+    let served = served(
+        "<@U0EXAMPLEB|grace> and <@U0EXAMPLEC> please",
+        "@U0EXAMPLEB|grace and @U0EXAMPLEC please",
+        &[],
+    )?;
+
+    assert_eq!(served.as_deref(), Some("@grace and @U0EXAMPLEC please"));
+    Ok(())
+}
+
+/// Only a mention the stored text shows as its id changes. A stored text that shows every
+/// person by a name or a label is served as stored, whatever the store holds; in one that
+/// shows a person as their id beside a named one, the named one keeps exactly its stored
+/// name, which may hold spaces and stand right beside another mention.
+#[test]
+fn only_a_mention_the_stored_text_shows_as_its_id_changes() -> Result<()> {
+    let known = [("U0EXAMPLEA", "Kim Lee"), ("U0EXAMPLED", "Ada King")];
+    let named = served(
+        "<@U0EXAMPLEA> <@U0EXAMPLED> and <#C0EXAMPLE02> to decide",
+        "@Kim @Ada Lovelace and #launch to decide",
+        &known,
+    )?;
+    let labelled = served("<@U0EXAMPLEA|kim> to decide", "@kim to decide", &known)?;
+    let one_bare = served(
+        "<@U0EXAMPLED><@U0EXAMPLEA> and <#C0EXAMPLE02> to decide",
+        "@Ada Lovelace@U0EXAMPLEA and #launch to decide",
+        &known,
+    )?;
+
+    assert_eq!(named, None, "every person is named: served as stored");
+    assert_eq!(labelled, None, "a label is not the id: served as stored");
+    assert_eq!(
+        one_bare.as_deref(),
+        Some("@Ada Lovelace@Kim Lee and #launch to decide")
+    );
+    Ok(())
+}
+
+/// An earlier renderer left `<!everyone>` and a channel as Slack wrote them. A stored text that
+/// names its person is served as stored, though the store names that person otherwise and
+/// though its id appears elsewhere in the message; one that shows the person as the id reads
+/// as a fetch writes it now.
+#[test]
+fn a_text_an_earlier_renderer_wrote_is_never_served_worse() -> Result<()> {
+    let text = "<@U0EXAMPLEA> (id U0EXAMPLEA) <!everyone>";
+    let stored = "@Kim (id U0EXAMPLEA) <!everyone>";
+    let bare = served(
+        "<@U0EXAMPLEA> see <#C0EXAMPLE02> <!everyone>",
+        "@U0EXAMPLEA see <#C0EXAMPLE02> <!everyone>",
+        &[("U0EXAMPLEA", "Kim Lee")],
+    )?;
+
+    assert_eq!(served(text, stored, &[])?, None);
+    assert_eq!(served(text, stored, &[("U0EXAMPLEA", "Kim Lee")])?, None);
+    assert_eq!(bare.as_deref(), Some("@Kim Lee see #C0EXAMPLE02 @everyone"));
+    Ok(())
+}
+
+/// A stored text that does not read as the message mention by mention, such as one whose
+/// `raw` an edit replaced, is served as stored, even where it shows an id.
+#[test]
+fn a_stored_text_that_does_not_read_as_the_message_is_served_as_stored() -> Result<()> {
+    let served = served(
+        "<@U0EXAMPLEA> please review the plan",
+        "@U0EXAMPLEA please review the new plan",
+        &[("U0EXAMPLEA", "Kim Lee")],
+    )?;
+
+    assert_eq!(served, None);
+    Ok(())
+}
+
 #[test]
 fn pre_window_parent_is_sent_as_a_context_record() -> Result<()> {
     let root = scratch("pre-window-parent")?;

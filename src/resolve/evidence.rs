@@ -1,10 +1,15 @@
 //! Evidence models and operations shared by provenance and quote judgment.
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+
 use anyhow::Result;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 use crate::pointer::{self, Pointer, Schemes};
 use crate::record::Record;
+use crate::source::slack::{Mentions, Spelled};
 use crate::store::Store;
 use crate::tree::{Doc, Tier};
 
@@ -69,71 +74,468 @@ pub(super) enum Provenance<'a> {
     /// The claim names no pointer at all, which only a summary or a secondhand account may do.
     Untraceable { start: usize, pointer: String },
 }
-/// The text a cited pointer resolves to, with the other texts a quote may have been taken
-/// from: earlier versions of its records, and the source's own text of each.
+/// The text a cited pointer resolves to, and every other text a quote may have been taken
+/// from, as the readings a quote is checked against. For each version of each of its records:
+/// the stored text and the source's own text; or, for a Slack message that mentions anyone,
+/// its text with each mention one of the complete spellings that name that one person
+/// ([`Mentions::spelled`]), which reads as the stored, the source's and the served text alike.
 pub(super) struct QuoteSource {
     pub(super) pointer: Pointer,
     pub(super) start: usize,
-    text: String,
-    older: Vec<String>,
+    readings: Vec<Reading>,
 }
 
 impl QuoteSource {
-    /// Reads the newest text of a pointer's thread, every earlier version of its records, and
-    /// the source's own text of each.
+    /// Reads the thread of a pointer as `ctx resolve --thread` serves it, with every earlier
+    /// version of its records.
+    ///
+    /// Each message reads in the thread with its mentions spelled, which spells its stored
+    /// text and the text ctx serves for it too wherever the stored text reads as Slack's. When
+    /// one does not, the thread is read once more exactly as `ctx resolve --thread` prints it:
+    /// that message as stored and every other one spelled, so a quote copied across messages
+    /// from that output holds, and a rendered name in it is still held whole.
     pub(super) fn load(
         store: &Store,
         schemes: &Schemes,
+        mentions: &Mentions<'_>,
         pointer: Pointer,
         start: usize,
     ) -> Result<Self> {
         let records = local_records(store, schemes, &pointer, true)?;
-        let text = records
-            .iter()
-            .map(|record| record.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut older = Vec::new();
-        let mut keep = |record: &Record, candidate: &str| {
-            if candidate != record.text && !older.iter().any(|kept| kept == candidate) {
-                older.push(candidate.to_owned());
-            }
-        };
+        let slack = mentions.is_slack_scheme(&pointer.scheme);
+        let mut seen = BTreeSet::new();
+        let mut each = Vec::with_capacity(records.len());
         for record in &records {
-            if let Some(own) = source_text(record) {
-                keep(record, own);
+            seen.insert(version_key(record));
+            each.push(record_parts(record, mentions)?);
+        }
+        let served_apart = each.iter().any(|parts| parts.served.is_some());
+        let mut thread = Vec::new();
+        let mut served = Vec::new();
+        let mut others = Vec::new();
+        for (index, parts) in each.into_iter().enumerate() {
+            if index > 0 {
+                thread.push(Part::Text(Cow::Borrowed("\n")));
+                if served_apart {
+                    served.push(Part::Text(Cow::Borrowed("\n")));
+                }
             }
+            if served_apart {
+                match parts.served {
+                    Some(as_served) => served.extend(as_served),
+                    None => served.extend(parts.thread.iter().cloned()),
+                }
+            }
+            thread.extend(parts.thread);
+            others.extend(parts.others);
+        }
+        let mut readings = Vec::new();
+        add_reading(&mut readings, thread, slack);
+        if served_apart {
+            add_reading(&mut readings, served, slack);
+        }
+        for parts in others {
+            add_reading(&mut readings, parts, slack);
+        }
+        for record in &records {
             let Some(parsed) = schemes.parse(&record.pointer) else {
                 continue;
             };
             for (_, version) in store.versions(&parsed)? {
-                keep(record, &version.text);
-                if let Some(own) = source_text(&version) {
-                    keep(record, own);
+                if !seen.insert(version_key(&version)) {
+                    continue;
+                }
+                let parts = record_parts(&version, mentions)?;
+                add_reading(&mut readings, parts.thread, slack);
+                if let Some(as_served) = parts.served {
+                    add_reading(&mut readings, as_served, slack);
+                }
+                for others in parts.others {
+                    add_reading(&mut readings, others, slack);
                 }
             }
         }
         Ok(Self {
             pointer,
             start,
-            text,
-            older,
+            readings,
         })
     }
 
-    /// Reports whether the quote appears in the current text or in one of the other texts it
-    /// may have been taken from. A quote taken before an edit stays verifiable, and so does one
-    /// taken while a Slack mention read as its id.
+    /// Reports whether the quote reads in the thread as served, or in one of the other texts
+    /// it may have been taken from. A quote taken before an edit stays verifiable, and so do
+    /// one taken while a Slack mention read as its id, one taken from what ctx served when it
+    /// named that mention, and one taken before that person's name changed. A Slack mention
+    /// in the quote holds only whole: as a whole spelling of the person the message mentions
+    /// there, or, in a text read as it is stored, as the whole mention it writes.
     pub(super) fn holds(&self, quote: &str) -> bool {
-        quote_matches(&self.text, quote) || self.older.iter().any(|text| quote_matches(text, quote))
+        let quote = normalise_quote_text(quote);
+        let fragments = fragments(&quote).collect::<Vec<_>>();
+        !fragments.is_empty()
+            && self
+                .readings
+                .iter()
+                .any(|reading| reading.holds(&fragments))
     }
 }
 
+/// What tells one stored version of a record from another for a quote: a digest of its text
+/// and of the source's own text, so a long document is not copied to tell.
+fn version_key(record: &Record) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(record.text.as_bytes());
+    if let Some(own) = source_text(record) {
+        digest.update([0]);
+        digest.update(own.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+/// How one record reads for a quote.
+struct RecordParts<'r> {
+    /// As it reads in its thread: with its mentions spelled, or as its stored text.
+    thread: Vec<Part<'r>>,
+    /// As `ctx resolve` prints it, where `thread` does not spell that: the stored text of a
+    /// Slack message that does not read as Slack's own text mention by mention.
+    served: Option<Vec<Part<'r>>>,
+    /// The other texts a quote of it may have been taken from, each read alone.
+    others: Vec<Vec<Part<'r>>>,
+}
+
+/// How `record` reads for a quote. A Slack message that mentions anyone reads with its
+/// mentions spelled, which spells its stored and served text where the stored text reads as
+/// Slack's; Slack's own text, and the stored text where it does not read as Slack's, are read
+/// as they are. Any other record reads as its stored text, and as the source's own text where
+/// that differs.
+fn record_parts<'r>(record: &'r Record, mentions: &Mentions<'_>) -> Result<RecordParts<'r>> {
+    let (stored, mut others) = literal_parts(record);
+    let Some(spelled) = mentions.spelled(record)? else {
+        return Ok(RecordParts {
+            thread: stored,
+            served: None,
+            others,
+        });
+    };
+    let thread = spelled
+        .parts
+        .into_iter()
+        .map(|part| match part {
+            Spelled::Text(text) => Part::Text(Cow::Owned(text)),
+            Spelled::OneOf(spellings) => Part::Mention(spellings),
+        })
+        .collect();
+    if spelled.spells_stored {
+        return Ok(RecordParts {
+            thread,
+            served: None,
+            others,
+        });
+    }
+    others.insert(0, stored);
+    Ok(RecordParts {
+        thread,
+        served: Some(vec![Part::Text(Cow::Borrowed(&record.text))]),
+        others,
+    })
+}
+
+/// `record` as its stored text, with the source's own text as another reading where it is
+/// not the same text.
+fn literal_parts(record: &Record) -> (Vec<Part<'_>>, Vec<Vec<Part<'_>>>) {
+    let others = source_text(record)
+        .filter(|own| *own != record.text)
+        .map(|own| vec![Part::Text(Cow::Borrowed(own))])
+        .into_iter()
+        .collect();
+    (vec![Part::Text(Cow::Borrowed(&record.text))], others)
+}
+
 /// The source's own text of a record, as its `raw` keeps it: for Slack, the message as Slack
-/// sent it, each mention still the id that normalising strips (`strip_mentions`), where the
-/// record's text names the person.
+/// sent it, each mention still its id, where the record's text names the person.
 fn source_text(record: &Record) -> Option<&str> {
     record.raw.get("text").and_then(Value::as_str)
+}
+
+/// Adds the reading `parts` make to `readings`, unless an identical one is there. `slack` says
+/// the texts are a Slack source's, whose mentions a quote holds only whole.
+fn add_reading(readings: &mut Vec<Reading>, parts: Vec<Part<'_>>, slack: bool) {
+    let reading = Reading::new(parts, slack);
+    if !readings.contains(&reading) {
+        readings.push(reading);
+    }
+}
+
+/// One part of a text a quote is compared against, before normalising: text, or a mention
+/// a quote may spell any one of several ways.
+#[derive(Clone)]
+enum Part<'a> {
+    Text(Cow<'a, str>),
+    Mention(Vec<String>),
+}
+
+/// One text a quote may have been taken from, normalised as a quote is.
+#[derive(Debug, PartialEq)]
+enum Reading {
+    /// A text with no mention to keep whole, compared as a string.
+    Plain(String),
+    /// A Slack message's text in segments: plain text, and each mention as its complete
+    /// spellings, of which a quote must hold one whole.
+    Spelled(Vec<Segment>),
+}
+
+/// One segment of a [`Reading::Spelled`].
+#[derive(Debug, PartialEq)]
+enum Segment {
+    Text(String),
+    Mention(Vec<String>),
+}
+
+impl Reading {
+    /// The reading `parts` make. When `slack`, each mention written into a text part as Slack
+    /// writes one (`<@U…>`, `<#C…>`, `<!…>`), or as `@` and a word (an id such as `@U…`, or a
+    /// name a renderer wrote), is a mention a quote holds only whole, as it is written there.
+    fn new(parts: Vec<Part<'_>>, slack: bool) -> Self {
+        if parts.iter().all(|part| matches!(part, Part::Text(_))) {
+            let text = match <[_; 1]>::try_from(parts) {
+                Ok([Part::Text(text)]) => text,
+                Ok([Part::Mention(_)]) => Cow::Borrowed(""),
+                Err(parts) => Cow::Owned(
+                    parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            Part::Text(text) => Some(text.as_ref()),
+                            Part::Mention(_) => None,
+                        })
+                        .collect(),
+                ),
+            };
+            let normalised = normalise_piece(&text);
+            if !slack || mention_tokens(&normalised).is_empty() {
+                return Self::Plain(normalised);
+            }
+            let mut segments = Vec::new();
+            push_normalised(&mut segments, &normalised, slack);
+            return Self::Spelled(segments);
+        }
+        let mut segments = Vec::new();
+        let mut text = String::new();
+        for part in parts {
+            match part {
+                Part::Text(more) => text.push_str(&more),
+                Part::Mention(spellings) => {
+                    push_text(&mut segments, &mut text, slack);
+                    let mut spellings = spellings
+                        .iter()
+                        .map(|spelling| normalise_quote_text(spelling))
+                        .filter(|spelling| !spelling.is_empty())
+                        .collect::<Vec<_>>();
+                    spellings.sort();
+                    spellings.dedup();
+                    segments.push(Segment::Mention(spellings));
+                }
+            }
+        }
+        push_text(&mut segments, &mut text, slack);
+        Self::Spelled(segments)
+    }
+
+    /// Whether each of `fragments` reads in the text, in order, each starting where the one
+    /// before it ended or later.
+    fn holds(&self, fragments: &[&str]) -> bool {
+        match self {
+            Self::Plain(text) => {
+                let mut cursor = 0;
+                for fragment in fragments {
+                    let Some(found) = text.get(cursor..).and_then(|rest| rest.find(fragment))
+                    else {
+                        return false;
+                    };
+                    cursor += found + fragment.len();
+                }
+                true
+            }
+            Self::Spelled(segments) => {
+                let mut from = Position::default();
+                for fragment in fragments {
+                    match earliest_end(segments, from, fragment) {
+                        Some(end) => from = end,
+                        None => return false,
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+/// Moves the text gathered so far into `segments`, normalised ([`push_normalised`]).
+fn push_text(segments: &mut Vec<Segment>, text: &mut String, slack: bool) {
+    if text.is_empty() {
+        return;
+    }
+    let normalised = normalise_piece(&std::mem::take(text));
+    push_normalised(segments, &normalised, slack);
+}
+
+/// Adds `normalised` text to `segments`: as text, and, when `slack`, each mention token in it
+/// ([`mention_tokens`]) as a mention whose one spelling is itself, so a quote holds it whole.
+fn push_normalised(segments: &mut Vec<Segment>, normalised: &str, slack: bool) {
+    let tokens = if slack {
+        mention_tokens(normalised)
+    } else {
+        Vec::new()
+    };
+    let mut written = 0;
+    for (start, end) in tokens {
+        if let Some(before) = normalised
+            .get(written..start)
+            .filter(|text| !text.is_empty())
+        {
+            segments.push(Segment::Text(before.to_owned()));
+        }
+        if let Some(token) = normalised.get(start..end) {
+            segments.push(Segment::Mention(vec![token.to_owned()]));
+        }
+        written = end;
+    }
+    if let Some(rest) = normalised.get(written..).filter(|text| !text.is_empty()) {
+        segments.push(Segment::Text(rest.to_owned()));
+    }
+}
+
+/// Where a normalised Slack text writes a mention itself, as byte ranges in order: a sequence
+/// Slack writes, `<@…>`, `<#…>` or `<!…>`, and `@` where it starts a word, with the word after
+/// it: letters and digits, joined by `.` or `-`. That word is a person's id, or a name a
+/// renderer wrote, whose end a text read as it is shows nowhere else. A quote holds each whole.
+fn mention_tokens(normalised: &str) -> Vec<(usize, usize)> {
+    let mut tokens = Vec::new();
+    let mut previous: Option<char> = None;
+    let mut characters = normalised.char_indices().peekable();
+    while let Some((start, character)) = characters.next() {
+        let starts_word = previous.is_none_or(|before| !before.is_alphanumeric());
+        let next = characters.peek().map(|(_, next)| *next);
+        let end = match character {
+            '<' if matches!(next, Some('@' | '#' | '!')) => normalised
+                .get(start..)
+                .and_then(|rest| rest.find('>'))
+                .map(|close| start + close + 1),
+            '@' if starts_word && next.is_some_and(char::is_alphanumeric) => {
+                let word = start + 1;
+                let mut end = word;
+                let rest = normalised.get(word..).unwrap_or_default();
+                for (offset, following) in rest.char_indices() {
+                    if following.is_alphanumeric() {
+                        end = word + offset + following.len_utf8();
+                        continue;
+                    }
+                    // A `.` or `-` joins the word only to more of it.
+                    let joins = matches!(following, '.' | '-')
+                        && rest
+                            .get(offset + 1..)
+                            .and_then(|after| after.chars().next())
+                            .is_some_and(char::is_alphanumeric);
+                    if !joins {
+                        break;
+                    }
+                }
+                Some(end)
+            }
+            _ => None,
+        };
+        match end {
+            Some(end) => {
+                tokens.push((start, end));
+                while characters.peek().is_some_and(|(at, _)| *at < end) {
+                    previous = characters.next().map(|(_, skipped)| skipped);
+                }
+            }
+            None => previous = Some(character),
+        }
+    }
+    tokens
+}
+
+/// A place in a [`Reading::Spelled`]: a byte offset in one of its segments, where the offset
+/// in a mention is always 0, its start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Position {
+    segment: usize,
+    offset: usize,
+}
+
+/// Where `fragment` ends, at the earliest, when it reads in `segments` at or after `from`. It
+/// starts in a text or where a mention starts, never inside a mention, and it holds each
+/// mention it reaches as one whole spelling, so it ends where a mention ends or in a text.
+fn earliest_end(segments: &[Segment], from: Position, fragment: &str) -> Option<Position> {
+    let mut best: Option<Position> = None;
+    for (index, segment) in segments.iter().enumerate().skip(from.segment) {
+        // What starts here ends here or later.
+        if best.is_some_and(|best| best.segment < index) {
+            break;
+        }
+        let start = if index == from.segment {
+            from.offset
+        } else {
+            0
+        };
+        let found = match segment {
+            Segment::Text(text) => {
+                let inside = text
+                    .get(start..)
+                    .and_then(|rest| rest.find(fragment))
+                    .map(|found| Position {
+                        segment: index,
+                        offset: start + found + fragment.len(),
+                    });
+                // A start this close to the text's end runs on past it.
+                let first = text
+                    .len()
+                    .saturating_sub(fragment.len().saturating_sub(1))
+                    .max(start);
+                let crossing = (first..text.len())
+                    .filter(|offset| text.is_char_boundary(*offset))
+                    .filter_map(|offset| {
+                        let rest = fragment.strip_prefix(text.get(offset..)?)?;
+                        from_boundary(segments, index + 1, rest)
+                    })
+                    .min();
+                inside.into_iter().chain(crossing).min()
+            }
+            Segment::Mention(_) if start == 0 => from_boundary(segments, index, fragment),
+            Segment::Mention(_) => None,
+        };
+        best = best.into_iter().chain(found).min();
+    }
+    best
+}
+
+/// Where `rest`, which is not empty, ends at the earliest when it reads from the start of the
+/// segment at `index`: through each text, and through each mention as one whole spelling.
+fn from_boundary(segments: &[Segment], index: usize, rest: &str) -> Option<Position> {
+    match segments.get(index)? {
+        Segment::Text(text) if rest.len() <= text.len() => {
+            text.starts_with(rest).then_some(Position {
+                segment: index,
+                offset: rest.len(),
+            })
+        }
+        Segment::Text(text) => {
+            from_boundary(segments, index + 1, rest.strip_prefix(text.as_str())?)
+        }
+        Segment::Mention(spellings) => spellings
+            .iter()
+            .filter_map(|spelling| {
+                if rest == spelling {
+                    Some(Position {
+                        segment: index + 1,
+                        offset: 0,
+                    })
+                } else {
+                    from_boundary(segments, index + 1, rest.strip_prefix(spelling.as_str())?)
+                }
+            })
+            .min(),
+    }
 }
 
 /// One quoted claim to verify: the quote, the source text the record wrote beside it, and the
@@ -421,24 +823,6 @@ fn collect_source_pointers(value: &Value, schemes: &Schemes, pointers: &mut Vec<
     }
 }
 
-fn quote_matches(text: &str, quote: &str) -> bool {
-    let text = normalise_quote_text(text);
-    let quote = normalise_quote_text(quote);
-    let mut cursor = 0;
-    let mut matched_fragment = false;
-    for fragment in fragments(&quote) {
-        let Some(relative) = text
-            .get(cursor..)
-            .and_then(|remaining| remaining.find(fragment))
-        else {
-            return false;
-        };
-        matched_fragment = true;
-        cursor += relative + fragment.len();
-    }
-    matched_fragment
-}
-
 /// The parts of a normalised quote between its ellipses, each of which must appear in the
 /// source, in order.
 fn fragments(normalised: &str) -> impl Iterator<Item = &str> {
@@ -467,23 +851,28 @@ pub(super) fn long_enough(quote: &str) -> bool {
     long
 }
 
+/// `text` as a quote is compared: trimmed, and read as [`normalise_piece`] reads it.
 fn normalise_quote_text(text: &str) -> String {
-    let text = strip_mentions(&unwrap_slack_links(text));
-    let mut normalised = String::new();
-    let mut whitespace = false;
+    normalise_piece(text).trim().to_owned()
+}
+
+/// `text` as a quote and its source are compared: a Slack link reads as its label, emphasis
+/// marks drop out, curly quotes, dashes and the ellipsis read as plain ones, letters read in
+/// lower case, and each run of whitespace reads as one space, kept at either end so that the
+/// pieces of a [`Reading`] read on together. A mention reads as it is written: whom it names
+/// is a matter for the reading's spellings, never for dropping it.
+fn normalise_piece(text: &str) -> String {
+    let text = unwrap_slack_links(text);
+    let mut normalised = String::with_capacity(text.len());
     for character in text.chars() {
         if character.is_whitespace() {
-            whitespace = !normalised.is_empty();
+            if !normalised.ends_with(' ') {
+                normalised.push(' ');
+            }
             continue;
-        }
-        if matches!(character, '*' | '_' | '~' | '`') {
-            continue;
-        }
-        if whitespace {
-            normalised.push(' ');
-            whitespace = false;
         }
         match character {
+            '*' | '_' | '~' | '`' => {}
             '‘' | '’' | 'ʼ' => normalised.push('\''),
             '“' | '”' => normalised.push('"'),
             '–' | '—' | '−' => normalised.push('-'),
@@ -529,60 +918,165 @@ fn unwrap_slack_links(text: &str) -> String {
     unwrapped
 }
 
-fn strip_mentions(text: &str) -> String {
-    let mut stripped = String::new();
-    let mut remaining = text;
-    while let Some(character) = remaining.chars().next() {
-        if let Some(after) = remaining.strip_prefix("<@") {
-            if let Some(close) = after.find('>') {
-                let identifier = after.get(..close);
-                if identifier.is_some_and(|identifier| identifier.starts_with('U')) {
-                    let Some(after_mention) = after.get(close + '>'.len_utf8()..) else {
-                        break;
-                    };
-                    remaining = after_mention;
-                    continue;
-                }
-            }
-        }
-        let mention_boundary = stripped.chars().next_back().is_none_or(|previous| {
-            !previous.is_alphanumeric() && previous != '_' && previous != '-'
-        });
-        if character == '@' && mention_boundary {
-            let Some(after) = remaining.get(character.len_utf8()..) else {
-                break;
-            };
-            let name_end = mention_name_end(after);
-            if name_end > 0 {
-                let Some(mut after_mention) = after.get(name_end..) else {
-                    break;
-                };
-                // A labelled Slack mention, `<@U…|label>`, once read as `@U…|label`.
-                if let Some(label) = after_mention.strip_prefix('|') {
-                    let label_end = mention_name_end(label);
-                    if let Some(after_label) = label.get(label_end..).filter(|_| label_end > 0) {
-                        after_mention = after_label;
-                    }
-                }
-                remaining = after_mention;
-                continue;
-            }
-        }
-        stripped.push(character);
-        let Some(after_character) = remaining.get(character.len_utf8()..) else {
-            break;
-        };
-        remaining = after_character;
-    }
-    stripped
-}
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
 
-/// Where the name of a mention that `text` starts with ends: the first character that is not
-/// a letter, a digit, `_` or `-`.
-fn mention_name_end(text: &str) -> usize {
-    text.char_indices()
-        .find_map(|(offset, character)| {
-            (!character.is_alphanumeric() && character != '_' && character != '-').then_some(offset)
-        })
-        .unwrap_or(text.len())
+    use chrono::DateTime;
+    use serde_json::json;
+
+    use super::{add_reading, literal_parts, normalise_quote_text, Part, Reading};
+    use crate::record::Record;
+
+    /// Whether `quote` holds in `reading`, as [`super::QuoteSource::holds`] checks it.
+    fn holds(reading: &Reading, quote: &str) -> bool {
+        let quote = normalise_quote_text(quote);
+        let fragments = super::fragments(&quote).collect::<Vec<_>>();
+        !fragments.is_empty() && reading.holds(&fragments)
+    }
+
+    /// A Slack message that asks one person, with that person's spellings.
+    fn asked() -> Reading {
+        Reading::new(
+            vec![
+                Part::Text(Cow::Borrowed("Please ask cc ")),
+                Part::Mention(vec![
+                    "@U0EXAMPLEA".to_owned(),
+                    "<@U0EXAMPLEA>".to_owned(),
+                    "@Kim Lee".to_owned(),
+                ]),
+                Part::Text(Cow::Borrowed(" to review this proposal.")),
+            ],
+            true,
+        )
+    }
+
+    /// A quote that includes any part of a mention holds only with one of its spellings
+    /// whole; it may end before a mention or start after one.
+    #[test]
+    fn a_quote_holds_a_mention_only_whole() {
+        let reading = asked();
+        for (quote, expected) in [
+            ("Please ask cc @U0EXAMPLEA to review", true),
+            ("Please ask cc <@U0EXAMPLEA> to review", true),
+            ("ask cc @Kim Lee to review this proposal", true),
+            ("Please ask cc", true),
+            ("to review this proposal.", true),
+            ("Please ask ... @Kim Lee ... proposal", true),
+            ("Please ask cc @U0EXAMPLE", false),
+            ("Please ask cc <@U0EXAMPLE", false),
+            ("Please ask cc @Kim", false),
+            ("Lee to review this proposal", false),
+            ("EXAMPLEA to review this proposal", false),
+            ("Please ask cc @U0EXAMPLED to review", false),
+        ] {
+            assert_eq!(holds(&reading, quote), expected, "{quote}");
+        }
+    }
+
+    /// A Slack message's stored text and Slack's own text, read as they are, hold any quote
+    /// copied from them, escapes included, but a quote that starts or stops inside a mention
+    /// they write, `@U…`, `<@U…>` or a rendered `@Name`, does not hold.
+    #[test]
+    fn a_literal_slack_text_holds_its_mentions_only_whole() {
+        let stored = Reading::new(
+            vec![Part::Text(Cow::Borrowed(
+                "Please ask cc @U0EXAMPLEA to review the new plan",
+            ))],
+            true,
+        );
+        let own = Reading::new(
+            vec![Part::Text(Cow::Borrowed(
+                "Please ask cc <@U0EXAMPLEA> to check A &amp; B",
+            ))],
+            true,
+        );
+        let named = Reading::new(
+            vec![Part::Text(Cow::Borrowed(
+                "Please ask cc @Kimberly to review the plan. Ask @kim.lee-park too.",
+            ))],
+            true,
+        );
+        for (reading, quote, expected) in [
+            (
+                &stored,
+                "Please ask cc @U0EXAMPLEA to review the new plan",
+                true,
+            ),
+            (&stored, "Please ask cc", true),
+            (&stored, "to review the new plan", true),
+            (&stored, "Please ask cc @U0EXAMPLE", false),
+            (&stored, "0EXAMPLEA to review the new plan", false),
+            (&own, "Please ask cc <@U0EXAMPLEA> to check A &amp; B", true),
+            (&own, "<@U0EXAMPLEA> to check A &amp; B", true),
+            (&own, "Please ask cc <@U0EXAMPLE", false),
+            (&own, "Please ask cc <@U0EXAMPLEA", false),
+            (&own, "U0EXAMPLEA> to check A &amp; B", false),
+            (&named, "Please ask cc @Kimberly to review the plan", true),
+            (&named, "Please ask cc @Kim", false),
+            (&named, "Please ask cc @Kim ... to review the plan", false),
+            (&named, "berly to review the plan", false),
+            (&named, "Ask @kim.lee-park too", true),
+            (&named, "Ask @kim.lee", false),
+            (&named, "the plan. Ask", true),
+        ] {
+            assert_eq!(holds(reading, quote), expected, "{quote}");
+        }
+    }
+
+    /// A text that is no Slack source's is compared as a string, `@` words and all.
+    #[test]
+    fn a_text_of_another_source_keeps_no_mention_whole() {
+        let reading = Reading::new(
+            vec![Part::Text(Cow::Borrowed("Thanks @user123 for the review"))],
+            false,
+        );
+
+        assert!(matches!(reading, Reading::Plain(_)));
+        assert!(holds(&reading, "Thanks @user123 for the review"));
+    }
+
+    /// A large text with no mention is one plain string, compared as a string, and a record
+    /// whose source text is the same text reads once: no graph and no second copy.
+    #[test]
+    fn a_large_plain_text_reads_once_as_a_string() -> anyhow::Result<()> {
+        let mut text = "Some words that fill a long document. ".repeat(140_000);
+        text.push_str("At last the vendor signed the renewal.");
+        let record = Record {
+            pointer: "drive:1LargeExampleDocument000000".to_owned(),
+            stream: "drive".to_owned(),
+            ts: DateTime::UNIX_EPOCH,
+            label: None,
+            author: None,
+            author_id: None,
+            thread: None,
+            title: None,
+            url: None,
+            text: text.clone(),
+            aliases: Vec::new(),
+            context: false,
+            raw: json!({ "text": text }),
+        };
+        let (primary, others) = literal_parts(&record);
+        let mut readings = Vec::new();
+        add_reading(&mut readings, primary, false);
+        for parts in others {
+            add_reading(&mut readings, parts, false);
+        }
+        add_reading(
+            &mut readings,
+            vec![Part::Text(Cow::Borrowed(&record.text))],
+            false,
+        );
+
+        assert_eq!(readings.len(), 1, "identical texts read once");
+        let [reading @ Reading::Plain(plain)] = readings.as_slice() else {
+            anyhow::bail!("a text with no mention reads as one plain string: {readings:?}");
+        };
+        assert!(record.text.len() > 5 * 1024 * 1024);
+        assert!(plain.len() <= record.text.len(), "one normalised copy");
+        assert!(holds(reading, "the vendor signed the renewal"));
+        assert!(!holds(reading, "the vendor never signed"));
+        Ok(())
+    }
 }

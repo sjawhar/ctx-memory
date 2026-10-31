@@ -24,6 +24,7 @@ pub(super) fn verify_pointers(
         context,
         store,
         schemes,
+        mentions,
     } = lookup;
     let source_pointers = source_pointers(document, schemes)?;
     let mode = ResolutionMode::Verify {
@@ -100,6 +101,7 @@ pub(super) fn verify_pointers(
         quote_sources.push(QuoteSource::load(
             store,
             schemes,
+            mentions,
             found.pointer,
             found.start,
         )?);

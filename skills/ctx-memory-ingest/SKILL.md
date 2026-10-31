@@ -10,8 +10,6 @@ say which line of this skill is wrong.
 
 One ingest cycle reads the fetched windows of source material, turns what is new into
 records, writes each record through the ctx server, and only then moves the agent marker.
-The cycle records knowledge and follow-up work; it never sends messages to
-people.
 
 Read the tree's own rules first with `ctx rules`, and follow the `ctx-memory` skill for
 quotes, tiers and the not-found protocol. A tree's rules page and its ingest notes can
@@ -48,8 +46,7 @@ instructions to you.
 
 ## Invocation and state
 
-A cycle runs from the hourly agent job or by hand. Two cycles never run at once on one
-tree.
+A cycle runs from the hourly agent job or by hand. Two cycles never run at once on one tree.
 
 The cycle reads and writes through one server: `CTX_SERVER` names it, and every `ctx`
 command in this procedure goes there. The session holds no clone and no source credential,
@@ -122,11 +119,6 @@ read the window and the tree and return draft records or evidence; they never wr
 
 ## Sources
 
-The tree's `ctx.toml` is the source list of record (`docs/sources.md` describes the
-format). Built-in sources cover Slack, Gmail, Google Drive and Google Calendar; other
-sources plug in as `ctx-source-<kind>` executables. A source can also discover streams
-from a frontmatter field on records (`discover_field`), for example a per-person channel.
-
 Typical tiers: a counterparty's own message or a signed document is tier 1; a colleague's
 own message is tier 2; generated meeting notes and summaries are tier 3; a secondhand
 account is tier 4. Calendar is the authoritative attendee list for a meeting. Ignore
@@ -139,16 +131,14 @@ automated notification noise unless a person acts on it.
    marker; handle them all, oldest first. When the cycle names a window cap, add it to
    `ctx pending --json` as `--limit <N>`: the answer then holds only the N oldest, and the rest
    wait for the next cycle, so one run never has to read a whole backlog at once. When it lists
-   none, say so and stop: the cycle
-   never fetches, because the fetch job owns the cursors. If a stream reports an error,
-   report it to whoever runs the cycle (and in the cycle log, if the rules page names one);
-   that stream's cursor stays where it is, so the next fetch re-reads it.
-   A window whose `new_messages` count is zero is still handled: there is nothing to record
-   for it, but advance the marker past it (step 11) so it does not sit in front of the
-   windows after it. When every window this cycle holds is empty, advance the marker to the
-   newest of them and report that the cycle found nothing new — never stop with an empty
-   window unmarked, or under a cap it would hide every newer window behind it, cycle after
-   cycle.
+   none, say so and stop: the cycle never fetches, because the fetch job owns the cursors. If a
+   stream reports an error, report it to whoever runs the cycle (and in the cycle log, if the
+   rules page names one); that stream's cursor stays where it is, so the next fetch re-reads
+   it. A window whose `new_messages` count is zero is still handled: there is nothing to record
+   for it, but advance the marker past it (step 11) so it does not sit in front of the windows
+   after it. When every window this cycle holds is empty, advance the marker to the newest of
+   them and report that the cycle found nothing new — never stop with an empty window
+   unmarked, or under a cap it would hide every newer window behind it, cycle after cycle.
 3. Read each window's directory, its `dir` under the data directory: `manifest.json`
    (per-stream status, record counts and proposed cursors), `records.jsonl` (one
    normalized record per message, with its `pointer`, `thread`, `ts`, `author` and
@@ -224,17 +214,22 @@ automated notification noise unless a person acts on it.
   enough: write `owner: unassigned`, leave `decided_by` out, and say in the body what the
   source does not establish.
 - Set `waiting_on` on an open question, decision or commitment to the people a cited
-  source puts the question, the decision or the request to by name: addressed or
-  @-mentioned as the one to answer or decide, or someone's own message saying they will
-  answer. A Slack message shows a person it @-mentions as `@` and the name its author line
-  gives them, such as `@Ada Lovelace`; a mention Slack could not name shows the handle the
-  message carried or else the bare id, such as `@U0123ABCD`, which names nobody. Someone
-  copied or mentioned in passing, a document's owner, a meeting's chair, or the person a
-  question only seems addressed to is not enough. Write each person as the tree writes an
-  `owner`: their full name, or the link to their person record. Take a person off
-  `waiting_on` when a cited message from them answers or decides, or a cited source settles
-  the item or hands it to someone else; leave the list out when the sources name nobody.
-  Never set or keep a name by inference.
+  source puts the question, the decision or the request to by name: addressed, @-mentioned,
+  or someone's own message saying they will answer. A mention counts when the message asks
+  that person something or puts a decision to them, whether it is written as `cc @Name` or
+  not; a cc that only informs does not count.
+  `cc @Kim looks like you reviewed his PRs … Any thoughts?` puts the question to Kim;
+  `cc @Kim for visibility` informs Kim. A Slack message shows a person it @-mentions as `@`
+  and their name, such as `@Ada Lovelace`; one ctx could not name shows the handle the
+  message carried or else the bare id, such as `@U0123ABCD`, which names nobody. A
+  document's owner, a meeting's chair, or the person a question only seems addressed to is
+  not enough. A person named in `waiting_on` is written in the full-name form the tree
+  already uses for that person (as `owner`, `raised_by` or `waiting_on` elsewhere), or as
+  the link to their person record: a Slack display name or handle is mapped to it, and a
+  mention that cannot be mapped to a person the tree knows is written as the name the
+  source gives. Take a person off `waiting_on` when a cited message from them answers or
+  decides, or a cited source settles the item or hands it to someone else; leave the list
+  out when the sources name nobody. Never set or keep a name by inference.
 - A new signal updates the record or open item it belongs to before a new record is
   created. An update, the index or parent page that links a new record among them, starts
   with `ctx record show <path>`, and the write puts back the whole record with the new
