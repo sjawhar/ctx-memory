@@ -520,7 +520,7 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     if arguments.index_wait > 0 {
         let mut warmed = warming.clone();
         let wait = Duration::from_secs(arguments.index_wait);
-        if tokio::time::timeout(wait, warmed.wait_for(|built| *built))
+        if tokio::time::timeout(wait, index_built(&mut warmed))
             .await
             .is_err()
         {
@@ -703,7 +703,7 @@ fn follow(
     tokio::spawn(async move {
         let period = Duration::from_secs(interval.max(1));
         let mut heard: Option<std::time::Instant> = None;
-        let _ = warming.wait_for(|built| *built).await;
+        index_built(&mut warming).await;
         loop {
             tokio::time::sleep(period).await;
             let following = Arc::clone(&shared);
@@ -751,6 +751,22 @@ fn warm_index(shared: Arc<Shared>) -> tokio::sync::watch::Receiver<bool> {
         drop(built.send(true));
     });
     building
+}
+
+/// Waits until the index build [`warm_index`] started is over, however it went.
+///
+/// The value is read out of the receiver rather than held, so nothing of the channel's own is
+/// alive while this waits.
+async fn index_built(building: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        let built = *building.borrow_and_update();
+        if built {
+            return;
+        }
+        if building.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// One pass of the follow loop.
