@@ -840,6 +840,59 @@ fn the_cycle_passes_its_window_cap_to_ctx_pending() -> Result<()> {
     Ok(())
 }
 
+/// The runner waits for the server to answer a read quickly before it starts a session, and
+/// gives the cycle up when it never does.
+///
+/// A copy of the server that has just started can hold its tree for minutes while it builds
+/// its index. A session started behind one waits in its first command, which omp turns into a
+/// background job and print mode then cancels, so the execution writes nothing; waiting here
+/// costs seconds and says so, and a server that never answers costs no session at all.
+#[test]
+fn the_runner_waits_for_the_server_before_it_starts_a_session() -> Result<()> {
+    let root = scratch("server-wait")?;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let path = std::env::var("PATH").context("PATH is not set")?;
+    let wait = script_function("wait_for_server")?;
+    let run = |ctx: &str, probe: &str, ready: &str| -> Result<std::process::Output> {
+        write_executable(&bin.join("ctx"), ctx)?;
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -eu\nSERVER_PROBE_SECONDS={probe}\nSERVER_READY_SECONDS={ready}\n{wait}\nwait_for_server"
+            ))
+            .env("PATH", format!("{}:{path}", bin.display()))
+            .output()
+            .context("running the wait for the server")
+    };
+    // A server that answers, and one that never does: `exec`, so the stand-in is the process
+    // the probe's timeout stops, with nothing left holding the read open behind it.
+    let answered = run("#!/bin/sh\nprintf '%s\\n' '{\"ok\":true}'\n", "5", "30")?;
+    let hung = run("#!/bin/sh\nexec sleep 30\n", "1", "1")?;
+    remove_scratch(&root)?;
+
+    ensure!(
+        answered.status.success(),
+        "the runner did not go on behind a server that answered: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    ensure!(
+        String::from_utf8_lossy(&answered.stdout).contains("the server answered a read"),
+        "the runner said nothing about the server it waited for: {}",
+        String::from_utf8_lossy(&answered.stdout)
+    );
+    ensure!(
+        !hung.status.success(),
+        "the runner went on to a session behind a server that answered no read"
+    );
+    ensure!(
+        String::from_utf8_lossy(&hung.stderr).contains("has not answered a read within 1s"),
+        "the runner did not say the server never answered: {}",
+        String::from_utf8_lossy(&hung.stderr)
+    );
+    Ok(())
+}
+
 /// The cap is optional and a positive whole number of windows: anything else is refused before
 /// anything is prepared for a session, the way a missing variable is.
 #[test]
@@ -1029,8 +1082,11 @@ fn a_maintenance_pass_runs_whether_or_not_a_window_is_pending() -> Result<()> {
     );
     pass_refusal?;
     ensure!(
-        pass_calls.is_empty(),
-        "the maintenance pass ran ctx before its session: {pass_calls:?}"
+        pass_calls
+            .lines()
+            .all(|line| line.starts_with("marker show")),
+        "the maintenance pass ran ctx for something other than the wait for the server before \
+         its session: {pass_calls:?}"
     );
     Ok(())
 }

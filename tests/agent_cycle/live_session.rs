@@ -654,6 +654,75 @@ fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
     Ok(())
 }
 
+/// No command the session runs becomes a background job.
+///
+/// omp backgrounds a command that outlives its threshold and hands the model a job id; the
+/// model can then end its turn waiting for a result, and print mode cancels every running job
+/// as it exits and still exits 0, so the session writes nothing and the execution is lost.
+/// That is what a restarted server cost the deployment on 2026-11-01, when the two reads a
+/// maintenance pass opened with took 163 s each. policy.yml turns auto-backgrounding and async
+/// bash off, so a slow command holds its turn and ends at the bash tool's own deadline, as an
+/// error the model reads and the job log keeps. The stand-in `ctx` here never answers, as a
+/// server behind its own first index build did not. No model is called.
+#[test]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
+fn a_live_session_waits_for_a_slow_command_rather_than_backgrounding_it() -> Result<()> {
+    let omp = pinned_omp()?;
+    let root = scratch("live-no-background")?;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    write_executable(&bin.join("ctx"), "#!/bin/sh\nexec sleep 30\n")?;
+    // A deadline of five seconds leaves omp four to wait in before it would background the
+    // call (`min(thresholdMs, timeoutMs - 1000)`), so a probe that would be backgrounded is
+    // backgrounded here in four seconds rather than in sixty.
+    let model = FakeModel::start(vec![
+        json!({"tool": "bash", "input": {"command": "ctx rules", "timeout": 5}}),
+        json!({"tool": "bash", "input": {"command": "ctx rules", "timeout": 5, "async": true}}),
+        json!({"text": "The script is finished."}),
+    ])?;
+    let path = std::env::var("PATH").unwrap_or_default();
+    let outcome = run_session(
+        &omp,
+        &root,
+        &model,
+        "Run the scripted probe.",
+        &[("PATH", &format!("{}:{path}", bin.display()))],
+        &[],
+    );
+    remove_scratch(&root)?;
+    outcome?;
+
+    let fields = model.tool_fields("bash")?;
+    ensure!(
+        !fields.iter().any(|field| field == "async"),
+        "the session's bash tool offers the model a background job: {fields:?}"
+    );
+    let results = model.tool_results()?;
+    for step in 0..2 {
+        let (error, text) = results
+            .iter()
+            .find(|(id, _, _)| *id == format!("toolu_{step}"))
+            .map(|(_, failed, text)| (*failed, text.clone()))
+            .with_context(|| {
+                format!("the session sent back no result for step {step}: {results:?}")
+            })?;
+        ensure!(
+            !text.contains("Backgrounded as job"),
+            "step {step} became a background job the session would wait for: {text}"
+        );
+        ensure!(error, "step {step} did not end as an error: {text}");
+    }
+    let (_, first) = results
+        .first()
+        .map(|(_, failed, text)| (*failed, text.clone()))
+        .context("the session sent back no result at all")?;
+    ensure!(
+        first.to_lowercase().contains("timed out"),
+        "the slow command did not end at the bash tool's deadline: {first}"
+    );
+    Ok(())
+}
+
 /// The arguments and standard input of each call the stand-in `ctx` kept, one directory per
 /// call under `calls`. A batch is a JSON list, compared by value: the order of keys in an object
 /// is the writer's.

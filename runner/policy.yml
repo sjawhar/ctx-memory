@@ -59,7 +59,19 @@ launch:
 # making HOME root's. The cycle uses no MCP server.
 mcp:
   enableProjectConfig: false
+# A command that outlives omp's threshold becomes a background job, and the model may then end
+# its turn waiting for a result that never comes: print mode cancels every background job as it
+# exits, and omp exits 0. One cycle was lost that way on 2026-11-01, when the server a restart
+# had just replaced took 163 s to answer the session's first two reads. The session runs no
+# command it should wait minutes for, so it gets no background jobs at all: a slow command holds
+# its turn and ends at the bash tool's own deadline, which the model reads as the error it is
+# (bash.autoBackground.enabled, async.enabled; exec/settings.ts, tools/bash.ts at the pinned
+# release).
+async:
+  enabled: false
 bash:
+  autoBackground:
+    enabled: false
   # direnv would load an .envrc the session can write in its working directory into every
   # shell (exec/direnv.ts). The image has no direnv, and this keeps it so if one is added.
   direnv: "off"

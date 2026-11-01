@@ -23,6 +23,7 @@ use axum::Router;
 use chrono::{DateTime, Utc};
 use tokio::net::TcpListener;
 
+use crate::config::{DataDir, StateDir};
 use crate::context::Context;
 use crate::git::{Access, Repo};
 use crate::lease::{self, Lease};
@@ -66,12 +67,17 @@ pub struct ServeArgs {
     /// Seconds between one pull of `main` and the next.
     #[arg(long, value_name = "SECONDS", default_value_t = 60)]
     pub pull_interval: u64,
+
+    /// Seconds the listeners wait for this copy's record index before they bind.
+    #[arg(long, value_name = "SECONDS", default_value_t = 90)]
+    pub index_wait: u64,
 }
 
 /// Everything the request handlers share: one loaded tree behind one lock, the write lease
 /// this copy holds, the last health check, which a probe answers from while the tree is
 /// busy, how the follow loop is doing, whether the disk holds what a failed rollback left,
-/// and the server's own directories, which no answer names.
+/// where the share's windows and this copy's index are, and the server's own directories,
+/// which no answer names.
 pub struct Shared {
     context: Mutex<Context>,
     lease: Mutex<WriteLease>,
@@ -82,6 +88,11 @@ pub struct Shared {
     /// tree back from disk: the tree served stays the one from before the write, until the
     /// clone holds nothing the remote lacks.
     tainted: AtomicBool,
+    /// The share's directory and this copy's own, read once when the server starts, as
+    /// [`Places`] reads the same paths. The index is built and caught up from them with no
+    /// hold on the tree, so a read is answered while that runs.
+    data: DataDir,
+    state: StateDir,
     places: Places,
 }
 
@@ -193,16 +204,33 @@ pub struct Following {
 }
 
 impl Shared {
-    /// Holds the tree a server answers from, with no lease taken yet, and makes the first
-    /// health check. A probe that finds the tree busy answers from the last check, and the
-    /// follow loop can take the tree before any probe gets in.
+    /// Holds the tree a server answers from, with no lease taken yet, makes the first health
+    /// check, and reads the directories this copy indexes from and keeps its index in.
+    ///
+    /// A probe that finds the tree busy answers from the last check, and the follow loop can
+    /// take the tree before any probe gets in.
     ///
     /// # Errors
     ///
-    /// Returns an error when the clone cannot be checked.
+    /// Returns an error when the clone cannot be checked or those directories cannot be
+    /// resolved.
     pub fn new(context: Context) -> Result<Self> {
         let health = command::check_health(&context)?;
         let places = Places::of(&context);
+        let data = DataDir::new(
+            context
+                .data()
+                .context("resolving the directory this copy indexes the share from")?
+                .root()
+                .to_path_buf(),
+        );
+        let state = StateDir::new(
+            context
+                .state()
+                .context("resolving the directory this copy keeps its index in")?
+                .root()
+                .to_path_buf(),
+        );
         Ok(Self {
             context: Mutex::new(context),
             lease: Mutex::new(WriteLease {
@@ -212,8 +240,22 @@ impl Shared {
             health: Mutex::new(health),
             following: Mutex::new(Following::default()),
             tainted: AtomicBool::new(false),
+            data,
+            state,
             places,
         })
+    }
+
+    /// Where the share keeps its windows, as this copy read it when it started.
+    #[must_use]
+    pub fn data(&self) -> &DataDir {
+        &self.data
+    }
+
+    /// Where this copy keeps its own index, as it read it when it started.
+    #[must_use]
+    pub fn state(&self) -> &StateDir {
+        &self.state
     }
 
     /// `text`, as a remote caller may read it: the server's own directories are named
@@ -467,6 +509,28 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     // tree busy answers from the last check, and the first follow pass may hold the tree
     // before any probe gets in. A clone that cannot be checked is one no write can start from.
     let shared = Arc::new(Shared::new(context).context("checking the clone before serving it")?);
+    // The record index is replayed from every window on the share whenever the state
+    // directory holds none, which a container's does at every start, and the first caller to
+    // need one used to wait that replay out. It is built here instead, before any port is
+    // bound, so the deployment's startup probe holds traffic while it runs, and off the tree
+    // lock, so a read that needs no index is answered while it goes. The listeners wait no
+    // longer than `--index-wait` for it, because a startup probe gives a container a bounded
+    // time to accept a connection and a share whose replay outlasts that still needs serving.
+    let warming = warm_index(Arc::clone(&shared));
+    if arguments.index_wait > 0 {
+        let mut warmed = warming.clone();
+        let wait = Duration::from_secs(arguments.index_wait);
+        if tokio::time::timeout(wait, warmed.wait_for(|built| *built))
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "the record index is still being built after {}s: binding the listeners now, \
+                 and a read that needs the index waits for the rest of it",
+                arguments.index_wait
+            );
+        }
+    }
     let mut servers = Vec::new();
     // A container runtime stops this copy with SIGTERM before the copy that replaces it
     // writes. Both listeners stop on that signal, and the lease is given up afterwards.
@@ -522,7 +586,7 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
                 .into_future(),
         ));
     }
-    let following = follow(Arc::clone(&shared), arguments.pull_interval);
+    let following = follow(Arc::clone(&shared), arguments.pull_interval, warming);
     let signalled = tokio::spawn(async move {
         match terminated().await {
             Ok(()) => drop(stop.send(true)),
@@ -623,29 +687,29 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(300);
 
 /// Follows `main` and the windows the fetch job writes.
 ///
-/// Every interval, under the one writer lock: fast-forward the clone, reload the tree and its
-/// index when the commit moved, and index the windows that appeared on the share. A record a
-/// person merges on GitHub is searchable within one interval. How each pass went is kept for
-/// `/healthz`, and said on standard error: each failed pass, and a heartbeat while they succeed.
-fn follow(shared: Arc<Shared>, interval: u64) -> tokio::task::JoinHandle<()> {
+/// Every interval: fast-forward the clone and reload the tree when the commit moved, under
+/// the one writer lock, and index the windows that appeared on the share, which takes no
+/// lock. A record a person merges on GitHub is searchable within one interval. How each pass
+/// went is kept for `/healthz`, and said on standard error: each failed pass, and a heartbeat
+/// while they succeed.
+///
+/// The first pass waits for the index this copy built as it started ([`warm_index`]): a pass
+/// beside that build would replay the same windows a second time.
+fn follow(
+    shared: Arc<Shared>,
+    interval: u64,
+    mut warming: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let period = Duration::from_secs(interval.max(1));
-        let mut seen: Option<windows::WindowId> = None;
         let mut heard: Option<std::time::Instant> = None;
+        let _ = warming.wait_for(|built| *built).await;
         loop {
             tokio::time::sleep(period).await;
             let following = Arc::clone(&shared);
-            let carried = seen.clone();
-            let followed = tokio::task::spawn_blocking(move || {
-                let mut seen = carried;
-                follow_once(&following, &mut seen).map(|()| seen)
-            })
-            .await;
+            let followed = tokio::task::spawn_blocking(move || follow_once(&following)).await;
             let failure = match followed {
-                Ok(Ok(next)) => {
-                    seen = next;
-                    None
-                }
+                Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(format!("{error:#}")),
                 Err(error) => Some(format!("the follow pass stopped: {error}")),
             };
@@ -662,7 +726,40 @@ fn follow(shared: Arc<Shared>, interval: u64) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// Builds this copy's record index, and catches it up to the windows on the share.
+///
+/// The index is in the state directory, which a container's image does not carry, so it is
+/// replayed from every window on the share at every start. That replay is started here, as
+/// the server starts, rather than left to the first caller that needs an index or to the
+/// first follow pass. It holds nothing a read waits on.
+///
+/// The receiver says when the build is over, however it went: a failure is one line on
+/// standard error, and the next follow pass tries again.
+fn warm_index(shared: Arc<Shared>) -> tokio::sync::watch::Receiver<bool> {
+    let (built, building) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let indexed =
+            tokio::task::spawn_blocking(move || index_windows(shared.data(), shared.state())).await;
+        match indexed {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "building the record index: {}",
+                one_line(&format!("{error:#}"))
+            ),
+            Err(error) => eprintln!("building the record index: the build stopped: {error}"),
+        }
+        drop(built.send(true));
+    });
+    building
+}
+
 /// One pass of the follow loop.
+///
+/// The pull takes the tree, because it rewrites the files the tree was read from. The windows
+/// are indexed after it, with the tree free: that reads the share and writes this copy's own
+/// index, and touches nothing a read is answered from. A pass used to hold the tree for all of
+/// it, so a copy whose state directory was empty — a container's is at every start — held it
+/// for as long as replaying every window on the share took, and every read waited that out.
 ///
 /// A failed pull is not the end of the pass: the windows the fetch job wrote are on the
 /// share, not in the clone, so they are still indexed while the remote is unreachable.
@@ -670,16 +767,18 @@ fn follow(shared: Arc<Shared>, interval: u64) -> tokio::task::JoinHandle<()> {
 /// A tree that is not a git repository has no `main` to follow. Every other failure — git
 /// unable to open the clone, GitHub refusing the token a pull needs — is the loop failing,
 /// and is reported.
-fn follow_once(shared: &Shared, seen: &mut Option<windows::WindowId>) -> Result<()> {
-    let mut tree = shared.tree()?;
-    let root = tree.tree.root.clone();
-    let pulled = match Repo::open_optional(&root) {
-        Ok(Some(repo)) => follow_main(repo, &mut tree, &root, shared),
-        Ok(None) => Ok(()),
-        Err(error) => Err(error),
+fn follow_once(shared: &Shared) -> Result<()> {
+    let pulled = {
+        let mut tree = shared.tree()?;
+        let root = tree.tree.root.clone();
+        match Repo::open_optional(&root) {
+            Ok(Some(repo)) => follow_main(repo, &mut tree, &root, shared),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        }
     };
-    let ingested = ingest_windows(&tree, seen);
-    pulled.and(ingested)
+    let indexed = index_windows(shared.data(), shared.state());
+    pulled.and(indexed)
 }
 
 /// Brings the clone up to the remote: puts a clone `ctx` made back the way the remote has it
@@ -711,22 +810,16 @@ fn follow_main(repo: Repo, tree: &mut Context, root: &Path, shared: &Shared) -> 
     pulled
 }
 
-/// Indexes the windows that appeared on the share since the last pass.
-fn ingest_windows(context: &Context, seen: &mut Option<windows::WindowId>) -> Result<()> {
-    let data = context.data()?;
-    let fresh = windows::after(&data.windows(), seen.as_ref())?;
-    if fresh.is_empty() {
-        return Ok(());
-    }
-    let store = Store::load(data, context.state()?)?;
-    for window in fresh {
-        let (fetched_at, by_source) = window.records_by_source()?;
-        for (source, records) in by_source {
-            store.put_all(&source, &records, fetched_at)?;
-        }
-        *seen = Some(window.id.clone());
-    }
-    Ok(())
+/// Indexes every completed window this copy's index has not indexed yet, oldest first.
+///
+/// The index keeps that watermark itself ([`Store::catch_up`]), so a copy replays the share
+/// once, when it builds its index, and reads only what appeared since on every pass after
+/// that. The follow loop used to keep the watermark in memory, where every copy starts with
+/// nothing: a copy's first pass then re-read every window on the share, however many there
+/// were, and the deployment's took 157 s of a restart on 2026-11-01 with the tree held.
+fn index_windows(data: &DataDir, state: &StateDir) -> Result<()> {
+    let store = Store::load(data, state).context("opening this copy's record index")?;
+    store.catch_up(data)
 }
 
 /// Prints one bound address, so a caller that asked for port 0 can find it.
@@ -807,8 +900,10 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{panic_line, Places, Shared};
+    use super::{index_windows, panic_line, Places, Shared};
     use crate::context::Context;
+    use crate::pointer::Pointer;
+    use crate::store::Store;
 
     /// A panic's report is one line whatever its message holds, names where the panic
     /// happened, and carries no credential.
@@ -977,6 +1072,57 @@ mod tests {
             "the mark went while the record was there"
         );
         assert!(!tainted_after, "the mark stayed once the tree was clean");
+        Ok(())
+    }
+
+    /// The share is indexed with the tree free. A read takes the tree, and a pass that held
+    /// it while it replayed every window on the share made every read wait behind it: on
+    /// 2026-11-01 a restarted copy of the deployment held it for 157 s, and the two reads a
+    /// scheduled session opened with waited 163 s.
+    #[test]
+    fn the_share_is_indexed_while_something_else_holds_the_tree() -> Result<()> {
+        let id = format!("ctx-index-off-the-lock-{}", std::process::id());
+        let root = std::env::temp_dir().join(&id);
+        let data = root.join("data");
+        let window = data.join("windows/20260102T000000Z-0000");
+        std::fs::create_dir_all(&window)?;
+        std::fs::write(
+            root.join("ctx.toml"),
+            format!(
+                "version = 1\nid = \"{id}\"\ndata_dir = \"{}\"\n",
+                data.display()
+            ),
+        )?;
+        std::fs::write(root.join("rules.md"), "---\ntype: rules\n---\n# Rules\n")?;
+        std::fs::write(
+            window.join("manifest.json"),
+            "{\"version\":1,\"window\":\"20260102T000000Z-0000\",\"generated_at\":\"2026-01-02T00:00:00Z\",\"window_end\":\"2026-01-02T00:00:00Z\",\"sources\":{},\"warnings\":[],\"exit_status\":\"ok\"}\n",
+        )?;
+        std::fs::write(
+            window.join("records.jsonl"),
+            "{\"source\":\"echo\",\"record\":{\"pointer\":\"echo:C0EXAMPLE01/held\",\"stream\":\"C0EXAMPLE01\",\"ts\":\"2026-01-01T23:00:00Z\",\"text\":\"indexed while the tree was held\"}}\n",
+        )?;
+        std::fs::write(window.join("rendered.md"), "# window\n")?;
+
+        let shared = Shared::new(Context::open(&root)?)?;
+        let state = shared.state().root().to_path_buf();
+        let held = shared.tree()?;
+        let indexed = index_windows(shared.data(), shared.state());
+        drop(held);
+        let found = Store::load(shared.data(), shared.state()).and_then(|store| {
+            store.get(&Pointer {
+                scheme: "echo".to_owned(),
+                locator: "C0EXAMPLE01/held".to_owned(),
+            })
+        });
+        std::fs::remove_dir_all(&root)?;
+        std::fs::remove_dir_all(&state)?;
+
+        indexed?;
+        assert!(
+            found?.is_some(),
+            "the window was not indexed while the tree was held"
+        );
         Ok(())
     }
 }

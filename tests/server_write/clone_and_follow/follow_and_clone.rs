@@ -49,23 +49,13 @@ fn a_new_window_becomes_resolvable() -> Result<()> {
     let tree = fixture_clone("follow-window")?;
     fetch_window(&tree)?;
     let server = Server::start(&tree, &["--pull-interval", "1"])?;
-    // The first resolve builds the server's local index from the window the fetch wrote.
+    // The window the fetch wrote is in the index the server built before it bound its port.
     let first = server.command(&["resolve", "echo:C0EXAMPLE01/record"])?;
     assert_eq!(first.field("exit_code")?, &json!(0));
 
     // The fetch job writes a later window on the share, which the server has not indexed.
     let root = tree.parent().context("the fixture has a root")?;
-    let window = root.join("data/windows/20260102T000000Z-0001");
-    std::fs::create_dir_all(&window)?;
-    std::fs::write(
-        window.join("manifest.json"),
-        "{\"version\":1,\"window\":\"20260102T000000Z-0001\",\"generated_at\":\"2026-01-02T00:00:00Z\",\"window_end\":\"2026-01-02T00:00:00Z\",\"sources\":{},\"warnings\":[],\"exit_status\":\"ok\"}\n",
-    )?;
-    std::fs::write(
-        window.join("records.jsonl"),
-        "{\"source\":\"echo\",\"record\":{\"pointer\":\"echo:C0EXAMPLE02/record\",\"stream\":\"C0EXAMPLE02\",\"ts\":\"2026-01-01T23:00:00Z\",\"text\":\"echo C0EXAMPLE02\"}}\n",
-    )?;
-    std::fs::write(window.join("rendered.md"), "# window\n")?;
+    write_window(root, "20260102T000000Z-0001", "C0EXAMPLE02")?;
 
     let resolved = within(10, || {
         let reply = server.command(&["resolve", "echo:C0EXAMPLE02/record"])?;
@@ -74,6 +64,107 @@ fn a_new_window_becomes_resolvable() -> Result<()> {
             .map(str::to_owned)
             .ok()
             .filter(|stdout| stdout.contains("echo C0EXAMPLE02")))
+    });
+    drop(server);
+    remove_fixture(&tree)?;
+    resolved?;
+    Ok(())
+}
+
+/// Writes one completed window on the share, as the fetch job leaves it: a record of the echo
+/// source in `stream`, under the pointer `echo:<stream>/record`.
+fn write_window(root: &Path, id: &str, stream: &str) -> Result<()> {
+    let window = root.join("data/windows").join(id);
+    std::fs::create_dir_all(&window)?;
+    std::fs::write(
+        window.join("manifest.json"),
+        format!(
+            "{{\"version\":1,\"window\":\"{id}\",\"generated_at\":\"2026-01-02T00:00:00Z\",\"window_end\":\"2026-01-02T00:00:00Z\",\"sources\":{{}},\"warnings\":[],\"exit_status\":\"ok\"}}\n"
+        ),
+    )?;
+    std::fs::write(
+        window.join("records.jsonl"),
+        format!(
+            "{{\"source\":\"echo\",\"record\":{{\"pointer\":\"echo:{stream}/record\",\"stream\":\"{stream}\",\"ts\":\"2026-01-01T23:00:00Z\",\"text\":\"echo {stream}\"}}}}\n"
+        ),
+    )?;
+    std::fs::write(window.join("rendered.md"), "# window\n")?;
+    Ok(())
+}
+
+/// A copy builds its index before it binds a port. The index is in the state directory, which
+/// a container's image does not carry, so a copy that left the build to the first caller that
+/// needed one — or to its first follow pass, a pull interval later — answered that caller
+/// minutes later. The pull interval here is long enough that no pass runs during the test, so
+/// only the build this copy makes before it binds can have indexed the window.
+#[test]
+fn the_index_is_built_before_the_listeners_are_bound() -> Result<()> {
+    let tree = fixture_clone("index-before-listen")?;
+    fetch_window(&tree)?;
+    let root = tree.parent().context("the fixture has a root")?;
+    write_window(root, "20260102T000000Z-0001", "C0EXAMPLE02")?;
+
+    let server = Server::start(&tree, &["--pull-interval", "600"])?;
+    let resolved = server
+        .command(&["resolve", "echo:C0EXAMPLE02/record"])
+        .and_then(|reply| reply.text("stdout").map(str::to_owned));
+    drop(server);
+    remove_fixture(&tree)?;
+    let resolved = resolved?;
+    assert!(
+        resolved.contains("echo C0EXAMPLE02"),
+        "the window was not indexed before the listeners were bound: {resolved}"
+    );
+    Ok(())
+}
+
+/// A copy that starts reads only the windows its index has not indexed yet. Each one used to
+/// re-read every window on the share at its first pass, because the loop kept that watermark
+/// in memory: the deployment's copy of 2026-11-01 held the tree for 157 s doing it, and every
+/// read waited behind it. The store keeps the watermark, so the window read here is the new
+/// one; the old one cannot be read at all, and reading it would be the failure.
+#[test]
+fn a_restarted_copy_reads_only_the_windows_its_index_has_not_seen() -> Result<()> {
+    let tree = fixture_clone("index-watermark")?;
+    fetch_window(&tree)?;
+    let root = tree.parent().context("the fixture has a root")?;
+    let mut server = Server::start(&tree, &["--pull-interval", "1"])?;
+    let indexed = within(10, || {
+        let reply = server.command(&["resolve", "echo:C0EXAMPLE01/record"])?;
+        Ok(reply
+            .text("stdout")
+            .map(str::to_owned)
+            .ok()
+            .filter(|stdout| stdout.contains("echo C0EXAMPLE01")))
+    });
+    server.terminate()?;
+    drop(server);
+    indexed?;
+
+    // The copy that replaces it finds the window it already indexed unreadable, and a new one
+    // beside it. A pass that read the share from the start would fail on the first and never
+    // reach the second.
+    let fetched = std::fs::read_dir(root.join("data/windows"))?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("2026"))
+        .context("the fetch wrote no window")?;
+    std::fs::write(
+        root.join("data/windows")
+            .join(&fetched)
+            .join("records.jsonl"),
+        "this window cannot be read\n",
+    )?;
+    write_window(root, "20260103T000000Z-0000", "C0EXAMPLE03")?;
+
+    let server = Server::start(&tree, &["--pull-interval", "1"])?;
+    let resolved = within(10, || {
+        let reply = server.command(&["resolve", "echo:C0EXAMPLE03/record"])?;
+        Ok(reply
+            .text("stdout")
+            .map(str::to_owned)
+            .ok()
+            .filter(|stdout| stdout.contains("echo C0EXAMPLE03")))
     });
     drop(server);
     remove_fixture(&tree)?;

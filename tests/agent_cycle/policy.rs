@@ -329,6 +329,32 @@ fn the_session_reads_no_url() -> Result<()> {
     Ok(())
 }
 
+/// At the pinned omp a non-PTY command that outlives `bash.autoBackground.thresholdMs`
+/// becomes a background job, and `async.enabled` offers the model one outright. A session
+/// that ends its turn waiting for a job gets nothing: print mode cancels every running job as
+/// it exits, and omp exits 0. The cycle runs no command worth waiting minutes for, so both are
+/// off and a slow command ends at the bash tool's own deadline, as an error the model reads
+/// (`exec/settings.ts`, `tools/bash.ts` at the pinned release).
+#[test]
+fn the_session_turns_no_command_into_a_background_job() -> Result<()> {
+    let policy = policy()?;
+    assert_eq!(
+        policy
+            .pointer("/bash/autoBackground/enabled")
+            .and_then(Value::as_bool),
+        Some(false),
+        "the policy leaves bash.autoBackground.enabled at omp's default, so a command that \
+         outlives its threshold becomes a job the session can end its turn waiting for"
+    );
+    assert_eq!(
+        policy.pointer("/async/enabled").and_then(Value::as_bool),
+        Some(false),
+        "the policy leaves async.enabled at omp's default, so the session's bash tool offers \
+         the model a background job"
+    );
+    Ok(())
+}
+
 #[test]
 fn the_model_key_leaves_the_session_environment() -> Result<()> {
     let script = runner("run-cycle.sh")?;
