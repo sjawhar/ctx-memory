@@ -281,11 +281,13 @@ fn the_ingest_skill_closes_quoted_text_only_with_the_cycles_nonce() -> Result<()
 }
 
 /// Six kinds of message made records nobody used: payment receipts, spend alerts, the fetch's
-/// own bookkeeping, mirrors of one pull request or issue, records closed when created, and
-/// records about the pipeline itself. The skill names each, and where a fact worth keeping in
-/// one goes instead: a metric, a decision a merged pull request carries, the open record a
-/// closing source closes. This checks that the instructions are there, not that an agent
-/// follows them.
+/// own bookkeeping, a record of one change in a repository, records of what had already
+/// happened, and records about the pipeline itself. The skill names each, and where a fact
+/// worth keeping in one goes instead: a metric, a decision a merged change carries, the open
+/// record a closing source closes. A later trial showed the first two of those read too
+/// narrowly — a person's own commit was not read as "one change", and `status: active` on a
+/// merged change not as "closed on arrival" — so the pins below hold the wording that covers
+/// both. This checks that the instructions are there, not that an agent follows them.
 #[test]
 fn the_ingest_skill_says_what_is_not_a_record() -> Result<()> {
     let flat = skill("ctx-memory-ingest")?
@@ -303,12 +305,18 @@ fn the_ingest_skill_says_what_is_not_a_record() -> Result<()> {
         "Add the threshold and its date to the metric of that spending or usage",
         "no record of any type, `gap` included",
         "evidence a record lacks goes in that record's body",
-        "no project or ops record whose one source is a single pull request or issue",
-        "a decision and who made it, a named person's commitment, an open question or a metric, \
-         each citing the item",
+        "no project or ops record whose sources are one change in a repository (its pull \
+         request, issue, commits or release), whoever made it, a person's own commit as much \
+         as a bot's",
+        "a decision and who made it, a named person's commitment, an open question or a \
+         metric, each citing the item",
         "already answered, cancelled, closed, completed, done, resolved, superseded or withdrawn",
+        "none whose news is a change already merged, pushed, released or deployed, whatever \
+         status you would give it (`current` and `active` too)",
         "Close the open record the source closes",
         "a decision someone made is `decided`, not closed",
+        "An ops or project record names who must still do, decide or answer what; if no one \
+         must, write none",
         "The pipeline that builds this graph",
         "the issues and messages about them, get no record of any type",
         "With no cycle log named, write no record about the cycle",

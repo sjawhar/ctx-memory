@@ -132,6 +132,56 @@ fn rules_prints_the_rules_page() -> Result<()> {
     Ok(())
 }
 
+/// A writer has to know which fields its record type requires before it writes: the server
+/// refuses a record that breaks its type's schema, and the tree owns those schemas. `ctx rules`
+/// prints each one after the rules page, in both forms.
+#[test]
+fn rules_prints_each_schema_the_tree_owns() -> Result<()> {
+    let tree = scratch()?;
+    std::fs::write(tree.join("ctx.toml"), "version = 1\n")?;
+    std::fs::write(tree.join("rules.md"), "---\ntype: rules\n---\n# Rules\n")?;
+    let schemas = tree.join("schemas");
+    std::fs::create_dir(&schemas)?;
+    std::fs::write(
+        schemas.join("decision.yaml"),
+        "type: object\nrequired: [type, status, statement, revisit_by]\n",
+    )?;
+    std::fs::write(
+        schemas.join("metric.yaml"),
+        "type: object\nrequired: [type, name, value, unit, as_of]\n",
+    )?;
+    let tree_text = tree.to_str().context("test tree path is not valid UTF-8")?;
+    let printed = binary()
+        .args(["--memory", tree_text, "rules"])
+        .output()
+        .context("running ctx rules")?;
+    let value = ctx(&tree, &["--json", "rules"])?;
+    remove_scratch(&tree)?;
+
+    let stdout = String::from_utf8(printed.stdout)?;
+    assert_eq!(printed.status.code(), Some(0), "{stdout}");
+    for expected in [
+        "schemas/decision.yaml",
+        "required: [type, status, statement, revisit_by]",
+        "schemas/metric.yaml",
+        "required: [type, name, value, unit, as_of]",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "ctx rules never prints {expected:?}: {stdout}"
+        );
+    }
+    let kinds: Vec<&str> = value
+        .pointer("/data/schemas")
+        .and_then(Value::as_array)
+        .context("the rules answer lists the schemas")?
+        .iter()
+        .filter_map(|schema| schema.get("kind").and_then(Value::as_str))
+        .collect();
+    assert_eq!(kinds, ["decision", "metric"], "{value}");
+    Ok(())
+}
+
 #[test]
 fn dossier_page_resolves_a_unique_basename() -> Result<()> {
     let tree = fixture_tree()?;

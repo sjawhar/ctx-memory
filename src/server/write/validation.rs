@@ -84,11 +84,17 @@ pub(super) fn check(context: &Context, edits: &[Edit<'_>]) -> Result<Vec<Finding
         })
         .collect();
     let verification = resolve::verify_documents(context, &written, false)?;
+    // A record can carry many quotes from one source, so a quote finding names the record's
+    // line it is on, and says how a writer finds the words that do hold.
     for broken in verification.broken {
         findings.push(Finding {
             kind: "quote".to_owned(),
             path: broken.file,
-            detail: format!("{} — {}", broken.pointer, broken.why),
+            detail: format!(
+                "line {}: {} — {}; copy the quote word for word from `ctx resolve {}`, citing \
+                 the pointer exactly as the window's records.jsonl gives it",
+                broken.line, broken.pointer, broken.why, broken.pointer
+            ),
         });
     }
     // The server is the one writer: a quote it cannot check must not be committed as if it
@@ -200,7 +206,14 @@ fn structural_findings(sweep: &sweep::Findings, path: &str) -> Vec<Finding> {
     };
     let mut findings = Vec::new();
     for gap in sweep.gaps.iter().filter(|gap| gap.from == path) {
-        findings.push(about("gap", format!("the link {} has no file", gap.target)));
+        findings.push(about(
+            "gap",
+            format!(
+                "the link {} has no file: write that record first or in the same call, or link \
+                 a record that exists",
+                gap.target
+            ),
+        ));
     }
     for ambiguous in sweep.ambiguous.iter().filter(|entry| entry.from == path) {
         findings.push(about(
@@ -219,7 +232,10 @@ fn structural_findings(sweep: &sweep::Findings, path: &str) -> Vec<Finding> {
     {
         findings.push(about(
             "schema",
-            format!("{}{}", violation.pointer, violation.message),
+            format!(
+                "{}{} (`ctx rules` prints the schema of each record type)",
+                violation.pointer, violation.message
+            ),
         ));
     }
     for invalid in sweep

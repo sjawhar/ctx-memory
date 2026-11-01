@@ -129,9 +129,13 @@ pub(super) fn verify_quotes(
                 let Some(source) = sources.first() else {
                     continue;
                 };
+                // The finding names the line the record writes this quote on, not the line of
+                // the source's first citation: a record often quotes one source many times,
+                // and the writer has to see which quote failed.
+                let start = document.raw.find(claim.quote).unwrap_or(source.start);
                 verification.broken.push(broken(
                     document,
-                    source.start,
+                    start,
                     &source.pointer,
                     "quote does not appear in the resolved text".to_owned(),
                 ));

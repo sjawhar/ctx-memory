@@ -29,12 +29,17 @@ fn put_with_sweep_finding_is_422_and_leaves_tree_clean() -> Result<()> {
         .as_array()
         .context("findings is a list")?;
     assert_eq!(findings.len(), 1, "unexpected findings: {findings:?}");
-    assert_eq!(
-        findings
-            .first()
-            .and_then(|finding| finding.get("kind"))
-            .and_then(Value::as_str),
-        Some("gap")
+    let finding = findings.first().context("the refusal names a finding")?;
+    assert_eq!(finding.get("kind").and_then(Value::as_str), Some("gap"));
+    // The caller is a session that cannot read this code, so the finding says what to do
+    // about it: the two writes that land a record and the record it links.
+    let detail = finding
+        .get("detail")
+        .and_then(Value::as_str)
+        .context("the finding carries its detail")?;
+    assert!(
+        detail.contains("write that record first or in the same call"),
+        "the gap finding says only what is wrong: {detail}"
     );
     assert_eq!(status, "", "the rejected write left the tree dirty");
     assert!(
@@ -106,11 +111,67 @@ fn put_with_unverifiable_quote_is_422() -> Result<()> {
         .field("findings")?
         .as_array()
         .context("findings is a list")?;
+    let detail = findings
+        .iter()
+        .find(|finding| finding.get("kind").and_then(Value::as_str) == Some("quote"))
+        .and_then(|finding| finding.get("detail"))
+        .and_then(Value::as_str)
+        .with_context(|| format!("a quote finding with its detail: {findings:?}"))?;
+    // A record can quote one source many times, so the finding names the line this quote is
+    // on (line 5 of `cited_record`), and says where the words that do hold can be read.
     assert!(
-        findings
-            .iter()
-            .any(|finding| finding.get("kind").and_then(Value::as_str) == Some("quote")),
-        "unexpected findings: {findings:?}"
+        detail.starts_with("line 5: echo:C0EXAMPLE01/record"),
+        "the quote finding does not name the quote's own line: {detail}"
+    );
+    assert!(
+        detail.contains("copy the quote word for word from `ctx resolve echo:C0EXAMPLE01/record`"),
+        "the quote finding says only what is wrong: {detail}"
+    );
+    assert_eq!(status, "", "the rejected write left the tree dirty");
+    Ok(())
+}
+
+/// A record that breaks its type's schema is refused, and the finding names the field and
+/// where the writer reads the schema: a session that cannot see `schemas/` would otherwise
+/// guess the same record again.
+#[test]
+fn put_breaking_its_types_schema_is_422_and_names_where_the_schema_is() -> Result<()> {
+    let tree = fixture_clone("write-schema")?;
+    std::fs::create_dir(tree.join("schemas"))?;
+    std::fs::write(
+        tree.join("schemas/decision.yaml"),
+        "type: object\nrequired: [type, status, statement]\n",
+    )?;
+    git(&tree, &["add", "schemas/decision.yaml"])?;
+    crate::support::commit(&tree, "the decision schema")?;
+    git(&tree, &["push", "--quiet", "origin", "main"])?;
+    fetch_window(&tree)?;
+    let server = Server::start(&tree, &[])?;
+    let reply = server.post_as(
+        "ada@example.com",
+        "/v1/records/put",
+        // `good_record` carries no `statement`, which this tree's schema requires.
+        &put_body("decisions/schema.md", &good_record(), "session-schema"),
+    )?;
+    drop(server);
+    let status = git(&tree, &["status", "--porcelain"])?;
+    remove_fixture(&tree)?;
+
+    assert_eq!(reply.status, 422, "unexpected body: {}", reply.body);
+    let findings = reply
+        .field("findings")?
+        .as_array()
+        .context("findings is a list")?;
+    let detail = findings
+        .iter()
+        .find(|finding| finding.get("kind").and_then(Value::as_str) == Some("schema"))
+        .and_then(|finding| finding.get("detail"))
+        .and_then(Value::as_str)
+        .with_context(|| format!("a schema finding with its detail: {findings:?}"))?;
+    assert!(
+        detail.contains("\"statement\" is a required property")
+            && detail.contains("`ctx rules` prints the schema of each record type"),
+        "the schema finding does not say where the schema is: {detail}"
     );
     assert_eq!(status, "", "the rejected write left the tree dirty");
     Ok(())
