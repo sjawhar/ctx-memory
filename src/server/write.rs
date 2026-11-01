@@ -229,6 +229,9 @@ async fn advance(shared: &Arc<Shared>, caller: Caller, request: MarkerRequest) -
         Some(session) => format!("{} ({session})", caller.email),
         None => caller.email,
     };
+    // A write checks its records, which reads the index this copy builds as it comes up, so
+    // it waits for that build here rather than under the tree ([`Shared::index_ready`]).
+    shared.index_ready().await;
     // The answer, and the `write failed:` line of a marker that did not move, are made in the
     // blocking task: hyper drops a request whose caller hung up, not the task, and the line
     // must still come.
@@ -299,6 +302,7 @@ async fn write(
     note: &Note,
 ) -> Response {
     let shared = &listener.shared;
+    shared.index_ready().await;
     let writing = Arc::clone(shared);
     let session = session_label(session.as_deref()).unwrap_or_else(|| "unknown".to_owned());
     let note = note.clone();

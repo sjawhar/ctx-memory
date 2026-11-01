@@ -17,13 +17,14 @@
 # reach the server through the `ctx_record_put` tool, which runs `ctx record put -- <path> -`
 # with the record, or `ctx record put --batch -` with several, on standard input), --no-lsp
 # starts no language server, and omp keeps no shell snapshot, because the directory it would
-# write one to is root's. Before it starts, this script checks that ctx-agent can read the
-# windows and write its own transcript directory but nothing else on the share, nor anything in
-# its home or working directory (where omp reads its configuration, the shell its startup files,
-# and omp and ctx discover the tools and servers they start), omp's plugin directory and native
-# module, or that snapshot directory; if any check fails, no session runs. After the session,
-# the transcript directory goes back to root, so no later cycle can rewrite it; the next cycle
-# seals the directory of one that was killed before it could.
+# write one to is root's. Before it starts, this script waits for the server to answer a read
+# quickly, and checks that ctx-agent can read the windows and write its own transcript directory
+# but nothing else on the share, nor anything in its home or working directory (where omp reads
+# its configuration, the shell its startup files, and omp and ctx discover the tools and servers
+# they start), omp's plugin directory and native module, or that snapshot directory; if any
+# check fails, no session runs. After the session, the transcript directory goes back to root,
+# so no later cycle can rewrite it; the next cycle seals the directory of one that was killed
+# before it could.
 #
 # `run-cycle.sh maintain <pass>` runs one maintenance pass instead of a cycle: a one-time job over
 # the whole tree, such as re-checking a field on every open record after the ingest skill gained
@@ -230,6 +231,51 @@ fi
 # carry omp's own session id or the user, and a request or a record could not be traced back to
 # the session that sent it, whose JSONL is under the execution's name.
 export CTX_SESSION="$CLOUD_RUN_EXECUTION"
+
+# The server answers a cheap read, quickly, before anything else here runs. A copy that has
+# just started can hold its tree for minutes: the deployment's held it for 157 s on 2026-11-01
+# while it built its record index, and the two commands the session opened with waited 163 s
+# each. omp turns a command that outlives its threshold into a background job, the model ends
+# its turn waiting for that job, and print mode cancels it as it exits, so an execution that
+# waits in the session writes nothing at all. Waiting here instead costs seconds, says so in the
+# job log, and leaves a server that never answers as one `run-cycle:` line and no session.
+#
+# SERVER_PROBE_SECONDS is what "quickly" means: a read the server answers more slowly than this
+# is one the session must not be started behind. SERVER_READY_SECONDS is how long this waits for
+# such an answer before it gives the cycle up for the next one.
+SERVER_PROBE_SECONDS=15
+SERVER_READY_SECONDS=300
+
+command -v timeout >/dev/null 2>&1 ||
+	refuse "this image has no timeout(1), which the wait for the server needs"
+
+# Waits until the server answers `ctx marker show` within SERVER_PROBE_SECONDS, or says why it
+# never did and answers non-zero. Every attempt it gives up on is one line of the job log, with
+# what ctx printed, so a slow start and an unreachable server read differently afterwards. No
+# attempt outlives the deadline: each is given what is left of SERVER_READY_SECONDS when it
+# starts, and the wait ends there rather than a probe's length past it.
+wait_for_server() {
+	deadline=$(($(date +%s) + SERVER_READY_SECONDS))
+	while :; do
+		started="$(date +%s)"
+		patience=$((deadline - started))
+		[ "$patience" -gt 0 ] || return 1
+		[ "$patience" -le "$SERVER_PROBE_SECONDS" ] || patience="$SERVER_PROBE_SECONDS"
+		if probe="$(timeout "$patience" ctx marker show --json 2>&1)"; then
+			echo "run-cycle: the server answered a read in $(($(date +%s) - started))s"
+			return 0
+		else
+			probe_status=$?
+		fi
+		printf '%s\n' "$probe" >&2
+		echo "run-cycle: the server has not answered a read within ${patience}s (exit $probe_status)" >&2
+		[ "$((deadline - $(date +%s)))" -gt 5 ] || return 1
+		sleep 5
+	done
+}
+
+wait_for_server ||
+	refuse "the server at $CTX_SERVER did not answer a read within ${SERVER_PROBE_SECONDS}s in ${SERVER_READY_SECONDS}s of trying"
 
 # A cycle handles the pending windows, and exits 0 when there are none. A maintenance pass handles
 # no window, so it does not ask. The cap is passed here too, so this read is the size the session's
@@ -787,8 +833,8 @@ judge_session() {
 # A maintenance pass handles no window and must move no marker: its instructions say so, and this
 # enforces it. The marker is read here, after every check and right before the session, and again
 # after each of the pass's sessions (check_pass_marker); a pass that moved it fails the job. A
-# cycle moves the marker as it finishes each window, so this bracketing is for a pass alone, and it
-# is the pass's first and only ctx call before its session.
+# cycle moves the marker as it finishes each window, so this bracketing is for a pass alone. The
+# wait for the server reads the marker before this, and reads nothing else.
 marker_before=
 if [ -n "$pass" ]; then
 	if marker_before="$(ctx marker show --json)"; then

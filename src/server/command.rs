@@ -87,6 +87,11 @@ pub async fn command(
         return error_response(shared, StatusCode::BAD_REQUEST, &message);
     }
     let record_text = parsed.as_ref().is_some_and(shows_a_record);
+    // The index this copy builds as it comes up is read by `resolve`, `cite verify` and the
+    // mentions an answer carries, and a command that took the tree and then waited for that
+    // build would hold it, so every later command waited too. The wait is here instead,
+    // before the tree is taken.
+    shared.index_ready().await;
     let running = Arc::clone(shared);
     let captured = tokio::task::spawn_blocking(move || {
         let context = running.tree()?;
