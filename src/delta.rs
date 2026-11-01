@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::SystemTime;
 
 use anyhow::{bail, Context as _, Result};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -20,7 +22,7 @@ use crate::schema::{OPEN_KINDS, OPEN_STATES};
 use crate::source::slack::Mentions;
 use crate::source::{self, MAX_POINTER_BYTES};
 use crate::tree::{Doc, Tree};
-use crate::windows::{SourcedRecord, Window};
+use crate::windows::{SourcedRecord, Window, WindowId};
 
 const MIN_QUOTE_WORDS: usize = 5;
 const EXCERPT_CHARS: usize = 160;
@@ -1208,8 +1210,164 @@ pub fn combine(deltas: &[Delta], generated_at: DateTime<Utc>) -> Option<Delta> {
     })
 }
 
-/// Reads all durable deltas and returns replies still unreviewed by record path, leaving out
-/// every reply `exclusion` names.
+/// One open record a window's durable delta flagged, with what `ctx open` takes from each of
+/// its replies and nothing more: a window read once is kept this way for the life of the
+/// process, and the excerpt, title, kind and status the file carries are not.
+#[derive(Debug)]
+struct Flagged {
+    record: String,
+    replies: Vec<FlaggedReply>,
+}
+
+/// One reply of a flagged record, as staleness reports it.
+#[derive(Debug)]
+struct FlaggedReply {
+    pointer: String,
+    ts: DateTime<Utc>,
+    author: Option<String>,
+    how: String,
+}
+
+/// The `delta.json` a window's flags were read from: the file it was, its length and when it
+/// was last written.
+///
+/// `ctx delta --window <id> --write` computes a window's delta again and replaces the file,
+/// which it writes beside the old one and renames over it ([`write_replace`]), so the file is
+/// another one and the window is read again. The length and the modification time are read
+/// too, because a share can hold a file somebody replaced another way.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Stamp {
+    file: u64,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl Stamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
+            file: metadata.ino(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+}
+
+/// What one window carries for `ctx open`, with the file it was read from.
+struct Flags {
+    stamp: Stamp,
+    flagged: Vec<Flagged>,
+}
+
+/// Every window's durable delta this process has read, by the windows directory and the
+/// window in it.
+///
+/// A window's `delta.json` is written once, when the fetch completes the window, so a process
+/// that has read one need never read it again. A server answers every `ctx open` of its life
+/// from one process: a call lists the share's windows, looks at the `delta.json` of each, and
+/// reads only the ones it has not read or that were written since, so it parses no delta at
+/// all while the share stands still. Before this, every call read and parsed every window's
+/// delta, and one `ctx open` took seconds against a share of a few hundred windows while
+/// every other read command answered in milliseconds.
+///
+/// What is kept is the share's, not the tree's, so a tree the server reloads after a merge
+/// keeps it. A window that is no longer on the share drops out, so this holds no more than
+/// the share does. A command-line run reads what it needs once and exits.
+///
+/// A window stays as it was read while its `delta.json` is the same file: the manifest and
+/// the records beside it, which [`Window::open`] looks at before a window is first read, are
+/// not looked at again, and on a share whose attributes a client caches — an NFS mount —
+/// a window written again is seen when that client next reads the directory's attributes.
+/// Nothing writes a completed window's files but `ctx delta --window <id> --write`, which
+/// takes the fetch lease and runs where the share is mounted, not on a server.
+static READ_WINDOWS: Mutex<BTreeMap<PathBuf, BTreeMap<WindowId, Flags>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Reads into `cached` every completed window of `windows` this process has not read yet, or
+/// that has been written since it read it, and drops the windows that are gone.
+///
+/// The windows are read oldest first, as their identifiers sort, so a share holding more than
+/// one delta that cannot be decoded fails on the oldest of them, whatever order the directory
+/// is listed in.
+fn read_windows(windows: &Path, cached: &mut BTreeMap<WindowId, Flags>) -> Result<()> {
+    let mut present = BTreeMap::new();
+    for entry in fs::read_dir(windows).with_context(|| format!("reading {}", windows.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", windows.display()))?;
+        let dir = entry.path();
+        let Some(id) = dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| WindowId::parse(name).ok())
+        else {
+            continue;
+        };
+        // A window is completed once its delta is written, and that file is the whole of what
+        // staleness reads from the window: one look at it says both whether to read the
+        // window and whether what this process read from it still stands.
+        let Ok(metadata) = fs::metadata(dir.join("delta.json")) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        present.insert(id, (dir, Stamp::of(&metadata)));
+    }
+    cached.retain(|id, _| present.contains_key(id));
+    for (id, (dir, stamp)) in present {
+        if cached.get(&id).is_some_and(|flags| flags.stamp == stamp) {
+            continue;
+        }
+        let Ok(window) = Window::open(dir) else {
+            cached.remove(&id);
+            continue;
+        };
+        // Staleness only reports replies, so a pointer past the bound is left out here rather
+        // than failing `ctx open` for the whole tree; `read` refuses it where messages are
+        // handed to an agent.
+        let Some(mut delta) = read_file(&window)? else {
+            cached.remove(&id);
+            continue;
+        };
+        delta.bound_pointers();
+        cached.insert(
+            id,
+            Flags {
+                stamp,
+                flagged: flagged(delta),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// What `ctx open` takes from one window's open flags.
+fn flagged(delta: Delta) -> Vec<Flagged> {
+    delta
+        .unreviewed
+        .into_iter()
+        .map(|flag| Flagged {
+            record: flag.record,
+            replies: flag
+                .replies
+                .into_iter()
+                .map(|reply| FlaggedReply {
+                    pointer: reply.pointer,
+                    ts: reply.ts,
+                    author: reply.author,
+                    how: reply.how,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Reads the durable deltas this process has not read yet and returns replies still
+/// unreviewed by record path, leaving out every reply `exclusion` names.
+///
+/// The deltas this process has already read it keeps ([`READ_WINDOWS`]); the tree's review
+/// dates and the exclusion are applied to all of them here, on every call, so the answer
+/// follows the tree and the configuration as they are now.
 ///
 /// # Errors
 ///
@@ -1221,6 +1379,11 @@ pub fn staleness(
 ) -> Result<BTreeMap<String, Vec<Staleness>>> {
     let mut stale = BTreeMap::new();
     if !windows.exists() {
+        // The windows are gone, and so is what this process read from them.
+        READ_WINDOWS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(windows);
         return Ok(stale);
     }
     let reviewed = tree
@@ -1234,34 +1397,26 @@ pub fn staleness(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut completed = Vec::new();
-    for entry in fs::read_dir(windows).with_context(|| format!("reading {}", windows.display()))? {
-        let entry = entry.with_context(|| format!("reading {}", windows.display()))?;
-        let Ok(window) = Window::open(entry.path()) else {
-            continue;
-        };
-        if window.dir.join("delta.json").is_file() {
-            completed.push(window);
-        }
-    }
-    completed.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut cache = READ_WINDOWS.lock().unwrap_or_else(PoisonError::into_inner);
+    let cached = cache.entry(windows.to_path_buf()).or_default();
+    read_windows(windows, cached)?;
 
     let mut seen = BTreeSet::new();
-    for window in completed {
-        // Staleness only reports replies, so a pointer past the bound is left out here rather
-        // than failing `ctx open` for the whole tree; `read` refuses it where messages are
-        // handed to an agent.
-        let Some(mut delta) = read_file(&window)? else {
-            continue;
-        };
-        delta.bound_pointers();
-        delta.exclude(exclusion);
-        for flag in delta.unreviewed {
+    // Oldest window first, as the identifiers sort: the window that first carries a reply is
+    // the one that decides it.
+    for window in cached.values() {
+        for flag in &window.flagged {
             let Some(last_reviewed) = reviewed.get(&flag.record) else {
                 continue;
             };
-            for reply in flag.replies {
-                if !seen.insert((flag.record.clone(), reply.pointer.clone())) {
+            for reply in &flag.replies {
+                // A delta written before a pattern existed still lists what it names, so the
+                // exclusion is applied to the window as it was read, and an excluded reply is
+                // not one this answer has seen.
+                if exclusion.matches(&reply.pointer) {
+                    continue;
+                }
+                if !seen.insert((flag.record.as_str(), reply.pointer.as_str())) {
                     continue;
                 }
                 let (keep, same_day) = match last_reviewed {
@@ -1275,16 +1430,17 @@ pub fn staleness(
                         .entry(flag.record.clone())
                         .or_default()
                         .push(Staleness {
-                            pointer: reply.pointer,
+                            pointer: reply.pointer.clone(),
                             ts: reply.ts,
-                            author: reply.author,
-                            how: reply.how,
+                            author: reply.author.clone(),
+                            how: reply.how.clone(),
                             same_day,
                         });
                 }
             }
         }
     }
+
     for replies in stale.values_mut() {
         replies.sort_by_key(|reply| reply.ts);
     }
