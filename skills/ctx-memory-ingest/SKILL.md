@@ -90,14 +90,11 @@ delivered again unchanged is not new and is in no delta.
   quote whose source does not hold it, and a claim whose pointer nothing can check: a
   source that has never declared whether its records are its own words, one that stores
   renderings rather than words (the calendar), and a scheme no configured source owns
-  (`foo:bar`). A quote at tier 1 or 2 must name a pointer that resolves to a source storing
-  its records verbatim, so the server refuses a tier 1 or 2 claim with no pointer at all.
-  Free text such as `source: "overheard in standup"` is allowed only at tier 3 or 4, which
-  is what a summary and a secondhand account are. One checked quote in a record does not
-  carry the record's other claims: each is judged alone. A record whose own tier is 1 or 2,
-  a meeting or a decision as much as any other, needs at least one tier 1 or 2 quote that
-  was checked against its source: the server refuses it when it carries no quote, only
-  quotes at tier 3 or 4, or only tier 1 or 2 quotes too short to count (below).
+  (`foo:bar`). Free text such as `source: "overheard in standup"` is allowed only at tier 3
+  or 4, which is what a summary and a secondhand account are, so a tier 1 or 2 claim needs a
+  pointer that resolves to a source storing its records verbatim. One checked quote does not
+  carry the record's other claims: each is judged alone, and a record whose own tier is 1 or
+  2 needs at least one tier 1 or 2 quote that was checked against its source.
 - A failed stream keeps its own cursor, so the next fetch re-reads it. Report the error
   (step 2); do not skip the source silently.
 - A missing artifact is a gap to state in the record it belongs to, never a fact to fill in.
@@ -262,12 +259,14 @@ mint it; each rule says where a fact worth keeping goes instead.
   beyond it: a decision and who made it, a named person's commitment, an open question or a
   metric, each citing the item, or an update to its project's record.
 - Done on arrival: no record whose status is already answered, cancelled, closed,
-  completed, done, resolved, superseded or withdrawn, and none whose news is a change
-  already merged, pushed, released or deployed, whatever status you would give it (`current`
-  and `active` too), since it only restates its source. Close the open record the source
-  closes, or update the record or metric whose state it changes; a decision someone made is
-  `decided`, not closed. An ops or project record names who must still do, decide or answer
-  what; if no one must, write none.
+  completed, done, resolved, superseded or withdrawn, and none whose only news is that a
+  change is merged, pushed, released or deployed, whatever status you would give it
+  (`current` and `active` too), since that restates its source. Close the open record the
+  source closes, or update the record or metric whose state it changes; a decision someone
+  made is `decided`, not closed. What a finished change carries beyond its own state is
+  still a record, minted where none exists: a decision and who made it, a named person's
+  commitment, a question it leaves open, a figure it measures. An ops or project record
+  names who must still do, decide or answer what; if no one must, write none.
 - The pipeline that builds this graph (the fetch, the cycle, the ctx server): its failures,
   fixes and checks, and the issues and messages about them, get no record of any type, since
   whoever runs the cycle tracks them; put what you saw in your report to them.

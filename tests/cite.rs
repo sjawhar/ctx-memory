@@ -142,6 +142,69 @@ fn cite_verify_checks_every_quote() -> Result<()> {
     Ok(())
 }
 
+/// A record often quotes one source several times, and its title or body can repeat the same
+/// words. The finding names the line of the entry that failed: not the record's first
+/// citation of that source, not an earlier entry, and not the title.
+#[test]
+fn a_broken_quote_is_named_at_the_line_that_declares_it() -> Result<()> {
+    let root = test_root("broken-quote-line")?;
+    let tree = root.join("tree");
+    let state_base = root.join("state");
+    std::fs::create_dir(&tree)?;
+    write(
+        &tree,
+        "ctx.toml",
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"slack\"\nkind = \"slack\"\n",
+    )?;
+    write(
+        &tree,
+        "decision.md",
+        "---\n\
+         type: decision\n\
+         status: open\n\
+         title: \"gamma delta epsilon, as agreed\"\n\
+         quotes:\n\
+         \x20 - quote: \"alpha beta gamma\"\n\
+         \x20   source: \"slack:C0EXAMPLE01/1700000000.000001\"\n\
+         \x20   tier: 1\n\
+         \x20 - quote: \"gamma delta epsilon\"\n\
+         \x20   source: \"slack:C0EXAMPLE01/1700000000.000001\"\n\
+         \x20   tier: 1\n\
+         ---\n\
+         gamma delta epsilon.\n",
+    )?;
+    let store = Store::open(
+        &state_base.join("example/store.sqlite3"),
+        &state_base.join("example/sources.json"),
+        &state_base.join("example/resolved"),
+    )?;
+    store.put_all(
+        "slack",
+        &[stored(
+            "slack:C0EXAMPLE01/1700000000.000001",
+            1_700_000_000,
+            "alpha beta gamma",
+        )?],
+        Utc.timestamp_opt(1_700_000_010, 0)
+            .single()
+            .context("fetch time is valid")?,
+    )?;
+
+    let data = verify(&tree, &state_base);
+    remove_test_root(&root)?;
+
+    let data = data?;
+    let broken = entries(&data, "broken")?;
+    assert_eq!(broken.len(), 1, "{data}");
+    let finding = broken.first().context("the broken quote is reported")?;
+    assert_eq!(
+        finding.get("line").and_then(Value::as_u64),
+        Some(9),
+        "the finding does not name the second entry's own line: {data}"
+    );
+    Ok(())
+}
+
 #[test]
 fn sweep_accepts_quotes_list() -> Result<()> {
     let root = test_root("quotes-list")?;

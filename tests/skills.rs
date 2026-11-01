@@ -311,8 +311,10 @@ fn the_ingest_skill_says_what_is_not_a_record() -> Result<()> {
         "a decision and who made it, a named person's commitment, an open question or a \
          metric, each citing the item",
         "already answered, cancelled, closed, completed, done, resolved, superseded or withdrawn",
-        "none whose news is a change already merged, pushed, released or deployed, whatever \
-         status you would give it (`current` and `active` too)",
+        "none whose only news is that a change is merged, pushed, released or deployed, \
+         whatever status you would give it (`current` and `active` too)",
+        "What a finished change carries beyond its own state is still a record, minted where \
+         none exists",
         "Close the open record the source closes",
         "a decision someone made is `decided`, not closed",
         "An ops or project record names who must still do, decide or answer what; if no one \
