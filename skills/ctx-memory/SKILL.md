@@ -1,6 +1,6 @@
 ---
 name: ctx-memory
-description: "Search team memory before a spec, plan, design or asking someone, and when a task names a person"
+description: "Search team memory before a spec, plan, design, asking anyone, or for a named person; record facts"
 ---
 
 # ctx-memory
