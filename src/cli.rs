@@ -1063,11 +1063,24 @@ fn print_fetch(payload: &FetchPayload<'_>, out: &mut dyn Write) -> std::io::Resu
         )?;
         // Why the source failed, on the same line with any credential taken out, so the fetch
         // job's log says what to do and not only that it failed (a revoked Slack token names
-        // `ctx slack login`). Each stream's own error stays in the window's manifest.
+        // `ctx slack login`).
         if let Some(error) = &manifest.error {
             write!(out, ": {}", crate::redact::one_line(error))?;
         }
         writeln!(out)?;
+        // A source that ran can still hold a stream that failed, which holds that stream's
+        // cursor; each says why on a line of its own, its id flattened too since a source names
+        // its own streams, so the log names the stream and the cause without the manifest.
+        for (stream, result) in &manifest.streams {
+            if result.status != Status::Error {
+                continue;
+            }
+            write!(out, "  stream {}: error", crate::redact::flattened(stream))?;
+            if let Some(error) = &result.error {
+                write!(out, ": {}", crate::redact::one_line(error))?;
+            }
+            writeln!(out)?;
+        }
     }
     cursor::print_advance(payload.cursors, out)
 }

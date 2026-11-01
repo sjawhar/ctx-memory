@@ -142,6 +142,61 @@ fn a_comparison_github_cannot_make_lists_the_new_head_since_the_stored_time() ->
 }
 
 #[test]
+fn a_comparison_github_cannot_diff_reads_the_new_head_since_the_stored_time() -> Result<()> {
+    let base = api_base();
+    let subject = repo("example-org", "joined");
+    let fake = FakeGithub {
+        repos: BTreeMap::from([(1, vec![subject.clone()])]),
+        ..FakeGithub::default()
+    };
+    let old = commit("aaaaaaa1", "2026-10-25T09:00:00Z");
+    let (first_request, first) = a_branch_read_once(&fake, &subject, &old, vec![old.clone()])?;
+
+    // A merge brought a whole branch in, and GitHub cannot generate the comparison's diff: it
+    // answers `422` and lists none of its commits, on every request of it.
+    let render = commit("bbbbbbb2", "2026-10-27T00:05:00Z");
+    branch_at(&fake, &subject, &render);
+    fake.page(
+        &compare_url(&base, &subject, "aaaaaaa1", "bbbbbbb2"),
+        Page {
+            kind: PageKind::DiffUnavailable,
+            ..Page::default()
+        },
+    );
+    fake.page(
+        &commits_url(&base, &subject, "bbbbbbb2", WINDOW_END),
+        page(vec![render]),
+    );
+    let second = run(
+        &fake,
+        &next_request(&first_request, &first)?,
+        &config(vec![1], 600, 2000),
+    )?;
+
+    // The stream succeeds and moves on to the new head, rather than failing on the same
+    // comparison run after run, and it says what the listing by time cannot reach.
+    assert!(
+        pointers(&second).contains("github:example-org/joined@bbbbbbb2"),
+        "{:?}",
+        pointers(&second)
+    );
+    assert_eq!(
+        cursor_of(&second, &stream_id(&subject))?,
+        Some(format!("feed={LATER_END},head=bbbbbbb2@{LATER_END}"))
+    );
+    let warned = "could not generate the comparison of aaaaaaa1 with bbbbbbb2";
+    assert!(
+        second
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains(warned)),
+        "{:?}",
+        second.warnings
+    );
+    Ok(())
+}
+
+#[test]
 fn a_commit_dated_after_the_window_end_keeps_the_stored_head() -> Result<()> {
     let base = api_base();
     let subject = repo("example-org", "skewed");
