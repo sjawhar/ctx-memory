@@ -318,8 +318,8 @@ pub fn ctx_local(tree: &Path, arguments: &[&str]) -> Result<Local> {
     })
 }
 
-/// Runs `ctx` as a remote client: no tree, a working directory that holds none, and the
-/// environment a dev box or a Kubernetes pod would carry.
+/// Runs `ctx` as a remote client: no tree, a working directory that holds none, the
+/// environment a dev box or a Kubernetes pod would carry, and no session the test does not name.
 pub fn ctx_remote(
     cwd: &Path,
     environment: &[(&str, &str)],
@@ -335,6 +335,9 @@ pub fn ctx_remote(
         .env_remove("CTX_SERVER_AUDIENCE")
         .env_remove("GCE_METADATA_HOST")
         .env_remove("CTX_IAM_CREDENTIALS_URL")
+        .env_remove("CTX_SESSION")
+        .env_remove("OMP_SESSION_ID")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {

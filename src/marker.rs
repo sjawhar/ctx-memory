@@ -286,20 +286,6 @@ fn pending_in(
     })
 }
 
-/// Names the caller that moved the marker: the agent session when one is set.
-#[must_use]
-pub fn caller() -> String {
-    for name in ["CTX_SESSION", "USER"] {
-        if let Some(value) = std::env::var_os(name) {
-            let value = value.to_string_lossy().into_owned();
-            if !value.is_empty() {
-                return value;
-            }
-        }
-    }
-    "unknown".to_owned()
-}
-
 /// Prints the pending windows the way a person reads them.
 ///
 /// # Errors

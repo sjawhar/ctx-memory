@@ -74,7 +74,7 @@
 #                        variable of the job; this script moves it to a file and unsets it
 #   CLOUD_RUN_EXECUTION  the platform's own name for this execution (Cloud Run sets it), which
 #                        names the session directory and, as CTX_SESSION, every commit the
-#                        session makes
+#                        session makes and every request this execution sends the server
 set -eu
 
 refuse() {
@@ -195,6 +195,13 @@ if [ "$(printf '%s\n' "$models_text" | grep -c -e "apiKey[\"']*[[:space:]]*:" -e
 	refuse "CTX_MODELS_FILE must take its one apiKey from the key file this script writes, as runner/models.example.yml does, and name that file nowhere else: $CTX_MODELS_FILE"
 fi
 
+# Every request this execution sends the server, from the pending read below to the session's
+# last write, names its session in the server's request log, and every record the session writes
+# is committed with a `Session:` trailer; ctx takes both from CTX_SESSION. Without it they would
+# carry omp's own session id or the user, and a request or a record could not be traced back to
+# the session that sent it, whose JSONL is under the execution's name.
+export CTX_SESSION="$CLOUD_RUN_EXECUTION"
+
 # A cycle handles the pending windows, and exits 0 when there are none. A maintenance pass handles
 # no window, so it does not ask. The cap is passed here too, so this read is the size the session's
 # own read will be: an uncapped read of a long backlog is what the cap exists to avoid, and it can
@@ -223,11 +230,6 @@ if [ -z "$pass" ]; then
 		exit 0
 	fi
 fi
-
-# Every record the session writes is committed by the server with a `Session:` trailer, and
-# the server takes it from CTX_SESSION. Without it the trailer reads "unknown" and a record
-# cannot be traced back to the session that wrote it, whose JSONL is under the same name.
-export CTX_SESSION="$CLOUD_RUN_EXECUTION"
 
 # The session's transcript directory is its own while it runs and root's from the moment this
 # script exits, however it exits: a sealed directory is the record of what that cycle did, and no
@@ -661,8 +663,8 @@ if [ "$status" -ne 0 ] && [ -z "$marker_moved" ] && session_refused "$session_di
 		refuse "could not seal $session_dir"
 	fi
 	session_dir="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION-retry"
-	# The retry's records and marker moves carry its own transcript's name, so a record traces
-	# back to the session that wrote it: CTX_SESSION is the `Session:` trailer of every commit.
+	# The retry's requests, records and marker moves carry its own transcript's name, so each
+	# traces back to the session that sent it: CTX_SESSION names them all.
 	export CTX_SESSION="$CLOUD_RUN_EXECUTION-retry"
 	mkdir -p "$session_dir"
 	rm -f "$session_dir/.started"

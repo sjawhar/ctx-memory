@@ -23,6 +23,7 @@ use crate::protocol::{
     PUT_BATCH_ROUTE, PUT_ROUTE,
 };
 use crate::redact;
+use crate::session_id;
 
 /// The default endpoint of Google's IAM credentials API.
 const IAM_CREDENTIALS: &str = "https://iamcredentials.googleapis.com";
@@ -57,6 +58,7 @@ pub struct Client {
     base: String,
     http: reqwest::blocking::Client,
     token: Option<String>,
+    session: Option<String>,
 }
 
 impl Client {
@@ -67,12 +69,16 @@ impl Client {
     /// ([`origin`]); the token must be minted for that server and no other
     /// ([`identity_token`]); and an answer that redirects to another origin is not followed.
     ///
+    /// Every request carries `session`, the caller's session id, in
+    /// [`session_id::HEADER`]; one that does not [fit](session_id::fits) the header is not
+    /// sent.
+    ///
     /// # Errors
     ///
     /// Returns an error when the base is not such an address, when `CTX_SERVER_AUDIENCE` names
     /// another server, when the HTTP client cannot be built, or when an identity token is
     /// asked for and cannot be minted.
-    pub fn new(base: &str) -> Result<Self> {
+    pub fn new(base: &str, session: Option<&str>) -> Result<Self> {
         let base = base.trim_end_matches('/');
         let origin = origin(base)?;
         let token = identity_token(&origin)?;
@@ -89,6 +95,9 @@ impl Client {
             base: base.to_owned(),
             http: builder.build().context("building the remote HTTP client")?,
             token,
+            session: session
+                .filter(|session| session_id::fits(session))
+                .map(str::to_owned),
         })
     }
 
@@ -227,6 +236,9 @@ impl Client {
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
+        if let Some(session) = &self.session {
+            request = request.header(session_id::HEADER, session);
+        }
         request
             .send()
             .with_context(|| format!("asking {}{path}", self.base))
@@ -294,8 +306,22 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             tree.display()
         );
     }
-    let client = || Client::new(&base);
-    let session = marker::caller();
+    // The session goes with every request, so the server's log can tell apart the sessions
+    // that share one caller, and names a write's commit. CTX_SESSION is the caller's own
+    // choice: when the header cannot carry it, no other variable is sent in its place, and the
+    // caller is told.
+    let named = session_id::from_env();
+    if let Some((variable, _)) = named.as_ref().filter(|(_, id)| !session_id::fits(id)) {
+        writeln!(
+            sink.err,
+            "ctx: {variable} is not sent to the server as this session's id: it must be 1 to {} \
+             ASCII letters, digits, '.', '_', ':' or '-'",
+            session_id::MAX_CHARS
+        )?;
+    }
+    let id = named.as_ref().map(|(_, id)| id.as_str());
+    let client = || Client::new(&base, id);
+    let session = id.map_or_else(session_id::user, str::to_owned);
     match route {
         Remote::Local => Ok(None),
         Remote::Put { path, source } => {
