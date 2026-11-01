@@ -371,3 +371,30 @@ fn the_reading_skill_names_remote_mode() -> Result<()> {
     );
     Ok(())
 }
+
+/// An agent's skill list shows each skill by its description, and Oh My Pi cuts a description
+/// longer than 100 characters short while it has no compressed copy of it. The reading skill's
+/// description stays whole at that width and says when an agent searches the tree in the terms
+/// of its own work: before a spec, plan or design, before asking a person, and when a task names
+/// a person.
+#[test]
+fn the_reading_skill_description_fits_a_skill_list_and_names_when_to_search() -> Result<()> {
+    let text = skill("ctx-memory")?;
+    let description = text
+        .lines()
+        .find_map(|line| line.strip_prefix("description: "))
+        .map(|value| value.trim().trim_matches('"'))
+        .context("the reading skill has no description line")?;
+    let chars = description.chars().count();
+    assert!(
+        chars <= 100,
+        "the reading skill's description is {chars} characters; a skill list cuts it after 100: {description:?}"
+    );
+    for trigger in ["spec", "plan", "design", "asking", "names a person"] {
+        assert!(
+            description.contains(trigger),
+            "the reading skill's description does not say {trigger:?}: {description:?}"
+        );
+    }
+    Ok(())
+}

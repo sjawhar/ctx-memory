@@ -1,13 +1,18 @@
 ---
 name: ctx-memory
-description: "Use when answering a question the team memory may hold or recording a durable fact; ctx reaches the tree through the server CTX_SERVER names, or a local tree via CTX_MEMORY or ctx.toml."
+description: "Search team memory before a spec, plan, design or asking someone, and when a task names a person"
 ---
 
 # ctx-memory
 
 If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
 
-A memory tree is a graph of markdown records with YAML frontmatter and wikilinks. It is not injected into an agent session. Consult this skill and the `ctx` CLI when a durable fact or prior decision may matter.
+A memory tree is a graph of markdown records with YAML frontmatter and wikilinks. It is not injected into an agent session. Consult this skill and the `ctx` CLI when a durable fact or prior decision may matter:
+
+- before you write or approve a spec, a plan or a design;
+- when a task names a person, a customer, a vendor, a project or a past incident;
+- before you ask a person a question the tree may already answer;
+- when you record a durable fact or a decision ("Write the tree").
 
 ## Read the tree
 
