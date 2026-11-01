@@ -778,10 +778,11 @@ fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
 
     ensure!(
         code.iter()
-            .filter(|line| line.contains("ctx marker show --json"))
+            .filter(|line| line.contains("=\"$(ctx marker show --json)\""))
             .count()
             == 2,
-        "run-cycle.sh must read the marker before and after the pass to tell whether it moved"
+        "run-cycle.sh must read the marker into a variable before and after the pass, and \
+         nowhere else, to tell whether it moved"
     );
     ensure!(
         has("marker_before=\"$(ctx marker show --json)\"")
@@ -1079,6 +1080,14 @@ fn a_maintenance_pass_runs_whether_or_not_a_window_is_pending() -> Result<()> {
     ensure!(
         cycle_calls.lines().any(|line| line.starts_with("pending")),
         "the cycle did not ask what is pending: {cycle_calls:?}"
+    );
+    ensure!(
+        cycle_calls
+            .lines()
+            .next()
+            .is_some_and(|line| line.starts_with("marker show")),
+        "the cycle asked the server for something before it waited for the server to answer a \
+         read: {cycle_calls:?}"
     );
     pass_refusal?;
     ensure!(

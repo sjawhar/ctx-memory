@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -24,6 +25,12 @@ const SCHEMA_VERSION: u32 = 4;
 
 /// Numbers the staging files of rebuilds that run at the same time in one process.
 static NEXT_REBUILD: AtomicUsize = AtomicUsize::new(0);
+
+/// Lets one rebuild at a time run in this process. A copy that builds its index while it
+/// answers reads would otherwise replay every window once per caller, each replay reading the
+/// whole share; and a replay publishes a whole database, so the last one to be published is
+/// the one that stands, whatever another had added to the store meanwhile.
+static REBUILDING: Mutex<()> = Mutex::new(());
 
 /// How long a rebuild keeps trying to copy its replay into a store other connections keep
 /// locked. One batch holds the store for well under a second.
@@ -87,6 +94,11 @@ struct Resolved {
 impl Store {
     /// Opens the tree's index, rebuilding it from the files when it is missing or stale.
     ///
+    /// One caller rebuilds and the rest wait for it ([`REBUILDING`]), because a copy that
+    /// builds its index while it answers reads would otherwise read the whole share once per
+    /// caller. A caller that waited opens what the rebuild published rather than replaying
+    /// the share again.
+    ///
     /// # Errors
     ///
     /// Returns an error when the store cannot be opened, replayed, or replaced.
@@ -94,7 +106,16 @@ impl Store {
         if usable(&state.store())? {
             return Self::open(&state.store(), &data.sources(), &state.resolved());
         }
-        Self::rebuild(data, state)
+        let building = REBUILDING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if usable(&state.store())? {
+            drop(building);
+            return Self::open(&state.store(), &data.sources(), &state.resolved());
+        }
+        let rebuilt = Self::rebuild(data, state);
+        drop(building);
+        rebuilt
     }
 
     /// Opens a store at `path`, creating its parent directory and schema when needed, and
@@ -406,11 +427,15 @@ impl Store {
             .context("committing the delivered versions")
     }
 
+    /// Notes `window` as indexed, unless the store already counts a later one: a server and a
+    /// fetch that share a state directory both index windows, and a pass that read the
+    /// watermark before the other moved it must not move it back.
     fn mark_indexed(&self, window: &WindowId) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO indexed(key, window) VALUES ('windows', ?1)
-                 ON CONFLICT(key) DO UPDATE SET window = excluded.window",
+                 ON CONFLICT(key) DO UPDATE SET window = excluded.window
+                 WHERE excluded.window > indexed.window",
                 params![window.to_string()],
             )
             .with_context(|| format!("noting window {window} as indexed"))?;

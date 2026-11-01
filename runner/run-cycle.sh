@@ -251,20 +251,25 @@ command -v timeout >/dev/null 2>&1 ||
 
 # Waits until the server answers `ctx marker show` within SERVER_PROBE_SECONDS, or says why it
 # never did and answers non-zero. Every attempt it gives up on is one line of the job log, with
-# what ctx printed, so a slow start and an unreachable server read differently afterwards.
+# what ctx printed, so a slow start and an unreachable server read differently afterwards. No
+# attempt outlives the deadline: each is given what is left of SERVER_READY_SECONDS when it
+# starts, and the wait ends there rather than a probe's length past it.
 wait_for_server() {
 	deadline=$(($(date +%s) + SERVER_READY_SECONDS))
 	while :; do
 		started="$(date +%s)"
-		if probe="$(timeout "$SERVER_PROBE_SECONDS" ctx marker show --json 2>&1)"; then
+		patience=$((deadline - started))
+		[ "$patience" -gt 0 ] || return 1
+		[ "$patience" -le "$SERVER_PROBE_SECONDS" ] || patience="$SERVER_PROBE_SECONDS"
+		if probe="$(timeout "$patience" ctx marker show --json 2>&1)"; then
 			echo "run-cycle: the server answered a read in $(($(date +%s) - started))s"
 			return 0
 		else
 			probe_status=$?
 		fi
 		printf '%s\n' "$probe" >&2
-		echo "run-cycle: the server has not answered a read within ${SERVER_PROBE_SECONDS}s (exit $probe_status)" >&2
-		[ "$(date +%s)" -lt "$deadline" ] || return 1
+		echo "run-cycle: the server has not answered a read within ${patience}s (exit $probe_status)" >&2
+		[ "$((deadline - $(date +%s)))" -gt 5 ] || return 1
 		sleep 5
 	done
 }
