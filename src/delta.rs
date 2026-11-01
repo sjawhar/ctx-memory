@@ -1228,13 +1228,30 @@ struct FlaggedReply {
     how: String,
 }
 
-/// The `delta.json` a window's flags were read from: its length and when it was last written.
+/// The `delta.json` a window's flags were read from: the file it was, its length and when it
+/// was last written.
+///
 /// `ctx delta --window <id> --write` computes a window's delta again and replaces the file,
-/// which changes both, so a window written again is read again.
+/// which it writes beside the old one and renames over it ([`write_replace`]), so the file is
+/// another one and the window is read again. The length and the modification time are read
+/// too, because a share can hold a file somebody replaced another way.
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Stamp {
+    file: u64,
     len: u64,
     modified: Option<SystemTime>,
+}
+
+impl Stamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
+            file: metadata.ino(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
 }
 
 /// What one window carries for `ctx open`, with the file it was read from.
@@ -1283,10 +1300,7 @@ fn read_windows(windows: &Path, cached: &mut BTreeMap<WindowId, Flags>) -> Resul
         if !metadata.is_file() {
             continue;
         }
-        let stamp = Stamp {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-        };
+        let stamp = Stamp::of(&metadata);
         if cached.get(&id).is_some_and(|flags| flags.stamp == stamp) {
             present.insert(id);
             continue;
