@@ -1379,6 +1379,11 @@ pub fn staleness(
 ) -> Result<BTreeMap<String, Vec<Staleness>>> {
     let mut stale = BTreeMap::new();
     if !windows.exists() {
+        // The windows are gone, and so is what this process read from them.
+        READ_WINDOWS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(windows);
         return Ok(stale);
     }
     let reviewed = tree
