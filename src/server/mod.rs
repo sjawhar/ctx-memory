@@ -918,7 +918,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{dirs_of, follow_once, index_windows, panic_line, Places, Shared};
+    use super::{dirs_of, follow_once, panic_line, Places, Shared};
     use crate::context::Context;
     use crate::pointer::Pointer;
     use crate::store::Store;
@@ -1230,7 +1230,8 @@ mod tests {
         let shared = Shared::new(Context::open(&root)?)?;
         let state = dirs_of(&*shared.tree()?)?.1.root().to_path_buf();
         shared.index_done();
-        let waited = tokio::time::timeout(Duration::from_secs(5), shared.index_ready()).await;
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_secs(5), shared.index_ready()).await;
         std::fs::remove_dir_all(&root)?;
         if state.exists() {
             std::fs::remove_dir_all(&state)?;

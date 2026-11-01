@@ -146,24 +146,26 @@ fn a_copy_with_no_index_builds_one_before_it_binds() -> Result<()> {
             std::fs::remove_file(entry.path())?;
         }
     }
-    let fetched = Pointer {
-        scheme: "echo".to_owned(),
-        locator: "C0EXAMPLE01/record".to_owned(),
-    };
-    let indexed = |label: &str| -> Result<bool> {
-        let store = Store::open(&state.store(), &data.sources(), &state.resolved())
-            .with_context(|| format!("opening the index {label}"))?;
-        Ok(store.get(&fetched)?.is_some())
-    };
-    let cold = indexed("before the server started")?;
+    // Nothing is opened before the server starts: opening the index would create it, and the
+    // copy would then read the share into an index rather than build one.
+    let cold = !state.store().exists();
 
     let server = Server::start(&tree, &["--pull-interval", "600"])?;
-    let built = indexed("as the server bound its listeners")?;
+    let built = {
+        let store = Store::open(&state.store(), &data.sources(), &state.resolved())
+            .context("opening the index the server built")?;
+        store
+            .get(&Pointer {
+                scheme: "echo".to_owned(),
+                locator: "C0EXAMPLE01/record".to_owned(),
+            })?
+            .is_some()
+    };
     drop(server);
     remove_fixture(&tree)?;
 
     assert!(
-        !cold,
+        cold,
         "the test did not start from a state directory with no index"
     );
     assert!(
