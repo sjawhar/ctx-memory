@@ -521,6 +521,197 @@ fn staleness_tracks_current_last_reviewed_date() -> Result<()> {
     Ok(())
 }
 
+/// One completed window whose delta flags `questions/example.md` with `replies`, each a
+/// pointer and the time it was sent.
+fn flagged_window(windows: &Path, name: &str, replies: &[(&str, &str)]) -> Result<()> {
+    let completed = window(windows, name, Vec::new())?;
+    let end = timestamp("2026-10-25T12:00:00Z")?;
+    let flagged = replies
+        .iter()
+        .map(|(pointer, sent)| {
+            Ok(ReplyRef {
+                pointer: (*pointer).to_owned(),
+                ts: timestamp(sent)?,
+                author: Some("Bob".to_owned()),
+                how: "pointer".to_owned(),
+                excerpt: "A review reply.".to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let delta = Delta {
+        version: 1,
+        window: name.to_owned(),
+        window_end: end,
+        generated_at: end,
+        previous_window: None,
+        new_messages: Vec::new(),
+        unreviewed: vec![OpenFlag {
+            record: "questions/example.md".to_owned(),
+            kind: "question".to_owned(),
+            status: "open".to_owned(),
+            title: "questions/example.md".to_owned(),
+            owner: None,
+            last_reviewed: Some(date("2026-10-24")?),
+            replies: flagged,
+        }],
+        closed_since_previous: Vec::new(),
+        opened_since_previous: Vec::new(),
+        omitted_messages: None,
+        omitted_changes: None,
+    };
+    write(
+        &completed.dir.join("delta.json"),
+        &serde_json::to_string_pretty(&delta).context("serializing the test delta")?,
+    )
+}
+
+/// The pointers of every unreviewed reply an answer holds, record by record.
+fn pointers(stale: &BTreeMap<String, Vec<ctx_memory::delta::Staleness>>) -> Vec<String> {
+    stale
+        .values()
+        .flatten()
+        .map(|reply| reply.pointer.clone())
+        .collect()
+}
+
+/// A window's delta is written once, when the fetch completes the window, so a server that has
+/// read one need never read it again: `ctx open` cost 6.2 s of every call against the windows
+/// of a deployment because it parsed all of them every time.
+///
+/// The oldest window's delta is made unreadable between two calls, with its length and the
+/// time it was last written untouched: a call that reads it again fails there, and one that
+/// answers from what it read before gives the same answer. A window written after that is
+/// read, so the answer still follows the share.
+#[test]
+fn a_windows_delta_is_read_once_however_many_times_open_asks() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = scratch("read-once")?;
+    write(
+        &root.join("questions/example.md"),
+        "---\ntype: question\nstatus: open\nlast_reviewed: 2026-10-24\n---\n",
+    )?;
+    let (tree, _) = configured_tree(&root)?;
+    let windows = root.join("state/example/windows");
+    flagged_window(
+        &windows,
+        "20261025T120000Z-0001",
+        &[("echo:C0EXAMPLE01/r1", "2026-10-25T10:00:00Z")],
+    )?;
+    flagged_window(
+        &windows,
+        "20261025T130000Z-0002",
+        &[("echo:C0EXAMPLE02/r2", "2026-10-25T11:00:00Z")],
+    )?;
+
+    let first = pointers(&delta::staleness(&windows, &tree, &Exclusion::default())?);
+    let oldest = windows.join("20261025T120000Z-0001/delta.json");
+    fs::set_permissions(&oldest, fs::Permissions::from_mode(0o000))
+        .with_context(|| format!("closing {}", oldest.display()))?;
+    let again = pointers(&delta::staleness(&windows, &tree, &Exclusion::default())?);
+    flagged_window(
+        &windows,
+        "20261026T120000Z-0003",
+        &[("echo:C0EXAMPLE01/r3", "2026-10-26T09:00:00Z")],
+    )?;
+    let with_the_new_window = pointers(&delta::staleness(&windows, &tree, &Exclusion::default())?);
+    fs::set_permissions(&oldest, fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("opening {}", oldest.display()))?;
+    remove_scratch(&root)?;
+
+    assert_eq!(
+        first,
+        vec!["echo:C0EXAMPLE01/r1", "echo:C0EXAMPLE02/r2"],
+        "both windows' replies are unreviewed"
+    );
+    assert_eq!(again, first, "the oldest window's delta was not read again");
+    assert_eq!(
+        with_the_new_window,
+        vec![
+            "echo:C0EXAMPLE01/r1",
+            "echo:C0EXAMPLE02/r2",
+            "echo:C0EXAMPLE01/r3"
+        ],
+        "a window written since the last call is read"
+    );
+    Ok(())
+}
+
+/// What `ctx open` answers for a share does not depend on which of its windows this process
+/// has read before: the tree's review dates and the deployment's exclusions are applied to
+/// every window on every call, however the window was read.
+///
+/// Two shares hold the same windows. One is read before the last window is written, the review
+/// date moves and an exclusion is added; the other is read for the first time after all of it.
+#[test]
+fn a_warm_share_answers_as_a_first_read_of_the_same_windows_does() -> Result<()> {
+    let root = scratch("warm-answer")?;
+    write(
+        &root.join("questions/example.md"),
+        "---\ntype: question\nstatus: open\nlast_reviewed: 2026-10-24\n---\n",
+    )?;
+    let (tree, _) = configured_tree(&root)?;
+    let warm = root.join("state/warm/windows");
+    let cold = root.join("state/cold/windows");
+    for windows in [&warm, &cold] {
+        flagged_window(
+            windows,
+            "20261025T120000Z-0001",
+            &[("echo:C0EXAMPLE01/r1", "2026-10-25T10:00:00Z")],
+        )?;
+        flagged_window(
+            windows,
+            "20261025T130000Z-0002",
+            &[
+                ("echo:C0EXAMPLE01/r1", "2026-10-25T10:00:00Z"),
+                ("echo:C0EXAMPLE02/r2", "2026-10-25T11:00:00Z"),
+            ],
+        )?;
+    }
+    let read_once = pointers(&delta::staleness(&warm, &tree, &Exclusion::default())?);
+
+    for windows in [&warm, &cold] {
+        flagged_window(
+            windows,
+            "20261026T120000Z-0003",
+            &[("echo:C0EXAMPLE01/r3", "2026-10-26T09:00:00Z")],
+        )?;
+    }
+    write(
+        &root.join("questions/example.md"),
+        "---\ntype: question\nstatus: open\nlast_reviewed: 2026-10-26\n---\n",
+    )?;
+    let (reviewed, _) = configured_tree(&root)?;
+    let exclusion = Exclusion::new(&["echo:C0EXAMPLE02/*".to_owned()])?;
+    let warm_answer = delta::staleness(&warm, &reviewed, &exclusion)?;
+    let cold_answer = delta::staleness(&cold, &reviewed, &exclusion)?;
+    remove_scratch(&root)?;
+
+    assert_eq!(
+        read_once,
+        vec!["echo:C0EXAMPLE01/r1", "echo:C0EXAMPLE02/r2"],
+        "a reply two windows carry is listed once"
+    );
+    assert_eq!(
+        serde_json::to_value(&warm_answer).context("the answer from the share read before")?,
+        serde_json::to_value(&cold_answer).context("the answer from the share read now")?,
+    );
+    assert_eq!(
+        pointers(&warm_answer),
+        vec!["echo:C0EXAMPLE01/r3"],
+        "the reply of the day the record was reviewed, less the excluded one"
+    );
+    assert!(
+        warm_answer
+            .get("questions/example.md")
+            .context("the record is stale")?
+            .iter()
+            .all(|reply| reply.same_day),
+        "the review date of the tree as it is now decides the reply"
+    );
+    Ok(())
+}
+
 #[test]
 fn ctx_open_shows_unreviewed_replies_for_configured_sources() -> Result<()> {
     let root = scratch("open")?;
