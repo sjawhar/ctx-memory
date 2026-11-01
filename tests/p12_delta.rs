@@ -608,6 +608,10 @@ fn a_windows_delta_is_read_once_however_many_times_open_asks() -> Result<()> {
     let oldest = windows.join("20261025T120000Z-0001/delta.json");
     fs::set_permissions(&oldest, fs::Permissions::from_mode(0o000))
         .with_context(|| format!("closing {}", oldest.display()))?;
+    assert!(
+        fs::read(&oldest).is_err(),
+        "this test needs a user the file mode denies the read; run it as one"
+    );
     let again = pointers(&delta::staleness(&windows, &tree, &Exclusion::default())?);
     flagged_window(
         &windows,
@@ -664,7 +668,7 @@ fn a_warm_share_answers_as_a_first_read_of_the_same_windows_does() -> Result<()>
             "20261025T130000Z-0002",
             &[
                 ("echo:C0EXAMPLE01/r1", "2026-10-25T10:00:00Z"),
-                ("echo:C0EXAMPLE02/r2", "2026-10-25T11:00:00Z"),
+                ("echo:C0EXAMPLE02/r2", "2026-10-26T10:00:00Z"),
             ],
         )?;
     }

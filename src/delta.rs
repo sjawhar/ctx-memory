@@ -1265,22 +1265,33 @@ struct Flags {
 ///
 /// A window's `delta.json` is written once, when the fetch completes the window, so a process
 /// that has read one need never read it again. A server answers every `ctx open` of its life
-/// from one process: it reads each delta once and, on every call after that, only the windows
-/// that appeared since, so what one call costs follows the windows added since the call
-/// before it rather than how many the share holds. Before this, every call parsed every
-/// window's delta, and one `ctx open` took seconds against a share of a few hundred windows
-/// while every other read command answered in milliseconds.
+/// from one process: a call lists the share's windows, looks at the `delta.json` of each, and
+/// reads only the ones it has not read or that were written since, so it parses no delta at
+/// all while the share stands still. Before this, every call read and parsed every window's
+/// delta, and one `ctx open` took seconds against a share of a few hundred windows while
+/// every other read command answered in milliseconds.
 ///
 /// What is kept is the share's, not the tree's, so a tree the server reloads after a merge
 /// keeps it. A window that is no longer on the share drops out, so this holds no more than
 /// the share does. A command-line run reads what it needs once and exits.
+///
+/// A window stays as it was read while its `delta.json` is the same file: the manifest and
+/// the records beside it, which [`Window::open`] looks at before a window is first read, are
+/// not looked at again, and on a share whose attributes a client caches — an NFS mount —
+/// a window written again is seen when that client next reads the directory's attributes.
+/// Nothing writes a completed window's files but `ctx delta --window <id> --write`, which
+/// takes the fetch lease and runs where the share is mounted, not on a server.
 static READ_WINDOWS: Mutex<BTreeMap<PathBuf, BTreeMap<WindowId, Flags>>> =
     Mutex::new(BTreeMap::new());
 
 /// Reads into `cached` every completed window of `windows` this process has not read yet, or
 /// that has been written since it read it, and drops the windows that are gone.
+///
+/// The windows are read oldest first, as their identifiers sort, so a share holding more than
+/// one delta that cannot be decoded fails on the oldest of them, whatever order the directory
+/// is listed in.
 fn read_windows(windows: &Path, cached: &mut BTreeMap<WindowId, Flags>) -> Result<()> {
-    let mut present = BTreeSet::new();
+    let mut present = BTreeMap::new();
     for entry in fs::read_dir(windows).with_context(|| format!("reading {}", windows.display()))? {
         let entry = entry.with_context(|| format!("reading {}", windows.display()))?;
         let dir = entry.path();
@@ -1300,22 +1311,25 @@ fn read_windows(windows: &Path, cached: &mut BTreeMap<WindowId, Flags>) -> Resul
         if !metadata.is_file() {
             continue;
         }
-        let stamp = Stamp::of(&metadata);
+        present.insert(id, (dir, Stamp::of(&metadata)));
+    }
+    cached.retain(|id, _| present.contains_key(id));
+    for (id, (dir, stamp)) in present {
         if cached.get(&id).is_some_and(|flags| flags.stamp == stamp) {
-            present.insert(id);
             continue;
         }
         let Ok(window) = Window::open(dir) else {
+            cached.remove(&id);
             continue;
         };
         // Staleness only reports replies, so a pointer past the bound is left out here rather
         // than failing `ctx open` for the whole tree; `read` refuses it where messages are
         // handed to an agent.
         let Some(mut delta) = read_file(&window)? else {
+            cached.remove(&id);
             continue;
         };
         delta.bound_pointers();
-        present.insert(id.clone());
         cached.insert(
             id,
             Flags {
@@ -1324,7 +1338,6 @@ fn read_windows(windows: &Path, cached: &mut BTreeMap<WindowId, Flags>) -> Resul
             },
         );
     }
-    cached.retain(|id, _| present.contains(id));
     Ok(())
 }
 
