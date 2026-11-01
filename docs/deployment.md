@@ -72,7 +72,7 @@ The cycle reads text that people outside the deployment wrote, so its session ru
 
 ### The image
 
-- `ctx` and `omp` on `PATH`. omp is the release `runner/omp.lock` pins, its archive checked against the SHA-256 there before it is unpacked. `jq` and `setpriv` (util-linux) are installed; `gh` is not, because omp's `issue://` and `pr://` reads run it at the read tier, which the policy approves.
+- `ctx` and `omp` on `PATH`. omp is the release `runner/omp.lock` pins, its archive checked against the SHA-256 there before it is unpacked. `jq` (1.7 or later), `setpriv` (util-linux) and GNU coreutils' `tail`, whose `--pid` ends the job log's follow of the session, are installed; `gh` is not, because omp's `issue://` and `pr://` reads run it at the read tier, which the policy approves.
 - `runner/run-cycle.sh` on `PATH` as the entrypoint, which starts as root (no `USER`), and `runner/policy.yml` and `runner/ctx-record.ts` at `/opt/ctx-memory/policy.yml` and `/opt/ctx-memory/ctx-record.ts`, owned by root.
 - The two skills of the release, `skills/ctx-memory` and `skills/ctx-memory-ingest`, in a directory root owns, and `$HOME/.omp/agent/config.yml` naming that directory and no other under `skills.customDirectories`. `omp skill list --json` run as `ctx-agent` lists exactly those two `custom:user` skills.
 - A user `ctx-agent`, the session's user. `HOME` is its home, and that home, everything in it and the working directory are root's and closed to writes, with a `.bashrc`, `.profile`, `.bash_profile` and `.bash_logout` of root's in it.
@@ -84,7 +84,7 @@ The cycle reads text that people outside the deployment wrote, so its session ru
 | Variable | What it is |
 | --- | --- |
 | `CTX_SERVER`, `CTX_SERVER_AUDIENCE` | The server's URL and the audience of the identity token `ctx` mints for it. Every command of the cycle runs on the server, so the job holds no tree, no store and no source credential. |
-| `CTX_DATA_DIR` | The data directory on the share. The session reads the windows there and writes its JSONL transcript under `agent-sessions/<execution>/`, which goes back to root when the session ends. `ctx-agent` may read the windows and write nothing else on the share. |
+| `CTX_DATA_DIR` | The data directory on the share. The session reads the windows there and writes its JSONL transcript under `agent-sessions/<execution>/`, which goes back to root when the session ends, with omp's whole event stream moved into it as `events.jsonl`. `ctx-agent` may read the windows and write nothing else on the share. |
 | `CTX_MODEL_BASE_URL` | The model API's `http` or `https` origin, with no user, path or query. Every model call goes there. |
 | `CTX_MODELS_FILE` | The model provider file, by absolute path with no symbolic link: an omp `models.yml` naming the one provider the session may call, as in [`runner/models.example.yml`](../runner/models.example.yml). Past its comment lines, one line names `baseUrl`, `    baseUrl: "@CTX_MODEL_BASE_URL@"`, and one names `apiKey` or the key file, `    apiKey: "!cat /run/ctx-agent/model-key"`, each four spaces in; so no model or second provider names an address of its own, and the key goes nowhere else. `run-cycle.sh` writes the file, with the address in place of the placeholder, to `$HOME/.omp/agent/models.yml` as root before each session. It refuses a file that breaks those rules, and one that `ctx-agent` could change: the file or any directory above it owned by `ctx-agent` or writable by group or others, other than a directory of root's with the sticky bit, such as `/tmp`. Those line checks keep the file from routing a call or the key elsewhere by mistake; what the file may otherwise say is the deployment's to keep, as is the rest of the image. |
 | `CTX_MODEL` | The model the session selects, `<provider>/<model id>` of that file, as omp's `--model` takes it. |
@@ -114,6 +114,33 @@ An execution that exits 0 finished its work: a cycle found no pending window, or
 
 Log each execution, and treat a failed execution, or a log that stops growing while the schedule is enabled, as an outage to fix rather than a quiet period.
 
+### What the job log holds
+
+While a session runs, `run-cycle.sh` writes one line of JSON to standard output for each tool call and each model turn, as each ends, and Cloud Run puts each in its entry's `jsonPayload`. No line holds a record's text, a quote, a search query, a tool's output or anything a message said, and none is longer than about 17 KB, far under the about 100 KB at which Cloud Logging stores a line as text instead. omp's whole event stream, each record and finding in full among it, is kept only in the session's sealed transcript directory, `agent-sessions/<execution>/events.jsonl` (`<execution>-retry/` for a refused session's fresh one; `events.<n>.jsonl` when an earlier attempt of the execution left one). Every line has `type`, `severity` (taken by Cloud Logging as the entry's severity) and `session`, the session's `CTX_SESSION`: the `session` the server's request log names for each request the session's `ctx` makes, and the `Session:` trailer of the commits it makes. The `run-cycle:` lines above stay plain text.
+
+A tool call, when it ends, `"type": "tool_call"`:
+
+| Field | What it is |
+| --- | --- |
+| `tool` | The omp tool: `bash`, `read`, `grep`, `glob`, `todo`, `ctx_record_put` or `ctx_record_rm`; `(other)` for a name of another shape. |
+| `command` | The ctx subcommand: `record put` and `record rm` for the record tools, the words after `ctx` for a `bash` call, such as `record show`, `search` or `marker advance`. Absent for a `bash` call that does not run `ctx`, which the policy refuses. |
+| `paths` | The record paths the call names: each record a put writes or a remove removes, and the arguments of `ctx record show` and `ctx cite verify`, the only commands that take one, when the whole call is that one simple command of plain words; no other argument of a command, a search's query among them, is read for one. A path in no record path's shape, a `ctx record show` given more than one argument, every argument of a call that holds more than the one command (an operator, a comment, a heredoc, a word built of quoted pieces), and every path of a write refused for holding a credential read `(withheld)`. At most 50, with `paths_omitted` counting the rest. |
+| `path` | For `read`, `grep` and `glob`, the path it was given when that is under `CTX_DATA_DIR` or a `skill://` address, in plain characters; `(withheld)` otherwise. |
+| `result` | `ok`; `refused`, a write the server refused; `exit-<code>`, a command that failed; `timeout`; `denied`, a call the approval rules stopped; `error`, any other failure; or `unfinished`, a call still running when the session ended. |
+| `refusals` | For a refused write, the kind of each finding that refused it, in the order the CLI's report lists them, as the server's request log lists them (`gap`, `schema`, `quote`, …); a word that is not one of the server's kinds reads `other`. At most 50, with `refusals_omitted` counting the rest. |
+| `status` | For a write that failed with an HTTP status from the server, that status. |
+| `duration_ms` | How long the call ran, measured as the runner reads the events; `null` for a call whose start it did not see. |
+
+A model turn, when the model's message ends, `"type": "message_end"`, the name of omp's own event, so a query or alert written for omp's events still matches it:
+
+| Field | What it is |
+| --- | --- |
+| `message.stopReason` | How the turn ended: `toolUse`, `stop`, `error`, `aborted`, `length`. |
+| `message.errorStatus`, `message.errorId` | The HTTP status and omp's error classifier of a turn that failed, when omp names them. The error's prose is not copied: it can quote the request. |
+| `message.stopDetails` | The `type` and `category` of the provider's stop details, `(withheld)` when not a name's shape; for a model refusal, `type` `refusal` and a category such as `reasoning_extraction`. Its explanation and any other field are not copied. A model refusal is exactly one line with `message.stopDetails.type` `refusal`. |
+| `tool_calls` | How many tool calls the turn asked for. |
+| `usage`, `cost` | The turn's tokens (`input`, `output`, `cacheRead`, `cacheWrite`) and cost, as omp reports them. |
+
 ### Checking an image
 
-The runner's own tests (`tests/agent_cycle/`) check the policy against every `ctx` command the skills name, run `run-cycle.sh` against stand-ins for each refusal, run what it does after a session against omp's events, and drive live sessions of the pinned omp. What holds only in a built image — that the session runs as `ctx-agent` with no new privileges, that its model calls reach `CTX_MODEL_BASE_URL` with the job's key as the bearer token, that a `SIGTERM` reaches the session and the transcript is sealed, that no file the session tries to write lands — is the deployment's to check, by running the image as its job runs it, as root with a share mounted, against a stand-in for the server and the model API.
+The runner's own tests (`tests/agent_cycle/`) check the policy against every `ctx` command the skills name, run `run-cycle.sh` against stand-ins for each refusal, run what it does after a session and the job log it writes against omp's events, and drive live sessions of the pinned omp. What holds only in a built image — that the session runs as `ctx-agent` with no new privileges, that its model calls reach `CTX_MODEL_BASE_URL` with the job's key as the bearer token, that a `SIGTERM` reaches the session and the transcript is sealed, that no file the session tries to write lands — is the deployment's to check, by running the image as its job runs it, as root with a share mounted, against a stand-in for the server and the model API.
