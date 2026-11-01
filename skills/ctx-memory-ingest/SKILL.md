@@ -50,19 +50,16 @@ A cycle runs from the hourly agent job or by hand. Two cycles never run at once 
 
 The cycle reads and writes through one server: `CTX_SERVER` names it, and every `ctx`
 command in this procedure goes there. The session holds no clone and no source credential,
-so there is nothing on this machine to repair or clean up, and a command the server does
-not answer, such as a fetch, fails.
+and a command the server does not answer, such as a fetch, fails.
 
 A scheduled cycle runs under a policy that admits, at the shell, only the `ctx`
 subcommands this procedure names: one per shell call, with no pipe, no redirection and no
 `&&`. Any other program is refused, an external `ctx-<name>` command among them, and so is
 a web address: `read` and `grep` work on local files only. The session's tools are the
-shell, `read`, `grep`, `glob`, a todo list, and the two record tools of step 9. There is
-no tool that writes or edits a file, and no subagent, code evaluation or network tool.
-That policy is what keeps text in a window from becoming a command, so work within it:
-read the windows with `read`, `grep` and `glob` and a record of the tree with
-`ctx record show <path>`, and write each record through the record tool, which takes the
-whole record as an argument and starts no shell.
+shell, `read`, `grep`, `glob`, a todo list, and the two record tools of step 9; none writes
+or edits a file, and that policy keeps text in a window from becoming a command. Read the
+windows with `read`, `grep` and `glob`, a record of the tree with `ctx record show <path>`,
+and write each record through the record tool.
 
 The fetched material sits in the shared data directory, which the prompt that starts the
 cycle names. `ctx pending --json` gives each pending window's `dir`: its directory under the
@@ -75,13 +72,9 @@ delta. `ctx marker advance <window id>` moves the marker once the cycle's record
 written. Never edit cursor or marker state by hand: the fetch job moves the cursors itself.
 
 `ctx pending --json` leaves out the messages the deployment excludes, and one answer holds at
-most what fits in one reply. When `later_windows` is above zero, more windows wait than the
-answer lists; handle the ones it lists, and the next cycle gets the rest. When the answer has
-a `next_offset`, its delta lists only the oldest part of a large window (`listed_messages`
-below `new_messages`): handle that part, then run `ctx pending --json --offset <next_offset>`,
-with the same `--limit` if you gave one, for the next, and move the marker past that window
-only after its last part. A message a source delivered again unchanged is not new and is in
-no delta.
+most what fits in one reply. When its `later_windows` is above zero or it has a
+`next_offset`, read `skill://ctx-memory-ingest/references/large-windows.md`. A message a source
+delivered again unchanged is not new and is in no delta.
 
 ## Boundaries
 
@@ -97,25 +90,21 @@ no delta.
   quote whose source does not hold it, and a claim whose pointer nothing can check: a
   source that has never declared whether its records are its own words, one that stores
   renderings rather than words (the calendar), and a scheme no configured source owns
-  (`foo:bar`). A quote at tier 1 or 2 must name a pointer that resolves to a source storing
-  its records verbatim, so the server refuses a tier 1 or 2 claim with no pointer at all.
-  Free text such as `source: "overheard in standup"` is allowed only at tier 3 or 4, which
-  is what a summary and a secondhand account are. One checked quote in a record does not
-  carry the record's other claims: each is judged alone. A record whose own tier is 1 or 2,
-  a meeting or a decision as much as any other, needs at least one tier 1 or 2 quote that
-  was checked against its source: the server refuses it when it carries no quote, only
-  quotes at tier 3 or 4, or only tier 1 or 2 quotes too short to count (below).
+  (`foo:bar`). Free text such as `source: "overheard in standup"` is allowed only at tier 3
+  or 4, which is what a summary and a secondhand account are, so a tier 1 or 2 claim needs a
+  pointer that resolves to a source storing its records verbatim. One checked quote does not
+  carry the record's other claims: each is judged alone, and a record whose own tier is 1 or
+  2 needs at least one tier 1 or 2 quote that was checked against its source.
 - A failed stream keeps its own cursor, so the next fetch re-reads it. Report the error
   (step 2); do not skip the source silently.
 - A missing artifact is a gap to state in the record it belongs to, never a fact to fill in.
 - Never write credentials or secrets into the tree. Apply the rules page's audience
   rules before repeating tree content anywhere outward.
 
-## One writer, read-only helpers
+## One writer
 
-The server is the only writer of records, and this cycle is the only agent writing in it
-while it runs. It mints, appends, supersedes and closes. Helpers (subagents or lanes) may
-read the window and the tree and return draft records or evidence; they never write.
+The server is the only writer of records, and this cycle the only agent writing while it
+runs. A helper may read and draft records or evidence; it never writes.
 
 ## Sources
 
@@ -126,12 +115,13 @@ automated notification noise unless a person acts on it.
 
 ## Per-cycle procedure
 
-1. Run `ctx rules`, then `ctx pending --json`.
+1. Run `ctx rules`, then `ctx pending --json`. `ctx rules` prints the rules page, then the
+   schema of each record type: the fields a record of that type must carry.
 2. Get the windows to handle. `ctx pending --json` lists every completed window after the
    marker; handle them all, oldest first. When the cycle names a window cap, add it to
    `ctx pending --json` as `--limit <N>`: the answer then holds only the N oldest, and the rest
-   wait for the next cycle, so one run never has to read a whole backlog at once. When it lists
-   none, say so and stop: the cycle never fetches, because the fetch job owns the cursors. If a
+   wait for the next cycle. When it lists none, say so and stop: the cycle never fetches,
+   because the fetch job owns the cursors. If a
    stream reports an error, report it to whoever runs the cycle (and in the cycle log, if the
    rules page names one); that stream's cursor stays where it is, so the next fetch re-reads
    it. A window whose `new_messages` count is zero is still handled: there is nothing to record
@@ -156,9 +146,9 @@ automated notification noise unless a person acts on it.
 4. When a window holds a meeting (its notes, its transcript or its calendar event), read
    `skill://ctx-memory-ingest/references/meetings.md` before you write its records.
 5. Cite each message by the `pointer` field of its line in `records.jsonl`, copied
-   exactly (for example `slack:<channel>/<ts>`, `gmail:<id>`, or a third-party source's
-   own scheme). For a record about a whole thread, cite the line's `thread` pointer. Do
-   not copy raw messages into the tree.
+   exactly, never shortened (for example `slack:<channel>/<ts>`, `gmail:<id>`, a commit's
+   whole 40-character SHA, or a third-party source's own scheme). For a record about a whole
+   thread, cite the line's `thread` pointer. Do not copy raw messages into the tree.
 6. Extract decisions, commitments, questions, metrics and entities, each with its owner,
    the people it waits on (`waiting_on`, by the rule under "Record rules"), dates, status,
    a verbatim quote of at most about 20 words, the source pointer and a tier. Each fragment
@@ -171,8 +161,8 @@ automated notification noise unless a person acts on it.
    window id, the counts, and what was minted, updated and closed, as wikilinks. Do not
    narrate how you decided, what you weighed, what you set aside, or what you read and left
    unchanged; that account of your own reasoning belongs in no record, and a long retelling of
-   it on the cycle's last turn is what makes the model refuse it. Facts go in records, not in
-   the log. With no cycle log named, write no record about the cycle.
+   it on the cycle's last turn is what makes the model refuse it. With no cycle log named,
+   write no record about the cycle.
 8. Verify. Check each new quote against its source with `ctx resolve <pointer>`, adding
    `--thread` when the record cites a thread pointer.
 9. Write with the `ctx_record_put` tool: its `records` list holds each record's tree path and
@@ -180,10 +170,10 @@ automated notification noise unless a person acts on it.
    which takes its path. The two tools run `ctx record put <path>` and
    `ctx record rm <path>` against the server for you, each as one program with no shell, so
    any text is fine in a record. The server checks each write as `ctx sweep` and
-   `ctx cite verify` would, commits it under your own name with the session in the
-   message, and pushes it. A write the server refuses fails with its findings and changes
-   nothing: fix the record and call the tool again. Write a record before the page that
-   links to it. New records that link each other go in one call, since neither can be
+   `ctx cite verify` would, then commits and pushes it. A write the server refuses fails
+   with its findings and changes nothing: fix what each finding names and call the tool
+   again. Write a record before the page that links to it, or in the same call.
+   New records that link each other go in one call, since neither can be
    written first: the server checks them together and commits all of them or none.
 10. Sweep. Once every record of the cycle is written, run `ctx sweep` for the whole tree.
     It reports what a single write cannot see, such as a record no page links to yet, so
@@ -194,8 +184,7 @@ automated notification noise unless a person acts on it.
     window's records are written (step 9) and its quotes verified (step 8), and before you
     start the next window, run `ctx marker advance <that window id>`, and for an empty window
     as soon as you have seen it is empty (step 2). The marker covers every window up to the
-    one named; repeating it for the same window changes only who moved it and when, and it
-    refuses a window older than the one the marker already holds.
+    one named, and it refuses a window older than the one the marker already holds.
 
 ## Record rules
 
@@ -240,7 +229,10 @@ automated notification noise unless a person acts on it.
   elsewhere write it, never the cycle.
 - Keep superseded values with their citations; mark them superseded and link the
   replacement.
-- Give open decisions, commitments and questions a `due` or `revisit_by` date.
+- Give every decision and question a `revisit_by` date and every commitment a `due` date,
+  and keep it when the record is answered, decided or closed. Give each record every other
+  field its type's schema requires (`ctx rules` prints them): a decision's `statement`, a
+  metric's `name`, `value`, `unit` and `as_of`.
 - When a record carries a current-state date, use the date of its newest underlying
   fact, not the date the cycle ran.
 
@@ -261,14 +253,20 @@ mint it; each rule says where a fact worth keeping goes instead.
   cursor, what the cycle did): no record of any type, `gap` included, since it is about the
   pipeline, not anyone's work. Report stream trouble as step 2 says; evidence a record
   lacks goes in that record's body.
-- A mirror of one pull request or issue: no project or ops record whose one source is a
-  single pull request or issue, since the tracker holds its state. Record what the item
-  carries beyond it: a decision and who made it, a named person's commitment, an open
-  question or a metric, each citing the item, or an update to its project's record.
-- Closed on arrival: no record whose status is already answered, cancelled, closed,
-  completed, done, resolved, superseded or withdrawn, since it only restates its source.
-  Close the open record the source closes, or update the metric whose figure it changes;
-  a decision someone made is `decided`, not closed.
+- A record of one change: no project or ops record whose sources are one change in a
+  repository (its pull request, issue, commits or release), whoever made it, a person's own
+  commit as much as a bot's, since the repository holds it. Record what the change carries
+  beyond it: a decision and who made it, a named person's commitment, an open question or a
+  metric, each citing the item, or an update to its project's record.
+- Done on arrival: no record whose status is already answered, cancelled, closed,
+  completed, done, resolved, superseded or withdrawn, and none whose only news is that a
+  change is merged, pushed, released or deployed, whatever status you would give it
+  (`current` and `active` too), since that restates its source. Close the open record the
+  source closes, or update the record or metric whose state it changes; a decision someone
+  made is `decided`, not closed. What a finished change carries beyond its own state is
+  still a record, minted where none exists: a decision and who made it, a named person's
+  commitment, a question it leaves open, a figure it measures. An ops or project record
+  names who must still do, decide or answer what; if no one must, write none.
 - The pipeline that builds this graph (the fetch, the cycle, the ctx server): its failures,
   fixes and checks, and the issues and messages about them, get no record of any type, since
   whoever runs the cycle tracks them; put what you saw in your report to them.

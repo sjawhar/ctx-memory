@@ -24,6 +24,7 @@ use crate::open::{
 };
 use crate::output::{self, Outcome, Sink};
 use crate::plugin::{run_external, PluginEnv};
+use crate::records_schema;
 use crate::redact;
 use crate::remote;
 use crate::resolve::{self, Resolved};
@@ -406,6 +407,9 @@ struct RulesPayload<'a> {
     path: String,
     bytes: usize,
     text: &'a str,
+    /// The tree's own record schemas, so a writer sees which fields its record type requires
+    /// before it writes, rather than after the server refuses the write.
+    schemas: Vec<records_schema::SchemaFile>,
 }
 
 #[derive(Serialize)]
@@ -975,11 +979,18 @@ fn run_rules(run: &mut Run<'_, '_>) -> Result<Outcome> {
         path: document.rel.to_string_lossy().into_owned(),
         bytes: document.raw.len(),
         text: &document.raw,
+        schemas: records_schema::files(&run.context.tree)?,
     };
-    // The rules page is the tree's text, printed without its control characters.
+    // The rules page and each schema are the tree's own text, printed without the control
+    // characters that would drive a terminal.
     run.emit("rules", &payload, |payload, out| {
         writeln!(out, "{}", output::printable(&payload.path))?;
-        write!(out, "\n{}", output::printable(payload.text))
+        write!(out, "\n{}", output::printable(payload.text))?;
+        for schema in &payload.schemas {
+            writeln!(out, "\n{}", output::printable(&schema.path))?;
+            write!(out, "\n{}", output::printable(&schema.text))?;
+        }
+        Ok(())
     })?;
     Ok(Outcome::Pass)
 }

@@ -110,7 +110,14 @@ pub(super) fn verify_quotes(
     let mut verbatim_held = false;
     let mut verbatim_refused = false;
     let mut verbatim_short = false;
+    // Where the record declares the quote read last, so claims that hold the same words are
+    // matched to their own entries, in the order `quote_claims` gives them.
+    let mut declared_through = 0;
     for claim in claims {
+        let declared = quote_start(document, claim.quote, declared_through);
+        if let Some(start) = declared {
+            declared_through = start.saturating_add(claim.quote.len());
+        }
         let verbatim = claim.tier.is_some_and(Tier::is_verbatim);
         match claim_provenance(claim, document, schemes, evidence, &record_texts) {
             Provenance::Checkable(sources) => {
@@ -129,9 +136,15 @@ pub(super) fn verify_quotes(
                 let Some(source) = sources.first() else {
                     continue;
                 };
+                // The finding names the line the record declares this quote on, not the line
+                // of the source's first citation: a record often quotes one source many
+                // times, and the writer has to see which quote failed. A quote the raw text
+                // does not hold as it was read — YAML wrote it with an escape, or folded it
+                // over several lines — is not found there, and the source's own line stands.
+                let start = declared.unwrap_or(source.start);
                 verification.broken.push(broken(
                     document,
-                    source.start,
+                    start,
                     &source.pointer,
                     "quote does not appear in the resolved text".to_owned(),
                 ));
@@ -176,6 +189,31 @@ pub(super) fn verify_quotes(
     if !verbatim_held && !verbatim_refused {
         verify_record_tier(document, claims, verbatim_short, verification);
     }
+}
+
+/// Where the record declares `quote`, from byte `from` on: the first place the raw text holds
+/// it on a line that declares a quote (`quote: …`, or `- quote: …` in a `quotes` entry).
+///
+/// The claim's text is the value YAML read, so the raw text holds it only where the record
+/// wrote it plainly. Matching it on a declaring line, rather than anywhere in the record,
+/// keeps a title or a body sentence that repeats the same words from standing in for the
+/// entry; reading from `from` keeps two entries with the same words in their own order. A
+/// quote the raw text does not hold that way — YAML wrote it with an escape, or folded it
+/// over several lines — has no place here, and the caller falls back to the source's line.
+fn quote_start(document: &Doc, quote: &str, from: usize) -> Option<usize> {
+    let raw = &document.raw;
+    let mut searched = from.min(raw.len());
+    while let Some(found) = raw.get(searched..)?.find(quote) {
+        let start = searched + found;
+        let line_start = raw.get(..start)?.rfind('\n').map_or(0, |end| end + 1);
+        let before = raw.get(line_start..start)?.trim_start();
+        let before = before.strip_prefix("- ").unwrap_or(before);
+        if before.starts_with("quote:") {
+            return Some(start);
+        }
+        searched = start.saturating_add(quote.len().max(1));
+    }
+    None
 }
 
 /// Names a record that ranks at tier 1 or 2 when no quote at those tiers bears that out.

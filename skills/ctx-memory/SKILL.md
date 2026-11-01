@@ -11,7 +11,7 @@ A memory tree is a graph of markdown records with YAML frontmatter and wikilinks
 
 ## Read the tree
 
-1. Run `ctx rules` first. The root `rules.md` defines the tree's local rules.
+1. Run `ctx rules` first. The root `rules.md` defines the tree's local rules, and what it prints after the page is each record type's schema: the fields a record of that type must carry, which the server checks on every write.
 2. Search before answering:
    - `ctx search "<terms>"` matches every frontmatter value a record declares — title, quotes, statement, aliases, owner, status, dates, source pointers and a tree's own fields — and the body, and ranks direct sources above equally relevant summaries. Where embeddings are configured it also finds a record by meaning, so a paraphrase matches even with no shared word; a `--verbatim` run that finds nothing still reports how many lower-tier records matched, so it is not an absence.
    - `ctx dossier "<entity>"` follows the graph around one entity.
