@@ -118,6 +118,48 @@ fn the_index_is_built_before_the_listeners_are_bound() -> Result<()> {
     Ok(())
 }
 
+/// A copy whose state directory holds no index at all builds one before it binds, which is
+/// every container start: the image carries no index, so it is replayed from every window on
+/// the share. The index file is looked at directly, not through a command, because a command
+/// that found no index would build one itself and so could not tell the two apart.
+#[test]
+fn a_copy_with_no_index_builds_one_before_it_binds() -> Result<()> {
+    let tree = fixture_clone("index-cold-start")?;
+    fetch_window(&tree)?;
+    let root = tree.parent().context("the fixture has a root")?;
+    // The state directory a container starts with: the fetch's index and everything beside it
+    // are gone, and only the share's windows are left.
+    let state = root.join("state/server-write");
+    for entry in std::fs::read_dir(&state)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("store.sqlite3")
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    let store = state.join("store.sqlite3");
+    let cold = store.exists();
+
+    let server = Server::start(&tree, &["--pull-interval", "600"])?;
+    let built = store.exists();
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert!(
+        !cold,
+        "the test did not start from a state directory with no index"
+    );
+    assert!(
+        built,
+        "the copy bound its listeners with no index, so the first caller that needed one \
+         would have replayed the share itself"
+    );
+    Ok(())
+}
+
 /// A copy that starts reads only the windows its index has not indexed yet. Each one used to
 /// re-read every window on the share at its first pass, because the loop kept that watermark
 /// in memory: the deployment's copy of 2026-11-01 held the tree for 157 s doing it, and every

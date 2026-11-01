@@ -87,6 +87,12 @@ pub struct Shared {
     /// tree back from disk: the tree served stays the one from before the write, until the
     /// clone holds nothing the remote lacks.
     tainted: AtomicBool,
+    /// Whether the index build this copy started as it came up is over ([`warm_index`]).
+    /// Every request waits for it before it takes the tree: the build reads the whole share
+    /// when the state directory holds no index, and a request that took the tree and then
+    /// waited for that build would make every later request wait behind it, which is the
+    /// whole of what this copy must not do.
+    index: tokio::sync::watch::Sender<bool>,
     places: Places,
 }
 
@@ -217,8 +223,31 @@ impl Shared {
             health: Mutex::new(health),
             following: Mutex::new(Following::default()),
             tainted: AtomicBool::new(false),
+            index: tokio::sync::watch::channel(false).0,
             places,
         })
+    }
+
+    /// Waits until the index build this copy started as it came up is over, however it went.
+    ///
+    /// The value is copied out of the channel before the wait, so none of the channel's own
+    /// locks is held across it.
+    pub async fn index_ready(&self) {
+        let mut building = self.index.subscribe();
+        loop {
+            let built = *building.borrow_and_update();
+            if built {
+                return;
+            }
+            if building.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Says the index build is over, however it went.
+    fn index_done(&self) {
+        let _ = self.index.send(true);
     }
 
     /// `text`, as a remote caller may read it: the server's own directories are named
@@ -474,22 +503,23 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     let shared = Arc::new(Shared::new(context).context("checking the clone before serving it")?);
     // The record index is replayed from every window on the share whenever the state
     // directory holds none, which a container's does at every start, and the first caller to
-    // need one used to wait that replay out. It is built here instead, before any port is
-    // bound, so the deployment's startup probe holds traffic while it runs, and off the tree
-    // lock, so a read that needs no index is answered while it goes. The listeners wait no
-    // longer than `--index-wait` for it, because a startup probe gives a container a bounded
-    // time to accept a connection and a share whose replay outlasts that still needs serving.
-    let warming = warm_index(Arc::clone(&shared));
+    // need one used to wait that replay out under the tree lock, with every other caller
+    // behind it. It is built here instead, before any port is bound, so the deployment's
+    // startup probe holds traffic while it runs, and it holds the tree for no part of itself.
+    // The listeners wait no longer than `--index-wait` for it, because a startup probe gives
+    // a container a bounded time to accept a connection and a share whose replay outlasts
+    // that still needs serving; a request that arrives then waits for the rest of the build
+    // before it takes the tree ([`Shared::index_ready`]).
+    warm_index(Arc::clone(&shared));
     if arguments.index_wait > 0 {
-        let mut warmed = warming.clone();
         let wait = Duration::from_secs(arguments.index_wait);
-        if tokio::time::timeout(wait, index_built(&mut warmed))
+        if tokio::time::timeout(wait, shared.index_ready())
             .await
             .is_err()
         {
             eprintln!(
                 "the record index is still being built after {}s: binding the listeners now, \
-                 and a read that needs the index waits for the rest of it",
+                 and a request waits for the rest of it",
                 arguments.index_wait
             );
         }
@@ -549,7 +579,7 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
                 .into_future(),
         ));
     }
-    let following = follow(Arc::clone(&shared), arguments.pull_interval, warming);
+    let following = follow(Arc::clone(&shared), arguments.pull_interval);
     let signalled = tokio::spawn(async move {
         match terminated().await {
             Ok(()) => drop(stop.send(true)),
@@ -658,15 +688,11 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(300);
 ///
 /// The first pass waits for the index this copy built as it started ([`warm_index`]): a pass
 /// beside that build would replay the same windows a second time.
-fn follow(
-    shared: Arc<Shared>,
-    interval: u64,
-    mut warming: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
+fn follow(shared: Arc<Shared>, interval: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let period = Duration::from_secs(interval.max(1));
         let mut heard: Option<std::time::Instant> = None;
-        index_built(&mut warming).await;
+        shared.index_ready().await;
         loop {
             tokio::time::sleep(period).await;
             let following = Arc::clone(&shared);
@@ -694,20 +720,23 @@ fn follow(
 /// The index is in the state directory, which a container's image does not carry, so it is
 /// replayed from every window on the share at every start. That replay is started here, as
 /// the server starts, rather than left to the first caller that needs an index or to the
-/// first follow pass. It holds nothing a read waits on.
+/// first follow pass, and it holds the tree for no part of itself. A request still waits for
+/// it — the index it would read is the one being built — but it waits in
+/// [`Shared::index_ready`], before it takes the tree, so a request that needs no index is
+/// answered as soon as the build is over rather than behind the request that needed one.
 ///
-/// The receiver says when the build is over, however it went: a failure is one line on
-/// standard error, and the next follow pass tries again. A tree that keeps no index — one
-/// whose `ctx.toml` names no `id` — is such a failure, and the copy serves what needs none.
+/// [`Shared::index_ready`] says when the build is over, however it went: a failure is one
+/// line on standard error, and the next follow pass tries again. A tree that keeps no index —
+/// one whose `ctx.toml` names no `id` — is such a failure, and the copy serves what needs
+/// none.
 ///
 /// Which directories it reads is taken under the tree lock, as a follow pass takes them, and
-/// the lock is given back before the build itself. Nothing else holds the tree here, so that
-/// costs no wait.
-fn warm_index(shared: Arc<Shared>) -> tokio::sync::watch::Receiver<bool> {
-    let (built, building) = tokio::sync::watch::channel(false);
+/// the lock is given back before the build itself.
+fn warm_index(shared: Arc<Shared>) {
     tokio::spawn(async move {
+        let building = Arc::clone(&shared);
         let indexed = tokio::task::spawn_blocking(move || {
-            let (data, state) = dirs_of(&shared.tree()?)?;
+            let (data, state) = dirs_of(&*building.tree()?)?;
             index_windows(&data, &state)
         })
         .await;
@@ -719,25 +748,8 @@ fn warm_index(shared: Arc<Shared>) -> tokio::sync::watch::Receiver<bool> {
             ),
             Err(error) => eprintln!("building the record index: the build stopped: {error}"),
         }
-        let _ = built.send(true);
+        shared.index_done();
     });
-    building
-}
-
-/// Waits until the index build [`warm_index`] started is over, however it went.
-///
-/// The value is read out of the receiver rather than held, so nothing of the channel's own is
-/// alive while this waits.
-async fn index_built(building: &mut tokio::sync::watch::Receiver<bool>) {
-    loop {
-        let built = *building.borrow_and_update();
-        if built {
-            return;
-        }
-        if building.changed().await.is_err() {
-            return;
-        }
-    }
 }
 
 /// One pass of the follow loop.
@@ -810,16 +822,17 @@ fn follow_main(repo: Repo, tree: &mut Context, root: &Path, shared: &Shared) -> 
     pulled
 }
 
-/// Indexes every completed window this copy's index has not indexed yet, oldest first.
+/// Reads into this copy's index every completed window it has not read yet, oldest first.
 ///
-/// The index keeps that watermark itself ([`Store::catch_up`]), so a copy replays the share
-/// once, when it builds its index, and reads only what appeared since on every pass after
-/// that. The follow loop used to keep the watermark in memory, where every copy starts with
-/// nothing: a copy's first pass then re-read every window on the share, however many there
-/// were, and the deployment's took 157 s of a restart on 2026-11-01 with the tree held.
+/// The index keeps that watermark itself, under a key of the server's own
+/// ([`Store::read_share`]), so a copy replays the share once, when it builds its index, and
+/// reads only what appeared since on every pass after that. The follow loop used to keep the
+/// watermark in memory, where every copy starts with nothing: a copy's first pass then
+/// re-read every window on the share, however many there were, and the deployment's took
+/// 157 s of a restart on 2026-11-01 with the tree held.
 fn index_windows(data: &DataDir, state: &StateDir) -> Result<()> {
     let store = Store::load(data, state).context("opening this copy's record index")?;
-    store.catch_up(data)
+    store.read_share(data)
 }
 
 /// Prints one bound address, so a caller that asked for port 0 can find it.
@@ -1101,9 +1114,12 @@ mod tests {
     /// it: on 2026-11-01 a restarted copy of the deployment held it for 157 s, and the two
     /// reads a scheduled session opened with waited 163 s each.
     ///
-    /// The index is held against every writer here, so the pass is inside its indexing step
-    /// for as long as this test needs to look at the tree lock; it is given back as soon as
-    /// the test has looked, so the pass finishes and its window is indexed.
+    /// The pass is pinned in its indexing step: the test holds the index against every
+    /// writer, so the pass cannot get past it. That the pass is past its own tree section by
+    /// then is established first — the test holds the tree, and the pass does not end while
+    /// it does — so a tree found free afterwards is a tree the pass gave back, not one it
+    /// had yet to take. It is found free many times over, because the old pass gave it back
+    /// only when its indexing was done, which here cannot happen at all.
     #[test]
     fn a_pass_indexes_the_share_with_the_tree_free() -> Result<()> {
         let id = format!("ctx-index-off-the-lock-{}", std::process::id());
@@ -1120,7 +1136,7 @@ mod tests {
         std::fs::write(root.join("rules.md"), "---\ntype: rules\n---\n# Rules\n")?;
         window(&data, "20260102T000000Z-0000", "C0EXAMPLE01")?;
         let shared = Arc::new(Shared::new(Context::open(&root)?)?);
-        let (share, index) = dirs_of(&shared.tree()?)?;
+        let (share, index) = dirs_of(&*shared.tree()?)?;
         let state = index.root().to_path_buf();
         if state.exists() {
             std::fs::remove_dir_all(&state)?;
@@ -1130,15 +1146,28 @@ mod tests {
 
         let holder = rusqlite::Connection::open(index.store())?;
         holder.execute_batch("BEGIN EXCLUSIVE")?;
+        let held = shared.tree()?;
         let passing = Arc::clone(&shared);
         let pass = std::thread::spawn(move || follow_once(&passing));
-        let mut free = false;
-        while !pass.is_finished() {
-            if shared.try_tree()?.is_some() {
-                free = true;
+        // The pass wants the tree, which this test holds, so it cannot be anywhere near its
+        // indexing step yet.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let waited_for_the_tree = !pass.is_finished();
+        drop(held);
+        // The pass takes the tree, finds nothing to pull, gives it back and stops at the
+        // index. From here the tree is free, and stays free, until the index is given back.
+        let mut free = 0_u32;
+        let mut busy = 0_u32;
+        for _ in 0..60_u32 {
+            if pass.is_finished() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            if shared.try_tree()?.is_some() {
+                free += 1;
+            } else {
+                busy += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         holder.execute_batch("ROLLBACK")?;
         drop(holder);
@@ -1152,7 +1181,15 @@ mod tests {
         std::fs::remove_dir_all(&root)?;
         std::fs::remove_dir_all(&state)?;
 
-        assert!(free, "the pass held the tree while it indexed the share");
+        assert!(
+            waited_for_the_tree,
+            "the pass ended without ever waiting for the tree, so it indexed nothing"
+        );
+        assert!(
+            free > 20 && busy <= 2,
+            "the pass held the tree while it indexed the share: {free} polls found it free, \
+             {busy} found it held"
+        );
         match passed {
             Ok(outcome) => outcome?,
             Err(_) => anyhow::bail!("the pass panicked"),

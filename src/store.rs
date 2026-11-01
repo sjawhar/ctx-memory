@@ -36,6 +36,15 @@ static REBUILDING: Mutex<()> = Mutex::new(());
 /// locked. One batch holds the store for well under a second.
 const PUBLISH_PATIENCE: Duration = Duration::from_secs(60);
 
+/// The watermark of the windows a fetch has read in, with what each delivered as new. The
+/// name is the one older stores wrote, so a store built before this key existed is read as
+/// the fetch's own.
+const FETCHED: &str = "windows";
+
+/// The watermark of the windows a server has read in, which is its own: a server delivers
+/// nothing, and the fetch's watermark means that a window's deliveries are recorded.
+const SERVED: &str = "served-windows";
+
 /// The staging database of one rebuild, which that rebuild removes on every way out.
 ///
 /// The file belongs to the call that made it: its name carries this process's id and a counter,
@@ -238,7 +247,10 @@ impl Store {
                 store.put_all(&source, &records, fetched_at)?;
             }
             if let Some(through) = through {
-                store.mark_indexed(&through)?;
+                // The replay read every window there is, as a fetch and as a server each
+                // read it, so neither reads any of them again.
+                store.mark_indexed(FETCHED, &through)?;
+                store.mark_indexed(SERVED, &through)?;
             }
             publish(&store.conn, &path)?;
         }
@@ -367,7 +379,7 @@ impl Store {
             self.put_all(source, records, fetched_at)?;
         }
         self.deliver(by_source.values().flatten(), &window.id)?;
-        self.mark_indexed(&window.id)
+        self.mark_indexed(FETCHED, &window.id)
     }
 
     /// Indexes every completed window after the last one the store indexed, oldest first, so a
@@ -377,20 +389,47 @@ impl Store {
     ///
     /// Returns an error when a window cannot be read or SQLite cannot write.
     pub fn catch_up(&self, data: &DataDir) -> Result<()> {
+        for window in self.unindexed(data, FETCHED)? {
+            self.index_window(&window)?;
+        }
+        Ok(())
+    }
+
+    /// Reads into the store every completed window a server has not read yet, oldest first.
+    ///
+    /// A server indexes the share so that it can answer from it; it delivers nothing to
+    /// anybody, so it adds each window's records and nothing else. What a window delivered as
+    /// new is the fetch's own account of its own work, under its own watermark ([`FETCHED`]),
+    /// and a server that wrote it could tell a fetch sharing this state directory that a
+    /// message it never handed over was already delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a window cannot be read or SQLite cannot write.
+    pub fn read_share(&self, data: &DataDir) -> Result<()> {
+        for window in self.unindexed(data, SERVED)? {
+            let (fetched_at, by_source) = window.records_by_source()?;
+            for (source, records) in &by_source {
+                self.put_all(source, records, fetched_at)?;
+            }
+            self.mark_indexed(SERVED, &window.id)?;
+        }
+        Ok(())
+    }
+
+    /// The completed windows after the one `key`'s watermark names, oldest first.
+    fn unindexed(&self, data: &DataDir, key: &str) -> Result<Vec<Window>> {
         let indexed: Option<String> = self
             .conn
             .query_row(
-                "SELECT window FROM indexed WHERE key = 'windows'",
-                [],
+                "SELECT window FROM indexed WHERE key = ?1",
+                params![key],
                 |row| row.get(0),
             )
             .optional()
             .context("reading the newest indexed window")?;
         let indexed = indexed.map(|window| WindowId::parse(&window)).transpose()?;
-        for window in windows::after(&data.windows(), indexed.as_ref())? {
-            self.index_window(&window)?;
-        }
-        Ok(())
+        windows::after(&data.windows(), indexed.as_ref())
     }
 
     /// Notes, for each record a window delivered as new, the version it delivered. Context
@@ -427,16 +466,16 @@ impl Store {
             .context("committing the delivered versions")
     }
 
-    /// Notes `window` as indexed, unless the store already counts a later one: a server and a
-    /// fetch that share a state directory both index windows, and a pass that read the
-    /// watermark before the other moved it must not move it back.
-    fn mark_indexed(&self, window: &WindowId) -> Result<()> {
+    /// Notes `window` as indexed under `key`, unless the store already counts a later one: a
+    /// server and a fetch that share a state directory both read windows, each under its own
+    /// key, and two passes of either must not put the watermark back.
+    fn mark_indexed(&self, key: &str, window: &WindowId) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO indexed(key, window) VALUES ('windows', ?1)
+                "INSERT INTO indexed(key, window) VALUES (?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET window = excluded.window
                  WHERE excluded.window > indexed.window",
-                params![window.to_string()],
+                params![key, window.to_string()],
             )
             .with_context(|| format!("noting window {window} as indexed"))?;
         Ok(())
@@ -1105,6 +1144,47 @@ mod tests {
         );
         assert!(restored, "the restored text is the newest delivered");
         assert_eq!(after_rebuild, (true, false), "a rebuild agrees");
+        Ok(())
+    }
+
+    /// A server reads the share into its index, and writes no account of what the fetch
+    /// delivered: it hands nothing to anybody. A server and a fetch can share a state
+    /// directory, and a server that wrote that account would tell the fetch a message it
+    /// never handed over had already been delivered. Each keeps its own watermark, so
+    /// neither skips what the other read.
+    #[test]
+    fn a_server_reading_the_share_leaves_the_fetchs_account_of_it_alone() -> Result<()> {
+        let root = scratch("read-share")?;
+        let data = DataDir::new(root.join("data"));
+        let state = StateDir::new(root.join("state"));
+        let store = Store::load(&data, &state)?;
+        let message = "slack:C0EXAMPLE01/1";
+        window(
+            &data,
+            "20261025T110000Z-0000",
+            at(11),
+            &[record(message, "A")],
+        )?;
+        store.read_share(&data)?;
+        let served = (
+            store.get(&pointer(message)?)?.is_some(),
+            unchanged(&store, message, "A")?,
+        );
+        // The fetch's own read of the same window is not skipped by the server's.
+        store.catch_up(&data)?;
+        let fetched = unchanged(&store, message, "A")?;
+        drop(store);
+        remove_scratch(&root)?;
+
+        assert_eq!(
+            served,
+            (true, false),
+            "the server's read holds the record, and says nothing was delivered"
+        );
+        assert!(
+            fetched,
+            "the fetch's read of a window the server had read recorded no delivery"
+        );
         Ok(())
     }
 
