@@ -5,6 +5,10 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use serde_json::{json, Value};
 
+use ctx_memory::config::{DataDir, StateDir};
+use ctx_memory::pointer::Pointer;
+use ctx_memory::store::Store;
+
 use crate::fixtures::{good_record, install_hook, put_body, within};
 use crate::support;
 use crate::support::{commit, fetch_window, fixture_clone, git, remote_of, remove_fixture, Server};
@@ -120,8 +124,9 @@ fn the_index_is_built_before_the_listeners_are_bound() -> Result<()> {
 
 /// A copy whose state directory holds no index at all builds one before it binds, which is
 /// every container start: the image carries no index, so it is replayed from every window on
-/// the share. The index file is looked at directly, not through a command, because a command
-/// that found no index would build one itself and so could not tell the two apart.
+/// the share. The index is read here as a file, with `Store::open`, which builds nothing; a
+/// command would replay the share itself and so could not tell a copy that had built its
+/// index from one that had not.
 #[test]
 fn a_copy_with_no_index_builds_one_before_it_binds() -> Result<()> {
     let tree = fixture_clone("index-cold-start")?;
@@ -129,8 +134,9 @@ fn a_copy_with_no_index_builds_one_before_it_binds() -> Result<()> {
     let root = tree.parent().context("the fixture has a root")?;
     // The state directory a container starts with: the fetch's index and everything beside it
     // are gone, and only the share's windows are left.
-    let state = root.join("state/server-write");
-    for entry in std::fs::read_dir(&state)? {
+    let data = DataDir::new(root.join("data"));
+    let state = StateDir::new(root.join("state/server-write"));
+    for entry in std::fs::read_dir(state.root())? {
         let entry = entry?;
         if entry
             .file_name()
@@ -140,11 +146,19 @@ fn a_copy_with_no_index_builds_one_before_it_binds() -> Result<()> {
             std::fs::remove_file(entry.path())?;
         }
     }
-    let store = state.join("store.sqlite3");
-    let cold = store.exists();
+    let fetched = Pointer {
+        scheme: "echo".to_owned(),
+        locator: "C0EXAMPLE01/record".to_owned(),
+    };
+    let indexed = |label: &str| -> Result<bool> {
+        let store = Store::open(&state.store(), &data.sources(), &state.resolved())
+            .with_context(|| format!("opening the index {label}"))?;
+        Ok(store.get(&fetched)?.is_some())
+    };
+    let cold = indexed("before the server started")?;
 
     let server = Server::start(&tree, &["--pull-interval", "600"])?;
-    let built = store.exists();
+    let built = indexed("as the server bound its listeners")?;
     drop(server);
     remove_fixture(&tree)?;
 

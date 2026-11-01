@@ -246,8 +246,13 @@ impl Shared {
     }
 
     /// Says the index build is over, however it went.
+    ///
+    /// The value is replaced rather than sent: a send with nobody listening fails and keeps
+    /// the old value, and this copy has no listener between the moment the wait before
+    /// binding gives up and the moment the follow loop subscribes. A build that finished
+    /// there would never be seen to have finished, and every request would wait for ever.
     fn index_done(&self) {
-        let _ = self.index.send(true);
+        let _ = self.index.send_replace(true);
     }
 
     /// `text`, as a remote caller may read it: the server's own directories are named
@@ -722,8 +727,8 @@ fn follow(shared: Arc<Shared>, interval: u64) -> tokio::task::JoinHandle<()> {
 /// the server starts, rather than left to the first caller that needs an index or to the
 /// first follow pass, and it holds the tree for no part of itself. A request still waits for
 /// it — the index it would read is the one being built — but it waits in
-/// [`Shared::index_ready`], before it takes the tree, so a request that needs no index is
-/// answered as soon as the build is over rather than behind the request that needed one.
+/// [`Shared::index_ready`], before it takes the tree, so the wait is the build's own and no
+/// request waits for the tree a request before it is holding only to wait for the build.
 ///
 /// [`Shared::index_ready`] says when the build is over, however it went: a failure is one
 /// line on standard error, and the next follow pass tries again. A tree that keeps no index —
@@ -1114,12 +1119,11 @@ mod tests {
     /// it: on 2026-11-01 a restarted copy of the deployment held it for 157 s, and the two
     /// reads a scheduled session opened with waited 163 s each.
     ///
-    /// The pass is pinned in its indexing step: the test holds the index against every
-    /// writer, so the pass cannot get past it. That the pass is past its own tree section by
-    /// then is established first — the test holds the tree, and the pass does not end while
-    /// it does — so a tree found free afterwards is a tree the pass gave back, not one it
-    /// had yet to take. It is found free many times over, because the old pass gave it back
-    /// only when its indexing was done, which here cannot happen at all.
+    /// The pass is caught inside its indexing step, by what it does there rather than by any
+    /// wait: the state directory holds no index, so the pass replays the share into a staging
+    /// file of its own, and that file appearing is the pass saying where it is. It cannot get
+    /// past the replay, because this test holds the store's write lock, so the tree it is
+    /// found holding, or not holding, is the tree it holds while it indexes.
     #[test]
     fn a_pass_indexes_the_share_with_the_tree_free() -> Result<()> {
         let id = format!("ctx-index-off-the-lock-{}", std::process::id());
@@ -1141,55 +1145,62 @@ mod tests {
         if state.exists() {
             std::fs::remove_dir_all(&state)?;
         }
-        index_windows(&share, &index)?;
-        window(&data, "20260103T000000Z-0000", "C0EXAMPLE02")?;
+        std::fs::create_dir_all(&state)?;
 
+        // The store a container starts with: a file with no schema in it, which is rebuilt
+        // from the share. Its write lock is this test's, so the rebuild's last step, the copy
+        // into this file, waits (`PUBLISH_PATIENCE`) rather than failing. Reading is not
+        // blocked, so the rebuild gets that far.
         let holder = rusqlite::Connection::open(index.store())?;
-        holder.execute_batch("BEGIN EXCLUSIVE")?;
-        let held = shared.tree()?;
+        holder.execute_batch("PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;")?;
         let passing = Arc::clone(&shared);
         let pass = std::thread::spawn(move || follow_once(&passing));
-        // The pass wants the tree, which this test holds, so it cannot be anywhere near its
-        // indexing step yet.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let waited_for_the_tree = !pass.is_finished();
-        drop(held);
-        // The pass takes the tree, finds nothing to pull, gives it back and stops at the
-        // index. From here the tree is free, and stays free, until the index is given back.
-        let mut free = 0_u32;
-        let mut busy = 0_u32;
-        for _ in 0..60_u32 {
+
+        // The staging file of the replay: the pass is in its indexing step from the moment it
+        // appears, and cannot leave it while this test holds the store.
+        let replaying = |state: &std::path::Path| -> Result<bool> {
+            for entry in std::fs::read_dir(state)? {
+                if entry?
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("store.rebuilding-")
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut indexing = false;
+        while std::time::Instant::now() < deadline {
+            if replaying(&state)? {
+                indexing = true;
+                break;
+            }
             if pass.is_finished() {
                 break;
             }
-            if shared.try_tree()?.is_some() {
-                free += 1;
-            } else {
-                busy += 1;
-            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let free = indexing && shared.try_tree()?.is_some();
+
         holder.execute_batch("ROLLBACK")?;
         drop(holder);
         let passed = pass.join();
         let found = Store::load(&share, &index).and_then(|store| {
             store.get(&Pointer {
                 scheme: "echo".to_owned(),
-                locator: "C0EXAMPLE02/record".to_owned(),
+                locator: "C0EXAMPLE01/record".to_owned(),
             })
         });
         std::fs::remove_dir_all(&root)?;
         std::fs::remove_dir_all(&state)?;
 
         assert!(
-            waited_for_the_tree,
-            "the pass ended without ever waiting for the tree, so it indexed nothing"
+            indexing,
+            "the pass never reached its indexing step, so this test proves nothing"
         );
-        assert!(
-            free > 20 && busy <= 2,
-            "the pass held the tree while it indexed the share: {free} polls found it free, \
-             {busy} found it held"
-        );
+        assert!(free, "the pass held the tree while it indexed the share");
         match passed {
             Ok(outcome) => outcome?,
             Err(_) => anyhow::bail!("the pass panicked"),
@@ -1197,6 +1208,37 @@ mod tests {
         assert!(
             found?.is_some(),
             "the pass did not index the window it found on the share"
+        );
+        Ok(())
+    }
+
+    /// A build that finishes before anybody is listening is still a build that finished.
+    ///
+    /// The copy has no listener between the moment the wait before binding gives up and the
+    /// moment the follow loop subscribes, and a channel send with no listener keeps the old
+    /// value: every request would then wait for a build that was over.
+    #[tokio::test]
+    async fn a_build_that_finishes_before_anybody_waits_is_over_for_the_waiters() -> Result<()> {
+        let id = format!("ctx-index-gate-{}", std::process::id());
+        let root = std::env::temp_dir().join(&id);
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(
+            root.join("ctx.toml"),
+            format!("version = 1\nid = \"{id}\"\n"),
+        )?;
+        std::fs::write(root.join("rules.md"), "---\ntype: rules\n---\n# Rules\n")?;
+        let shared = Shared::new(Context::open(&root)?)?;
+        let state = dirs_of(&*shared.tree()?)?.1.root().to_path_buf();
+        shared.index_done();
+        let waited = tokio::time::timeout(Duration::from_secs(5), shared.index_ready()).await;
+        std::fs::remove_dir_all(&root)?;
+        if state.exists() {
+            std::fs::remove_dir_all(&state)?;
+        }
+
+        assert!(
+            waited.is_ok(),
+            "a build that finished with nobody listening left every later request waiting"
         );
         Ok(())
     }
