@@ -601,6 +601,7 @@ mod tests {
     #[test]
     fn a_refusal_whose_body_is_cut_short_keeps_its_status() -> Result<()> {
         let server = FakeServer::cut_short("429 Too Many Requests")?;
+        let url = server.url.clone();
         let error = get_json(&server.url, "token-example", &[])
             .err()
             .context("a body cut short was read whole")?;
@@ -615,7 +616,7 @@ mod tests {
         assert!(
             message.contains(&format!(
                 "reading the body of the 429 Too Many Requests answer to GET {}",
-                server.url
+                url
             )),
             "{message}"
         );
