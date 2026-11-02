@@ -174,16 +174,15 @@ fn a_page_sent_again_is_charged_for_each_time_it_was_sent() -> Result<()> {
     let request = request(BTreeMap::from([(stream_id(&subject), CURSOR.to_owned())]))?;
     let outcome = run(&fake, &request, &config(vec![1], 4, 2000))?;
 
-    // The first page cost three of the four requests, so the last one is left for issue 1's
-    // comments and the feed's second page is never asked. Charged once, it would have been.
+    // The first page cost three of the four requests and the feed's second page the last one,
+    // so issue 1's comments wait for the next run. Charged once, the first page would have left
+    // two requests, and the comments would have been read.
     let sent = fake.get_log.borrow().clone();
     assert_eq!(
-        sent.iter().filter(|url| **url == feed).count(),
-        3,
+        sent,
+        vec![feed.clone(), feed.clone(), feed, "page-2".to_owned()],
         "{sent:?}"
     );
-    assert!(!sent.iter().any(|url| url == "page-2"), "{sent:?}");
-    assert_eq!(sent.len(), 4, "{sent:?}");
     assert!(
         outcome
             .warnings
