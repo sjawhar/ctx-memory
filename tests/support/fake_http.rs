@@ -216,10 +216,19 @@ const fn reason(status: u16) -> &'static str {
     }
 }
 
+/// One answer queued for a path: a reply, or a connection closed with no answer at all.
+#[derive(Clone)]
+enum Answer {
+    Reply(Response),
+    /// The connection closes once the request is read, before any status: what a client sees
+    /// when the network drops its request.
+    HangUp,
+}
+
 #[derive(Default)]
 struct Shared {
     /// The answers queued per path; the last one repeats.
-    routes: HashMap<String, Vec<Response>>,
+    routes: HashMap<String, Vec<Answer>>,
     requests: Vec<Recorded>,
 }
 
@@ -285,9 +294,22 @@ impl FakeHttp {
         body: &str,
     ) -> Result<()> {
         let mut shared = self.lock()?;
-        shared
-            .routes
-            .insert(path.to_owned(), vec![canned(status, headers, body)]);
+        shared.routes.insert(
+            path.to_owned(),
+            vec![Answer::Reply(canned(status, headers, body))],
+        );
+        Ok(())
+    }
+
+    /// Closes every connection that asks for `path` without answering, replacing any earlier
+    /// answer: the client gets no status and no body, as when the network drops its request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shared state is poisoned.
+    pub fn hang_up(&self, path: &str) -> Result<()> {
+        let mut shared = self.lock()?;
+        shared.routes.insert(path.to_owned(), vec![Answer::HangUp]);
         Ok(())
     }
 
@@ -308,7 +330,7 @@ impl FakeHttp {
             .routes
             .entry(path.to_owned())
             .or_default()
-            .push(canned(status, headers, body));
+            .push(Answer::Reply(canned(status, headers, body)));
         Ok(())
     }
 
@@ -341,7 +363,8 @@ impl FakeHttp {
     }
 }
 
-/// Records the request and answers with the next answer queued for its path.
+/// Records the request and answers with the next answer queued for its path. A hang-up is an
+/// error, on which [`serve`] closes the connection without writing anything.
 fn answer(shared: &Mutex<Shared>, request: &Recorded) -> Result<Response> {
     let mut state = shared
         .lock()
@@ -352,12 +375,14 @@ fn answer(shared: &Mutex<Shared>, request: &Recorded) -> Result<Response> {
         Some(answers) => answers.first().cloned(),
         None => None,
     };
-    Ok(queued.unwrap_or_else(|| {
-        Response::json(
+    match queued {
+        Some(Answer::Reply(response)) => Ok(response),
+        Some(Answer::HangUp) => Err(anyhow!("hanging up on {}", request.path)),
+        None => Ok(Response::json(
             404,
             format!("{{\"error\":\"no answer for {}\"}}", request.path),
-        )
-    }))
+        )),
+    }
 }
 
 fn canned(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
