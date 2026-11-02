@@ -43,7 +43,6 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       ctx_sha256: ${{ steps.release.outputs.ctx_sha256 }}
       share_sha256: ${{ steps.release.outputs.share_sha256 }}
-      latest: ${{ steps.release.outputs.latest }}
       publish: ${{ steps.release.outputs.publish }}
     steps:
       - name: The release, its checksums and their attestations
@@ -100,7 +99,6 @@ jobs:
             printf 'version=%s\n' "$version"
             printf 'ctx_sha256=%s\n' "$ctx_sha256"
             printf 'share_sha256=%s\n' "$share_sha256"
-            printf 'latest=%s\n' "$([ "$tag" = "$latest_tag" ] && echo true || echo false)"
             printf 'publish=%s\n' "$publish"
           } >> "$GITHUB_OUTPUT"
           echo "release $tag (latest: $latest_tag); publish: $publish"
@@ -147,7 +145,12 @@ jobs:
             exit 0
           fi
           test "$(docker run --rm --network none --entrypoint ctx "$LOCAL" --version)" = "ctx $VERSION"
-          docker run --rm --network none --entrypoint omp "$LOCAL" --version
+          # As the session's user, which can write nothing where omp keeps its native module: both
+          # variants must already be there, `baseline` for a CPU without AVX2 among them.
+          for variant in modern baseline; do
+            docker run --rm --network none --user ctx-agent -e "PI_NATIVE_VARIANT=$variant" \
+              --entrypoint omp "$LOCAL" skill list --json > /dev/null
+          done
           # The image names no model provider, so the runner refuses to start a session until the
           # deployment names its own; every other variable it needs is set, and no network is.
           set +e
@@ -169,18 +172,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
-          LATEST: ${{ needs.release.outputs.latest }}
         run: |
           repo="ghcr.io/${GITHUB_REPOSITORY,,}/$IMAGE"
           printf '%s\n' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker tag "$LOCAL" "$repo:$VERSION"
+          docker push --quiet "$repo:$VERSION"
+          # `latest` follows the repository's latest release, read now, after the version tag is
+          # pushed and not when this run started: a run for an older release that finishes after a
+          # newer release's run then leaves `latest` where the newer one put it.
           tags=("$VERSION")
-          if [ "$LATEST" = true ]; then
+          if [ "$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)" = "v$VERSION" ]; then
+            docker tag "$LOCAL" "$repo:latest"
+            docker push --quiet "$repo:latest"
             tags+=(latest)
           fi
-          for tag in "${tags[@]}"; do
-            docker tag "$LOCAL" "$repo:$tag"
-            docker push --quiet "$repo:$tag"
-          done
           # The digest is the registry's for the version tag. The local image, the one the smoke
           # test ran, must be what was pushed there, and every tag must resolve to it, because the
           # attestation below names that digest.

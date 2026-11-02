@@ -190,12 +190,12 @@ docker run --rm \
   -v /srv/ctx-config/models.yml:/etc/ctx-memory/models.yml:ro \
   -e CTX_MODELS_FILE=/etc/ctx-memory/models.yml -e CTX_MODEL=<provider>/<model id> \
   -e CTX_MODEL_BASE_URL=https://<model API host> -e ANTHROPIC_API_KEY \
-  -e CTX_SERVER=https://<ctx server> -e CTX_SERVER_AUDIENCE=https://<ctx server> \
+  -e CTX_SERVER=https://<ctx server> \
   -e CLOUD_RUN_EXECUTION="cycle-$(date -u +%Y%m%dT%H%M%SZ)" \
   ghcr.io/sjawhar/ctx-memory/agent:<version>
 ```
 
-Run it on a schedule, such as hourly; [docs/deployment.md](docs/deployment.md#what-the-exit-status-means) says what each exit status means.
+Where the server is reached at `--listen`, add `-e CTX_SERVER_AUDIENCE=https://<ctx server>`: `ctx` then sends a Google identity token, which it takes from the Google metadata server (or mints as `CTX_IMPERSONATE_SA`), so the container needs a Google identity ([Remote mode](#remote-mode)). Run the cycle on a schedule, such as hourly; [docs/deployment.md](docs/deployment.md#what-the-exit-status-means) says what each exit status means.
 
 ## Extend
 

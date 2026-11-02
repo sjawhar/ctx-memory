@@ -148,19 +148,26 @@ RUN set -eu; \
     for dir in data state cache; do install -d -o root -g ctx-agent -m 1775 "/var/lib/omp/$dir/omp"; done; \
     install -d -o root -g root -m 0755 /var/lib/omp/data/omp/plugins
 # omp's native module is embedded in the binary and extracted on its first run, which is this
-# step, so a cycle starts without writing it. The same run checks that the skills are the
-# session's own: `omp skill list` resolves skills exactly as a session in this directory does, so
-# a config that does not reach them fails the build here. It runs as the session's user, with
-# HOME already closed to it, so a build whose omp needs to write there fails here too.
+# step, so a cycle starts without writing it. omp extracts one of two variants, chosen by the CPU:
+# `modern` where it has AVX2, `baseline` elsewhere. The build host has AVX2, so its first run
+# extracts `modern`, and a second run with PI_NATIVE_VARIANT=baseline extracts the other, so the
+# image runs on either kind of CPU once the directory is closed to the session below. The same
+# run checks that the skills are the session's own: `omp skill list` resolves skills exactly as a
+# session in this directory does, so a config that does not reach them fails the build here. It
+# runs as the session's user, with HOME already closed to it, so a build whose omp needs to write
+# there fails here too.
 USER ctx-agent
 RUN set -eu; \
     ctx --version; \
     omp --version; \
+    PI_NATIVE_VARIANT=baseline omp skill list --json > /dev/null; \
     omp skill list --json > /tmp/skills.json; \
     jq -e '([.skills[] | select(.source == "custom:user") | .name] | sort) == ["ctx-memory", "ctx-memory-ingest"]' /tmp/skills.json > /dev/null; \
     rm /tmp/skills.json; \
-    set -- "$XDG_DATA_HOME"/omp/natives/*/pi_natives.linux-x64-*.node; \
-    test -f "$1"; \
+    for variant in modern baseline; do \
+        set -- "$XDG_DATA_HOME"/omp/natives/*/"pi_natives.linux-x64-$variant.node"; \
+        test -f "$1" || { echo "omp extracted no $variant native module" >&2; exit 1; }; \
+    done; \
     rm -rf "$XDG_STATE_HOME/omp/logs"
 # The local state directory ctx would otherwise resolve from HOME. The cycle reads and writes
 # through the server, so nothing of consequence lands here, but the directory is the container's
