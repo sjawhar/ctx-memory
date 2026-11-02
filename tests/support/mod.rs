@@ -337,6 +337,7 @@ pub fn ctx_remote(
         .env_remove("CTX_IAM_CREDENTIALS_URL")
         .env_remove("CTX_SESSION")
         .env_remove("OMP_SESSION_ID")
+        .env_remove("PI_SESSION_ID")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .stdin(if stdin.is_some() {
             Stdio::piped()

@@ -19,7 +19,7 @@ case "$1" in
 			exit 1
 		fi
 	done
-	unset CTX_SESSION OMP_SESSION_ID CLAUDE_CODE_SESSION_ID
+	unset CTX_SESSION OMP_SESSION_ID PI_SESSION_ID CLAUDE_CODE_SESSION_ID
 	# An empty directory of its own, so no user configuration, whatever it spells, reaches a
 	# test; a test that needs one sets XDG_CONFIG_HOME for the `ctx` it runs.
 	XDG_CONFIG_HOME="$(mktemp -d "${TMPDIR:-/tmp}/ctx-test-config.XXXXXX")"

@@ -10,9 +10,15 @@
 use std::ffi::OsString;
 
 /// The variables that name the caller's session, in the order they are read: `CTX_SESSION`,
-/// which a person or a runner sets for ctx, then the ids Oh My Pi and Claude Code give every
-/// command their agent runs.
-pub const VARIABLES: [&str; 3] = ["CTX_SESSION", "OMP_SESSION_ID", "CLAUDE_CODE_SESSION_ID"];
+/// which a person or a runner sets for ctx; `OMP_SESSION_ID`, which an Oh My Pi setup may
+/// export for its session; `PI_SESSION_ID`, which Oh My Pi's bash tool sets for every command
+/// its agent runs; and `CLAUDE_CODE_SESSION_ID`, which Claude Code sets.
+pub const VARIABLES: [&str; 4] = [
+    "CTX_SESSION",
+    "OMP_SESSION_ID",
+    "PI_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+];
 
 /// The request header that carries the caller's session id.
 pub const HEADER: &str = "X-Ctx-Session";
@@ -81,22 +87,26 @@ mod tests {
         move |name| set.get(name).cloned()
     }
 
-    /// `CTX_SESSION` names the session when it is set; else Oh My Pi's id, else Claude Code's.
-    /// An empty variable counts as unset. White space is a value, which the header refuses,
-    /// and it keeps a later variable from being chosen in its place.
+    /// `CTX_SESSION` names the session when it is set; else an exported Oh My Pi id, else the
+    /// id Oh My Pi's bash tool sets, else Claude Code's. An empty variable counts as unset.
+    /// White space is a value, which the header refuses, and it keeps a later variable from
+    /// being chosen in its place.
     #[test]
     fn the_first_variable_set_names_the_session() {
         let omp = ("OMP_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000001");
+        let pi = ("PI_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000002");
         let claude = (
             "CLAUDE_CODE_SESSION_ID",
             "5f0c7d1e-2222-4333-8444-555566667777",
         );
-        let cases: [(&[Binding], Option<Binding>); 7] = [
+        let cases: [(&[Binding], Option<Binding>); 9] = [
             (
                 &[("CTX_SESSION", "cycle-1"), omp, claude],
                 Some(("CTX_SESSION", "cycle-1")),
             ),
-            (&[omp, claude], Some(omp)),
+            (&[omp, pi, claude], Some(omp)),
+            (&[pi, claude], Some(pi)),
+            (&[("OMP_SESSION_ID", ""), pi], Some(pi)),
             (&[claude], Some(claude)),
             (&[("CTX_SESSION", ""), ("OMP_SESSION_ID", "")], None),
             (&[("CTX_SESSION", ""), claude], Some(claude)),
