@@ -12,7 +12,8 @@ use std::ffi::OsString;
 /// The variables that name the caller's session, in the order they are read: `CTX_SESSION`,
 /// which a person or a runner sets for ctx; `OMP_SESSION_ID`, which an Oh My Pi setup may
 /// export for its session; `PI_SESSION_ID`, which Oh My Pi's bash tool sets for every command
-/// its agent runs; and `CLAUDE_CODE_SESSION_ID`, which Claude Code sets.
+/// its agent runs from Oh My Pi 18.12.4 on; and `CLAUDE_CODE_SESSION_ID`, which Claude Code
+/// sets. An agent on an older Oh My Pi names its session with `CTX_SESSION`.
 pub const VARIABLES: [&str; 4] = [
     "CTX_SESSION",
     "OMP_SESSION_ID",
