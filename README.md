@@ -154,7 +154,48 @@ Setting the app up takes three steps: create it from the manifest at [api.slack.
 
 ## Deploying
 
-A team runs three programs against one tree and one shared data directory: the server, the scheduled fetch job, and the scheduled ingest cycle, a headless Oh My Pi session that turns each fetch's windows into records through the server. The ingest cycle's runner — [`runner/run-cycle.sh`](runner/run-cycle.sh), the shell policy its session runs under, the record tools it writes through, and the Oh My Pi release it is tested against — ships in this repository and in each release, beside the skills. [docs/deployment.md](docs/deployment.md) is the contract: what an image installs, and the arguments and environment each program takes. A deployment supplies its own images, model provider, accounts and schedules.
+A team runs three programs against one tree and one shared data directory: the server, the scheduled fetch job, and the scheduled ingest cycle, a headless Oh My Pi session that turns each fetch's windows into records through the server. The ingest cycle's runner — [`runner/run-cycle.sh`](runner/run-cycle.sh), the shell policy its session runs under, the record tools it writes through, and the Oh My Pi release it is tested against — ships in this repository and in each release, beside the skills. [docs/deployment.md](docs/deployment.md) is the contract: what an image installs, and the arguments and environment each program takes. Each release publishes an image for the server and the fetch job and one for the ingest cycle; a deployment supplies its model provider, accounts, share and schedules.
+
+### The images
+
+Each `v*` release publishes two images for `linux/amd64`, tagged with the release's version and, for the newest release, `latest`; [`.github/workflows/images.yml`](.github/workflows/images.yml) builds them from that release's own archives, checked against its `SHA256SUMS` and its build attestations:
+
+- `ghcr.io/sjawhar/ctx-memory/server` ([`images/server/Dockerfile`](images/server/Dockerfile)): `ctx`, `git` and the CA certificates. Its entrypoint is `ctx` with no default command, so the server runs `serve …` and the fetch job `fetch`.
+- `ghcr.io/sjawhar/ctx-memory/agent` ([`images/agent/Dockerfile`](images/agent/Dockerfile)): `ctx`, the release's runner and skills, and the Oh My Pi release `runner/omp.lock` pins. Its entrypoint is `run-cycle.sh`: no arguments run one ingest cycle, `maintain <pass>` one maintenance pass.
+
+No arm64 image is published: the agent runs the pinned Oh My Pi build, which has no `linux-arm64` archive. Each image carries a GitHub build attestation: `gh attestation verify oci://ghcr.io/sjawhar/ctx-memory/server:<version> --repo sjawhar/ctx-memory`.
+
+The server and the fetch job take the environment in [docs/deployment.md](docs/deployment.md#the-server-and-the-fetch-job). Mount the share and name it in `CTX_DATA_DIR`; keep the clone (`CTX_MEMORY`) and the state directory (`CTX_STATE_DIR`, `/var/lib/ctx` in the image) on the container's own disk. Outside Google Cloud, give the GitHub App key as a file through `CTX_CREDENTIAL_GITHUB_APP_FILE` rather than `CTX_SECRET_GITHUB_APP`. The image runs as root, because a share often lets only root write. For example, a server that a Tailscale sidecar in the same network namespace reaches on loopback:
+
+```bash
+docker run -d --name ctx-server --network container:tailscale \
+  -v /srv/ctx-data:/data -e CTX_DATA_DIR=/data \
+  -e CTX_MEMORY=/var/lib/ctx/tree -e CTX_MEMORY_REMOTE=https://github.com/<owner>/<tree>.git \
+  -v /srv/ctx-secrets/github-app.json:/run/secrets/github-app.json:ro \
+  -e CTX_CREDENTIAL_GITHUB_APP_FILE=/run/secrets/github-app.json \
+  ghcr.io/sjawhar/ctx-memory/server:<version> serve --tailnet-listen 127.0.0.1:8080
+```
+
+The fetch job runs the same image with `fetch` and the sources' credentials ([docs/sources.md](docs/sources.md)).
+
+The ingest cycle takes the environment in [docs/deployment.md](docs/deployment.md#the-jobs-environment): `CTX_SERVER` (and `CTX_SERVER_AUDIENCE` for a server that takes Google identity tokens), `CTX_DATA_DIR`, `CTX_MODEL_BASE_URL`, `CTX_MODELS_FILE`, `CTX_MODEL`, `ANTHROPIC_API_KEY` and `CLOUD_RUN_EXECUTION`, a name unique to each run. Start it as root, as the image does; it runs the session as `ctx-agent`, uid and gid 10001, which must be able to read the share's windows and write nothing else on it. The image carries no model provider, and `run-cycle.sh` refuses to start without one. The provider file is the deployment's own:
+
+- Copy [`runner/models.example.yml`](runner/models.example.yml) and change the provider's name, `api` and models. Keep its `baseUrl` line, `    baseUrl: "@CTX_MODEL_BASE_URL@"`, and its `apiKey` line, `    apiKey: "!cat /run/ctx-agent/model-key"`, exactly as they are, four spaces in: the runner puts `CTX_MODEL_BASE_URL` in place of the placeholder, writes `ANTHROPIC_API_KEY` to `/run/ctx-agent/model-key` and removes it from the environment, and refuses a file with any other address or key line.
+- Mount it read-only at a path with no symbolic link, such as `/etc/ctx-memory/models.yml` (`/etc/ctx-memory` is root's in the image), and name that path in `CTX_MODELS_FILE`. Neither the file nor any directory above it may be owned by uid 10001 or writable by group or others. On Kubernetes, mount a ConfigMap key with `subPath`, because a ConfigMap volume's files are symbolic links.
+- Set `CTX_MODEL` to `<provider>/<model id>` of that file.
+
+```bash
+docker run --rm \
+  -v /srv/ctx-data:/data -e CTX_DATA_DIR=/data \
+  -v /srv/ctx-config/models.yml:/etc/ctx-memory/models.yml:ro \
+  -e CTX_MODELS_FILE=/etc/ctx-memory/models.yml -e CTX_MODEL=<provider>/<model id> \
+  -e CTX_MODEL_BASE_URL=https://<model API host> -e ANTHROPIC_API_KEY \
+  -e CTX_SERVER=https://<ctx server> \
+  -e CLOUD_RUN_EXECUTION="cycle-$(date -u +%Y%m%dT%H%M%SZ)" \
+  ghcr.io/sjawhar/ctx-memory/agent:<version>
+```
+
+Where the server is reached at `--listen`, add `-e CTX_SERVER_AUDIENCE=https://<ctx server>`: `ctx` then sends a Google identity token, which it takes from the Google metadata server (or mints as `CTX_IMPERSONATE_SA`), so the container needs a Google identity ([Remote mode](#remote-mode)). Run the cycle on a schedule, such as hourly; [docs/deployment.md](docs/deployment.md#what-the-exit-status-means) says what each exit status means.
 
 ## Extend
 

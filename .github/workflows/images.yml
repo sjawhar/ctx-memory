@@ -1,0 +1,249 @@
+name: images
+# The container images of a release: ghcr.io/<owner>/ctx-memory/server, the server and the fetch
+# job, and ghcr.io/<owner>/ctx-memory/agent, the ingest cycle (images/*/Dockerfile,
+# docs/deployment.md). Each installs the release's own archives, never a checkout: the build takes
+# the version and each archive's SHA-256 from the release's SHA256SUMS, after this workflow has
+# checked that each archive is the release workflow's attested build of that tag.
+#
+# release.yml calls it for each `v*` tag once the release exists. Run by hand (workflow_dispatch,
+# from main), it publishes the images of a release that already exists, from main's Dockerfiles.
+# Each image is tagged with the release's version, and `latest` names the images of the
+# repository's latest release, so publishing an older release never moves `latest` back. A pull
+# request that changes the images builds and checks both against the latest release and pushes
+# nothing.
+#
+# Only linux/amd64 is built: the agent runs the Oh My Pi release runner/omp.lock pins, which has no
+# linux-arm64 build, and the server is built for the same platform as the agent.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag to publish images of, such as v0.2.9
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag to publish images of, such as v0.2.9
+        type: string
+        required: true
+  pull_request:
+    paths:
+      - "images/**"
+      - .github/workflows/images.yml
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      ctx_sha256: ${{ steps.release.outputs.ctx_sha256 }}
+      share_sha256: ${{ steps.release.outputs.share_sha256 }}
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - name: The release, its checksums and their attestations
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          latest_tag="$(gh release view --repo "$REPO" --json tagName -q .tagName)"
+          if [ "$EVENT" = pull_request ]; then
+            tag="$latest_tag"
+            publish=false
+          else
+            # A run by hand publishes main's Dockerfiles, and the release workflow its tag's; a run
+            # on any other branch would publish images no review has seen.
+            case "$REF" in
+              refs/heads/main | "refs/tags/$TAG") ;;
+              *) echo "images are published from main or from the release's own tag, not $REF" >&2; exit 1 ;;
+            esac
+            tag="$TAG"
+            publish=true
+          fi
+          if ! printf '%s\n' "$tag" | grep -qxE 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'; then
+            echo "'$tag' is not a release tag such as v0.2.9" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          ctx_archive=ctx-x86_64-unknown-linux-musl.tar.gz
+          share_archive="ctx-memory-$version-share.tar.gz"
+          mkdir release
+          gh release download "$tag" --repo "$REPO" --dir release \
+            --pattern SHA256SUMS --pattern "$ctx_archive" --pattern "$share_archive"
+          cd release
+          # Each archive's line of SHA256SUMS, by exact name, is the digest the image build checks.
+          sum() {
+            awk -v name="$1" '$2 == name { print $1 }' SHA256SUMS | grep -xE '[0-9a-f]{64}' ||
+              { echo "SHA256SUMS of $tag lists no SHA-256 for $1" >&2; return 1; }
+          }
+          ctx_sha256="$(sum "$ctx_archive")"
+          share_sha256="$(sum "$share_archive")"
+          printf '%s  %s\n' "$ctx_sha256" "$ctx_archive" "$share_sha256" "$share_archive" |
+            sha256sum --check --strict
+          # SHA256SUMS is a release asset, and an asset can be replaced; the attestation cannot. Each
+          # archive must be what release.yml built from this tag on a GitHub-hosted runner.
+          for archive in "$ctx_archive" "$share_archive"; do
+            gh attestation verify "$archive" --repo "$REPO" \
+              --signer-workflow "$REPO/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$tag" --deny-self-hosted-runners > /dev/null
+          done
+          {
+            printf 'version=%s\n' "$version"
+            printf 'ctx_sha256=%s\n' "$ctx_sha256"
+            printf 'share_sha256=%s\n' "$share_sha256"
+            printf 'publish=%s\n' "$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "release $tag (latest: $latest_tag); publish: $publish"
+
+  image:
+    needs: release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [server, agent]
+    # A second run for the same release waits for the first, so two runs never push one tag at once.
+    concurrency:
+      group: images-${{ matrix.image }}-${{ needs.release.outputs.publish == 'true' && needs.release.outputs.version || github.ref }}
+    permissions:
+      # packages: write pushes the image; id-token and attestations sign and store its provenance.
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      IMAGE: ${{ matrix.image }}
+      VERSION: ${{ needs.release.outputs.version }}
+      CTX_SHA256: ${{ needs.release.outputs.ctx_sha256 }}
+      CTX_SHARE_SHA256: ${{ needs.release.outputs.share_sha256 }}
+      LOCAL: ctx-memory-${{ matrix.image }}:build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: |
+          args=(--build-arg "CTX_VERSION=$VERSION" --build-arg "CTX_SHA256=$CTX_SHA256")
+          if [ "$IMAGE" = agent ]; then
+            args+=(--build-arg "CTX_SHARE_SHA256=$CTX_SHARE_SHA256")
+          fi
+          docker build --provenance=false "${args[@]}" -t "$LOCAL" "images/$IMAGE"
+      # The image that is pushed below is this one, by tag, with nothing rebuilt in between.
+      - name: Smoke test
+        run: |
+          if [ "$IMAGE" = server ]; then
+            test "$(docker run --rm --network none "$LOCAL" --version)" = "ctx $VERSION"
+            docker run --rm --network none --entrypoint git "$LOCAL" --version
+            exit 0
+          fi
+          test "$(docker run --rm --network none --entrypoint ctx "$LOCAL" --version)" = "ctx $VERSION"
+          # As the session's user, which can write nothing where omp keeps its native module: both
+          # variants must already be there, `baseline` for a CPU without AVX2 among them.
+          for variant in modern baseline; do
+            docker run --rm --network none --user ctx-agent -e "PI_NATIVE_VARIANT=$variant" \
+              --entrypoint omp "$LOCAL" skill list --json > /dev/null
+          done
+          # The image names no model provider, so the runner refuses to start a session until the
+          # deployment names its own; every other variable it needs is set, and no network is.
+          set +e
+          out="$(docker run --rm --network none \
+            -e CTX_DATA_DIR=/tmp/data -e CTX_SERVER=https://ctx.invalid \
+            -e CTX_MODEL_BASE_URL=https://models.invalid -e CTX_MODEL=provider/model \
+            -e ANTHROPIC_API_KEY=unused -e CLOUD_RUN_EXECUTION=smoke "$LOCAL" 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$out"
+          expected='run-cycle: refusing to start the session: CTX_MODELS_FILE must name the model provider file the session reads'
+          if [ "$status" -ne 1 ] || [ "$out" != "$expected" ]; then
+            echo "run-cycle.sh without CTX_MODELS_FILE exited $status, not 1 with the refusal: $expected" >&2
+            exit 1
+          fi
+      - name: Push
+        id: push
+        if: needs.release.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}/$IMAGE"
+          printf '%s\n' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker tag "$LOCAL" "$repo:$VERSION"
+          docker push --quiet "$repo:$VERSION"
+          # The digest is the registry's for the version tag. The local image, the one the smoke
+          # test ran, must be what was pushed there, because the attestation below names that
+          # digest.
+          digest="$(docker buildx imagetools inspect "$repo:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)"
+          if ! printf '%s\n' "$digest" | grep -qxE 'sha256:[0-9a-f]{64}'; then
+            echo "the registry reported no digest for $repo:$VERSION: '$digest'" >&2
+            exit 1
+          fi
+          if ! docker image inspect --format '{{join .RepoDigests "\n"}}' "$LOCAL" | grep -qxF "$repo@$digest"; then
+            echo "$repo:$VERSION is $digest in the registry, which is not the image built here" >&2
+            exit 1
+          fi
+          printf 'name=%s\ndigest=%s\n' "$repo" "$digest" >> "$GITHUB_OUTPUT"
+          echo "$repo@$digest"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: needs.release.outputs.publish == 'true'
+        with:
+          subject-name: ${{ steps.push.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # `latest` names the images of the repository's latest release. Every publishing run moves it
+  # there, whichever release the run is for, and one run at a time: the group holds every version,
+  # so no run can read the latest release, stall, and move `latest` back after a newer release's
+  # run moved it on. A run waiting here that a newer run replaces has nothing left to do, because
+  # the newer run reads the latest release when it starts.
+  latest:
+    needs: [release, image]
+    if: needs.release.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: images-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Point latest at the latest release's images
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          printf '%s\n' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          latest_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          version="${latest_tag#v}"
+          resolve() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -er .digest
+          }
+          for image in server agent; do
+            repo="ghcr.io/${GITHUB_REPOSITORY,,}/$image"
+            # A newer release than this run's whose images are not pushed yet moves `latest` in its
+            # own run. This run's own release was pushed by the image job, so it must resolve.
+            if ! digest="$(resolve "$repo:$version")"; then
+              if [ "$version" = "$VERSION" ]; then
+                echo "$repo:$version, which this run pushed, does not resolve in the registry" >&2
+                exit 1
+              fi
+              echo "$repo:$version is not published yet; the run for $latest_tag moves latest"
+              continue
+            fi
+            # A copy of the version tag's manifest, so `latest` is the same digest, attested with it.
+            docker buildx imagetools create --prefer-index=false --tag "$repo:latest" "$repo@$digest"
+            if [ "$(resolve "$repo:latest")" != "$digest" ]; then
+              echo "$repo:latest does not resolve to $digest, the digest of $repo:$version" >&2
+              exit 1
+            fi
+            echo "$repo:latest = $repo:$version = $digest"
+          done
