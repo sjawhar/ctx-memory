@@ -14,13 +14,14 @@ Each `v*` tag publishes, through [`.github/workflows/release.yml`](../.github/wo
 
 - `ctx-x86_64-unknown-linux-musl.tar.gz` and `ctx-aarch64-unknown-linux-musl.tar.gz`, static Linux builds, and `ctx-aarch64-apple-darwin.tar.gz`, each holding the `ctx` binary alone;
 - `ctx-memory-<version>-share.tar.gz`, the tag's `skills/` and `runner/` trees, which an image installs beside the binary;
-- `SHA256SUMS`, and a GitHub build attestation of each archive (`gh attestation verify <archive> --repo sjawhar/ctx-memory`).
+- `SHA256SUMS`, and a GitHub build attestation of each archive (`gh attestation verify <archive> --repo sjawhar/ctx-memory`);
+- once those are published, two `linux/amd64` images built from them by [`.github/workflows/images.yml`](../.github/workflows/images.yml), each tagged with the version and, for the newest release, `latest`, and each with a GitHub build attestation: `ghcr.io/sjawhar/ctx-memory/server` for the server and the fetch job ([`images/server/Dockerfile`](../images/server/Dockerfile)), and `ghcr.io/sjawhar/ctx-memory/agent` for the ingest cycle ([`images/agent/Dockerfile`](../images/agent/Dockerfile)). The [README](../README.md#the-images) says how to run them.
 
-An image builds from a release, never from a checkout: download the archives by URL, check each against a SHA-256 the image's own build pins, and unpack them. The share archive's `runner/omp.lock` names the omp release the runner is tested against and that archive's SHA-256, so an image that installs omp from it runs the build the runner's tests drove.
+An image builds from a release, never from a checkout: download the archives by URL, check each against a SHA-256 the image's own build pins, and unpack them. The share archive's `runner/omp.lock` names the omp release the runner is tested against and that archive's SHA-256, so an image that installs omp from it runs the build the runner's tests drove. The published images build that way, with the version and each SHA-256 taken from the release's `SHA256SUMS` once each archive's attestation is checked; a deployment that builds its own can start from their Dockerfiles.
 
 ## The server and the fetch job
 
-Both run the `ctx` binary in an image that also holds `git` and the CA certificates (`ca-certificates` on Debian). Neither keeps a tree on the share: each clones its own into its container's disk.
+Both run the `ctx` binary in an image that also holds `git` and the CA certificates (`ca-certificates` on Debian), such as `ghcr.io/sjawhar/ctx-memory/server`. Neither keeps a tree on the share: each clones its own into its container's disk.
 
 | Variable | Server | Fetch job | What it is |
 | --- | --- | --- | --- |
@@ -78,6 +79,8 @@ The cycle reads text that people outside the deployment wrote, so its session ru
 - A user `ctx-agent`, the session's user. `HOME` is its home, and that home, everything in it and the working directory are root's and closed to writes, with a `.bashrc`, `.profile`, `.bash_profile` and `.bash_logout` of root's in it.
 - `XDG_DATA_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` set, each with an `omp` directory owned by root, group `ctx-agent`, mode `1775`; `$XDG_DATA_HOME/omp/plugins` and `$XDG_DATA_HOME/omp/natives` root's and closed to writes. omp extracts its native module on its first run, so a build step that runs omp once as `ctx-agent`, then gives `natives` to root, leaves the job nothing to write there.
 - The model provider file, at a path root owns in a directory root owns (see `CTX_MODELS_FILE` below).
+
+`ghcr.io/sjawhar/ctx-memory/agent` is such an image, with `ctx-agent` as uid and gid 10001 and no provider file: the deployment mounts its own and names it in `CTX_MODELS_FILE`.
 
 ### The job's environment
 

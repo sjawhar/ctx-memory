@@ -4,6 +4,7 @@ name: release
 # ctx-memory-<version>-share.tar.gz, the tag's skills/ and runner/ trees, for an image or a
 # machine that installs them beside the binary. The release carries
 # SHA256SUMS and a GitHub build attestation of each archive, which mise checks when it installs one.
+# Once the release exists, images.yml publishes the server and agent images built from it.
 # The tag must name the version Cargo.toml and package.json both carry, and the release job needs
 # ci.yml, which this workflow calls for the tagged commit, so the commit released is the commit
 # checked. A pull request that changes what the binary builds read runs the same jobs and
@@ -232,3 +233,18 @@ jobs:
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "ctx $VERSION" --generate-notes \
             release/ctx-*.tar.gz release/SHA256SUMS
+
+  # The server and agent images of the release, built from the archives just published
+  # (images.yml). A release whose images failed can have them published again by hand: run
+  # images.yml on main with the tag.
+  images:
+    needs: release
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/images.yml
+    with:
+      tag: ${{ github.ref_name }}
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+      packages: write
