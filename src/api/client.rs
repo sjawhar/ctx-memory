@@ -21,6 +21,41 @@ const TIMEOUT: Duration = Duration::from_secs(90);
 /// A status, response headers, and a parsed JSON body.
 pub type JsonReply = (StatusCode, HeaderMap, Value);
 
+/// A request that got no whole answer: it could not connect, timed out, or the connection
+/// closed or reset before the reply ended. It carries no HTTP status, so a caller whose request
+/// is safe to repeat may send it again. Its message names the cause first and the request
+/// after it, without the query string, so a log line cut to a few hundred characters still
+/// says why however long the URL is.
+#[derive(Debug)]
+pub struct NoAnswer(pub(crate) String);
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
+/// A refusal whose body ended early: the status and headers came, the body did not. The status
+/// is the answer, so a caller that acts on statuses (GitHub's throttle) reads them from here;
+/// any other caller gets the cause first and the request, as for [`NoAnswer`]. It is never a
+/// [`NoAnswer`], since the server did answer.
+#[derive(Debug)]
+pub struct CutShort {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    message: String,
+}
+
+impl std::fmt::Display for CutShort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CutShort {}
+
 /// `GET url` with `Authorization: Bearer <bearer>`, parsed as JSON.
 ///
 /// # Errors
@@ -46,7 +81,7 @@ pub fn get_json_with_headers(
     for (name, value) in headers {
         request = request.header(*name, value);
     }
-    json_reply(send(request, "GET", url)?)
+    json_reply(send(request, "GET", url)?, "GET")
 }
 
 /// `GET url` returning at most `limit` bytes, and whether the body was longer than that.
@@ -69,7 +104,12 @@ pub fn get_bytes(
     response
         .take(ceiling)
         .read_to_end(&mut bytes)
-        .with_context(|| format!("reading the body of {url}"))?;
+        .map_err(|error| {
+            no_answer(
+                &error,
+                &format!("reading the body of GET {}", without_query(url)),
+            )
+        })?;
     let truncated = bytes.len() > limit;
     bytes.truncate(limit);
     Ok((status, headers, bytes, truncated))
@@ -84,7 +124,7 @@ pub fn get_bytes(
 /// Returns an error when the request cannot be sent or the body is not JSON.
 pub fn post_form(url: &str, form: &[(&str, String)]) -> Result<JsonReply> {
     let request = client()?.post(url).form(form);
-    json_reply(send(request, "POST", url)?)
+    json_reply(send(request, "POST", url)?, "POST")
 }
 
 /// `POST url` with a form-encoded body, authenticated as an OAuth client with HTTP Basic
@@ -104,7 +144,7 @@ pub fn post_form_basic(
         .post(url)
         .basic_auth(client_id, Some(client_secret))
         .form(form);
-    json_reply(send(request, "POST", url)?)
+    json_reply(send(request, "POST", url)?, "POST")
 }
 
 /// `POST url` with a JSON body and `Authorization: Bearer <bearer>`, parsed as JSON.
@@ -114,7 +154,7 @@ pub fn post_form_basic(
 /// Returns an error when the request cannot be sent or the body is not JSON.
 pub fn post_json(url: &str, bearer: &str, body: &Value) -> Result<JsonReply> {
     let request = authorized(client()?.post(url), bearer).json(body);
-    json_reply(send(request, "POST", url)?)
+    json_reply(send(request, "POST", url)?, "POST")
 }
 
 /// Percent-encodes `value` for a URL path segment or query value, so every byte outside
@@ -145,8 +185,42 @@ fn authorized(request: RequestBuilder, bearer: &str) -> RequestBuilder {
     }
 }
 
+/// Sends `request`. A failure to get an answer is a [`NoAnswer`]; a request that could not be
+/// built, or a redirect loop, is a plain error with the same cause-first message.
 fn send(request: RequestBuilder, method: &str, url: &str) -> Result<Response> {
-    request.send().with_context(|| format!("{method} {url}"))
+    request.send().map_err(|error| {
+        let refused = error.is_builder() || error.is_redirect();
+        let error = error.without_url();
+        let request = format!("on {method} {}", without_query(url));
+        if refused {
+            anyhow!("{}, {request}", root_cause(&error))
+        } else {
+            no_answer(&error, &request)
+        }
+    })
+}
+
+/// A [`NoAnswer`] for `error`, which happened while doing `what`.
+fn no_answer(error: &(dyn std::error::Error + 'static), what: &str) -> anyhow::Error {
+    anyhow::Error::new(NoAnswer(format!("{}, {what}", root_cause(error))))
+}
+
+/// The innermost error under `error`, which says what happened on the wire (`connection
+/// closed before message completed`, `operation timed out`, `Connection refused (os error
+/// 111)`). The errors that wrap it say only that a request failed, and the request is named
+/// beside it.
+fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut cause = error;
+    while let Some(source) = cause.source() {
+        cause = source;
+    }
+    cause.to_string()
+}
+
+/// `url` without its query string, which can be longer than the rest and says nothing a log
+/// needs to tell one request from another of a run.
+fn without_query(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(path, _)| path)
 }
 
 /// One client, so connections and the TLS session cache are shared by every call.
@@ -164,18 +238,41 @@ fn client() -> Result<&'static Client> {
         .map_err(|error| anyhow!("building the HTTP client: {error}"))
 }
 
-fn json_reply(response: Response) -> Result<JsonReply> {
+/// The status, headers and JSON body of `response`. A body that ends early is a [`NoAnswer`]
+/// when the status is a success, since the answer is missing, and a [`CutShort`] carrying the
+/// status and headers otherwise.
+fn json_reply(response: Response, method: &str) -> Result<JsonReply> {
     let status = response.status();
     let headers = response.headers().clone();
     let url = response.url().clone();
-    let body = response
-        .text()
-        .with_context(|| format!("reading the body of {url}"))?;
-    let value = parse_json(&body, status, url.as_str())?;
+    let request = format!("{method} {}", without_query(url.as_str()));
+    let body = match response.text() {
+        Ok(body) => body,
+        Err(error) if status.is_success() => {
+            return Err(no_answer(
+                &error.without_url(),
+                &format!("reading the body of {request}"),
+            ))
+        }
+        Err(error) => {
+            let message = format!(
+                "{}, reading the body of the {status} answer to {request}",
+                root_cause(&error.without_url())
+            );
+            return Err(anyhow::Error::new(CutShort {
+                status,
+                headers,
+                message,
+            }));
+        }
+    };
+    let value = parse_json(&body, status, &request)?;
     Ok((status, headers, value))
 }
 
-fn parse_json(body: &str, status: StatusCode, url: &str) -> Result<Value> {
+/// `body` as JSON. A body that is not says so first, then which request it answered, then how
+/// it starts.
+fn parse_json(body: &str, status: StatusCode, request: &str) -> Result<Value> {
     if body.trim().is_empty() {
         return Ok(Value::Null);
     }
@@ -184,7 +281,7 @@ fn parse_json(body: &str, status: StatusCode, url: &str) -> Result<Value> {
         if body.chars().count() > 200 {
             excerpt.push('…');
         }
-        format!("{url} returned {status} with a body that is not JSON: {excerpt}")
+        format!("{status} with a body that is not JSON, from {request}: {excerpt}")
     })
 }
 
@@ -218,12 +315,41 @@ mod tests {
 
     impl FakeServer {
         fn start(response: &'static str, body: Vec<u8>) -> Result<Self> {
+            Self::serve(move |listener| serve_once(listener, response, &body))
+        }
+
+        /// A server that reads the request and closes the connection without answering it.
+        fn hang_up() -> Result<Self> {
+            Self::serve(|listener| {
+                let (mut stream, _) = listener.accept().context("accepting a fake request")?;
+                read_request(&mut stream)
+            })
+        }
+
+        /// A server that answers with `response` and a `Content-Length` longer than the body
+        /// it sends, then closes: the reply ends before its body does.
+        fn cut_short(response: &'static str) -> Result<Self> {
+            Self::serve(move |listener| {
+                let (mut stream, _) = listener.accept().context("accepting a fake request")?;
+                let received = read_request(&mut stream)?;
+                let reply = format!("HTTP/1.1 {response}\r\nContent-Length: 100\r\n\r\n{{\"a\"");
+                stream
+                    .write_all(reply.as_bytes())
+                    .context("writing a fake reply")?;
+                stream.flush().context("flushing a fake reply")?;
+                Ok(received)
+            })
+        }
+
+        fn serve(
+            answer: impl FnOnce(&TcpListener) -> Result<Received> + Send + 'static,
+        ) -> Result<Self> {
             let listener = TcpListener::bind("127.0.0.1:0").context("binding a fake server")?;
             let port = listener
                 .local_addr()
                 .context("reading the fake port")?
                 .port();
-            let handle = std::thread::spawn(move || serve_once(&listener, response, &body));
+            let handle = std::thread::spawn(move || answer(&listener));
             Ok(Self {
                 url: format!("http://127.0.0.1:{port}"),
                 handle,
@@ -416,6 +542,82 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&received.body),
             r#"{"instances":[{"content":"hello"}]}"#
+        );
+        Ok(())
+    }
+
+    /// A request that gets no answer fails with the cause first, so a log line cut to a few
+    /// hundred characters still says it, and with the URL once, without its query.
+    #[test]
+    fn a_request_that_gets_no_answer_names_the_cause_before_the_url_once() -> Result<()> {
+        let probe = FakeServer::hang_up()?;
+        let expected = root_cause(
+            &reqwest::blocking::get(&probe.url)
+                .err()
+                .context("a request the fake server hung up on succeeded")?,
+        );
+        probe.received()?;
+
+        let server = FakeServer::hang_up()?;
+        let path = format!("{}/repos/example-org/example-repo/issues", server.url);
+        let error = get_json(
+            &format!("{path}?state=all&since=2026-10-26T00%3A00%3A00Z&per_page=100"),
+            "token-example",
+            &[],
+        )
+        .err()
+        .context("a request the fake server hung up on succeeded")?;
+        server.received()?;
+
+        let message = format!("{error:#}");
+        assert!(message.starts_with(&expected), "{expected:?}: {message}");
+        assert_eq!(message.matches(&path).count(), 1, "{message}");
+        assert!(!message.contains("since="), "{message}");
+        assert!(message.contains(&format!("GET {path}")), "{message}");
+        Ok(())
+    }
+
+    /// A success whose body ends early has no answer to give: it is a [`NoAnswer`], so a
+    /// caller that may repeat the request does.
+    #[test]
+    fn a_success_whose_body_is_cut_short_is_no_answer() -> Result<()> {
+        let server = FakeServer::cut_short("200 OK")?;
+        let error = get_json(&server.url, "token-example", &[])
+            .err()
+            .context("a body cut short was read whole")?;
+        server.received()?;
+
+        assert!(error.downcast_ref::<NoAnswer>().is_some(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("reading the body of GET"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    /// A refusal whose body ends early is still the refusal: the error carries its status and
+    /// headers, so a throttle is seen as one, and names the cause and the request for any other
+    /// caller. It is never a [`NoAnswer`], so nothing sends it again.
+    #[test]
+    fn a_refusal_whose_body_is_cut_short_keeps_its_status() -> Result<()> {
+        let server = FakeServer::cut_short("429 Too Many Requests")?;
+        let url = server.url.clone();
+        let error = get_json(&server.url, "token-example", &[])
+            .err()
+            .context("a body cut short was read whole")?;
+        server.received()?;
+
+        let cut = error
+            .downcast_ref::<CutShort>()
+            .with_context(|| format!("not a CutShort: {error:#}"))?;
+        assert_eq!(cut.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.downcast_ref::<NoAnswer>().is_none(), "{error:#}");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "reading the body of the 429 Too Many Requests answer to GET {url}"
+            )),
+            "{message}"
         );
         Ok(())
     }

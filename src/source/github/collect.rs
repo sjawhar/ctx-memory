@@ -7,7 +7,7 @@ use anyhow::{bail, Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::api::github::{api_base, Page, PageKind, Repo};
+use crate::api::github::{api_base, retry_after, Page, PageKind, Repo};
 use crate::exclude::Exclusion;
 use crate::record::Record;
 
@@ -736,6 +736,10 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
     /// or the budget left is no more than `needed`. A page GitHub refused stops the listing. A
     /// `404`, and a comparison whose diff GitHub cannot generate, is an error unless
     /// `missing_ok`, when the caller gets that page.
+    ///
+    /// Each try is charged to the budget before it is sent, answered or not, since GitHub may
+    /// have counted it. A try that got no answer is sent again ([`retry_after`]) while the
+    /// budget has a request left; when it has none, the read fails with that try's error.
     fn page(&mut self, url: &str, needed: u32, missing_ok: bool) -> Result<Result<Page, Stop>> {
         if let Some(stop) = self.governor.blocked(self.installation) {
             return Ok(Err(stop));
@@ -743,14 +747,25 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
         if needed > 0 && self.governor.budget <= needed {
             return Ok(Err(Stop::Truncated));
         }
-        let page = self.api.get(self.installation, url)?;
+        let mut attempt = 1;
+        let page = loop {
+            self.governor.charge();
+            match self.api.get(self.installation, url) {
+                Ok(page) => break page,
+                Err(error) if self.governor.budget == 0 => return Err(error),
+                Err(error) => retry_after(error, attempt)?,
+            }
+            attempt += 1;
+        };
         self.governor.observe(self.installation, &page);
         match page.kind {
             // GitHub refused the pace, so the rest of this listing waits for the next fetch.
             PageKind::Throttled => Ok(Err(Stop::Throttled)),
-            PageKind::Missing if !missing_ok => bail!("reading {url} failed: 404 Not Found"),
+            PageKind::Missing if !missing_ok => {
+                bail!("GitHub answered 404 Not Found, to GET {url}")
+            }
             PageKind::DiffUnavailable if !missing_ok => {
-                bail!("reading {url} failed: 422 GitHub cannot generate the comparison's diff")
+                bail!("GitHub answered 422, it cannot generate the comparison's diff, to GET {url}")
             }
             PageKind::Items | PageKind::Missing | PageKind::DiffUnavailable => Ok(Ok(page)),
         }
@@ -1039,10 +1054,13 @@ impl Governor {
         }
     }
 
-    /// Charges a page against the budget and learns the rate limit of the installation and
-    /// resource it was counted against.
-    fn observe(&mut self, installation: u64, page: &Page) {
+    /// Charges one request against the budget.
+    fn charge(&mut self) {
         self.budget = self.budget.saturating_sub(1);
+    }
+
+    /// Learns the rate limit of the installation and resource a page was counted against.
+    fn observe(&mut self, installation: u64, page: &Page) {
         if let Some(remaining) = page.rate_remaining {
             let resource = page.rate_resource.as_deref().unwrap_or(REST_RESOURCE);
             let resources = self.remaining.entry(installation).or_default();

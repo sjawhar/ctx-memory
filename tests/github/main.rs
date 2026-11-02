@@ -10,3 +10,4 @@ mod client_contract;
 mod cursors_and_commits;
 mod fixtures;
 mod pagination;
+mod transport;
