@@ -7,9 +7,10 @@ name: images
 #
 # release.yml calls it for each `v*` tag once the release exists. Run by hand (workflow_dispatch,
 # from main), it publishes the images of a release that already exists, from main's Dockerfiles.
-# Each image is tagged with the release's version, and with `latest` when the release is the
-# repository's latest, so publishing an older release never moves `latest` back. A pull request
-# that changes the images builds and checks both against the latest release and pushes nothing.
+# Each image is tagged with the release's version, and `latest` names the images of the
+# repository's latest release, so publishing an older release never moves `latest` back. A pull
+# request that changes the images builds and checks both against the latest release and pushes
+# nothing.
 #
 # Only linux/amd64 is built: the agent runs the Oh My Pi release runner/omp.lock pins, which has no
 # linux-arm64 build, and the server is built for the same platform as the agent.
@@ -177,23 +178,10 @@ jobs:
           printf '%s\n' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
           docker tag "$LOCAL" "$repo:$VERSION"
           docker push --quiet "$repo:$VERSION"
-          # `latest` follows the repository's latest release, read now, after the version tag is
-          # pushed and not when this run started: a run for an older release that finishes after a
-          # newer release's run then leaves `latest` where the newer one put it.
-          tags=("$VERSION")
-          latest_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
-          if [ "$latest_tag" = "v$VERSION" ]; then
-            docker tag "$LOCAL" "$repo:latest"
-            docker push --quiet "$repo:latest"
-            tags+=(latest)
-          fi
           # The digest is the registry's for the version tag. The local image, the one the smoke
-          # test ran, must be what was pushed there, and every tag must resolve to it, because the
-          # attestation below names that digest.
-          resolve() {
-            docker buildx imagetools inspect "$repo:$1" --format '{{json .Manifest}}' | jq -r .digest
-          }
-          digest="$(resolve "$VERSION")"
+          # test ran, must be what was pushed there, because the attestation below names that
+          # digest.
+          digest="$(docker buildx imagetools inspect "$repo:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)"
           if ! printf '%s\n' "$digest" | grep -qxE 'sha256:[0-9a-f]{64}'; then
             echo "the registry reported no digest for $repo:$VERSION: '$digest'" >&2
             exit 1
@@ -202,17 +190,60 @@ jobs:
             echo "$repo:$VERSION is $digest in the registry, which is not the image built here" >&2
             exit 1
           fi
-          for tag in "${tags[@]}"; do
-            if [ "$(resolve "$tag")" != "$digest" ]; then
-              echo "$repo:$tag does not resolve to $digest in the registry" >&2
-              exit 1
-            fi
-          done
           printf 'name=%s\ndigest=%s\n' "$repo" "$digest" >> "$GITHUB_OUTPUT"
-          echo "$repo@$digest (${tags[*]})"
+          echo "$repo@$digest"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         if: needs.release.outputs.publish == 'true'
         with:
           subject-name: ${{ steps.push.outputs.name }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  # `latest` names the images of the repository's latest release. Every publishing run moves it
+  # there, whichever release the run is for, and one run at a time: the group holds every version,
+  # so no run can read the latest release, stall, and move `latest` back after a newer release's
+  # run moved it on. A run waiting here that a newer run replaces has nothing left to do, because
+  # the newer run reads the latest release when it starts.
+  latest:
+    needs: [release, image]
+    if: needs.release.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: images-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Point latest at the latest release's images
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          printf '%s\n' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          latest_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          version="${latest_tag#v}"
+          resolve() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -er .digest
+          }
+          for image in server agent; do
+            repo="ghcr.io/${GITHUB_REPOSITORY,,}/$image"
+            # A newer release than this run's whose images are not pushed yet moves `latest` in its
+            # own run. This run's own release was pushed by the image job, so it must resolve.
+            if ! digest="$(resolve "$repo:$version")"; then
+              if [ "$version" = "$VERSION" ]; then
+                echo "$repo:$version, which this run pushed, does not resolve in the registry" >&2
+                exit 1
+              fi
+              echo "$repo:$version is not published yet; the run for $latest_tag moves latest"
+              continue
+            fi
+            # A copy of the version tag's manifest, so `latest` is the same digest, attested with it.
+            docker buildx imagetools create --prefer-index=false --tag "$repo:latest" "$repo@$digest"
+            if [ "$(resolve "$repo:latest")" != "$digest" ]; then
+              echo "$repo:latest does not resolve to $digest, the digest of $repo:$version" >&2
+              exit 1
+            fi
+            echo "$repo:latest = $repo:$version = $digest"
+          done
