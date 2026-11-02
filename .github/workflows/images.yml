@@ -181,7 +181,8 @@ jobs:
           # pushed and not when this run started: a run for an older release that finishes after a
           # newer release's run then leaves `latest` where the newer one put it.
           tags=("$VERSION")
-          if [ "$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)" = "v$VERSION" ]; then
+          latest_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          if [ "$latest_tag" = "v$VERSION" ]; then
             docker tag "$LOCAL" "$repo:latest"
             docker push --quiet "$repo:latest"
             tags+=(latest)
