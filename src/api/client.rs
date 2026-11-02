@@ -615,8 +615,7 @@ mod tests {
         let message = format!("{error:#}");
         assert!(
             message.contains(&format!(
-                "reading the body of the 429 Too Many Requests answer to GET {}",
-                url
+                "reading the body of the 429 Too Many Requests answer to GET {url}"
             )),
             "{message}"
         );
