@@ -748,9 +748,11 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
         match page.kind {
             // GitHub refused the pace, so the rest of this listing waits for the next fetch.
             PageKind::Throttled => Ok(Err(Stop::Throttled)),
-            PageKind::Missing if !missing_ok => bail!("reading {url} failed: 404 Not Found"),
+            PageKind::Missing if !missing_ok => {
+                bail!("GitHub answered 404 Not Found, to GET {url}")
+            }
             PageKind::DiffUnavailable if !missing_ok => {
-                bail!("reading {url} failed: 422 GitHub cannot generate the comparison's diff")
+                bail!("GitHub answered 422, it cannot generate the comparison's diff, to GET {url}")
             }
             PageKind::Items | PageKind::Missing | PageKind::DiffUnavailable => Ok(Ok(page)),
         }
@@ -1039,10 +1041,10 @@ impl Governor {
         }
     }
 
-    /// Charges a page against the budget and learns the rate limit of the installation and
-    /// resource it was counted against.
+    /// Charges a page against the budget, one request for each time it was sent, and learns
+    /// the rate limit of the installation and resource it was counted against.
     fn observe(&mut self, installation: u64, page: &Page) {
-        self.budget = self.budget.saturating_sub(1);
+        self.budget = self.budget.saturating_sub(page.retries.saturating_add(1));
         if let Some(remaining) = page.rate_remaining {
             let resource = page.rate_resource.as_deref().unwrap_or(REST_RESOURCE);
             let resources = self.remaining.entry(installation).or_default();

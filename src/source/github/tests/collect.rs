@@ -153,6 +153,45 @@ fn stops_at_request_budget_and_names_only_what_it_finished() -> Result<()> {
     Ok(())
 }
 
+/// A page GitHub was sent three times for, because the first two got no answer, costs three
+/// requests of the budget: GitHub may have counted each one.
+#[test]
+fn a_page_sent_again_is_charged_for_each_time_it_was_sent() -> Result<()> {
+    let base = api_base();
+    let subject = repo("example-org", "example-repo");
+    let fake = FakeGithub {
+        repos: BTreeMap::from([(1, vec![subject.clone()])]),
+        ..FakeGithub::default()
+    };
+    let mut first = page(vec![issue(1, "2026-10-25T10:00:00Z")]);
+    first.next = Some("page-2".to_owned());
+    first.retries = 2;
+    fake.page(&issues_url(&base, &subject, SINCE), first);
+    fake.page("page-2", page(Vec::new()));
+    fake.page(&issue_comments_url(&base, &subject, 1), page(Vec::new()));
+
+    let request = request(BTreeMap::from([(stream_id(&subject), CURSOR.to_owned())]))?;
+    let outcome = run(&fake, &request, &config(vec![1], 4, 2000))?;
+
+    // The first page cost three of the four requests, so the last one is left for issue 1's
+    // comments and the feed's second page is never asked. Charged once, it would have been.
+    assert!(
+        !fake.get_log.borrow().iter().any(|url| url == "page-2"),
+        "{:?}",
+        fake.get_log.borrow()
+    );
+    assert_eq!(fake.get_log.borrow().len(), 2);
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("request budget")),
+        "{:?}",
+        outcome.warnings
+    );
+    Ok(())
+}
+
 #[test]
 fn stops_when_rate_limit_remaining_is_low() -> Result<()> {
     let base = api_base();

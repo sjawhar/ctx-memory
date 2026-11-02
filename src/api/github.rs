@@ -16,14 +16,24 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::api::client;
+use crate::api::client::{self, JsonReply, NoAnswer};
 use crate::credentials::{self, Secret};
+use crate::redact::one_line;
 
 /// The default GitHub API endpoint.
 const API: &str = "https://api.github.com";
 
 /// How long the app JWT is valid. GitHub refuses more than ten minutes.
 const JWT_LIFETIME: u64 = 540;
+
+/// How many times a read that gets no answer is sent in all: once, and twice more.
+const READ_ATTEMPTS: u32 = 3;
+
+/// The pause before a read that got no answer is sent again. The network that dropped it, or a
+/// connection GitHub closed, is replaced by a fresh connection at the next try; the pause only
+/// keeps the tries out of the same moment of trouble, and two of them cost a run of a few
+/// minutes nothing.
+const READ_RETRY_PAUSE: Duration = Duration::from_secs(2);
 
 /// The shape of the `github_app` credential.
 #[derive(Debug, Deserialize)]
@@ -321,6 +331,9 @@ pub struct Page {
     pub total: Option<u64>,
     /// What GitHub answered: the page, or a refusal.
     pub kind: PageKind,
+    /// How many times the read was sent again after it got no answer, so a caller that counts
+    /// requests charges each one sent.
+    pub retries: u32,
 }
 
 /// The GitHub App as a reader: it mints a read-only token for each installation and
@@ -392,10 +405,8 @@ impl GithubClient {
         let mut repositories = Vec::new();
         let mut url = Some(format!("{}/installation/repositories?per_page=100", base()));
         while let Some(current) = url {
-            let (status, headers, body) =
-                client::get_json_with_headers(&current, &token, &[], &api_headers()).with_context(
-                    || format!("listing repositories for installation {installation}"),
-                )?;
+            // The caller names the installation, so the error says it once.
+            let ((status, headers, body), _) = read(&current, &token)?;
             if throttled(status, &headers) {
                 return Ok(None);
             }
@@ -433,12 +444,11 @@ impl GithubClient {
     /// it with a status that is none of those.
     pub fn get_page(&self, installation: u64, url: &str) -> Result<Page> {
         let token = self.token(installation)?;
-        let (status, headers, body) =
-            client::get_json_with_headers(url, &token, &[], &api_headers())
-                .with_context(|| format!("reading {url}"))?;
+        let ((status, headers, body), retries) = read(url, &token)?;
         let rated = Page {
             rate_remaining: rate_remaining(&headers),
             rate_resource: header_value(&headers, "x-ratelimit-resource"),
+            retries,
             ..Page::default()
         };
         if status == StatusCode::CONFLICT {
@@ -467,7 +477,7 @@ impl GithubClient {
             });
         }
         if !status.is_success() {
-            bail!("reading {url} failed: {status} {}", excerpt(&body));
+            bail!("GitHub answered {status} {}, to GET {url}", excerpt(&body));
         }
         let items = body
             .as_array()
@@ -494,12 +504,39 @@ impl GithubClient {
     pub fn graphql(&self, installation: u64, request: &Value) -> Result<Value> {
         let token = self.token(installation)?;
         let url = format!("{}/graphql", base());
-        let (status, _, body) =
-            client::post_json(&url, &token, request).with_context(|| format!("posting {url}"))?;
+        let (status, _, body) = client::post_json(&url, &token, request)?;
         if !status.is_success() {
-            bail!("posting {url} failed: {status} {}", excerpt(&body));
+            bail!("GitHub answered {status} {}, to POST {url}", excerpt(&body));
         }
         Ok(body)
+    }
+}
+
+/// `GET url` with an installation's token, and how many times it was sent again. A read that
+/// gets no answer at all — it cannot connect, it times out, the connection closes or resets
+/// before a status — is sent again, [`READ_ATTEMPTS`] times in all, [`READ_RETRY_PAUSE`] apart,
+/// each retry a line on standard error: a `GET` is safe to repeat. Any HTTP status, a refusal
+/// or a throttle among them, is returned as it is.
+fn read(url: &str, token: &str) -> Result<(JsonReply, u32)> {
+    let mut attempt = 1;
+    loop {
+        let error = match client::get_json_with_headers(url, token, &[], &api_headers()) {
+            Ok(reply) => return Ok((reply, attempt - 1)),
+            Err(error) if error.downcast_ref::<NoAnswer>().is_some() => error,
+            Err(error) => return Err(error),
+        };
+        if attempt >= READ_ATTEMPTS {
+            return Err(error.context(format!("GitHub gave no answer in {READ_ATTEMPTS} tries")));
+        }
+        eprintln!(
+            "{}",
+            one_line(&format!(
+                "github: try {attempt} of {READ_ATTEMPTS} got no answer, trying again in {} s: {error:#}",
+                READ_RETRY_PAUSE.as_secs()
+            ))
+        );
+        std::thread::sleep(READ_RETRY_PAUSE);
+        attempt += 1;
     }
 }
 

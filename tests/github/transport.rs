@@ -89,6 +89,7 @@ fn fetch(api: &FakeHttp, root: &Path) -> Result<Output> {
         "CTX_MEMORY",
         "CTX_MEMORY_REMOTE",
         "CTX_DATA_DIR",
+        "CTX_EXCLUDE",
         "CTX_LEASE_BUCKET",
         "CLOUD_RUN_JOB",
         "CTX_EMBED_MODEL",
