@@ -1136,3 +1136,138 @@ fn the_runner_refuses_a_maintenance_pass_it_does_not_know() -> Result<()> {
     rig.remove()?;
     result
 }
+
+/// Runs `run-cycle.sh`'s `prepare_context` on a pending answer naming window `w1`, with `ctx`
+/// answering as `ctx_script` and the session user's `test` answering `agent_test`, in a scratch
+/// share. Answers the run, the prompt sentence it set, and the file it wrote.
+fn run_prepare_context(
+    label: &str,
+    ctx_script: &str,
+    agent_test: &str,
+    lock_sessions: bool,
+) -> Result<(std::process::Output, String, Option<String>)> {
+    let root = scratch(label)?;
+    let bin = root.join("bin");
+    let sessions = root.join("data/agent-sessions");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir_all(&sessions)?;
+    write_executable(&bin.join("ctx"), ctx_script)?;
+    write_executable(&bin.join("chown"), "#!/bin/sh\nexit 0\n")?;
+    if lock_sessions {
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o555))?;
+    }
+    let path = std::env::var("PATH").context("PATH is not set")?;
+    let script = format!(
+        "set -eu\nCTX_DATA_DIR='{}'\nCLOUD_RUN_EXECUTION=ctx-agent-test-1\nAGENT_USER=ctx-agent\n\
+         CONTEXT_SECONDS=5\ncontext_file=\"$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION.context.json\"\n\
+         as_agent_user() {{ {agent_test}; }}\n{}\n{}\n{}\n\
+         pending='{{\"ok\":true,\"data\":{{\"windows\":[{{\"window\":\"w1\"}}]}}}}'\n\
+         prepare_context \"$pending\"\nprintf '%s' \"$context_prompt\"\n",
+        root.join("data").display(),
+        script_function("refuse")?,
+        script_function("write_context")?,
+        script_function("prepare_context")?,
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .output()
+        .context("running prepare_context")?;
+    let written = std::fs::read_to_string(sessions.join("ctx-agent-test-1.context.json")).ok();
+    let prompt = String::from_utf8_lossy(&output.stdout).into_owned();
+    remove_scratch(&root)?;
+    Ok((output, prompt, written))
+}
+
+/// The runner reads each pending window's context with `ctx context` and writes it to a file
+/// beside the session directories, which the prompt then names as quoted material.
+#[test]
+fn the_runner_writes_each_windows_context_for_the_session() -> Result<()> {
+    let (output, prompt, written) = run_prepare_context(
+        "context-written",
+        "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"data\":{\"window\":\"w1\",\"subjects\":[\"K-1\"],\"items\":[{\"ref\":\"K-1\",\"title\":\"t\",\"status\":\"done\",\"links\":[]}]}}'\n",
+        "return 1",
+        false,
+    )?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&written.context("no context file was written")?)?;
+    ensure!(
+        written.pointer("/windows/0/items/0/ref") == Some(&serde_json::json!("K-1")),
+        "the file does not hold the window's items: {written}"
+    );
+    ensure!(
+        prompt.contains("ctx-agent-test-1.context.json") && prompt.contains("quoted material"),
+        "the prompt does not name the context file as quoted material: {prompt}"
+    );
+    Ok(())
+}
+
+/// A context file the session's user could rewrite would let one session feed the next what to
+/// believe, so the runner refuses to start a session beside one.
+#[test]
+fn the_runner_refuses_a_context_file_the_session_can_write() -> Result<()> {
+    let (output, _, _) = run_prepare_context(
+        "context-writable",
+        "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"data\":{\"window\":\"w1\",\"subjects\":[],\"items\":[]}}'\n",
+        "return 0",
+        false,
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        !output.status.success()
+            && stderr.contains("can rewrite")
+            && stderr.contains("context.json"),
+        "the runner went on beside a context file the session can write: {stderr}"
+    );
+    Ok(())
+}
+
+/// Context is optional: a `ctx context` that fails leaves `unavailable` in the file, and a file
+/// that cannot be written leaves the cycle without one. Either way the runner goes on.
+#[test]
+fn the_runner_goes_on_when_context_fails() -> Result<()> {
+    let (failed, prompt, written) =
+        run_prepare_context("context-failed", "#!/bin/sh\nexit 7\n", "return 1", false)?;
+    ensure!(
+        failed.status.success(),
+        "a failed context read failed the cycle: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&written.context("no context file was written")?)?;
+    ensure!(
+        written
+            .pointer("/windows/0/unavailable")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "a failed read did not mark the window unavailable: {written}"
+    );
+    ensure!(
+        !prompt.is_empty(),
+        "the prompt does not name the context file"
+    );
+
+    let (unwritable, prompt, written) = run_prepare_context(
+        "context-unwritable",
+        "#!/bin/sh\nexit 7\n",
+        "return 1",
+        true,
+    )?;
+    ensure!(
+        unwritable.status.success(),
+        "a context file that could not be written failed the cycle: {}",
+        String::from_utf8_lossy(&unwritable.stderr)
+    );
+    ensure!(written.is_none() && prompt.is_empty(), "prompt {prompt:?}");
+    ensure!(
+        String::from_utf8_lossy(&unwritable.stderr).contains("goes on without context"),
+        "the runner did not say it went on without context"
+    );
+    Ok(())
+}

@@ -84,8 +84,9 @@ delivered again unchanged is not new and is in no delta.
   refuses a write to it, and refuses every write while `ctx sweep` reports it broken.
 - Only configured sources are citable. A citation points to committed tree content or to
   a pointer `ctx resolve` can answer, copied from a window's `records.jsonl`. A web address
-  that a message holds is text of that message: it never becomes a record's source or a
-  `tracked_by` entry, even though the server takes a web address as a tier 3 source.
+  that a message holds is text of that message: it never becomes a record's source, even
+  though the server takes one as a tier 3 source, nor a `tracked_by` entry but as
+  `skill://ctx-memory-ingest/references/context.md` allows.
 - Every quote is checked against the source its own entry names. The server refuses a
   quote whose source does not hold it, and a claim whose pointer nothing can check: a
   source that has never declared whether its records are its own words, one that stores
@@ -225,8 +226,8 @@ automated notification noise unless a person acts on it.
   evidence added: `ctx_record_put` replaces the file, so text left out is lost. An update
   checks the record's existing `owner`, `decided_by` and `waiting_on` by the rules above,
   and corrects them when the sources it cites do not establish them or a newer cited source
-  settles the item. It keeps `tracked_by` as it stands: the people who track the record
-  elsewhere write it, never the cycle.
+  settles the item. It keeps every `tracked_by` entry people wrote; the cycle only adds one, as
+  `skill://ctx-memory-ingest/references/context.md` allows.
 - Keep superseded values with their citations; mark them superseded and link the
   replacement.
 - Give every decision and question a `revisit_by` date and every commitment a `due` date,
