@@ -52,6 +52,8 @@ pub(super) struct FakeGithub {
     pub(super) graphql_errors: RefCell<Option<Value>>,
     /// Every GraphQL request the source sent.
     pub(super) graphql_log: RefCell<Vec<Value>>,
+    /// How many more requests for each URL get no answer before GitHub answers it.
+    pub(super) no_answer: RefCell<BTreeMap<String, u32>>,
 }
 
 impl FakeGithub {
@@ -111,6 +113,17 @@ impl GithubApi for FakeGithub {
 
     fn get(&self, _installation: u64, url: &str) -> Result<Page> {
         self.get_log.borrow_mut().push(url.to_owned());
+        if let Some(left) = self
+            .no_answer
+            .borrow_mut()
+            .get_mut(url)
+            .filter(|left| **left > 0)
+        {
+            *left -= 1;
+            return Err(anyhow::Error::new(crate::api::client::NoAnswer(format!(
+                "connection closed before message completed, on GET {url}"
+            ))));
+        }
         self.pages
             .borrow()
             .get(url)

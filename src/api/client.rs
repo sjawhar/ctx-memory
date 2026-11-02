@@ -27,7 +27,7 @@ pub type JsonReply = (StatusCode, HeaderMap, Value);
 /// after it, without the query string, so a log line cut to a few hundred characters still
 /// says why however long the URL is.
 #[derive(Debug)]
-pub struct NoAnswer(String);
+pub struct NoAnswer(pub(crate) String);
 
 impl std::fmt::Display for NoAnswer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -36,6 +36,25 @@ impl std::fmt::Display for NoAnswer {
 }
 
 impl std::error::Error for NoAnswer {}
+
+/// A refusal whose body ended early: the status and headers came, the body did not. The status
+/// is the answer, so a caller that acts on statuses (GitHub's throttle) reads them from here;
+/// any other caller gets the cause first and the request, as for [`NoAnswer`]. It is never a
+/// [`NoAnswer`], since the server did answer.
+#[derive(Debug)]
+pub struct CutShort {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    message: String,
+}
+
+impl std::fmt::Display for CutShort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CutShort {}
 
 /// `GET url` with `Authorization: Bearer <bearer>`, parsed as JSON.
 ///
@@ -219,10 +238,9 @@ fn client() -> Result<&'static Client> {
         .map_err(|error| anyhow!("building the HTTP client: {error}"))
 }
 
-/// The status, headers and JSON body of `response`. A body cut short is a [`NoAnswer`] when the
-/// status is a success, since the answer is missing; for any other status the status is the
-/// answer, so it comes back with no body and the caller acts on it (a throttle is still a
-/// throttle when GitHub closes the connection before its message ends).
+/// The status, headers and JSON body of `response`. A body that ends early is a [`NoAnswer`]
+/// when the status is a success, since the answer is missing, and a [`CutShort`] carrying the
+/// status and headers otherwise.
 fn json_reply(response: Response, method: &str) -> Result<JsonReply> {
     let status = response.status();
     let headers = response.headers().clone();
@@ -230,12 +248,22 @@ fn json_reply(response: Response, method: &str) -> Result<JsonReply> {
     let request = format!("{method} {}", without_query(url.as_str()));
     let body = match response.text() {
         Ok(body) => body,
-        Err(_) if !status.is_success() => return Ok((status, headers, Value::Null)),
-        Err(error) => {
+        Err(error) if status.is_success() => {
             return Err(no_answer(
                 &error.without_url(),
                 &format!("reading the body of {request}"),
             ))
+        }
+        Err(error) => {
+            let message = format!(
+                "{}, reading the body of the {status} answer to {request}",
+                root_cause(&error.without_url())
+            );
+            return Err(anyhow::Error::new(CutShort {
+                status,
+                headers,
+                message,
+            }));
         }
     };
     let value = parse_json(&body, status, &request)?;
@@ -567,16 +595,30 @@ mod tests {
         Ok(())
     }
 
-    /// A refusal whose body ends early is still the refusal: its status and headers come
-    /// back, so a throttle is seen as one and never sent again.
+    /// A refusal whose body ends early is still the refusal: the error carries its status and
+    /// headers, so a throttle is seen as one, and names the cause and the request for any other
+    /// caller. It is never a [`NoAnswer`], so nothing sends it again.
     #[test]
     fn a_refusal_whose_body_is_cut_short_keeps_its_status() -> Result<()> {
         let server = FakeServer::cut_short("429 Too Many Requests")?;
-        let (status, _headers, body) = get_json(&server.url, "token-example", &[])?;
+        let error = get_json(&server.url, "token-example", &[])
+            .err()
+            .context("a body cut short was read whole")?;
         server.received()?;
 
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(body, Value::Null);
+        let cut = error
+            .downcast_ref::<CutShort>()
+            .with_context(|| format!("not a CutShort: {error:#}"))?;
+        assert_eq!(cut.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.downcast_ref::<NoAnswer>().is_none(), "{error:#}");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "reading the body of the 429 Too Many Requests answer to GET {}",
+                server.url
+            )),
+            "{message}"
+        );
         Ok(())
     }
 }

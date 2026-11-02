@@ -153,8 +153,8 @@ fn stops_at_request_budget_and_names_only_what_it_finished() -> Result<()> {
     Ok(())
 }
 
-/// A page GitHub was sent three times for, because the first two got no answer, costs three
-/// requests of the budget: GitHub may have counted each one.
+/// A page sent three times, because the first two tries got no answer, costs three requests of
+/// the budget: GitHub may have counted each one.
 #[test]
 fn a_page_sent_again_is_charged_for_each_time_it_was_sent() -> Result<()> {
     let base = api_base();
@@ -163,10 +163,11 @@ fn a_page_sent_again_is_charged_for_each_time_it_was_sent() -> Result<()> {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),
         ..FakeGithub::default()
     };
+    let feed = issues_url(&base, &subject, SINCE);
     let mut first = page(vec![issue(1, "2026-10-25T10:00:00Z")]);
     first.next = Some("page-2".to_owned());
-    first.retries = 2;
-    fake.page(&issues_url(&base, &subject, SINCE), first);
+    fake.page(&feed, first);
+    fake.no_answer.borrow_mut().insert(feed.clone(), 2);
     fake.page("page-2", page(Vec::new()));
     fake.page(&issue_comments_url(&base, &subject, 1), page(Vec::new()));
 
@@ -175,12 +176,14 @@ fn a_page_sent_again_is_charged_for_each_time_it_was_sent() -> Result<()> {
 
     // The first page cost three of the four requests, so the last one is left for issue 1's
     // comments and the feed's second page is never asked. Charged once, it would have been.
-    assert!(
-        !fake.get_log.borrow().iter().any(|url| url == "page-2"),
-        "{:?}",
-        fake.get_log.borrow()
+    let sent = fake.get_log.borrow().clone();
+    assert_eq!(
+        sent.iter().filter(|url| **url == feed).count(),
+        3,
+        "{sent:?}"
     );
-    assert_eq!(fake.get_log.borrow().len(), 2);
+    assert!(!sent.iter().any(|url| url == "page-2"), "{sent:?}");
+    assert_eq!(sent.len(), 4, "{sent:?}");
     assert!(
         outcome
             .warnings
@@ -188,6 +191,94 @@ fn a_page_sent_again_is_charged_for_each_time_it_was_sent() -> Result<()> {
             .any(|warning| warning.message.contains("request budget")),
         "{:?}",
         outcome.warnings
+    );
+    Ok(())
+}
+
+/// With one request of the budget left, a read that gets no answer is not sent again: the
+/// budget, not the retry, decides how many requests the run sends.
+#[test]
+fn a_read_that_gets_no_answer_is_not_sent_again_past_the_budget() -> Result<()> {
+    let base = api_base();
+    let first = repo("example-org", "first-repo");
+    let second = repo("example-org", "second-repo");
+    let fake = FakeGithub {
+        repos: BTreeMap::from([(1, vec![first.clone(), second.clone()])]),
+        ..FakeGithub::default()
+    };
+    let feed = issues_url(&base, &first, SINCE);
+    fake.no_answer.borrow_mut().insert(feed.clone(), 3);
+
+    let request = request(BTreeMap::from([
+        (stream_id(&first), CURSOR.to_owned()),
+        (stream_id(&second), CURSOR.to_owned()),
+    ]))?;
+    let outcome = run(&fake, &request, &config(vec![1], 1, 2000))?;
+
+    // One request was sent in all: the first repository's feed, once. It errored that stream,
+    // and the second repository was held by the spent budget, not read.
+    assert_eq!(*fake.get_log.borrow(), vec![feed]);
+    let failed = outcome
+        .streams
+        .get(&stream_id(&first))
+        .context("the first repository has a stream result")?;
+    assert_eq!(failed.status, StreamStatus::Error);
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("connection closed before message completed")),
+        "{:?}",
+        failed.error
+    );
+    assert_ne!(
+        outcome.streams.get(&stream_id(&second)).map(|s| s.status),
+        Some(StreamStatus::Error)
+    );
+    Ok(())
+}
+
+/// A read that gets no answer in three tries errors its stream, the three tries are charged,
+/// and the run goes on to the next repository with the budget that is left.
+#[test]
+fn a_read_that_never_gets_an_answer_costs_three_requests_and_the_run_goes_on() -> Result<()> {
+    let base = api_base();
+    let first = repo("example-org", "first-repo");
+    let second = repo("example-org", "second-repo");
+    let fake = FakeGithub {
+        repos: BTreeMap::from([(1, vec![first.clone(), second.clone()])]),
+        ..FakeGithub::default()
+    };
+    let feed = issues_url(&base, &first, SINCE);
+    fake.no_answer.borrow_mut().insert(feed.clone(), 3);
+    let other = issues_url(&base, &second, SINCE);
+    fake.page(&other, page(Vec::new()));
+
+    let request = request(BTreeMap::from([
+        (stream_id(&first), CURSOR.to_owned()),
+        (stream_id(&second), CURSOR.to_owned()),
+    ]))?;
+    let outcome = run(&fake, &request, &config(vec![1], 4, 2000))?;
+
+    // Three tries of the first feed, then the second feed with the one request left; the
+    // second repository's commits wait for the next run.
+    let sent = fake.get_log.borrow().clone();
+    assert_eq!(
+        sent,
+        vec![feed.clone(), feed.clone(), feed, other],
+        "{sent:?}"
+    );
+    let failed = outcome
+        .streams
+        .get(&stream_id(&first))
+        .context("the first repository has a stream result")?;
+    assert_eq!(failed.status, StreamStatus::Error);
+    assert!(
+        failed.error.as_deref().is_some_and(
+            |error| error.starts_with("GitHub gave no answer in 3 tries: connection closed")
+        ),
+        "{:?}",
+        failed.error
     );
     Ok(())
 }

@@ -16,7 +16,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::api::client::{self, JsonReply, NoAnswer};
+use crate::api::client::{self, CutShort, NoAnswer};
 use crate::credentials::{self, Secret};
 use crate::redact::one_line;
 
@@ -331,9 +331,6 @@ pub struct Page {
     pub total: Option<u64>,
     /// What GitHub answered: the page, or a refusal.
     pub kind: PageKind,
-    /// How many times the read was sent again after it got no answer, so a caller that counts
-    /// requests charges each one sent.
-    pub retries: u32,
 }
 
 /// The GitHub App as a reader: it mints a read-only token for each installation and
@@ -406,7 +403,15 @@ impl GithubClient {
         let mut url = Some(format!("{}/installation/repositories?per_page=100", base()));
         while let Some(current) = url {
             // The caller names the installation, so the error says it once.
-            let ((status, headers, body), _) = read(&current, &token)?;
+            let mut attempt = 1;
+            let (status, headers, body) = loop {
+                match client::get_json_with_headers(&current, &token, &[], &api_headers()) {
+                    Ok(reply) => break reply,
+                    Err(error) if cut_short_throttle(&error).is_some() => return Ok(None),
+                    Err(error) => retry_after(error, attempt)?,
+                }
+                attempt += 1;
+            };
             if throttled(status, &headers) {
                 return Ok(None);
             }
@@ -438,17 +443,34 @@ impl GithubClient {
     /// both. The items are the answer's array, or the `commits` array of a comparison
     /// (`/compare/<base>...<head>`), which wraps them in an object.
     ///
+    /// It sends the request once: a caller that may send it again after it got no answer
+    /// ([`retry_after`]) counts each request it sends.
+    ///
     /// # Errors
     ///
     /// Returns an error when the token cannot be minted, the request fails, or GitHub refuses
     /// it with a status that is none of those.
     pub fn get_page(&self, installation: u64, url: &str) -> Result<Page> {
         let token = self.token(installation)?;
-        let ((status, headers, body), retries) = read(url, &token)?;
+        let (status, headers, body) =
+            match client::get_json_with_headers(url, &token, &[], &api_headers()) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    // A throttle whose body GitHub cut short is still a throttle.
+                    let Some(headers) = cut_short_throttle(&error) else {
+                        return Err(error);
+                    };
+                    return Ok(Page {
+                        rate_remaining: rate_remaining(&headers),
+                        rate_resource: header_value(&headers, "x-ratelimit-resource"),
+                        kind: PageKind::Throttled,
+                        ..Page::default()
+                    });
+                }
+            };
         let rated = Page {
             rate_remaining: rate_remaining(&headers),
             rate_resource: header_value(&headers, "x-ratelimit-resource"),
-            retries,
             ..Page::default()
         };
         if status == StatusCode::CONFLICT {
@@ -512,32 +534,41 @@ impl GithubClient {
     }
 }
 
-/// `GET url` with an installation's token, and how many times it was sent again. A read that
-/// gets no answer at all — it cannot connect, it times out, the connection closes or resets
-/// before a status — is sent again, [`READ_ATTEMPTS`] times in all, [`READ_RETRY_PAUSE`] apart,
-/// each retry a line on standard error: a `GET` is safe to repeat. Any HTTP status, a refusal
-/// or a throttle among them, is returned as it is.
-fn read(url: &str, token: &str) -> Result<(JsonReply, u32)> {
-    let mut attempt = 1;
-    loop {
-        let error = match client::get_json_with_headers(url, token, &[], &api_headers()) {
-            Ok(reply) => return Ok((reply, attempt - 1)),
-            Err(error) if error.downcast_ref::<NoAnswer>().is_some() => error,
-            Err(error) => return Err(error),
-        };
-        if attempt >= READ_ATTEMPTS {
-            return Err(error.context(format!("GitHub gave no answer in {READ_ATTEMPTS} tries")));
-        }
-        eprintln!(
-            "{}",
-            one_line(&format!(
-                "github: try {attempt} of {READ_ATTEMPTS} got no answer, trying again in {} s: {error:#}",
-                READ_RETRY_PAUSE.as_secs()
-            ))
-        );
-        std::thread::sleep(READ_RETRY_PAUSE);
-        attempt += 1;
+/// What to do after try `attempt` of a GitHub `GET` failed with `error`. A read that got no
+/// answer at all — it could not connect, it timed out, the connection closed or reset before a
+/// status — and has tries left is sent again: this logs the retry on one line of standard
+/// error, pauses [`READ_RETRY_PAUSE`], and returns `Ok`. A `GET` is safe to repeat. Any other
+/// error, an HTTP status among them, and a read out of its [`READ_ATTEMPTS`] tries, comes back
+/// as the error to fail with.
+///
+/// # Errors
+///
+/// Returns the error to fail with when the read is not to be sent again.
+pub fn retry_after(error: anyhow::Error, attempt: u32) -> Result<()> {
+    if error.downcast_ref::<NoAnswer>().is_none() {
+        return Err(error);
     }
+    if attempt >= READ_ATTEMPTS {
+        return Err(error.context(format!("GitHub gave no answer in {attempt} tries")));
+    }
+    eprintln!(
+        "{}",
+        one_line(&format!(
+            "github: try {attempt} of {READ_ATTEMPTS} got no answer, trying again in {} s: {error:#}",
+            READ_RETRY_PAUSE.as_secs()
+        ))
+    );
+    std::thread::sleep(READ_RETRY_PAUSE);
+    Ok(())
+}
+
+/// The headers of a refusal whose body GitHub cut short, when it refused to protect a rate
+/// limit.
+fn cut_short_throttle(error: &anyhow::Error) -> Option<HeaderMap> {
+    error
+        .downcast_ref::<CutShort>()
+        .filter(|cut| throttled(cut.status, &cut.headers))
+        .map(|cut| cut.headers.clone())
 }
 
 /// The request headers every GitHub REST call carries.
