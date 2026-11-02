@@ -48,6 +48,7 @@ fn search(environment: &[(&str, &str)]) -> Result<Local> {
         "CTX_IAM_CREDENTIALS_URL",
         "CTX_SESSION",
         "OMP_SESSION_ID",
+        "PI_SESSION_ID",
         "CLAUDE_CODE_SESSION_ID",
         "HTTP_PROXY",
         "http_proxy",
@@ -129,22 +130,24 @@ fn sessions_sent(environment: &[(&str, &str)]) -> Result<(Local, Vec<Option<Stri
 type Binding = (&'static str, &'static str);
 
 /// Every request names the caller's session in `X-Ctx-Session`, so the server's log can tell
-/// apart sessions that reach it under one identity: `CTX_SESSION` when it is set, else the id
-/// Oh My Pi gives every command its agent runs, else Claude Code's, else none. An empty
-/// variable counts as unset.
+/// apart sessions that reach it under one identity: `CTX_SESSION` when it is set, else an
+/// exported Oh My Pi id, else the id Oh My Pi's bash tool gives every command its agent runs,
+/// else Claude Code's, else none. An empty variable counts as unset.
 #[test]
 fn every_request_names_the_caller_s_session() -> Result<()> {
     let omp = ("OMP_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000001");
+    let pi = ("PI_SESSION_ID", "01a1b2c3-0000-7000-8000-000000000002");
     let claude = (
         "CLAUDE_CODE_SESSION_ID",
         "5f0c7d1e-2222-4333-8444-555566667777",
     );
-    let cases: [(&[Binding], Option<&str>); 5] = [
+    let cases: [(&[Binding], Option<&str>); 6] = [
         (
             &[("CTX_SESSION", "ctx-agent-x7k2p"), omp, claude],
             Some("ctx-agent-x7k2p"),
         ),
-        (&[omp, claude], Some(omp.1)),
+        (&[omp, pi, claude], Some(omp.1)),
+        (&[pi, claude], Some(pi.1)),
         (&[("CTX_SESSION", ""), claude], Some(claude.1)),
         (&[claude], Some(claude.1)),
         (&[], None),

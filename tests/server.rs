@@ -1043,9 +1043,9 @@ fn record_put_reads_stdin() -> Result<()> {
     Ok(())
 }
 
-/// With no `CTX_SESSION` set, the id Oh My Pi gives every command its agent runs names the
-/// session: the server's request log names it on each request, a read's and a write's alike,
-/// and the write's commit carries it in its `Session:` line.
+/// With no `CTX_SESSION` set, the id Oh My Pi's bash tool gives every command its agent runs
+/// (`PI_SESSION_ID`) names the session: the server's request log names it on each request, a
+/// read's and a write's alike, and the write's commit carries it in its `Session:` line.
 #[test]
 fn the_session_an_agent_runs_in_names_its_requests_and_its_commits() -> Result<()> {
     let tree = support::fixture_clone("remote-session-omp")?;
@@ -1055,7 +1055,7 @@ fn the_session_an_agent_runs_in_names_its_requests_and_its_commits() -> Result<(
     let metadata = metadata_identity("ada@example.com")?;
     let omp = "01a1b2c3-0000-7000-8000-000000000001";
     let mut environment = cloud_env(&server, &metadata)?;
-    environment.push(("OMP_SESSION_ID".to_owned(), omp.to_owned()));
+    environment.push(("PI_SESSION_ID".to_owned(), omp.to_owned()));
     let elsewhere = support::scratch("remote-session-omp-cwd")?;
     let put = support::ctx_remote(
         &elsewhere,
