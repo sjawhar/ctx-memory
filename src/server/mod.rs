@@ -12,7 +12,7 @@ pub mod write;
 
 use std::future::IntoFuture as _;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
@@ -29,6 +29,7 @@ use tokio::net::TcpListener;
 
 use crate::config::{DataDir, StateDir};
 use crate::context::Context;
+use crate::delta;
 use crate::git::{Access, Repo};
 use crate::lease::{self, Lease};
 use crate::output::{Outcome, Sink};
@@ -49,6 +50,21 @@ pub struct ServeArgs {
     /// Loopback address for the Tailscale sidecar, which sets the caller's login header.
     #[arg(long, value_name = "ADDR")]
     pub tailnet_listen: Option<SocketAddr>,
+
+    /// A tailnet tag (`tag:<name>`) whose nodes the tailnet listener answers without a login
+    /// header, named by the tag. Repeat the flag, or separate the tags with commas. Needs
+    /// `--tailnet-listen` and `--tailscale-socket`.
+    #[arg(
+        long = "tailnet-allow-tag",
+        env = "CTX_SERVER_TAILNET_TAGS",
+        value_name = "TAG",
+        value_delimiter = ','
+    )]
+    pub tailnet_allow_tag: Vec<String>,
+
+    /// The unix socket of tailscaled's local API, asked which node a tagged caller is.
+    #[arg(long, env = "CTX_TAILSCALE_SOCKET", value_name = "PATH")]
+    pub tailscale_socket: Option<PathBuf>,
 
     /// Loopback address for a machine with one person on it. Every request there is the
     /// `--local-caller`, with no proof asked: any process on this machine can read and write as
@@ -85,7 +101,8 @@ pub struct ServeArgs {
     #[arg(long, value_name = "SECONDS", default_value_t = 60)]
     pub pull_interval: u64,
 
-    /// Seconds the listeners wait for this copy's record index before they bind.
+    /// Seconds the listeners wait, at most, for this copy's record index and for the window
+    /// deltas `ctx open` reads, before they bind.
     #[arg(long, value_name = "SECONDS", default_value_t = 90)]
     pub index_wait: u64,
 }
@@ -507,8 +524,9 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     {
         bail!("ctx serve needs one or more of --listen, --tailnet-listen and --local-listen");
     }
-    // The local door is checked first, before this copy puts its clone back, builds its index
-    // or binds a port.
+    // The tailnet tags and the local door are checked first, before this copy puts its clone
+    // back, builds its index or binds a port.
+    let tailnet_tags = tailnet_tags(arguments)?;
     let local = match arguments.local_listen {
         Some(address) => Some((address, local_caller(address, arguments)?)),
         None => None,
@@ -541,20 +559,13 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     // a container a bounded time to accept a connection and a share whose replay outlasts
     // that still needs serving; a request that arrives then waits for the rest of the build
     // before it takes the tree ([`Shared::index_ready`]).
+    // `ctx open` reads every window's delta on the share the first time a process answers it,
+    // which took the first caller after a restart 12.8 s while the next took 29 ms. Those
+    // deltas are read here too, beside the index build and under the same bound, so the
+    // first caller finds them read ([`warm_open`]).
     warm_index(Arc::clone(&shared));
-    if arguments.index_wait > 0 {
-        let wait = Duration::from_secs(arguments.index_wait);
-        if tokio::time::timeout(wait, shared.index_ready())
-            .await
-            .is_err()
-        {
-            eprintln!(
-                "the record index is still being built after {}s: binding the listeners now, \
-                 and a request waits for the rest of it",
-                arguments.index_wait
-            );
-        }
-    }
+    let open = warm_open(Arc::clone(&shared));
+    wait_for_warm_up(&shared, open, arguments.index_wait).await;
     let mut servers = Vec::new();
     // A container runtime stops this copy with SIGTERM before the copy that replaces it
     // writes. Every listener stops on that signal, and the lease is given up afterwards.
@@ -579,7 +590,7 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
             allowed,
         )?);
         let identity = Identity::Google(google);
-        servers.push(open(sink, "listen", address, identity, &shared, &stop).await?);
+        servers.push(serve_door(sink, "listen", address, identity, &shared, &stop).await?);
     }
 
     if let Some(address) = arguments.tailnet_listen {
@@ -591,13 +602,13 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
                 "--tailnet-listen takes a loopback address: the sidecar runs beside this process"
             );
         }
-        let identity = Identity::Tailscale;
-        servers.push(open(sink, "tailnet-listen", address, identity, &shared, &stop).await?);
+        let identity = Identity::Tailscale(tailnet_tags);
+        servers.push(serve_door(sink, "tailnet-listen", address, identity, &shared, &stop).await?);
     }
 
     if let Some((address, caller)) = local {
         let identity = Identity::Local(Arc::new(caller));
-        servers.push(open(sink, "local-listen", address, identity, &shared, &stop).await?);
+        servers.push(serve_door(sink, "local-listen", address, identity, &shared, &stop).await?);
     }
     let following = follow(Arc::clone(&shared), arguments.pull_interval);
     let signalled = tokio::spawn(async move {
@@ -675,7 +686,7 @@ fn local_caller(address: SocketAddr, arguments: &ServeArgs) -> Result<Caller> {
 
 /// Binds one listener, says where ([`announce`]), and serves the routes of `identity` on it
 /// until `stop` says to stop.
-async fn open(
+async fn serve_door(
     sink: &mut Sink<'_>,
     label: &str,
     address: SocketAddr,
@@ -837,6 +848,66 @@ fn warm_index(shared: Arc<Shared>) {
     });
 }
 
+/// Waits for the index build and the read [`warm_open`] started, both together for no longer
+/// than `index_wait` seconds, and says on standard error which of them is still running when
+/// that time is up. Neither is stopped then: the listeners bind, and each goes on beside them.
+/// `0` waits for nothing.
+async fn wait_for_warm_up(shared: &Shared, open: tokio::task::JoinHandle<()>, index_wait: u64) {
+    if index_wait == 0 {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(index_wait);
+    if tokio::time::timeout_at(deadline, shared.index_ready())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "the record index is still being built after {index_wait}s: binding the listeners \
+             now, and a request waits for the rest of it"
+        );
+    }
+    if tokio::time::timeout_at(deadline, open).await.is_err() {
+        eprintln!(
+            "the window deltas ctx open reads are still being read after {index_wait}s: binding \
+             the listeners now, and an open reads the ones not read yet itself"
+        );
+    }
+}
+
+/// Reads every window's delta `ctx open` reads into this process's cache of them
+/// ([`delta::read_for_open`]), so the first `ctx open` this copy answers reads none itself.
+///
+/// Which windows directory it reads is taken under the tree lock, and the lock is given back
+/// before the read. The read holds no lock a request takes, so a request that arrives while it
+/// runs is answered as it would have been without it. A failure is one line on standard
+/// error, and the first `ctx open` reads what it needs, as it did before this existed.
+fn warm_open(shared: Arc<Shared>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let read = tokio::task::spawn_blocking(move || {
+            let windows = {
+                let tree = shared.tree()?;
+                // `ctx open` reads no delta for a tree with no source, so none is read for it.
+                if tree.config.sources.is_empty() {
+                    return Ok(());
+                }
+                tree.data()?.windows()
+            };
+            delta::read_for_open(&windows)
+        })
+        .await;
+        match read {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "reading the window deltas ctx open reads: {}",
+                one_line(&format!("{error:#}"))
+            ),
+            Err(error) => {
+                eprintln!("reading the window deltas ctx open reads: the read stopped: {error}");
+            }
+        }
+    })
+}
+
 /// One pass of the follow loop.
 ///
 /// The pull takes the tree, because it rewrites the files the tree was read from. The windows
@@ -970,8 +1041,9 @@ async fn no_web_page(State(shared): State<Arc<Shared>>, request: Request, next: 
 pub enum Identity {
     /// Cloud Run ingress: a Google identity token for this server's audience.
     Google(Arc<identity::Google>),
-    /// The Tailscale sidecar on loopback: the login header it sets for a user device.
-    Tailscale,
+    /// The Tailscale sidecar on loopback: the login header it sets for a user device, and,
+    /// when the deployment allows tags, a tagged node tailscaled names.
+    Tailscale(Option<Arc<identity::TailnetTags>>),
     /// A machine with one person on it, on loopback: that person, whichever of its processes
     /// sent the request, unless a web page did, which [`router`] refuses before any route.
     ///
@@ -985,7 +1057,7 @@ impl Identity {
     const fn door(&self) -> request_log::Door {
         match self {
             Self::Google(_) => request_log::Door::IdentityToken,
-            Self::Tailscale => request_log::Door::Tailnet,
+            Self::Tailscale(_) => request_log::Door::Tailnet,
             Self::Local(_) => request_log::Door::Local,
         }
     }
@@ -1007,10 +1079,40 @@ impl Listener {
     pub async fn caller(&self, headers: &HeaderMap) -> Result<Caller> {
         match &self.identity {
             Identity::Google(google) => google.caller(headers).await,
-            Identity::Tailscale => identity::tailscale(headers),
+            Identity::Tailscale(tags) => identity::tailscale(headers, tags.as_deref()).await,
             Identity::Local(caller) => Ok(Caller::clone(caller)),
         }
     }
+}
+
+/// The tagged nodes the tailnet listener answers, as `--tailnet-allow-tag` and
+/// `--tailscale-socket` name them, or `None` when no tag is allowed.
+///
+/// # Errors
+///
+/// Returns an error when a tag is malformed, or tags are allowed without `--tailnet-listen` or
+/// without `--tailscale-socket`, so a deployment that meant to admit a tagged node never starts
+/// in a shape that would refuse it, or answer it on a port nothing guards.
+fn tailnet_tags(arguments: &ServeArgs) -> Result<Option<Arc<identity::TailnetTags>>> {
+    let tags = identity::tags(&arguments.tailnet_allow_tag)
+        .context("--tailnet-allow-tag (CTX_SERVER_TAILNET_TAGS)")?;
+    if tags.is_empty() {
+        return Ok(None);
+    }
+    if arguments.tailnet_listen.is_none() {
+        bail!("--tailnet-allow-tag needs --tailnet-listen: tagged nodes reach only that port");
+    }
+    let socket = arguments
+        .tailscale_socket
+        .as_deref()
+        .filter(|socket| !socket.as_os_str().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "--tailnet-allow-tag needs --tailscale-socket (CTX_TAILSCALE_SOCKET): tailscaled's \
+                 local API is what names a tagged node"
+            )
+        })?;
+    Ok(Some(Arc::new(identity::TailnetTags::new(tags, socket)?)))
 }
 
 /// How many completed fetch windows the tree's data directory holds.

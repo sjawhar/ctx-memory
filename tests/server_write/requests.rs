@@ -62,6 +62,50 @@ fn put_commits_and_pushes_as_caller() -> Result<()> {
     Ok(())
 }
 
+/// A tagged node `--tailnet-allow-tag` admits writes under its tag: the commit's author and
+/// committer are the tag, name and email both.
+#[test]
+fn a_tagged_caller_commits_under_its_tag() -> Result<()> {
+    let tree = fixture_clone("write-tagged")?;
+    fetch_window(&tree)?;
+    let root = tree.parent().context("the fixture has a root")?.to_owned();
+    let api = crate::support::fake_tailscaled::FakeTailscaled::start(
+        &root.join("tailscaled"),
+        &[("100.64.0.7", &["tag:ctx-ingest"])],
+    )?;
+    let socket = api.socket.to_str().context("socket path is not UTF-8")?;
+    let server = Server::start(
+        &tree,
+        &[
+            "--tailnet-allow-tag",
+            "tag:ctx-ingest",
+            "--tailscale-socket",
+            socket,
+        ],
+    )?;
+    let reply = server.post(
+        server.tailnet_address()?,
+        "/v1/records/put",
+        &put_body("decisions/cadence.md", &good_record(), "session-7"),
+        &[("X-Forwarded-For", "100.64.0.7")],
+    )?;
+    drop(server);
+    let bare = remote_of(&tree)?;
+    let (subject, author, email, head) = remote_head(&bare)?;
+    let committer = git(&bare, &["log", "-1", "--format=%cn <%ce>", "main"])?;
+    remove_fixture(&tree)?;
+
+    assert_eq!(reply.status, 200, "unexpected body: {}", reply.body);
+    assert_eq!(reply.text("commit")?, head);
+    assert_eq!(subject, "put decisions/cadence.md");
+    assert_eq!(
+        (author.as_str(), email.as_str()),
+        ("tag:ctx-ingest", "tag:ctx-ingest")
+    );
+    assert_eq!(committer, "tag:ctx-ingest <tag:ctx-ingest>");
+    Ok(())
+}
+
 #[test]
 fn concurrent_puts_are_serialized() -> Result<()> {
     let tree = fixture_clone("write-concurrent")?;

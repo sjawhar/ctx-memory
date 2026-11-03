@@ -17,6 +17,16 @@ const CYCLE: &str = "cycle@example.com";
 /// question is tracked by a link, with one fetched window. Returns the tree, the window id and
 /// the file the stub writes its standard input to.
 fn tree_with_source(label: &str, stub: &str, extra: &str) -> Result<(PathBuf, String, PathBuf)> {
+    tree_with_source_for(label, stub, extra, &format!("'{CYCLE}'"))
+}
+
+/// [`tree_with_source`] whose `callers` are `callers`, a TOML list body.
+fn tree_with_source_for(
+    label: &str,
+    stub: &str,
+    extra: &str,
+    callers: &str,
+) -> Result<(PathBuf, String, PathBuf)> {
     let tree = fixture_clone(label)?;
     let root = tree
         .parent()
@@ -32,7 +42,7 @@ fn tree_with_source(label: &str, stub: &str, extra: &str) -> Result<(PathBuf, St
     std::fmt::Write::write_fmt(
         &mut config,
         format_args!(
-        "\n[context_source]\ncommand = ['{}']\ncallers = ['{CYCLE}']\nkey_pattern = 'C0EXAMPLE[0-9]+'\nlink_prefixes = ['https://tracker.example/']\n{extra}",
+        "\n[context_source]\ncommand = ['{}']\ncallers = [{callers}]\nkey_pattern = 'C0EXAMPLE[0-9]+'\nlink_prefixes = ['https://tracker.example/']\n{extra}",
         program.display()
         ),
     )?;
@@ -238,6 +248,46 @@ fn a_caller_the_context_source_does_not_name_is_refused() -> Result<()> {
         "the program ran for a caller it does not serve"
     );
     assert_eq!(cycle.status, 200, "{}", cycle.body);
+    Ok(())
+}
+
+/// A tagged ingest cycle has no login header; `context_source.callers` names it by its tag,
+/// which the server admits through `--tailnet-allow-tag`, and only that tag reads the context.
+#[test]
+fn a_tagged_cycle_named_by_its_tag_reads_the_context() -> Result<()> {
+    let (tree, window, _) = tree_with_source_for(
+        "context-tagged",
+        r#"printf '%s' '{"items":[]}'"#,
+        "",
+        "'tag:ctx-ingest'",
+    )?;
+    let root = tree.parent().context("the fixture has a root")?.to_owned();
+    let api = support::fake_tailscaled::FakeTailscaled::start(
+        &root.join("tailscaled"),
+        &[
+            ("100.64.0.7", &["tag:ctx-ingest"]),
+            ("100.64.0.8", &["tag:ctx-legion"]),
+        ],
+    )?;
+    let socket = api.socket.to_str().context("socket path is not UTF-8")?;
+    let server = Server::start(
+        &tree,
+        &[
+            "--tailnet-allow-tag",
+            "tag:ctx-ingest,tag:ctx-legion",
+            "--tailscale-socket",
+            socket,
+        ],
+    )?;
+    let path = format!("/v1/windows/{window}/context");
+    let tailnet = server.tailnet_address()?;
+    let ingest = server.get(tailnet, &path, &[("X-Forwarded-For", "100.64.0.7")])?;
+    let legion = server.get(tailnet, &path, &[("X-Forwarded-For", "100.64.0.8")])?;
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert_eq!(ingest.status, 200, "{}", ingest.body);
+    assert_eq!(legion.status, 403, "{}", legion.body);
     Ok(())
 }
 
