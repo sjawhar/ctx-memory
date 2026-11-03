@@ -79,6 +79,10 @@ pub(super) fn deferred(shared: &Shared, route: &str, message: &str, pause: u64) 
     response
         .headers_mut()
         .insert(axum::http::header::RETRY_AFTER, HeaderValue::from(pause));
+    // The request log files this answer as `deferred`, a warning, not as a server error.
+    response
+        .extensions_mut()
+        .insert(super::super::request_log::Deferred);
     response
 }
 

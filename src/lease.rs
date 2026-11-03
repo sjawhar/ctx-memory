@@ -153,10 +153,14 @@ pub struct HeldElsewhere {
 }
 
 impl HeldElsewhere {
-    /// Whole seconds until this copy may take the lease over, rounded up, and at least 1.
+    /// Whole seconds until this copy may take the lease over, rounded up, from 1 to 120. A
+    /// holder whose clock runs ahead of this copy's reads as renewed in the future; the answer
+    /// is then the whole takeover window, never more.
     #[must_use]
     pub fn takeover_in(&self) -> u64 {
-        let left = (Duration::seconds(TAKEOVER) - self.age).num_milliseconds();
+        let left = (Duration::seconds(TAKEOVER) - self.age)
+            .num_milliseconds()
+            .clamp(0, TAKEOVER * 1000);
         u64::try_from((left + 999) / 1000).unwrap_or(1).max(1)
     }
 }

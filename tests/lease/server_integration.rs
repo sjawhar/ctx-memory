@@ -604,3 +604,69 @@ fn a_copy_past_its_handover_fails_a_write_another_copy_holds_the_lease_for() -> 
     );
     Ok(())
 }
+
+/// A copy that has held the lease and lost it to a takeover is one of two live writers when
+/// it meets the new holder, even inside its handover: the write fails, `503` with no
+/// `Retry-After` and a `write failed:` line, and nothing is deferred.
+#[test]
+fn a_copy_that_held_the_lease_never_defers_a_write() -> Result<()> {
+    let cloud = Cloud::start()?;
+    let tree = fixture_clone("lease-handover-taken")?;
+    fetch_window(&tree)?;
+    let outcome = (|| -> Result<(Answer, Answer, Answer, String, Lease)> {
+        let server = Logged::start(&tree, &["--pull-interval", "3600"], &cloud)?;
+        let first = server.post(
+            "/v1/records/put",
+            &json!({ "path": "decisions/cadence.md", "content": cited_record(), "session": "s" }),
+        )?;
+        let takeover = Lease::acquire_with(
+            BUCKET,
+            "server",
+            "server@takeover",
+            frozen(Utc::now() + Duration::seconds(121)),
+        )?;
+        // The first write after the takeover finds its own lease gone; the next one meets the
+        // copy that took it over.
+        let lost = server.post(
+            "/v1/records/put",
+            &json!({ "path": "decisions/cadence-two.md", "content": cited_record(), "session": "s" }),
+        )?;
+        let met = server.post(
+            "/v1/records/put",
+            &json!({ "path": "decisions/cadence-three.md", "content": cited_record(), "session": "s" }),
+        )?;
+        Ok((first, lost, met, server.stop_and_read_log()?, takeover))
+    })();
+    remove_fixture(&tree)?;
+
+    let (first, lost, met, logged, takeover) = outcome?;
+    takeover.check()?;
+    assert_eq!(first.status, 200, "{}", first.body);
+    for answer in [&lost, &met] {
+        assert_eq!(answer.status, 503, "{}", answer.body);
+        assert_eq!(
+            answer.retry_after, None,
+            "a fault was answered as a handover"
+        );
+    }
+    assert!(
+        met.body.to_string().contains("server@takeover"),
+        "the second refusal did not meet the new holder: {}",
+        met.body
+    );
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line.starts_with("write deferred: ")),
+        "a copy that held the lease deferred a write: {logged}"
+    );
+    assert_eq!(
+        logged
+            .lines()
+            .filter(|line| line.starts_with("write failed: /v1/records/put 503 "))
+            .count(),
+        2,
+        "{logged}"
+    );
+    Ok(())
+}
