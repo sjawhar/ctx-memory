@@ -6,6 +6,8 @@
 
 Each `v*` tag publishes `ctx` as a GitHub release: a static build for x86_64 and aarch64 Linux (`ctx-x86_64-unknown-linux-musl.tar.gz`, `ctx-aarch64-unknown-linux-musl.tar.gz`) and a build for Apple silicon macOS (`ctx-aarch64-apple-darwin.tar.gz`), each holding the `ctx` binary alone, and `ctx-memory-<version>-share.tar.gz`, the tag's `skills/` and `runner/` trees for an image or a machine that installs them beside the binary ([docs/deployment.md](docs/deployment.md)). The release carries `SHA256SUMS` and a GitHub build attestation of each archive. [`.github/workflows/release.yml`](.github/workflows/release.yml) builds them from the tagged commit once it passes CI.
 
+There is no Intel macOS build: on an Intel Mac, skip mise and the download below and install from source.
+
 With [mise](https://mise.jdx.dev): install mise first and activate it in your shell ([mise's getting started guide](https://mise.jdx.dev/getting-started.html)), then install the latest release:
 
 ```bash
@@ -29,7 +31,7 @@ export PATH="$HOME/.local/bin:$PATH"   # add this line to your shell profile too
 ctx --version
 ```
 
-On Apple silicon macOS (there is no Intel macOS release; install from source there):
+On Apple silicon macOS:
 
 ```bash
 archive=ctx-aarch64-apple-darwin.tar.gz
@@ -43,7 +45,7 @@ export PATH="$HOME/.local/bin:$PATH"   # add this line to your shell profile too
 ctx --version
 ```
 
-From source:
+From source (needs a Rust toolchain; install one with [rustup](https://rustup.rs)):
 
 ```bash
 cargo install --locked --git https://github.com/sjawhar/ctx-memory
