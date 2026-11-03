@@ -5,6 +5,7 @@ mod drive;
 mod external;
 pub mod github;
 pub mod gmail;
+mod matrix;
 pub mod slack;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,6 +25,7 @@ pub use drive::DriveSource;
 pub use external::External;
 pub use github::GithubSource;
 pub use gmail::GmailSource;
+pub use matrix::MatrixSource;
 pub use slack::SlackSource;
 
 /// The version of the JSONL source protocol understood by this crate.
@@ -184,6 +186,7 @@ pub fn open(spec: &SourceConfig, scheme: &str) -> Result<Box<dyn Source>> {
         "drive" => Ok::<Box<dyn Source>, anyhow::Error>(Box::new(DriveSource::new())),
         "calendar" => Ok::<Box<dyn Source>, anyhow::Error>(Box::new(CalendarSource::new())),
         "github" => Ok::<Box<dyn Source>, anyhow::Error>(Box::new(GithubSource::new())),
+        "matrix" => Ok::<Box<dyn Source>, anyhow::Error>(Box::new(MatrixSource::new())),
         _ => {
             let external = External::find(&spec.kind)?.with_timeout_secs(spec.timeout_secs);
             Ok::<Box<dyn Source>, anyhow::Error>(Box::new(external))
@@ -275,6 +278,26 @@ pub const MAX_SLICE_DAYS: i64 = 7;
 #[must_use]
 pub fn slice_end(start: DateTime<Utc>, window_end: DateTime<Utc>) -> DateTime<Utc> {
     (start + Duration::days(MAX_SLICE_DAYS)).min(window_end)
+}
+
+/// How far past the moment a run reads an item its own date may lie and still be the time it
+/// changed or arrived: room for this machine's clock to run behind the service's.
+pub const CLOCK_SKEW_MARGIN: Duration = Duration::minutes(10);
+
+/// The latest date an item read now can carry and still be a change that happened: the later of
+/// the window end and now, plus [`CLOCK_SKEW_MARGIN`].
+///
+/// A service takes an item's date from what a client or a sender wrote — a file's modified time,
+/// a message's arrival date, a chat message's send time on a bridged network — so it can lie in
+/// the future. Such an item has not changed after the window; its date is wrong. A source that
+/// held its cursor for it would hold every later change behind it until the clock passed the
+/// date, so it stores the item in the current window instead. An item dated at or before this
+/// bound and after the window end did change after the window, and waits for the next one. A
+/// source takes the bound once, just after it reads the listing, page or history that names the
+/// item.
+#[must_use]
+pub fn latest_believable(window_end: DateTime<Utc>) -> DateTime<Utc> {
+    window_end.max(Utc::now()) + CLOCK_SKEW_MARGIN
 }
 
 /// What separates a token from the time beside it in a cursor.

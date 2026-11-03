@@ -4,8 +4,9 @@ use anyhow::{anyhow, Context as _, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
-use crate::api::google::{self, Text};
+use crate::api::google::Text;
 use crate::record::Record;
+use crate::source::{latest_believable, CLOCK_SKEW_MARGIN};
 
 use super::api::DriveApi;
 
@@ -21,7 +22,7 @@ const EXPORTS: [(&str, &str); 3] = [
 #[derive(Clone, Copy)]
 pub(super) struct Bounds {
     window_end: DateTime<Utc>,
-    /// [`google::latest_believable`], taken when the run read that listing or page.
+    /// [`latest_believable`], taken when the run read that listing or page.
     believable: DateTime<Utc>,
 }
 
@@ -32,7 +33,7 @@ pub(super) enum Place {
     Inside,
     /// Changed after the window end: the next window stores it.
     After,
-    /// Dated later than [`google::latest_believable`]: no clock has reached that date, so the
+    /// Dated later than [`latest_believable`]: no clock has reached that date, so the
     /// date is wrong and the file did not change after the window. Holding the cursor for it
     /// would hold every later change until the clock passed the date, so this window stores it
     /// at its end, and the record's raw data keeps the date Drive gave.
@@ -43,7 +44,7 @@ impl Bounds {
     pub(super) fn read_now(window_end: DateTime<Utc>) -> Self {
         Self {
             window_end,
-            believable: google::latest_believable(window_end),
+            believable: latest_believable(window_end),
         }
     }
 
@@ -117,7 +118,7 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
             warnings.push(format!(
                 "{scheme}:{id} {named} is dated {}, more than {} minutes after both the window end and the time this fetch read it; the date is taken for a wrong clock, so this window stores the file at its end ({}) and its raw data keeps the date Drive gave",
                 modified.to_rfc3339_opts(SecondsFormat::Secs, true),
-                google::CLOCK_SKEW_MARGIN.num_minutes(),
+                CLOCK_SKEW_MARGIN.num_minutes(),
                 bounds.window_end.to_rfc3339_opts(SecondsFormat::Secs, true)
             ));
             (bounds.window_end, false)

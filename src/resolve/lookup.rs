@@ -64,19 +64,24 @@ pub(super) fn thread_refresh_pointer(
 
 /// What a source's records are taken to be when no hello has declared it.
 ///
-/// The built-in sources declare themselves: Slack, Gmail, Drive and GitHub store the text
-/// their API returned, and Calendar renders an event, so only the first four are verbatim.
+/// The built-in sources declare themselves: Slack, Gmail, Drive, GitHub and Matrix store the
+/// text their API returned, and Calendar renders an event, so only the first five are verbatim.
 fn default_verbatim(source: Option<&SourceConfig>, scheme: &str) -> bool {
     source.map_or(
-        matches!(scheme, "slack" | "gmail" | "drive" | "github"),
-        |source| matches!(source.kind.as_str(), "slack" | "gmail" | "drive" | "github"),
+        matches!(scheme, "slack" | "gmail" | "drive" | "github" | "matrix"),
+        |source| {
+            matches!(
+                source.kind.as_str(),
+                "slack" | "gmail" | "drive" | "github" | "matrix"
+            )
+        },
     )
 }
 
 fn is_builtin_source(source: &SourceConfig) -> bool {
     matches!(
         source.kind.as_str(),
-        "slack" | "gmail" | "drive" | "calendar" | "github"
+        "slack" | "gmail" | "drive" | "calendar" | "github" | "matrix"
     )
 }
 

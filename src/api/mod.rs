@@ -3,4 +3,5 @@
 pub mod client;
 pub mod github;
 pub mod google;
+pub mod matrix;
 pub mod slack;

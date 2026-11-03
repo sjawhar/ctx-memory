@@ -34,7 +34,7 @@ impl Schemes {
     /// Creates a parser registry containing every built-in scheme and valid configured schemes.
     #[must_use]
     pub fn new(configured: impl IntoIterator<Item = String>) -> Self {
-        let mut schemes = ["slack", "gmail", "drive", "gcal", "github"]
+        let mut schemes = ["slack", "gmail", "drive", "gcal", "github", "matrix"]
             .into_iter()
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
@@ -102,6 +102,7 @@ impl Schemes {
                     "drive" => drive_pointer_at(text, start),
                     "gcal" => gcal_pointer_at(text, start),
                     "github" => github_pointer_at(text, start),
+                    "matrix" => matrix_pointer_at(text, start),
                     _ => generic_pointer_at(text, start, scheme),
                 })
         })
@@ -468,6 +469,54 @@ fn github_commit_end(text: &str, sha_start: usize) -> Option<usize> {
     (7..=40).contains(&length).then_some(sha_end)
 }
 
+/// A byte a Matrix room id may hold after its `!`: the opaque id and the server name with its
+/// port. A room id never holds `/`, so the first `/` ends it.
+fn is_matrix_room_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'=' | b'~')
+}
+
+/// A byte a Matrix event id may hold after its `$`: URL-safe base64 (room version 4 on),
+/// standard base64 with `+` and `/` (room version 3), and `:` and a server name (versions 1
+/// and 2).
+fn is_matrix_event_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(byte, b'-' | b'_' | b'+' | b'/' | b'=' | b'.' | b':' | b'~')
+}
+
+/// Parses a Matrix pointer: `matrix:<room id>/<event id>`, both ids as the homeserver writes
+/// them, so `matrix:!room:example.org/$event`. The room id runs from its `!` to the first `/`;
+/// the event id runs from the `$` after it over the bytes an event id may hold, less a
+/// trailing `.` or `:`, which no event id of room version 3 or later holds and which prose puts
+/// after a pointer.
+fn matrix_pointer_at(text: &str, start: usize) -> Option<(Pointer, usize)> {
+    let locator_start = start.checked_add("matrix:".len())?;
+    if byte_at(text, locator_start) != Some(b'!') {
+        return None;
+    }
+    let room_end = scan_while(text, locator_start.checked_add(1)?, is_matrix_room_byte);
+    if room_end == locator_start + 1 || byte_at(text, room_end) != Some(b'/') {
+        return None;
+    }
+    let event_start = room_end.checked_add(1)?;
+    if byte_at(text, event_start) != Some(b'$') {
+        return None;
+    }
+    let mut end = scan_while(text, event_start.checked_add(1)?, is_matrix_event_byte);
+    while end > event_start + 1 && matches!(byte_at(text, end - 1), Some(b'.' | b':')) {
+        end -= 1;
+    }
+    if end == event_start + 1 {
+        return None;
+    }
+    Some((
+        Pointer {
+            scheme: "matrix".to_owned(),
+            locator: text.get(locator_start..end)?.to_owned(),
+        },
+        end,
+    ))
+}
+
 fn slack_permalink_at(text: &str, start: usize) -> Option<Found> {
     let protocol_length = if text.get(start..)?.starts_with("https://") {
         "https://".len()
@@ -613,6 +662,57 @@ mod tests {
             [
                 "github:example-org/example-repo#12",
                 "github:example-org/example-repo#12/review/88"
+            ]
+        );
+    }
+
+    /// A Matrix pointer names a room and an event by their ids, as the homeserver writes them:
+    /// a room id with or without a server name (room version 12 drops it), an event id of any
+    /// room version, the legacy `$local:server` form and room version 3's `+` and `/` included.
+    #[test]
+    fn parses_every_matrix_pointer_form() {
+        for text in [
+            "matrix:!AbCdEfGhIjKlMnOpQr:example.org/$Rqnc-F-dvnEYJTyHq_iKxU2bZ1CI92-kuZq3a5lr5Zg",
+            "matrix:!-bCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefg/$Ab_cD-efGhIjKlMnOpQrStUvWxYz0123456789abc_",
+            "matrix:!room:example.org:8448/$event-",
+            "matrix:!room:example.org/$legacy1234:example.org",
+            "matrix:!room:example.org/$abc+def/ghi=",
+        ] {
+            assert_eq!(parsed(text).as_deref(), Some(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_matrix_pointer_without_a_room_and_an_event_is_not_a_pointer() {
+        for text in [
+            "matrix:!room:example.org",
+            "matrix:!room:example.org/",
+            "matrix:room:example.org/$event",
+            "matrix:!room:example.org/event",
+            "matrix:!/$event",
+            "matrix:!room:example.org/$",
+            "matrix:$event",
+        ] {
+            assert_eq!(parsed(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_matrix_pointer_ends_before_the_prose_around_it() {
+        let schemes = Schemes::new([]);
+        let found = schemes.find_all(
+            "see (matrix:!room:example.org/$Ev_1-), and matrix:!other/$e2. Also `matrix:!r:example.org/$e3:example.org`: done",
+        );
+        let pointers: Vec<String> = found
+            .iter()
+            .map(|entry| entry.pointer.to_string())
+            .collect();
+        assert_eq!(
+            pointers,
+            [
+                "matrix:!room:example.org/$Ev_1-",
+                "matrix:!other/$e2",
+                "matrix:!r:example.org/$e3:example.org"
             ]
         );
     }
