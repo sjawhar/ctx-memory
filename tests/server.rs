@@ -2019,6 +2019,19 @@ fn allowed_tags_need_a_tailnet_listener_and_a_socket() -> Result<()> {
             "--tailnet-allow-tag needs --tailscale-socket",
         ),
         (
+            "server-tag-empty-socket",
+            vec![
+                "--tailnet-listen",
+                "127.0.0.1:0",
+                "--tailnet-allow-tag",
+                "tag:ctx-ingest",
+                "--tailscale-socket",
+                "",
+            ],
+            // clap itself refuses an empty path before the server's own check.
+            "--tailscale-socket",
+        ),
+        (
             "server-tag-no-listener",
             vec![
                 "--listen",

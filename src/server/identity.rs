@@ -182,14 +182,17 @@ pub fn tag(entry: &str) -> Result<String> {
     Ok(entry.to_owned())
 }
 
-/// Reads the tailnet tags a deployment allows, skipping empty entries and repeats.
+/// Reads the tailnet tags a deployment allows, skipping repeats. Every entry must be a tag: a
+/// blank one (`--tailnet-allow-tag ''`, a stray comma) is refused rather than dropped, since
+/// dropping it would start a server that meant to admit a tag without the checks that go with
+/// one.
 ///
 /// # Errors
 ///
 /// Returns an error when an entry is not a tailnet tag ([`tag`]).
 pub fn tags(entries: &[String]) -> Result<Vec<String>> {
     let mut tags: Vec<String> = Vec::new();
-    for entry in entries.iter().filter(|entry| !entry.trim().is_empty()) {
+    for entry in entries {
         let tag = tag(entry)?;
         if !tags.contains(&tag) {
             tags.push(tag);
@@ -367,13 +370,23 @@ impl TailnetTags {
     /// Identifies a request without a login header by the node it came from.
     async fn caller(&self, headers: &HeaderMap) -> Result<Caller> {
         let address = forwarded_for(headers)?;
+        // A failure to reach or read the local API is logged here and answered with a fixed
+        // message: its error chain names the socket path and the local API's URL, which the
+        // caller has no need of.
+        let unanswered = |error: &dyn std::fmt::Display| {
+            eprintln!(
+                "asking tailscaled who {address} is: {}",
+                crate::redact::one_line(&error.to_string())
+            );
+            anyhow!("tailscaled's local API did not say who {address} is")
+        };
         let response = self
             .whois
             .get(format!("http://{LOCAL_API_HOST}/localapi/v0/whois"))
             .query(&[("addr", address.to_string())])
             .send()
             .await
-            .with_context(|| format!("asking tailscaled who {address} is"))?;
+            .map_err(|error| unanswered(&format!("{:#}", anyhow::Error::from(error))))?;
         let status = response.status();
         if !status.is_success() {
             bail!("tailscaled does not name a node at {address} (status {status})");
@@ -381,7 +394,7 @@ impl TailnetTags {
         let whois: WhoIs = response
             .json()
             .await
-            .with_context(|| format!("reading tailscaled's answer about {address}"))?;
+            .map_err(|error| unanswered(&format!("{:#}", anyhow::Error::from(error))))?;
         let node_tags = whois.node.and_then(|node| node.tags).unwrap_or_default();
         if node_tags.is_empty() {
             bail!("no {TAILSCALE_LOGIN_HEADER} header, and the node at {address} carries no tag");
@@ -711,7 +724,7 @@ mod tests {
         let tags = allow(&dir.join("tailscaled.sock"))?;
         let refused = refusal(&forwarded(&["100.64.0.7"])?, &tags).await;
         assert!(
-            refused.starts_with("asking tailscaled who 100.64.0.7 is"),
+            refused == "tailscaled's local API did not say who 100.64.0.7 is",
             "{refused}"
         );
         Ok(())
@@ -756,15 +769,15 @@ mod tests {
             assert!(tag(bad).is_err(), "{bad}");
         }
         assert_eq!(
-            tags(&[
-                "tag:a".to_owned(),
-                String::new(),
-                "tag:a".to_owned(),
-                "tag:b".to_owned()
-            ])
-            .ok(),
+            tags(&["tag:a".to_owned(), "tag:a".to_owned(), "tag:b".to_owned()]).ok(),
             Some(vec!["tag:a".to_owned(), "tag:b".to_owned()])
         );
+        for blank in ["", "  "] {
+            assert!(
+                tags(&["tag:a".to_owned(), blank.to_owned()]).is_err(),
+                "{blank:?}"
+            );
+        }
     }
 
     /// A context source's callers may name a tagged node by its tag; the ingress list may not,

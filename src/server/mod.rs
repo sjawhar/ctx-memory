@@ -938,12 +938,16 @@ fn tailnet_tags(arguments: &ServeArgs) -> Result<Option<Arc<identity::TailnetTag
     if arguments.tailnet_listen.is_none() {
         bail!("--tailnet-allow-tag needs --tailnet-listen: tagged nodes reach only that port");
     }
-    let socket = arguments.tailscale_socket.as_deref().ok_or_else(|| {
-        anyhow!(
-            "--tailnet-allow-tag needs --tailscale-socket (CTX_TAILSCALE_SOCKET): tailscaled's \
-             local API is what names a tagged node"
-        )
-    })?;
+    let socket = arguments
+        .tailscale_socket
+        .as_deref()
+        .filter(|socket| !socket.as_os_str().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "--tailnet-allow-tag needs --tailscale-socket (CTX_TAILSCALE_SOCKET): tailscaled's \
+                 local API is what names a tagged node"
+            )
+        })?;
     Ok(Some(Arc::new(identity::TailnetTags::new(tags, socket)?)))
 }
 
