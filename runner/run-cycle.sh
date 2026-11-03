@@ -78,9 +78,11 @@
 #                        handles every pending window
 #   ANTHROPIC_API_KEY    the key the session's model calls carry, as a secret environment
 #                        variable of the job; this script moves it to a file and unsets it
-#   CLOUD_RUN_EXECUTION  the platform's own name for this execution (Cloud Run sets it), which
-#                        names the session directory and, as CTX_SESSION, every commit the
-#                        session makes and every request this execution sends the server
+#   CTX_EXECUTION        a name unique to this execution, which names the session directory and,
+#                        as CTX_SESSION, every commit the session makes and every request this
+#                        execution sends the server: letters, digits, '.', '_' and '-', starting
+#                        with a letter or digit, at most 122 characters. Unset or empty, the
+#                        name is CLOUD_RUN_EXECUTION, which Cloud Run gives each execution
 set -eu
 
 refuse() {
@@ -119,7 +121,20 @@ seal_session() {
 [ -n "${CTX_MODELS_FILE:-}" ] || refuse "CTX_MODELS_FILE must name the model provider file the session reads"
 [ -n "${CTX_MODEL:-}" ] || refuse "CTX_MODEL must name the model the session selects, <provider>/<model id>"
 [ -n "${ANTHROPIC_API_KEY:-}" ] || refuse "ANTHROPIC_API_KEY must hold the key the model calls carry"
-[ -n "${CLOUD_RUN_EXECUTION:-}" ] || refuse "CLOUD_RUN_EXECUTION must name this job execution"
+# The execution's name is CTX_EXECUTION, which the deployment sets, or, where that is unset or
+# empty, CLOUD_RUN_EXECUTION, which Cloud Run sets. This script, as root, makes a directory of
+# that name on the share and hands it to the session, and every request carries it as the
+# session's id, so it is one plain name, and short enough that the retry's "<name>-retry" still
+# fits the 128 characters a session id may hold.
+execution="${CTX_EXECUTION:-${CLOUD_RUN_EXECUTION:-}}"
+[ -n "$execution" ] || refuse "CTX_EXECUTION (on Cloud Run, CLOUD_RUN_EXECUTION) must name this job execution"
+case "$execution" in
+[!A-Za-z0-9]* | *[!A-Za-z0-9._-]*)
+	refuse "CTX_EXECUTION (on Cloud Run, CLOUD_RUN_EXECUTION) must be one name of letters, digits, '.', '_' and '-' that starts with a letter or digit: '$execution'"
+	;;
+esac
+[ "${#execution}" -le 122 ] ||
+	refuse "CTX_EXECUTION (on Cloud Run, CLOUD_RUN_EXECUTION) must be at most 122 characters, so its retry's name fits a session id: '$execution'"
 # The window cap is optional, and a positive whole number when it is set: 0, and any leading-zero
 # spelling of it such as 00, hands the session a cycle with nothing to handle (the `ctx` CLI reads
 # `00` as zero), and a cycle with no cap is spelled by leaving it unset.
@@ -230,7 +245,7 @@ fi
 # is committed with a `Session:` trailer; ctx takes both from CTX_SESSION. Without it they would
 # carry omp's own session id or the user, and a request or a record could not be traced back to
 # the session that sent it, whose JSONL is under the execution's name.
-export CTX_SESSION="$CLOUD_RUN_EXECUTION"
+export CTX_SESSION="$execution"
 
 # The server answers a cheap read, quickly, before anything else here runs. A copy that has
 # just started can hold its tree for minutes: the deployment's held it for 157 s on 2026-11-01
@@ -312,7 +327,7 @@ fi
 # maintenance pass whose session is refused starts a second one in its own directory; that refused
 # attempt is sealed before the retry starts (below), and this trap seals the directory of
 # whichever attempt is current when the script exits.
-session_dir="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION"
+session_dir="$CTX_DATA_DIR/agent-sessions/$execution"
 mkdir -p "$session_dir"
 trap 'seal_session "$session_dir" || { echo "run-cycle: could not seal $session_dir" >&2; exit 1; }' EXIT
 # A capture beside the directory is an earlier attempt's of this execution that never reached it.
@@ -343,7 +358,7 @@ if ! unsealed="$(find "$CTX_DATA_DIR/agent-sessions" -mindepth 1 -maxdepth 1 -ty
 	! -path "$session_dir" \( ! -user 0 -o -perm /022 \) -print)"; then
 	refuse "could not look for unsealed transcripts under $CTX_DATA_DIR/agent-sessions"
 fi
-# Execution names are Cloud Run's and hold no newline, and only root makes directories here.
+# Execution names hold no newline (checked above), and only root makes directories here.
 printf '%s\n' "$unsealed" | while IFS= read -r dir; do
 	[ -n "$dir" ] || continue
 	stamp="$dir/.started"
@@ -499,7 +514,7 @@ nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 # this file, which root writes beside the transcript directories, closed to the session's writes,
 # and the prompt names as quoted material. A read that fails leaves `unavailable` in the file, and
 # the cycle goes on without context: context is optional, and the cycle never fails for it.
-context_file="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION.context.json"
+context_file="$CTX_DATA_DIR/agent-sessions/$execution.context.json"
 # The cycle's bounds for context, across all its windows and both of its sessions together: the
 # context source's time, the subjects sent to it, and the size of each file. A read gets what is
 # left of the first two, and a window past either gets `unavailable`. The budget is set once
@@ -985,10 +1000,10 @@ if [ "$status" -ne 0 ] && [ -z "$marker_moved" ] && session_refused "$session_di
 	if ! seal_session "$session_dir"; then
 		refuse "could not seal $session_dir"
 	fi
-	session_dir="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION-retry"
+	session_dir="$CTX_DATA_DIR/agent-sessions/$execution-retry"
 	# The retry's requests, records and marker moves carry its own transcript's name, so each
 	# traces back to the session that sent it: CTX_SESSION names them all.
-	export CTX_SESSION="$CLOUD_RUN_EXECUTION-retry"
+	export CTX_SESSION="$execution-retry"
 	mkdir -p "$session_dir"
 	# As for the first attempt: a capture an earlier attempt of this execution left beside the
 	# retry's directory is moved in before this session writes its own there.
@@ -1014,7 +1029,7 @@ if [ "$status" -ne 0 ] && [ -z "$marker_moved" ] && session_refused "$session_di
 	# never named, so it gets a context file and a prompt of its own. Whatever is pending is read
 	# again here; a read that fails leaves the retry without context, as a failed context read does.
 	if [ -z "$pass" ]; then
-		context_file="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION-retry.context.json"
+		context_file="$CTX_DATA_DIR/agent-sessions/$execution-retry.context.json"
 		if pending="$(ctx pending --json ${CTX_CYCLE_MAX_WINDOWS:+--limit "$CTX_CYCLE_MAX_WINDOWS"})"; then
 			prepare_context "$pending"
 		else

@@ -666,7 +666,8 @@ fn same_origin_redirects(origin: String) -> reqwest::redirect::Policy {
 ///
 /// A Kubernetes pod runs as a Kubernetes service account Cloud Run does not accept, so it
 /// impersonates a Google service account; anything else inside Google Cloud asks the metadata
-/// server directly; a dev box sends no token and is identified by its Tailscale login.
+/// server directly; a dev box sends no token and is identified by its Tailscale login, or, at a
+/// server's `--local-listen`, is that server's one `--local-caller`.
 ///
 /// `CTX_SERVER_AUDIENCE` asks for a token, and must name the origin the token is sent to: a
 /// token says which server it is for, and one minted for another server would let the server

@@ -406,6 +406,8 @@ pub struct Server {
     child: Child,
     pub tailnet: SocketAddr,
     pub ingress: Option<SocketAddr>,
+    /// The `--local-listen` port, when the server was started with one.
+    pub local: Option<SocketAddr>,
     client: reqwest::blocking::Client,
     /// Every line the server prints on standard output after its listener lines. A thread
     /// reads the pipe for the life of the server, so the server never writes into a pipe
@@ -443,8 +445,8 @@ impl Server {
             .take()
             .ok_or_else(|| anyhow!("ctx serve has no stdout"))?;
         let stdout = read_lines(stdout);
-        let (tailnet, ingress) = match read_listeners(&stdout, extra.contains(&"--listen")) {
-            Ok(addresses) => addresses,
+        let listeners = match read_listeners(&stdout, extra) {
+            Ok(listeners) => listeners,
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -453,8 +455,9 @@ impl Server {
         };
         Ok(Self {
             child,
-            tailnet,
-            ingress,
+            tailnet: listeners.tailnet,
+            ingress: listeners.ingress,
+            local: listeners.local,
             stdout: Mutex::new(stdout),
             client: reqwest::blocking::Client::builder()
                 // Long enough to mean "the server is not answering" rather than "the box is
@@ -532,6 +535,11 @@ impl Server {
             .ok_or_else(|| anyhow!("this server has no ingress listener"))
     }
 
+    pub fn local_address(&self) -> Result<SocketAddr> {
+        self.local
+            .ok_or_else(|| anyhow!("this server has no local listener"))
+    }
+
     /// Stops the server the way Cloud Run does, and waits for it to finish.
     pub fn terminate(&mut self) -> Result<()> {
         let pid = i32::try_from(self.child.id()).context("the server has an unusable pid")?;
@@ -599,23 +607,51 @@ pub fn read_lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
     read
 }
 
-/// Reads the listener lines `ctx serve` prints once it is bound.
-fn read_listeners(
-    stdout: &Receiver<String>,
-    expect_ingress: bool,
-) -> Result<(SocketAddr, Option<SocketAddr>)> {
+/// The ports a server bound.
+struct Listeners {
+    tailnet: SocketAddr,
+    ingress: Option<SocketAddr>,
+    local: Option<SocketAddr>,
+}
+
+/// How long a test waits for `ctx serve` to print the listener lines it expects.
+const LISTENER_WAIT: Duration = Duration::from_secs(300);
+
+/// Reads the listener lines `ctx serve` prints once it is bound, waiting for the ingress and
+/// local ones too when `extra`, the server's other arguments, asked for them, and for no longer
+/// than [`LISTENER_WAIT`]: a server that bound some of its ports and never the rest would
+/// otherwise keep the test waiting for ever.
+fn read_listeners(stdout: &Receiver<String>, extra: &[&str]) -> Result<Listeners> {
+    let expect_ingress = extra.contains(&"--listen");
+    let expect_local = extra.contains(&"--local-listen");
     let mut tailnet = None;
     let mut ingress = None;
-    for line in stdout {
+    let mut local = None;
+    let deadline = std::time::Instant::now() + LISTENER_WAIT;
+    while let Ok(line) =
+        stdout.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+    {
         if let Some(address) = line.strip_prefix("tailnet-listen ") {
             tailnet = Some(address.trim().parse()?);
+        } else if let Some(address) = line.strip_prefix("local-listen ") {
+            local = Some(address.trim().parse()?);
         } else if let Some(address) = line.strip_prefix("listen ") {
             ingress = Some(address.trim().parse()?);
         }
-        if tailnet.is_some() && (!expect_ingress || ingress.is_some()) {
+        if tailnet.is_some()
+            && (!expect_ingress || ingress.is_some())
+            && (!expect_local || local.is_some())
+        {
             break;
         }
     }
     let tailnet = tailnet.ok_or_else(|| anyhow!("ctx serve printed no tailnet listener"))?;
-    Ok((tailnet, ingress))
+    if expect_local && local.is_none() {
+        bail!("ctx serve printed no local listener");
+    }
+    Ok(Listeners {
+        tailnet,
+        ingress,
+        local,
+    })
 }

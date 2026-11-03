@@ -143,8 +143,8 @@ AGENT_USER=ctx-agent
 pass='{pass}'
 windows=1
 CTX_DATA_DIR="$VERDICT_DIR/data"
-CLOUD_RUN_EXECUTION=ctx-agent-test-1
-session_dir="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION"
+execution=ctx-agent-test-1
+session_dir="$CTX_DATA_DIR/agent-sessions/$execution"
 mkdir -p "$session_dir"
 nonce=0123456789abcdef0123456789abcdef
 context_prompt=
