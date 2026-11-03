@@ -90,7 +90,7 @@ pub struct ServeArgs {
     #[arg(long, value_name = "SECONDS", default_value_t = 90)]
     pub index_wait: u64,
 
-    /// Seconds after the listeners bind during which a write that finds the lease held by
+    /// Seconds from when the listeners open during which a write that finds the lease held by
     /// another copy is a rollout's handover: answered `503` with `Retry-After` and logged
     /// `write deferred:`, not `write failed:`, while this copy has never held the lease.
     #[arg(long, value_name = "SECONDS", default_value_t = 300)]
@@ -117,8 +117,8 @@ pub struct Shared {
     /// waited for that build would make every later request wait behind it, which is the
     /// whole of what this copy must not do.
     index: tokio::sync::watch::Sender<bool>,
-    /// When this copy's handover ends: the listeners bound, plus `--handover` seconds. Unset
-    /// until they bind, and then nothing is a handover.
+    /// When this copy's handover ends: when its listeners open, plus `--handover` seconds.
+    /// Unset until then, and then nothing is a handover.
     handover: OnceLock<Instant>,
     places: Places,
 }
@@ -272,12 +272,12 @@ impl Shared {
 
     /// The seconds a caller should wait before it asks again, when `error` — why
     /// [`Shared::hold_lease`] refused — is a rollout's handover: another copy holds the lease,
-    /// or gave it up while this copy read it, this copy has never held it, and its handover has
+    /// or changed it while this copy was taking it, this copy has never held it, and its handover has
     /// not ended. `None` for anything else, which is a write that failed.
     fn deferral(&self, error: &anyhow::Error) -> Option<u64> {
         let pause = if let Some(held) = error.downcast_ref::<lease::HeldElsewhere>() {
             held.takeover_in()
-        } else if error.downcast_ref::<lease::ReleasedWhileRead>().is_some() {
+        } else if error.downcast_ref::<lease::ChangedWhileTaken>().is_some() {
             1
         } else {
             return None;

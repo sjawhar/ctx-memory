@@ -179,25 +179,20 @@ impl std::fmt::Display for HeldElsewhere {
 
 impl std::error::Error for HeldElsewhere {}
 
-/// The holder gave the lease up between this copy's read of its generation and of its content:
-/// the lease is free, and the next try takes it. Typed, so a server that meets it while it is
-/// new defers the write for a moment, as it does for [`HeldElsewhere`].
+/// The lease object changed while this copy was taking it: its holder gave it up between this
+/// copy's two reads, or another copy wrote it between this copy's read and its write. The next
+/// try reads it afresh. Typed, so a server that meets it while it is new defers the write for a
+/// moment, as it does for [`HeldElsewhere`].
 #[derive(Debug)]
-pub struct ReleasedWhileRead {
-    object: String,
-}
+pub struct ChangedWhileTaken(String);
 
-impl std::fmt::Display for ReleasedWhileRead {
+impl std::fmt::Display for ChangedWhileTaken {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "the {} lease was released while it was read; try again",
-            self.object
-        )
+        formatter.write_str(&self.0)
     }
 }
 
-impl std::error::Error for ReleasedWhileRead {}
+impl std::error::Error for ChangedWhileTaken {}
 
 impl Lease {
     /// Takes the lease named `object` in `bucket`, or reports who holds it.
@@ -224,8 +219,10 @@ impl Lease {
         let (expected, previous) = match held.generation()? {
             None => (0, None),
             Some(generation) => {
-                let written = held.written()?.ok_or_else(|| ReleasedWhileRead {
-                    object: object.to_owned(),
+                let written = held.written()?.ok_or_else(|| {
+                    ChangedWhileTaken(format!(
+                        "the {object} lease was released while it was read; try again"
+                    ))
                 })?;
                 (generation, Some(written))
             }
@@ -243,7 +240,12 @@ impl Lease {
         }
         let generation = match held.write(expected, now)? {
             Wrote::Generation(generation) => generation,
-            Wrote::Refused(detail) => bail!("another copy took the {object} lease first: {detail}"),
+            Wrote::Refused(detail) => {
+                return Err(ChangedWhileTaken(format!(
+                    "another copy took the {object} lease first: {detail}"
+                ))
+                .into())
+            }
         };
         held.set(State {
             generation,
