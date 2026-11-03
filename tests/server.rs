@@ -1897,3 +1897,142 @@ fn an_argument_that_is_not_text_is_refused_not_a_panic() -> Result<()> {
     );
     Ok(())
 }
+
+/// A tagged node gets no login header from Tailscale Serve. With its tag allowed, the server
+/// asks tailscaled who the address in `X-Forwarded-For` is and answers the node by its tag,
+/// which the request log names; a node whose tags are not allowed is refused.
+#[test]
+fn an_allowed_tagged_node_is_answered_by_its_tag() -> Result<()> {
+    let tree = fixture_tree("server-tagged")?;
+    let root = tree.parent().context("the tree has no parent")?.to_owned();
+    let api = support::fake_tailscaled::FakeTailscaled::start(
+        &root.join("tailscaled"),
+        &[
+            ("100.64.0.7", &["tag:ctx-ingest"]),
+            ("100.64.0.8", &["tag:other"]),
+        ],
+    )?;
+    let socket = api.socket.to_str().context("socket path is not UTF-8")?;
+    let mut server = Server::start(
+        &tree,
+        &[
+            "--tailnet-allow-tag",
+            "tag:ctx-ingest,tag:ctx-legion",
+            "--tailscale-socket",
+            socket,
+        ],
+    )?;
+    let body = json!({ "argv": ["search", "quarterly"] });
+    let start = chrono::Utc::now();
+    let allowed = server.post(
+        server.tailnet,
+        "/v1/command",
+        &body,
+        &[("X-Forwarded-For", "100.64.0.7")],
+    )?;
+    let other = server.post(
+        server.tailnet,
+        "/v1/command",
+        &body,
+        &[("X-Forwarded-For", "100.64.0.8")],
+    )?;
+    let printed = server.stop_and_read_stdout()?;
+    let window = (start, chrono::Utc::now());
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert_eq!(allowed.status, 200, "{}", allowed.body);
+    assert_eq!(other.status, 401, "{}", other.body);
+    assert!(
+        other.text("error")?.contains("allows none of them"),
+        "{}",
+        other.body
+    );
+    let lines = request_lines(&printed)?;
+    let [admitted, refused] = lines.as_slice() else {
+        anyhow::bail!("not one line per request: {printed:?}");
+    };
+    assert_logged(
+        admitted,
+        &json!({
+            "severity": "INFO", "door": "tailnet", "caller": "tag:ctx-ingest",
+            "command": "search", "query_chars": 9, "result": "ok", "status": 200,
+            "response_bytes": allowed.bytes,
+        }),
+        window,
+    )?;
+    assert_logged(
+        refused,
+        &json!({
+            "severity": "WARNING", "door": "tailnet", "caller": null, "command": null,
+            "result": "unidentified", "status": 401, "response_bytes": other.bytes,
+        }),
+        window,
+    )?;
+    Ok(())
+}
+
+/// Runs `ctx serve` with `arguments`, which must refuse to start, and returns its stderr.
+fn refused_serve(label: &str, arguments: &[&str]) -> Result<String> {
+    let tree = fixture_tree(label)?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let output = support::binary()
+        .args(["--memory", tree_text, "serve"])
+        .args(arguments)
+        .args(["--pull-interval", "3600"])
+        .envs(support::tree_env(&tree)?)
+        .env_remove("CTX_SERVER_TAILNET_TAGS")
+        .env_remove("CTX_TAILSCALE_SOCKET")
+        .output()
+        .context("running ctx serve")?;
+    remove_fixture(&tree)?;
+    assert!(!output.status.success(), "ctx serve started: {arguments:?}");
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// A deployment that allows a tag must name a well-formed tag, the tailnet listener the node
+/// reaches and the local API that names it, or the server does not start.
+#[test]
+fn allowed_tags_need_a_tailnet_listener_and_a_socket() -> Result<()> {
+    let socket = "/nonexistent/tailscaled.sock";
+    for (label, arguments, expected) in [
+        (
+            "server-tag-malformed",
+            vec![
+                "--tailnet-listen",
+                "127.0.0.1:0",
+                "--tailnet-allow-tag",
+                "ctx-ingest",
+                "--tailscale-socket",
+                socket,
+            ],
+            "is not a tailnet tag",
+        ),
+        (
+            "server-tag-no-socket",
+            vec![
+                "--tailnet-listen",
+                "127.0.0.1:0",
+                "--tailnet-allow-tag",
+                "tag:ctx-ingest",
+            ],
+            "--tailnet-allow-tag needs --tailscale-socket",
+        ),
+        (
+            "server-tag-no-listener",
+            vec![
+                "--listen",
+                "127.0.0.1:0",
+                "--tailnet-allow-tag",
+                "tag:ctx-ingest",
+                "--tailscale-socket",
+                socket,
+            ],
+            "--tailnet-allow-tag needs --tailnet-listen",
+        ),
+    ] {
+        let stderr = refused_serve(label, &arguments)?;
+        assert!(stderr.contains(expected), "{label}: {stderr}");
+    }
+    Ok(())
+}

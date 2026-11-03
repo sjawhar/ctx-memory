@@ -12,7 +12,7 @@ pub mod write;
 
 use std::future::IntoFuture as _;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
@@ -46,6 +46,21 @@ pub struct ServeArgs {
     /// Loopback address for the Tailscale sidecar, which sets the caller's login header.
     #[arg(long, value_name = "ADDR")]
     pub tailnet_listen: Option<SocketAddr>,
+
+    /// A tailnet tag (`tag:<name>`) whose nodes the tailnet listener answers without a login
+    /// header, named by the tag. Repeat the flag, or separate the tags with commas. Needs
+    /// `--tailnet-listen` and `--tailscale-socket`.
+    #[arg(
+        long = "tailnet-allow-tag",
+        env = "CTX_SERVER_TAILNET_TAGS",
+        value_name = "TAG",
+        value_delimiter = ','
+    )]
+    pub tailnet_allow_tag: Vec<String>,
+
+    /// The unix socket of tailscaled's local API, asked which node a tagged caller is.
+    #[arg(long, env = "CTX_TAILSCALE_SOCKET", value_name = "PATH")]
+    pub tailscale_socket: Option<PathBuf>,
 
     /// The audience every Google identity token must carry.
     #[arg(long, env = "CTX_SERVER_AUDIENCE")]
@@ -488,6 +503,7 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     if arguments.listen.is_none() && arguments.tailnet_listen.is_none() {
         bail!("ctx serve needs --listen, --tailnet-listen, or both");
     }
+    let tailnet_tags = tailnet_tags(arguments)?;
     // A Cloud Run rollout runs the old copy and the new one at once, and the write lease is
     // what keeps one of them the only writer. A copy on Cloud Run with no lease bucket would
     // take no lease and write beside the other, so it does not start. Cloud Run reaches a
@@ -578,7 +594,7 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
             .await
             .with_context(|| format!("binding {address}"))?;
         announce(sink, "tailnet-listen", listener.local_addr()?)?;
-        let router = router(Arc::clone(&shared), Identity::Tailscale);
+        let router = router(Arc::clone(&shared), Identity::Tailscale(tailnet_tags));
         servers.push(tokio::spawn(
             axum::serve(listener, router)
                 .with_graceful_shutdown(stopped(stop.subscribe()))
@@ -869,8 +885,9 @@ fn router(shared: Arc<Shared>, identity: Identity) -> Router {
 pub enum Identity {
     /// Cloud Run ingress: a Google identity token for this server's audience.
     Google(Arc<identity::Google>),
-    /// The Tailscale sidecar on loopback: the login header it sets for a user device.
-    Tailscale,
+    /// The Tailscale sidecar on loopback: the login header it sets for a user device, and,
+    /// when the deployment allows tags, a tagged node tailscaled names.
+    Tailscale(Option<Arc<identity::TailnetTags>>),
 }
 
 impl Identity {
@@ -878,7 +895,7 @@ impl Identity {
     const fn door(&self) -> request_log::Door {
         match self {
             Self::Google(_) => request_log::Door::IdentityToken,
-            Self::Tailscale => request_log::Door::Tailnet,
+            Self::Tailscale(_) => request_log::Door::Tailnet,
         }
     }
 }
@@ -899,9 +916,35 @@ impl Listener {
     pub async fn caller(&self, headers: &HeaderMap) -> Result<Caller> {
         match &self.identity {
             Identity::Google(google) => google.caller(headers).await,
-            Identity::Tailscale => identity::tailscale(headers),
+            Identity::Tailscale(tags) => identity::tailscale(headers, tags.as_deref()).await,
         }
     }
+}
+
+/// The tagged nodes the tailnet listener answers, as `--tailnet-allow-tag` and
+/// `--tailscale-socket` name them, or `None` when no tag is allowed.
+///
+/// # Errors
+///
+/// Returns an error when a tag is malformed, or tags are allowed without `--tailnet-listen` or
+/// without `--tailscale-socket`, so a deployment that meant to admit a tagged node never starts
+/// in a shape that would refuse it, or answer it on a port nothing guards.
+fn tailnet_tags(arguments: &ServeArgs) -> Result<Option<Arc<identity::TailnetTags>>> {
+    let tags = identity::tags(&arguments.tailnet_allow_tag)
+        .context("--tailnet-allow-tag (CTX_SERVER_TAILNET_TAGS)")?;
+    if tags.is_empty() {
+        return Ok(None);
+    }
+    if arguments.tailnet_listen.is_none() {
+        bail!("--tailnet-allow-tag needs --tailnet-listen: tagged nodes reach only that port");
+    }
+    let socket = arguments.tailscale_socket.as_deref().ok_or_else(|| {
+        anyhow!(
+            "--tailnet-allow-tag needs --tailscale-socket (CTX_TAILSCALE_SOCKET): tailscaled's \
+             local API is what names a tagged node"
+        )
+    })?;
+    Ok(Some(Arc::new(identity::TailnetTags::new(tags, socket)?)))
 }
 
 /// How many completed fetch windows the tree's data directory holds.
