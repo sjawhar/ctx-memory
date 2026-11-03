@@ -8,6 +8,7 @@ pub mod fake_github;
 pub mod fake_google;
 pub mod fake_http;
 pub mod fake_matrix;
+pub mod fake_tailscaled;
 
 use std::io::{BufRead as _, BufReader, Read};
 use std::net::SocketAddr;

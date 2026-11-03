@@ -1006,6 +1006,146 @@ fn remote_open_filters_by_waiting_on_and_overdue() -> Result<()> {
     Ok(())
 }
 
+/// A tree with one source and one open question last reviewed on 2026-10-24, and `count`
+/// completed windows on its share, each flagging a reply to that question. Returns the
+/// `delta.json` of every window, oldest first.
+fn flagged_share(tree: &std::path::Path, count: usize) -> Result<Vec<std::path::PathBuf>> {
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"server-test\"\n\n[[sources]]\nid = \"echo\"\nkind = \"echo\"\n\
+         scheme = \"echo\"\nstreams = [\"C0EXAMPLE01\"]\n",
+    )?;
+    std::fs::create_dir_all(tree.join("questions"))?;
+    std::fs::write(
+        tree.join("questions/example.md"),
+        "---\ntype: question\nstatus: open\nlast_reviewed: 2026-10-24\n---\nWho reviews it?\n",
+    )?;
+    let windows = tree
+        .parent()
+        .context("the fixture has a root")?
+        .join("data/windows");
+    (1..=count).map(|n| flagged_window(&windows, n)).collect()
+}
+
+/// Writes the `n`th completed window of `windows`, whose delta flags one reply to the question
+/// `flagged_share` writes, and returns its `delta.json`.
+fn flagged_window(windows: &std::path::Path, n: usize) -> Result<std::path::PathBuf> {
+    let name = format!("202610{:02}T120000Z-{n:04}", 24 + n);
+    let end = format!("2026-10-{:02}T12:00:00Z", 24 + n);
+    let dir = windows.join(&name);
+    std::fs::create_dir_all(&dir)?;
+    let manifest = json!({
+        "version": 1, "window": name, "generated_at": end, "window_end": end,
+        "sources": {}, "warnings": [], "exit_status": "ok",
+    });
+    std::fs::write(dir.join("manifest.json"), manifest.to_string())?;
+    std::fs::write(dir.join("records.jsonl"), "")?;
+    std::fs::write(dir.join("rendered.md"), "")?;
+    let delta = json!({
+        "version": 1, "window": name, "window_end": end, "generated_at": end,
+        "previous_window": null, "new_messages": [],
+        "unreviewed": [{
+            "record": "questions/example.md", "kind": "question", "status": "open",
+            "title": "questions/example.md", "owner": null, "last_reviewed": "2026-10-24",
+            "replies": [{
+                "pointer": format!("echo:C0EXAMPLE01/r{n}"),
+                "ts": format!("2026-10-{:02}T10:00:00Z", 24 + n),
+                "author": "Bob", "how": "pointer", "excerpt": "A review reply.",
+            }],
+        }],
+        "closed_since_previous": [], "opened_since_previous": [],
+    });
+    let path = dir.join("delta.json");
+    std::fs::write(&path, delta.to_string())?;
+    Ok(path)
+}
+
+/// A server reads every window's delta for `ctx open` before it binds its listeners, under the
+/// same `--index-wait` bound as its record index, so the first `ctx open` a fresh copy answers
+/// reads no `delta.json` at all. The first `open` after a restart took 12.8 s in production
+/// while the next took 29 ms, because the first caller read every window on the share.
+///
+/// Every window's delta is made unreadable once the server has bound, with its length and the
+/// time it was last written untouched: an `open` that reads one then fails, and one that answers
+/// from what the server read before it bound gives what a local run gave before.
+#[test]
+fn a_fresh_servers_first_open_reads_no_windows_delta() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tree = fixture_tree("server-open-warm")?;
+    let deltas = flagged_share(&tree, 3)?;
+    let local = ctx_local(&tree, &["--json", "open"])?;
+    let server = Server::start(&tree, &[])?;
+    for path in &deltas {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))?;
+    }
+    let unreadable = deltas.iter().all(|path| std::fs::read(path).is_err());
+    let reply = server.command(&["--json", "open"]);
+    drop(server);
+    for path in &deltas {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
+    }
+    remove_fixture(&tree)?;
+    let reply = reply?;
+
+    assert!(
+        unreadable,
+        "this test needs a user the file mode denies the read; run it as one"
+    );
+    assert_eq!(local.exit_code, 0, "{}", local.stderr);
+    for n in 1..=3 {
+        assert!(
+            local.stdout.contains(&format!("echo:C0EXAMPLE01/r{n}")),
+            "the local run lists every window's reply: {}",
+            local.stdout
+        );
+    }
+    assert_eq!(
+        reply.field("exit_code")?,
+        &json!(0),
+        "the first open read a window's delta: {}",
+        reply.body
+    );
+    assert_eq!(reply.text("stdout")?, local.stdout);
+    Ok(())
+}
+
+/// What a fresh server's `ctx open` answers is what a local run answers, for the windows it read
+/// before it bound and for a window written after: the cache it starts with follows the share.
+#[test]
+fn a_fresh_servers_open_answers_as_a_local_run_does() -> Result<()> {
+    let tree = fixture_tree("server-open-warm-answer")?;
+    flagged_share(&tree, 2)?;
+    let server = Server::start(&tree, &[])?;
+    let windows = tree
+        .parent()
+        .context("the fixture has a root")?
+        .join("data/windows");
+    let outcome = (|| {
+        let first = server.command(&["--json", "open"])?;
+        flagged_window(&windows, 3)?;
+        let later = server.command(&["--json", "open"])?;
+        let local = ctx_local(&tree, &["--json", "open"])?;
+        Ok::<_, anyhow::Error>((first, later, local))
+    })();
+    drop(server);
+    remove_fixture(&tree)?;
+    let (first, later, local) = outcome?;
+
+    assert_eq!(local.exit_code, 0, "{}", local.stderr);
+    assert_eq!(first.field("exit_code")?, &json!(0), "{}", first.body);
+    let first = first.text("stdout")?;
+    assert!(first.contains("echo:C0EXAMPLE01/r2"), "{first}");
+    assert!(!first.contains("echo:C0EXAMPLE01/r3"), "{first}");
+    assert_eq!(later.text("stdout")?, local.stdout);
+    assert!(
+        local.stdout.contains("echo:C0EXAMPLE01/r3"),
+        "{}",
+        local.stdout
+    );
+    Ok(())
+}
+
 #[test]
 fn record_put_reads_stdin() -> Result<()> {
     let tree = support::fixture_clone("remote-record-put")?;
@@ -1895,5 +2035,157 @@ fn an_argument_that_is_not_text_is_refused_not_a_panic() -> Result<()> {
         asked.is_empty(),
         "the command reached the server: {asked:?}"
     );
+    Ok(())
+}
+
+/// A tagged node gets no login header from Tailscale Serve. With its tag allowed, the server
+/// asks tailscaled who the address in `X-Forwarded-For` is and answers the node by its tag,
+/// which the request log names; a node whose tags are not allowed is refused.
+#[test]
+fn an_allowed_tagged_node_is_answered_by_its_tag() -> Result<()> {
+    let tree = fixture_tree("server-tagged")?;
+    let root = tree.parent().context("the tree has no parent")?.to_owned();
+    let api = support::fake_tailscaled::FakeTailscaled::start(
+        &root.join("tailscaled"),
+        &[
+            ("100.64.0.7", &["tag:ctx-ingest"]),
+            ("100.64.0.8", &["tag:other"]),
+        ],
+    )?;
+    let socket = api.socket.to_str().context("socket path is not UTF-8")?;
+    let mut server = Server::start(
+        &tree,
+        &[
+            "--tailnet-allow-tag",
+            "tag:ctx-ingest,tag:ctx-legion",
+            "--tailscale-socket",
+            socket,
+        ],
+    )?;
+    let body = json!({ "argv": ["search", "quarterly"] });
+    let start = chrono::Utc::now();
+    let allowed = server.post(
+        server.tailnet,
+        "/v1/command",
+        &body,
+        &[("X-Forwarded-For", "100.64.0.7")],
+    )?;
+    let other = server.post(
+        server.tailnet,
+        "/v1/command",
+        &body,
+        &[("X-Forwarded-For", "100.64.0.8")],
+    )?;
+    let printed = server.stop_and_read_stdout()?;
+    let window = (start, chrono::Utc::now());
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert_eq!(allowed.status, 200, "{}", allowed.body);
+    assert_eq!(other.status, 401, "{}", other.body);
+    assert!(
+        other.text("error")?.contains("allows none of them"),
+        "{}",
+        other.body
+    );
+    let lines = request_lines(&printed)?;
+    let [admitted, refused] = lines.as_slice() else {
+        anyhow::bail!("not one line per request: {printed:?}");
+    };
+    assert_logged(
+        admitted,
+        &json!({
+            "severity": "INFO", "door": "tailnet", "caller": "tag:ctx-ingest",
+            "command": "search", "query_chars": 9, "result": "ok", "status": 200,
+            "response_bytes": allowed.bytes,
+        }),
+        window,
+    )?;
+    assert_logged(
+        refused,
+        &json!({
+            "severity": "WARNING", "door": "tailnet", "caller": null, "command": null,
+            "result": "unidentified", "status": 401, "response_bytes": other.bytes,
+        }),
+        window,
+    )?;
+    Ok(())
+}
+
+/// Runs `ctx serve` with `arguments`, which must refuse to start, and returns its stderr.
+fn refused_serve(label: &str, arguments: &[&str]) -> Result<String> {
+    let tree = fixture_tree(label)?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let output = support::binary()
+        .args(["--memory", tree_text, "serve"])
+        .args(arguments)
+        .args(["--pull-interval", "3600"])
+        .envs(support::tree_env(&tree)?)
+        .env_remove("CTX_SERVER_TAILNET_TAGS")
+        .env_remove("CTX_TAILSCALE_SOCKET")
+        .output()
+        .context("running ctx serve")?;
+    remove_fixture(&tree)?;
+    assert!(!output.status.success(), "ctx serve started: {arguments:?}");
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// A deployment that allows a tag must name a well-formed tag, the tailnet listener the node
+/// reaches and the local API that names it, or the server does not start.
+#[test]
+fn allowed_tags_need_a_tailnet_listener_and_a_socket() -> Result<()> {
+    let socket = "/nonexistent/tailscaled.sock";
+    for (label, arguments, expected) in [
+        (
+            "server-tag-malformed",
+            vec![
+                "--tailnet-listen",
+                "127.0.0.1:0",
+                "--tailnet-allow-tag",
+                "ctx-ingest",
+                "--tailscale-socket",
+                socket,
+            ],
+            "is not a tailnet tag",
+        ),
+        (
+            "server-tag-no-socket",
+            vec![
+                "--tailnet-listen",
+                "127.0.0.1:0",
+                "--tailnet-allow-tag",
+                "tag:ctx-ingest",
+            ],
+            "--tailnet-allow-tag needs --tailscale-socket",
+        ),
+        (
+            "server-tag-empty-socket",
+            vec![
+                "--tailnet-listen",
+                "127.0.0.1:0",
+                "--tailnet-allow-tag",
+                "tag:ctx-ingest",
+                "--tailscale-socket",
+                "",
+            ],
+            // clap itself refuses an empty path before the server's own check.
+            "--tailscale-socket",
+        ),
+        (
+            "server-tag-no-listener",
+            vec![
+                "--listen",
+                "127.0.0.1:0",
+                "--tailnet-allow-tag",
+                "tag:ctx-ingest",
+                "--tailscale-socket",
+                socket,
+            ],
+            "--tailnet-allow-tag needs --tailnet-listen",
+        ),
+    ] {
+        let stderr = refused_serve(label, &arguments)?;
+        assert!(stderr.contains(expected), "{label}: {stderr}");
+    }
     Ok(())
 }

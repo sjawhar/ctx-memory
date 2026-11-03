@@ -1362,6 +1362,36 @@ fn flagged(delta: Delta) -> Vec<Flagged> {
         .collect()
 }
 
+/// Reads into this process's [`READ_WINDOWS`] every window's delta [`staleness`] would read
+/// now, and answers nothing.
+///
+/// A server calls this before it binds its listeners, so the first `ctx open` it answers finds
+/// every window already read rather than reading the whole share itself: on a share of a few
+/// hundred windows that first call took 12.8 s while the next took 29 ms.
+///
+/// The deltas are read without holding [`READ_WINDOWS`], so a `ctx open` that arrives while
+/// this still runs reads what it needs itself, as it did before, and waits for nothing here.
+/// What this read is then added for each window no call has read meanwhile; a window this
+/// read that has changed or gone since is read again or dropped by the next call, which looks
+/// at every window's `delta.json` as it always does.
+///
+/// # Errors
+///
+/// Returns an error when a durable delta cannot be read or decoded.
+pub fn read_for_open(windows: &Path) -> Result<()> {
+    if !windows.exists() {
+        return Ok(());
+    }
+    let mut read = BTreeMap::new();
+    read_windows(windows, &mut read)?;
+    let mut cache = READ_WINDOWS.lock().unwrap_or_else(PoisonError::into_inner);
+    let cached = cache.entry(windows.to_path_buf()).or_default();
+    for (id, flags) in read {
+        cached.entry(id).or_insert(flags);
+    }
+    Ok(())
+}
+
 /// Reads the durable deltas this process has not read yet and returns replies still
 /// unreviewed by record path, leaving out every reply `exclusion` names.
 ///

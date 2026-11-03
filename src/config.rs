@@ -90,9 +90,10 @@ pub struct ContextSourceConfig {
     /// The program and its arguments, run with no shell: the first word is looked up on
     /// `PATH`.
     pub command: Vec<String>,
-    /// Who may read a window's context: account emails, or `@domain` for every account in one
-    /// domain, as `--allow-principal` takes them. The ingest cycle's own identity, and nobody
-    /// else's: what the program answers is for the cycle that handles the window.
+    /// Who may read a window's context: account emails, `@domain` for every account in one
+    /// domain, as `--allow-principal` takes them, or a tailnet tag (`tag:<name>`) for a tagged
+    /// node `--tailnet-allow-tag` admits. The ingest cycle's own identity, and nobody else's:
+    /// what the program answers is for the cycle that handles the window.
     pub callers: Vec<String>,
     /// A regular expression whose every match in a window's messages is a subject, such as
     /// an issue key (`\b[A-Z][A-Z0-9]+-[0-9]+\b`).
