@@ -45,7 +45,7 @@ export PATH="$HOME/.local/bin:$PATH"   # add this line to your shell profile too
 ctx --version
 ```
 
-From source (needs a Rust toolchain; install one with [rustup](https://rustup.rs)):
+From source (needs Rust, a C compiler and linker, and [CMake](https://cmake.org/download/): install Rust with [rustup](https://rustup.rs); on macOS run `xcode-select --install` and install CMake; on Debian or Ubuntu run `sudo apt install build-essential cmake`):
 
 ```bash
 cargo install --locked --git https://github.com/sjawhar/ctx-memory
