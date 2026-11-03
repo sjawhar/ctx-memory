@@ -55,7 +55,7 @@ fn ask(server: &Server, window: &str, caller: Option<&str>) -> Result<support::R
         .map(|caller| vec![("Tailscale-User-Login", caller)])
         .unwrap_or_default();
     server.get(
-        server.tailnet,
+        server.tailnet_address()?,
         &format!("/v1/windows/{window}/context"),
         &headers,
     )

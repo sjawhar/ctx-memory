@@ -80,9 +80,10 @@
 #                        variable of the job; this script moves it to a file and unsets it
 #   CTX_EXECUTION        a name unique to this execution, which names the session directory and,
 #                        as CTX_SESSION, every commit the session makes and every request this
-#                        execution sends the server: letters, digits, '.', '_' and '-', starting
-#                        with a letter or digit, at most 122 characters. Unset or empty, the
-#                        name is CLOUD_RUN_EXECUTION, which Cloud Run gives each execution
+#                        execution sends the server: letters, digits, '_' and '-', starting with a
+#                        letter or digit, not ending in -retry, at most 122 characters. Unset or
+#                        empty, the name is CLOUD_RUN_EXECUTION, which Cloud Run gives each
+#                        execution
 set -eu
 
 refuse() {
@@ -125,12 +126,16 @@ seal_session() {
 # empty, CLOUD_RUN_EXECUTION, which Cloud Run sets. This script, as root, makes a directory of
 # that name on the share and hands it to the session, and every request carries it as the
 # session's id, so it is one plain name, and short enough that the retry's "<name>-retry" still
-# fits the 128 characters a session id may hold.
+# fits the 128 characters a session id may hold. Beside that directory this script keeps
+# "<name>.events.json" and "<name>.context.json", and a retry is "<name>-retry", so a name holds
+# no '.' and does not end in -retry: it would be another execution's file or retry.
 execution="${CTX_EXECUTION:-${CLOUD_RUN_EXECUTION:-}}"
 [ -n "$execution" ] || refuse "CTX_EXECUTION (on Cloud Run, CLOUD_RUN_EXECUTION) must name this job execution"
 case "$execution" in
-[!A-Za-z0-9]* | *[!A-Za-z0-9._-]*)
-	refuse "CTX_EXECUTION (on Cloud Run, CLOUD_RUN_EXECUTION) must be one name of letters, digits, '.', '_' and '-' that starts with a letter or digit: '$execution'"
+[!A-Za-z0-9]* | *[!A-Za-z0-9_-]* | *-retry)
+	# The name comes from the deployment, so it is shown with every character a name may not hold
+	# as '?': a line break in it would otherwise start a line of the job log.
+	refuse "CTX_EXECUTION (on Cloud Run, CLOUD_RUN_EXECUTION) must be one name of letters, digits, '_' and '-' that starts with a letter or digit and does not end in -retry: '$(printf %s "$execution" | tr -c 'A-Za-z0-9_-' '?')'"
 	;;
 esac
 [ "${#execution}" -le 122 ] ||

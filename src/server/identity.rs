@@ -311,11 +311,14 @@ fn git_strips(c: char) -> bool {
 /// That port asks for no proof, which holds for the processes of the one person on the
 /// machine, but a page from anywhere on the web runs in that person's browser too. A browser
 /// names the page's origin in `Origin` on every request a page posts to another origin, so a
-/// request that carries `Origin` is refused. A page whose own host name was pointed at this
-/// machine (DNS rebinding) is of the port's origin, and could read its answers, but it still
-/// names its own host in `Host`, so a `Host` other than `localhost` or a loopback address is
-/// refused too. The `ctx` client sends no `Origin`, and names the loopback address it was
-/// given.
+/// request that carries `Origin` is refused. A page's `<img>`, `<script>` or no-cors `fetch` is
+/// a GET that carries no `Origin`, but a browser adds the Fetch Metadata headers
+/// (`Sec-Fetch-Site` and the rest) to every request it sends to a loopback address, so a
+/// request that carries any `Sec-Fetch-*` header is refused too. A page whose own host name was
+/// pointed at this machine (DNS rebinding) is of the port's origin, and could read its answers,
+/// but it still names its own host in `Host`, so a `Host` other than `localhost` or a loopback
+/// address is refused as well. The `ctx` client sends neither `Origin` nor any `Sec-Fetch-*`
+/// header, and names the loopback address it was given.
 ///
 /// # Errors
 ///
@@ -323,6 +326,15 @@ fn git_strips(c: char) -> bool {
 pub fn local_request(headers: &HeaderMap) -> Result<()> {
     if headers.contains_key(ORIGIN) {
         bail!("the local listener answers no web page, and this request carries an Origin header");
+    }
+    if let Some(name) = headers
+        .keys()
+        .find(|name| name.as_str().starts_with("sec-fetch-"))
+    {
+        bail!(
+            "the local listener answers no web page, and this request carries {name}, a header \
+             only a browser sends"
+        );
     }
     let Some(host) = headers.get(HOST) else {
         return Ok(());
@@ -428,8 +440,10 @@ mod tests {
         }
     }
 
-    /// The `ctx` client names the loopback address it was given and sends no `Origin`; a web
-    /// page in the browser sends `Origin`, and one reached by DNS rebinding names its own host.
+    /// The `ctx` client names the loopback address it was given and sends neither `Origin` nor
+    /// any `Sec-Fetch-*` header; a web page in the browser sends `Origin` on a post, the browser
+    /// adds the `Sec-Fetch-*` headers to every request to a loopback address, and a page reached
+    /// by DNS rebinding names its own host.
     #[test]
     fn the_local_listener_answers_no_web_page() -> anyhow::Result<()> {
         for host in [
@@ -460,6 +474,22 @@ mod tests {
         headers.insert(HOST, "127.0.0.1:4100".parse()?);
         headers.insert(ORIGIN, "https://example.org".parse()?);
         assert!(local_request(&headers).is_err());
+        // An `<img>`, a `<script>` or a no-cors `fetch` from any page is a GET without `Origin`.
+        for (name, value) in [
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "no-cors"),
+            ("sec-fetch-dest", "image"),
+            ("sec-fetch-user", "?1"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(HOST, "127.0.0.1:4100".parse()?);
+            headers.insert(name, value.parse()?);
+            let refused = local_request(&headers).err().map(|error| error.to_string());
+            assert!(
+                refused.as_deref().is_some_and(|why| why.contains(name)),
+                "{name}: {refused:?}"
+            );
+        }
         Ok(())
     }
 }

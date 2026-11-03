@@ -18,7 +18,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use axum::http::HeaderMap;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use chrono::{DateTime, Utc};
@@ -925,10 +928,13 @@ fn announce(sink: &mut Sink<'_>, label: &str, address: SocketAddr) -> Result<()>
 }
 
 /// The routes one listener answers. The listener decides how a caller is identified, and each
-/// request it answers is one line of the request log ([`request_log`]).
+/// request it answers is one line of the request log ([`request_log`]). At the local door every
+/// request, to any path, axum's own `404` and `405` answers included, is first checked for a
+/// web page's ([`no_web_page`]).
 fn router(shared: Arc<Shared>, identity: Identity) -> Router {
     let door = identity.door();
-    Router::new()
+    let local = matches!(identity, Identity::Local(_));
+    let routes = Router::new()
         .route("/healthz", get(command::healthz))
         .route(protocol::COMMAND_ROUTE, post(command::command))
         .route(protocol::PUT_ROUTE, post(write::put))
@@ -936,8 +942,27 @@ fn router(shared: Arc<Shared>, identity: Identity) -> Router {
         .route(protocol::DELETE_ROUTE, post(write::delete))
         .route(protocol::MARKER_ROUTE, post(write::marker_advance))
         .route(protocol::CONTEXT_ROUTE, get(context::window_context))
-        .with_state(Listener { shared, identity })
-        .layer(axum::middleware::from_fn_with_state(door, request_log::log))
+        .with_state(Listener {
+            shared: Arc::clone(&shared),
+            identity,
+        });
+    let routes = if local {
+        routes.layer(axum::middleware::from_fn_with_state(shared, no_web_page))
+    } else {
+        routes
+    };
+    routes.layer(axum::middleware::from_fn_with_state(door, request_log::log))
+}
+
+/// Answers `401` to a request at the local door that a web page sent
+/// ([`identity::local_request`]), before any route sees it.
+async fn no_web_page(State(shared): State<Arc<Shared>>, request: Request, next: Next) -> Response {
+    match identity::local_request(request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(error) => {
+            command::error_response(&shared, StatusCode::UNAUTHORIZED, &format!("{error:#}"))
+        }
+    }
 }
 
 /// How one listener identifies its callers.
@@ -948,7 +973,7 @@ pub enum Identity {
     /// The Tailscale sidecar on loopback: the login header it sets for a user device.
     Tailscale,
     /// A machine with one person on it, on loopback: that person, whichever of its processes
-    /// sent the request, unless a web page did ([`identity::local_request`]).
+    /// sent the request, unless a web page did, which [`router`] refuses before any route.
     ///
     /// Each handler takes the listener's state by value, which clones it for every request, so
     /// the caller is shared rather than copied there.
@@ -983,10 +1008,7 @@ impl Listener {
         match &self.identity {
             Identity::Google(google) => google.caller(headers).await,
             Identity::Tailscale => identity::tailscale(headers),
-            Identity::Local(caller) => {
-                identity::local_request(headers)?;
-                Ok(Caller::clone(caller))
-            }
+            Identity::Local(caller) => Ok(Caller::clone(caller)),
         }
     }
 }

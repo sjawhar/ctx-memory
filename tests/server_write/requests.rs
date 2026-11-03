@@ -33,7 +33,7 @@ fn put_commits_and_pushes_as_caller() -> Result<()> {
     // A copy that reported itself unhealthy after each write would be restarted out from
     // under the next one: a published commit is one the remote has, so the clone can still
     // fast-forward.
-    let health = server.get(server.tailnet, "/healthz", &[])?;
+    let health = server.get(server.tailnet_address()?, "/healthz", &[])?;
     drop(server);
     let bare = remote_of(&tree)?;
     let (subject, author, email, head) = remote_head(&bare)?;

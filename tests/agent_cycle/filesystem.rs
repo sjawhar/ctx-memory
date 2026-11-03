@@ -972,7 +972,7 @@ fn the_cycle_takes_its_execution_name_from_ctx_execution_else_cloud_run() -> Res
         (Some("cycle-own"), Some("cycle-cloud-run"), "cycle-own"),
         (None, Some("cycle-fallback"), "cycle-fallback"),
         (Some(""), Some("cycle-empty-own"), "cycle-empty-own"),
-        (Some("A.b_c-9"), None, "A.b_c-9"),
+        (Some("Ab_c-9"), None, "Ab_c-9"),
         (Some(longest.as_str()), None, longest.as_str()),
     ];
     let mut result = Ok(());
@@ -1013,9 +1013,12 @@ fn the_cycle_takes_its_execution_name_from_ctx_execution_else_cloud_run() -> Res
 }
 
 /// The execution's name is a directory root makes and gives away on the share, and the session
-/// every request names, so it is one plain name: letters, digits, `.`, `_` and `-`, starting
-/// with a letter or digit, short enough that its retry's `-retry` still fits the 128 characters
-/// a session id may hold. Anything else is refused before anything is touched.
+/// every request names, so it is one plain name: letters, digits, `_` and `-`, starting with a
+/// letter or digit, short enough that its retry's `-retry` still fits the 128 characters a
+/// session id may hold. The runner keeps `<name>.events.json` and `<name>.context.json` beside
+/// that directory and gives a retry `<name>-retry`, so a name holds no `.` and does not end in
+/// `-retry`: it would be another execution's file or retry. Anything else is refused before
+/// anything is touched, in one line, whatever the name holds.
 #[test]
 fn the_cycle_refuses_an_execution_name_that_is_not_one_plain_name() -> Result<()> {
     let rig = CycleRig::new("execution-name-bad")?;
@@ -1030,6 +1033,9 @@ fn the_cycle_refuses_an_execution_name_that_is_not_one_plain_name() -> Result<()
         ".hidden",
         "-flag",
         "line\nbreak",
+        "cycle-1.events.json",
+        "cycle-1.context.json",
+        "cycle-1-retry",
         long.as_str(),
     ] {
         for variable in ["CTX_EXECUTION", "CLOUD_RUN_EXECUTION"] {
@@ -1039,8 +1045,16 @@ fn the_cycle_refuses_an_execution_name_that_is_not_one_plain_name() -> Result<()
                 .env(variable, name)
                 .output()
                 .context("running run-cycle.sh with a bad execution name")?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
             result = result.and_then(|()| {
                 assert_refused(&rig, &output, "CTX_EXECUTION")
+                    .and_then(|()| {
+                        ensure!(
+                            stderr.lines().count() == 1,
+                            "the refusal is not one line: {stderr:?}"
+                        );
+                        Ok(())
+                    })
                     .with_context(|| format!("{variable}={name:?}"))
             });
         }

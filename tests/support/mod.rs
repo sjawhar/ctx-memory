@@ -404,7 +404,9 @@ impl Reply {
 /// A `ctx serve` child process bound to loopback ports the kernel chose.
 pub struct Server {
     child: Child,
-    pub tailnet: SocketAddr,
+    /// The `--tailnet-listen` port, which every server has unless it was started
+    /// [without one](Server::start_without_tailnet).
+    pub tailnet: Option<SocketAddr>,
     pub ingress: Option<SocketAddr>,
     /// The `--local-listen` port, when the server was started with one.
     pub local: Option<SocketAddr>,
@@ -427,13 +429,27 @@ impl Server {
         extra: &[&str],
         environment: &[(&str, &str)],
     ) -> Result<Self> {
+        let mut arguments = vec!["--tailnet-listen", "127.0.0.1:0"];
+        arguments.extend_from_slice(extra);
+        Self::launch(tree, &arguments, environment)
+    }
+
+    /// Starts `ctx serve` with only the listeners `extra` asks for, and no tailnet listener.
+    pub fn start_without_tailnet(
+        tree: &Path,
+        extra: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Result<Self> {
+        Self::launch(tree, extra, environment)
+    }
+
+    fn launch(tree: &Path, arguments: &[&str], environment: &[(&str, &str)]) -> Result<Self> {
         let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
         let mut command = binary();
         command
             .args(["--memory", tree_text, "serve"])
             .envs(tree_env(tree)?)
-            .args(["--tailnet-listen", "127.0.0.1:0"])
-            .args(extra)
+            .args(arguments)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         for (name, value) in environment {
@@ -445,7 +461,7 @@ impl Server {
             .take()
             .ok_or_else(|| anyhow!("ctx serve has no stdout"))?;
         let stdout = read_lines(stdout);
-        let listeners = match read_listeners(&stdout, extra) {
+        let listeners = match read_listeners(&stdout, arguments) {
             Ok(listeners) => listeners,
             Err(error) => {
                 let _ = child.kill();
@@ -471,7 +487,12 @@ impl Server {
 
     /// Posts to the tailnet listener as a signed-in tailnet user.
     pub fn post_as(&self, user: &str, path: &str, body: &Value) -> Result<Reply> {
-        self.post(self.tailnet, path, body, &[("Tailscale-User-Login", user)])
+        self.post(
+            self.tailnet_address()?,
+            path,
+            body,
+            &[("Tailscale-User-Login", user)],
+        )
     }
 
     pub fn post(
@@ -528,6 +549,11 @@ impl Server {
     /// Runs one allowlisted command over `/v1/command` as a tailnet user.
     pub fn command(&self, argv: &[&str]) -> Result<Reply> {
         self.post_as("ada@example.com", "/v1/command", &json!({ "argv": argv }))
+    }
+
+    pub fn tailnet_address(&self) -> Result<SocketAddr> {
+        self.tailnet
+            .ok_or_else(|| anyhow!("this server has no tailnet listener"))
     }
 
     pub fn ingress_address(&self) -> Result<SocketAddr> {
@@ -609,7 +635,7 @@ pub fn read_lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
 
 /// The ports a server bound.
 struct Listeners {
-    tailnet: SocketAddr,
+    tailnet: Option<SocketAddr>,
     ingress: Option<SocketAddr>,
     local: Option<SocketAddr>,
 }
@@ -617,13 +643,14 @@ struct Listeners {
 /// How long a test waits for `ctx serve` to print the listener lines it expects.
 const LISTENER_WAIT: Duration = Duration::from_secs(300);
 
-/// Reads the listener lines `ctx serve` prints once it is bound, waiting for the ingress and
-/// local ones too when `extra`, the server's other arguments, asked for them, and for no longer
-/// than [`LISTENER_WAIT`]: a server that bound some of its ports and never the rest would
-/// otherwise keep the test waiting for ever.
-fn read_listeners(stdout: &Receiver<String>, extra: &[&str]) -> Result<Listeners> {
-    let expect_ingress = extra.contains(&"--listen");
-    let expect_local = extra.contains(&"--local-listen");
+/// Reads the listener lines `ctx serve` prints once it is bound, waiting for each one
+/// `arguments`, the server's own, asked for, and for no longer than [`LISTENER_WAIT`]: a server
+/// that bound some of its ports and never the rest would otherwise keep the test waiting for
+/// ever.
+fn read_listeners(stdout: &Receiver<String>, arguments: &[&str]) -> Result<Listeners> {
+    let expect_tailnet = arguments.contains(&"--tailnet-listen");
+    let expect_ingress = arguments.contains(&"--listen");
+    let expect_local = arguments.contains(&"--local-listen");
     let mut tailnet = None;
     let mut ingress = None;
     let mut local = None;
@@ -638,14 +665,16 @@ fn read_listeners(stdout: &Receiver<String>, extra: &[&str]) -> Result<Listeners
         } else if let Some(address) = line.strip_prefix("listen ") {
             ingress = Some(address.trim().parse()?);
         }
-        if tailnet.is_some()
+        if (!expect_tailnet || tailnet.is_some())
             && (!expect_ingress || ingress.is_some())
             && (!expect_local || local.is_some())
         {
             break;
         }
     }
-    let tailnet = tailnet.ok_or_else(|| anyhow!("ctx serve printed no tailnet listener"))?;
+    if expect_tailnet && tailnet.is_none() {
+        bail!("ctx serve printed no tailnet listener");
+    }
     if expect_local && local.is_none() {
         bail!("ctx serve printed no local listener");
     }

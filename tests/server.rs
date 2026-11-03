@@ -77,7 +77,7 @@ fn command_outside_allowlist_is_400() -> Result<()> {
 fn healthz_reports_the_loaded_tree() -> Result<()> {
     let tree = fixture_tree("server-health")?;
     let server = Server::start(&tree, &[])?;
-    let reply = server.get(server.tailnet, "/healthz", &[])?;
+    let reply = server.get(server.tailnet_address()?, "/healthz", &[])?;
     drop(server);
     remove_fixture(&tree)?;
 
@@ -188,7 +188,7 @@ fn each_request_at_either_door_is_one_line_of_the_request_log() -> Result<()> {
         &json!({ "argv": ["search", query] }),
         &[],
     )?;
-    let health = server.get(server.tailnet, "/healthz", &[])?;
+    let health = server.get(server.tailnet_address()?, "/healthz", &[])?;
     let printed = server.stop_and_read_stdout()?;
     let window = (start, chrono::Utc::now());
     drop(server);
@@ -274,7 +274,7 @@ fn every_answer_is_one_line_whoever_gave_it() -> Result<()> {
     use reqwest::Method;
     let tree = fixture_tree("server-request-log-answers")?;
     let mut server = Server::start(&tree, &[])?;
-    let tailnet = server.tailnet;
+    let tailnet = server.tailnet_address()?;
     let ada = [("Tailscale-User-Login", "ada@example.com")];
     let entity = "Zebra Holdings";
     let start = chrono::Utc::now();
@@ -824,7 +824,7 @@ fn tailnet_listener_without_login_header_is_401() -> Result<()> {
     let tree = fixture_tree("server-tailnet-anon")?;
     let server = Server::start(&tree, &[])?;
     let reply = server.post(
-        server.tailnet,
+        server.tailnet_address()?,
         "/v1/command",
         &json!({ "argv": ["rules"] }),
         &[],
@@ -867,7 +867,7 @@ fn a_local_listener_answers_the_local_caller_with_no_identity() -> Result<()> {
     )?;
     // The tailnet door beside it still names nobody without its login header.
     let tailnet = server.post(
-        server.tailnet,
+        server.tailnet_address()?,
         "/v1/command",
         &json!({ "argv": ["rules"] }),
         &[],
@@ -898,47 +898,97 @@ fn a_local_listener_answers_the_local_caller_with_no_identity() -> Result<()> {
     Ok(())
 }
 
-/// The local door asks no proof, so it answers no web page in the machine's browser: not one
-/// that posts to it from another origin, which the browser names in `Origin`, and not one whose
-/// own host name was pointed at this machine (DNS rebinding), which still names that host in
-/// `Host`. The same request without either is answered.
+/// The one-machine setup in docs/deployment.md serves `--local-listen` alone, with no tailnet
+/// door beside it. The `ctx` client reads and writes there, and the server stops cleanly.
+#[test]
+fn a_local_listener_serves_on_its_own() -> Result<()> {
+    let tree = support::fixture_clone("server-local-alone")?;
+    support::fetch_window(&tree)?;
+    let mut server = Server::start_without_tailnet(&tree, &LOCAL_DOOR, &[])?;
+    let tailnet = server.tailnet;
+    let origin = format!("http://{}", server.local_address()?);
+    let environment = [("CTX_SERVER", origin.as_str())];
+    let elsewhere = support::scratch("server-local-alone-cwd")?;
+    let rules = support::ctx_remote(&elsewhere, &environment, &["rules"], None)?;
+    let put = support::ctx_remote(
+        &elsewhere,
+        &environment,
+        &["record", "put", "decisions/alone.md", "-"],
+        Some(&support::cited_record()),
+    )?;
+    let stopped = server.terminate();
+    drop(server);
+    let listing = support::remote_of(&tree)
+        .and_then(|bare| support::git(&bare, &["ls-tree", "-r", "--name-only", "main"]));
+    support::remove_scratch(&elsewhere)?;
+    remove_fixture(&tree)?;
+
+    assert_eq!(tailnet, None, "the server opened a tailnet door");
+    assert_eq!(rules.exit_code, 0, "{}{}", rules.stdout, rules.stderr);
+    assert!(rules.stdout.contains("# Rules"), "{}", rules.stdout);
+    assert_eq!(put.exit_code, 0, "{}{}", put.stdout, put.stderr);
+    let listing = listing?;
+    assert!(
+        listing.lines().any(|name| name == "decisions/alone.md"),
+        "the record is not on the remote: {listing}"
+    );
+    stopped
+}
+
+/// The local door asks no proof, so it answers no web page in the machine's browser, at any
+/// path: not one that posts to it from another origin, which the browser names in `Origin`;
+/// not one that loads it as an image or a script, a GET with no `Origin`, which the browser
+/// still marks with `Sec-Fetch-Site`; and not one whose own host name was pointed at this
+/// machine (DNS rebinding), which still names that host in `Host`. The same requests without
+/// any of those are answered.
 #[test]
 fn a_local_listener_answers_no_web_page() -> Result<()> {
-    let tree = fixture_tree("server-local-browser")?;
+    let tree = support::fixture_clone("server-local-browser")?;
+    let window = support::fetch_window(&tree)?;
     let server = Server::start(&tree, &LOCAL_DOOR)?;
     let local = server.local_address()?;
     let rebound = format!("example.org:{}", local.port());
+    let page = ("Origin", "https://example.org");
+    let context = format!("/v1/windows/{window}/context");
     let rules = json!({ "argv": ["rules"] });
+    let post = |path: &str, body: &Value, headers: &[(&str, &str)]| {
+        server
+            .post(local, path, body, headers)
+            .map(|reply| reply.status)
+    };
+    let get = |path: &str, headers: &[(&str, &str)]| {
+        server
+            .raw(reqwest::Method::GET, local, path, None, headers)
+            .map(|(status, _)| status)
+    };
     let asked = [
-        server.post(local, "/v1/command", &rules, &[]),
-        server.post(
-            local,
-            "/v1/command",
-            &rules,
-            &[("Origin", "https://example.org")],
-        ),
-        server.post(local, "/v1/command", &rules, &[("Host", rebound.as_str())]),
-        server.post(
-            local,
+        post("/v1/command", &rules, &[]),
+        post("/v1/command", &rules, &[page]),
+        post("/v1/command", &rules, &[("Host", rebound.as_str())]),
+        post(
             "/v1/records/put",
             &json!({ "path": "decisions/page.md", "content": support::cited_record() }),
-            &[("Origin", "https://example.org")],
+            &[page],
         ),
+        get(&context, &[]),
+        get(&context, &[("Sec-Fetch-Site", "cross-site")]),
+        get("/healthz", &[]),
+        get("/healthz", &[("Host", rebound.as_str())]),
+        get("/nowhere", &[]),
+        get("/nowhere", &[page]),
     ];
     drop(server);
     remove_fixture(&tree)?;
 
-    let statuses = asked
-        .into_iter()
-        .map(|reply| reply.map(|reply| reply.status))
-        .collect::<Result<Vec<_>>>()?;
-    assert_eq!(statuses, [200, 401, 401, 401]);
+    let statuses = asked.into_iter().collect::<Result<Vec<_>>>()?;
+    assert_eq!(statuses, [200, 401, 401, 401, 200, 401, 200, 401, 404, 401]);
     Ok(())
 }
 
 /// Each request at the local door is one line of the request log, at door `local`, naming the
 /// `--local-caller`, here given as `CTX_SERVER_LOCAL_CALLER`. A write the checks refuse is
-/// refused there as at every other door, and commits nothing.
+/// refused there as at every other door, and commits nothing. A web page's request is refused
+/// before any route sees it, and still logged, naming nobody.
 #[test]
 fn the_local_door_logs_each_request_as_the_local_caller() -> Result<()> {
     let tree = support::fixture_clone("server-local-log")?;
@@ -964,6 +1014,12 @@ fn the_local_door_logs_each_request_as_the_local_caller() -> Result<()> {
         support::cited_record()
     );
     let refused = put("decisions/gap.md", &gap)?;
+    let page = server.post(
+        local,
+        "/v1/records/put",
+        &json!({ "path": "decisions/page.md", "content": support::cited_record(), "session": "s" }),
+        &[("Sec-Fetch-Site", "cross-site")],
+    )?;
     let printed = server.stop_and_read_stdout()?;
     drop(server);
     let listing = support::remote_of(&tree)
@@ -971,16 +1027,19 @@ fn the_local_door_logs_each_request_as_the_local_caller() -> Result<()> {
     remove_fixture(&tree)?;
 
     assert_eq!(
-        [rules.status, written.status, refused.status],
-        [200, 200, 422],
-        "unexpected answers: {} {} {}",
+        [rules.status, written.status, refused.status, page.status],
+        [200, 200, 422, 401],
+        "unexpected answers: {} {} {} {}",
         rules.body,
         written.body,
-        refused.body
+        refused.body,
+        page.body
     );
     let listing = listing?;
     assert!(
-        !listing.lines().any(|name| name == "decisions/gap.md"),
+        !listing
+            .lines()
+            .any(|name| name == "decisions/gap.md" || name == "decisions/page.md"),
         "the refused record reached the remote: {listing}"
     );
     let fields = ["door", "caller", "command", "result"];
@@ -997,6 +1056,12 @@ fn the_local_door_logs_each_request_as_the_local_caller() -> Result<()> {
             expected("rules", "ok"),
             expected("record put", "ok"),
             expected("record put", "refused"),
+            [
+                Some(json!("local")),
+                Some(Value::Null),
+                Some(json!("record put")),
+                Some(json!("unidentified")),
+            ],
         ],
         "{printed:?}"
     );
@@ -1102,7 +1167,7 @@ fn a_local_listener_never_opens_in_a_shared_deployment() -> Result<()> {
             Some(("CLOUD_RUN_JOB", "ctx-fetch")),
             "CLOUD_RUN_JOB",
         ),
-        (&beside_ingress, None, "--listen"),
+        (&beside_ingress, None, "--listen is Cloud Run's ingress"),
     ];
     let said: Result<Vec<String>> = cases
         .iter()

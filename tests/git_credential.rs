@@ -67,7 +67,7 @@ fn the_server_clones_pulls_and_pushes_a_private_remote() -> Result<()> {
     let head = git(&bare, &["rev-parse", "main"])?;
 
     let server = Server::start_with_env(&tree, &["--pull-interval", "1"], &borrowed(&environment))?;
-    let health = server.get(server.tailnet, "/healthz", &[])?;
+    let health = server.get(server.tailnet_address()?, "/healthz", &[])?;
     support::fetch_window(&tree)?;
     let put = server.post_as(
         "ada@example.com",
