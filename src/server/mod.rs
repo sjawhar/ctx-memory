@@ -26,6 +26,7 @@ use tokio::net::TcpListener;
 
 use crate::config::{DataDir, StateDir};
 use crate::context::Context;
+use crate::delta;
 use crate::git::{Access, Repo};
 use crate::lease::{self, Lease};
 use crate::output::{Outcome, Sink};
@@ -84,7 +85,8 @@ pub struct ServeArgs {
     #[arg(long, value_name = "SECONDS", default_value_t = 60)]
     pub pull_interval: u64,
 
-    /// Seconds the listeners wait for this copy's record index before they bind.
+    /// Seconds the listeners wait, at most, for this copy's record index and for the window
+    /// deltas `ctx open` reads, before they bind.
     #[arg(long, value_name = "SECONDS", default_value_t = 90)]
     pub index_wait: u64,
 }
@@ -532,20 +534,13 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     // a container a bounded time to accept a connection and a share whose replay outlasts
     // that still needs serving; a request that arrives then waits for the rest of the build
     // before it takes the tree ([`Shared::index_ready`]).
+    // `ctx open` reads every window's delta on the share the first time a process answers it,
+    // which took the first caller after a restart 12.8 s while the next took 29 ms. Those
+    // deltas are read here too, beside the index build and under the same bound, so the
+    // first caller finds them read ([`warm_open`]).
     warm_index(Arc::clone(&shared));
-    if arguments.index_wait > 0 {
-        let wait = Duration::from_secs(arguments.index_wait);
-        if tokio::time::timeout(wait, shared.index_ready())
-            .await
-            .is_err()
-        {
-            eprintln!(
-                "the record index is still being built after {}s: binding the listeners now, \
-                 and a request waits for the rest of it",
-                arguments.index_wait
-            );
-        }
-    }
+    let open = warm_open(Arc::clone(&shared));
+    wait_for_warm_up(&shared, open, arguments.index_wait).await;
     let mut servers = Vec::new();
     // A container runtime stops this copy with SIGTERM before the copy that replaces it
     // writes. Both listeners stop on that signal, and the lease is given up afterwards.
@@ -772,6 +767,66 @@ fn warm_index(shared: Arc<Shared>) {
         }
         shared.index_done();
     });
+}
+
+/// Waits for the index build and the read [`warm_open`] started, both together for no longer
+/// than `index_wait` seconds, and says on standard error which of them is still running when
+/// that time is up. Neither is stopped then: the listeners bind, and each goes on beside them.
+/// `0` waits for nothing.
+async fn wait_for_warm_up(shared: &Shared, open: tokio::task::JoinHandle<()>, index_wait: u64) {
+    if index_wait == 0 {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(index_wait);
+    if tokio::time::timeout_at(deadline, shared.index_ready())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "the record index is still being built after {index_wait}s: binding the listeners \
+             now, and a request waits for the rest of it"
+        );
+    }
+    if tokio::time::timeout_at(deadline, open).await.is_err() {
+        eprintln!(
+            "the window deltas ctx open reads are still being read after {index_wait}s: binding \
+             the listeners now, and an open reads the ones not read yet itself"
+        );
+    }
+}
+
+/// Reads every window's delta `ctx open` reads into this process's cache of them
+/// ([`delta::read_for_open`]), so the first `ctx open` this copy answers reads none itself.
+///
+/// Which windows directory it reads is taken under the tree lock, and the lock is given back
+/// before the read. The read holds no lock a request takes, so a request that arrives while it
+/// runs is answered as it would have been without it. A failure is one line on standard
+/// error, and the first `ctx open` reads what it needs, as it did before this existed.
+fn warm_open(shared: Arc<Shared>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let read = tokio::task::spawn_blocking(move || {
+            let windows = {
+                let tree = shared.tree()?;
+                // `ctx open` reads no delta for a tree with no source, so none is read for it.
+                if tree.config.sources.is_empty() {
+                    return Ok(());
+                }
+                tree.data()?.windows()
+            };
+            delta::read_for_open(&windows)
+        })
+        .await;
+        match read {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "reading the window deltas ctx open reads: {}",
+                one_line(&format!("{error:#}"))
+            ),
+            Err(error) => {
+                eprintln!("reading the window deltas ctx open reads: the read stopped: {error}");
+            }
+        }
+    })
 }
 
 /// One pass of the follow loop.
