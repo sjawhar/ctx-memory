@@ -319,6 +319,186 @@ fn search_finds_title() -> Result<()> {
     Ok(())
 }
 
+/// The first hit's `matched_terms` and `total_terms`.
+fn first_hit_terms(response: &Value) -> Option<(u64, u64)> {
+    let hit = response.get("data")?.get("hits")?.as_array()?.first()?;
+    Some((
+        hit.get("matched_terms")?.as_u64()?,
+        hit.get("total_terms")?.as_u64()?,
+    ))
+}
+
+/// A name is spelled with a hyphen or a dot in one place and joined or spaced in another: a
+/// search for a name written joined once missed a record that spelled it with a hyphen, because
+/// the index split the hyphenated name into two words and the query was a third. A hyphenated or
+/// dotted compound in a record is found by its joined form and by its parts, and the hit counts
+/// the query's term as matched, so the output does not call the best match partial.
+#[test]
+fn search_finds_a_hyphenated_or_dotted_name_by_its_joined_and_spaced_forms() -> Result<()> {
+    let root = test_root("hyphen-joined")?;
+    write(
+        &root,
+        "purchases/blender.md",
+        "---\n\
+         type: purchase\n\
+         title: Blendo-Matic 500 blender\n\
+         ---\n\
+         Bought a used Blendo-Matic from a neighbour.\n",
+    )?;
+    write(
+        &root,
+        "purchases/kettle.md",
+        "---\n\
+         type: purchase\n\
+         title: Kettle from Brewly.Home\n\
+         ---\n\
+         The kettle came with a two-year warranty.\n",
+    )?;
+    write(
+        &root,
+        "purchases/toaster.md",
+        "---\n\
+         type: purchase\n\
+         title: Toaster\n\
+         ---\n\
+         A plain toaster with no brand to speak of.\n",
+    )?;
+    let joined = ctx(&root, &["search", "Blendomatic"]);
+    let spaced = ctx(&root, &["search", "blendo matic"]);
+    let hyphenated = ctx(&root, &["search", "Blendo-Matic"]);
+    let dotted = ctx(&root, &["search", "brewlyhome"]);
+    let root_text = root
+        .to_str()
+        .context("test tree path is not valid UTF-8")?
+        .to_owned();
+    let text = binary()
+        .args(["--memory", &root_text, "search", "blendomatic"])
+        .output()
+        .context("running ctx search");
+    remove_test_root(&root)?;
+
+    let joined = joined?;
+    assert_eq!(hit_paths(&joined)?, ["purchases/blender.md"]);
+    assert_eq!(first_hit_terms(&joined), Some((1, 1)));
+    assert_eq!(hit_paths(&spaced?)?, ["purchases/blender.md"]);
+    assert_eq!(hit_paths(&hyphenated?)?, ["purchases/blender.md"]);
+    assert_eq!(hit_paths(&dotted?)?, ["purchases/kettle.md"]);
+    let text = text?;
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("purchases/blender.md") && !text.contains("no document matches all"),
+        "the joined form of a hyphenated name reads as a partial match: {text}"
+    );
+    Ok(())
+}
+
+/// The other way round: a record that writes the name joined is found by the name hyphenated,
+/// as one query word, and spaced, as two.
+#[test]
+fn search_finds_a_joined_name_by_its_hyphenated_and_spaced_forms() -> Result<()> {
+    let root = test_root("joined-hyphen")?;
+    write(
+        &root,
+        "purchases/soda-maker.md",
+        "---\n\
+         type: purchase\n\
+         title: Fizzbrook soda maker\n\
+         ---\n\
+         The Fizzbrook takes the screw-in canisters.\n",
+    )?;
+    write(
+        &root,
+        "purchases/toaster.md",
+        "---\n\
+         type: purchase\n\
+         title: Toaster\n\
+         ---\n\
+         A plain toaster with no brand to speak of.\n",
+    )?;
+    let hyphenated = ctx(&root, &["search", "Fizz-Brook"]);
+    let spaced = ctx(&root, &["search", "fizz brook"]);
+    remove_test_root(&root)?;
+
+    let hyphenated = hyphenated?;
+    assert_eq!(hit_paths(&hyphenated)?, ["purchases/soda-maker.md"]);
+    assert_eq!(first_hit_terms(&hyphenated), Some((1, 1)));
+    assert_eq!(hit_paths(&spaced?)?, ["purchases/soda-maker.md"]);
+    Ok(())
+}
+
+/// Joining is for names: a number written with a dot or a hyphen (a decimal, a range, a date) is
+/// not searched for as the number its digits run together into, and neither is a two-character
+/// abbreviation whose joined form is a common word (`U.S.`, `a.m.`). A hit found by another word
+/// does not count such a term matched by its joined form either.
+#[test]
+fn search_does_not_join_numbers_or_two_letter_abbreviations() -> Result<()> {
+    let root = test_root("no-numeric-join")?;
+    write(
+        &root,
+        "notes/ratio.md",
+        "---\ntype: note\ntitle: Ratio\n---\nMix at 1.5 parts water to one part syrup.\n",
+    )?;
+    write(
+        &root,
+        "notes/weight.md",
+        "---\ntype: note\ntitle: Weight\n---\nUse 15 grams of coffee per cup.\n",
+    )?;
+    write(
+        &root,
+        "notes/team.md",
+        "---\ntype: note\ntitle: Team\n---\nThe vendor asked us to wait.\n",
+    )?;
+    let decimal = ctx(&root, &["search", "1.5"]);
+    let abbreviation = ctx(&root, &["search", "U.S."]);
+    let beside_a_word = ctx(&root, &["search", "vendor U.S."]);
+    remove_test_root(&root)?;
+
+    assert_eq!(hit_paths(&decimal?)?, ["notes/ratio.md"]);
+    assert_eq!(hit_paths(&abbreviation?)?, Vec::<String>::new());
+    let beside_a_word = beside_a_word?;
+    assert_eq!(hit_paths(&beside_a_word)?, ["notes/team.md"]);
+    assert_eq!(first_hit_terms(&beside_a_word), Some((1, 2)));
+    Ok(())
+}
+
+/// A query that names a compound beside plain words matches each word as it would alone: the
+/// joined or hyphenated name counts as one matched term, and a record that holds only one of the
+/// query's words is still found, as one term of two.
+#[test]
+fn search_matches_a_compound_beside_plain_words() -> Result<()> {
+    let root = test_root("compound-beside-words")?;
+    write(
+        &root,
+        "purchases/blender.md",
+        "---\ntype: purchase\ntitle: Blendo-Matic 500 blender\n---\nA used one.\n",
+    )?;
+    write(
+        &root,
+        "purchases/soda-maker.md",
+        "---\ntype: purchase\ntitle: Fizzbrook soda maker\n---\nTakes screw-in canisters.\n",
+    )?;
+    write(
+        &root,
+        "purchases/toaster.md",
+        "---\ntype: purchase\ntitle: Toaster\n---\nA plain toaster.\n",
+    )?;
+    let joined_beside = ctx(&root, &["search", "Blendomatic blender"]);
+    let hyphenated_beside = ctx(&root, &["search", "Fizz-Brook soda"]);
+    let one_each = ctx(&root, &["search", "blendomatic toaster"]);
+    remove_test_root(&root)?;
+
+    let joined_beside = joined_beside?;
+    assert_eq!(hit_paths(&joined_beside)?, ["purchases/blender.md"]);
+    assert_eq!(first_hit_terms(&joined_beside), Some((2, 2)));
+    let hyphenated_beside = hyphenated_beside?;
+    assert_eq!(hit_paths(&hyphenated_beside)?, ["purchases/soda-maker.md"]);
+    assert_eq!(first_hit_terms(&hyphenated_beside), Some((2, 2)));
+    let mut found = hit_paths(&one_each?)?;
+    found.sort();
+    assert_eq!(found, ["purchases/blender.md", "purchases/toaster.md"]);
+    Ok(())
+}
+
 /// Text output written to a pipe, or under `NO_COLOR`, carries no terminal escape codes.
 ///
 /// The ctx server captures a command's stdout and returns it in `/v1/command`, which agents

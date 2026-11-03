@@ -84,6 +84,13 @@ pub fn run(
     limit: usize,
 ) -> Result<Search> {
     let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    // A term counts as matched in a record that holds it, or holds it written with a hyphen or
+    // a dot or without one where the index joins it: the index finds `Blendo-Matic` by
+    // `blendomatic`, and the other way round, but not `U.S.` by `us` nor `1.5` by `15`.
+    let joined_terms: Vec<Option<String>> = terms
+        .iter()
+        .map(|term| index::joinable(term).then(|| index::without_joiners(term)))
+        .collect();
     // Without a filter the index applies the limit; with one it cannot, because the
     // dropped documents must still be counted to tell a filtered result from an absence.
     let found = index.search(query, if verbatim_only { 0 } else { limit })?;
@@ -112,15 +119,25 @@ pub fn run(
             continue;
         }
         let haystack = index::document_text(doc).to_lowercase();
+        let mut joined_haystack = None;
+        let matched_terms = terms
+            .iter()
+            .zip(&joined_terms)
+            .filter(|(term, joined)| {
+                haystack.contains(term.as_str())
+                    || joined.as_deref().is_some_and(|joined| {
+                        joined_haystack
+                            .get_or_insert_with(|| index::without_joiners(&haystack))
+                            .contains(joined)
+                    })
+            })
+            .count();
         hits.push(Hit {
             path: found.path,
             tier: tier.map(|tier| tier.label().to_owned()),
             title: doc.label(),
             line: one_line(&found.snippet),
-            matched_terms: terms
-                .iter()
-                .filter(|term| haystack.contains(term.as_str()))
-                .count(),
+            matched_terms,
             total_terms: terms.len(),
             by_meaning: found.by_meaning,
         });
