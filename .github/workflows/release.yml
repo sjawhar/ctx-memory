@@ -23,6 +23,13 @@ on:
 
 permissions: {}
 
+# A newer push to a pull request cancels that pull request's run, waiting or running: every
+# sjawhar repository shares one limit of 40 GitHub-hosted jobs at a time, and a superseded build
+# only holds runners. A tag's run is a group of its own and is never cancelled.
+concurrency:
+  group: release-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # The toolchain every target builds with. rust-toolchain.toml names the `stable` channel, which
   # rustup would resolve to whatever is newest; RUSTUP_TOOLCHAIN outranks the file, so each build
