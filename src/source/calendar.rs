@@ -1069,30 +1069,43 @@ mod tests {
     fn a_listing_by_time_keeps_only_what_starts_before_the_horizon() -> Result<()> {
         // Google answers to a day past the horizon, so a one-off event there comes back too; the
         // horizon listing records it once the horizon reaches it.
-        let api = api(vec![listing(
-            "sync-3",
-            vec![
-                event(
-                    "EVENT-BEFORE",
-                    "2027-11-29T12:00:00Z",
-                    "2027-11-29T13:00:00Z",
-                    None,
-                ),
-                event(
-                    "EVENT-IN-MARGIN",
-                    "2027-11-30T12:00:00Z",
-                    "2027-11-30T13:00:00Z",
-                    None,
-                ),
-            ],
-        )]);
-        let request = request(Some("2026-10-24T00:00:00Z"))?;
-        let messages = run_fetch(&api, &request)?;
+        let page = || {
+            listing(
+                "sync-3",
+                vec![
+                    event(
+                        "EVENT-BEFORE",
+                        "2027-11-29T12:00:00Z",
+                        "2027-11-29T13:00:00Z",
+                        None,
+                    ),
+                    event(
+                        "EVENT-IN-MARGIN",
+                        "2027-11-30T12:00:00Z",
+                        "2027-11-30T13:00:00Z",
+                        None,
+                    ),
+                ],
+            )
+        };
+        for (case, cursor, pages) in [
+            ("first listing", None, vec![page()]),
+            ("time cursor", Some("2026-10-24T00:00:00Z"), vec![page()]),
+            (
+                "resync after 410",
+                Some("sync-2@2026-10-24T00:00:00Z"),
+                vec![gone(), page()],
+            ),
+        ] {
+            let api = api(pages);
+            let messages = run_fetch(&api, &request(cursor)?)?;
 
-        assert_eq!(
-            pointers(&records(&messages)),
-            ["gcal:team@example.com/EVENT-BEFORE"]
-        );
+            assert_eq!(
+                pointers(&records(&messages)),
+                ["gcal:team@example.com/EVENT-BEFORE"],
+                "{case}"
+            );
+        }
         Ok(())
     }
 

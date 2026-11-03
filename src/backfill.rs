@@ -11,7 +11,8 @@
 //! for a backfill that reaches back to it, and removes it once the window is published with every
 //! stream that read the backfill stored. The protocol carries one backfill per source, so every
 //! stream of that source with no cursor reads from that start, a stream new since that read
-//! included.
+//! included. A stream that keeps failing holds the start until it stores a read or leaves the
+//! source's configuration.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -25,8 +26,11 @@ use crate::atomic::write_replace;
 use crate::windows::{Manifest, Status};
 
 /// The start of the earliest backfill read each source has not stored.
+///
+/// A field this build does not know is ignored rather than refused: machines on different builds
+/// share the data directory, and this file only says how far back a backfill reaches, so losing
+/// a later build's field costs at most a read that build would have made.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Backfills {
     pub version: u32,
     pub sources: BTreeMap<String, DateTime<Utc>>,

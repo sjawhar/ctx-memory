@@ -74,6 +74,9 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
     let exclusion = Exclusion::configured(&context.config)?;
 
     let cursors = cursor::load(&data.cursors())?;
+    // Read before the window is staged, so a file this build cannot read stops the fetch with
+    // nothing staged.
+    let mut backfills = backfill::load(&data.backfill())?;
     let staged = windows::stage(&data.windows(), options.window_end)?;
     let store = Store::load(data, state)?;
     // What the windows this store has not indexed yet delivered — another machine's fetches, or
@@ -82,7 +85,7 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
     let schemes = source::configured_schemes(&context.config.sources)?;
     let generated_at = Utc::now();
     let mut collected = Collected::default();
-    let (mut backfills, reads) = begin_backfills(context, data, options, &mut collected.warnings)?;
+    let reads = begin_backfills(context, data, options, &mut backfills)?;
 
     for (spec, span) in reads {
         lease
@@ -90,6 +93,7 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
             .map_or(Ok(()), Lease::check)
             .with_context(|| format!("before fetching {}", spec.id))?;
         let result = run_source(context, data, spec, &span, &cursors, &schemes, &exclusion)?;
+        collected.warnings.extend(span.warning(&spec.id, &result));
         collect_source_result(spec, result, &mut collected, &store, &exclusion)?;
     }
 
@@ -207,49 +211,53 @@ fn validate_selection(sources: &[SourceConfig], only: &[String]) -> Result<()> {
 struct Span {
     window_end: DateTime<Utc>,
     backfill_hours: u32,
+    /// Where a backfill read an earlier fetch did not store began, when the backfill reaches
+    /// further back than configured to read it.
+    unstored_since: Option<DateTime<Utc>>,
+}
+
+impl Span {
+    /// The warning that names a backfill reaching further than configured. Only a stream with
+    /// no cursor reads the backfill, so there is one only when such a stream ran.
+    fn warning(&self, source: &str, run: &SourceRun) -> Option<String> {
+        let start = self.unstored_since.filter(|_| run.read_backfill())?;
+        Some(format!(
+            "source {source}: its backfill reaches back to {}, where a read an earlier fetch did not store began",
+            start.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+        ))
+    }
 }
 
 /// Notes where each selected source's backfill starts, and writes it before any source runs, so
 /// a fetch that stops before it publishes its window leaves the next one reading from there.
-/// Returns the state and each source's span; a backfill that reaches further than configured
-/// gets a warning.
+/// A source no longer configured keeps its start, as it keeps its cursors, for when it returns.
 fn begin_backfills<'a>(
     context: &'a Context,
     data: &DataDir,
     options: &FetchOptions,
-    warnings: &mut Vec<String>,
-) -> Result<(backfill::Backfills, Vec<(&'a SourceConfig, Span)>)> {
-    let mut backfills = backfill::load(&data.backfill())?;
-    backfills
-        .sources
-        .retain(|id, _| context.config.sources.iter().any(|spec| spec.id == *id));
-    let mut reads = Vec::new();
-    for spec in context
+    backfills: &mut backfill::Backfills,
+) -> Result<Vec<(&'a SourceConfig, Span)>> {
+    let reads = context
         .config
         .sources
         .iter()
         .filter(|spec| options.only.is_empty() || options.only.contains(&spec.id))
-    {
-        let reach = backfills.begin(
-            &spec.id,
-            options.window_end,
-            context.config.ingest.backfill_hours,
-        );
-        if let Some(start) = reach.unstored_since {
-            warnings.push(format!(
-                "source {}: its backfill reaches back to {}, where a read an earlier fetch did not store began",
-                spec.id,
-                start.to_rfc3339_opts(SecondsFormat::Secs, true)
-            ));
-        }
-        let span = Span {
-            window_end: options.window_end,
-            backfill_hours: reach.hours,
-        };
-        reads.push((spec, span));
-    }
-    backfill::write(&data.backfill(), &backfills)?;
-    Ok((backfills, reads))
+        .map(|spec| {
+            let reach = backfills.begin(
+                &spec.id,
+                options.window_end,
+                context.config.ingest.backfill_hours,
+            );
+            let span = Span {
+                window_end: options.window_end,
+                backfill_hours: reach.hours,
+                unstored_since: reach.unstored_since,
+            };
+            (spec, span)
+        })
+        .collect();
+    backfill::write(&data.backfill(), backfills)?;
+    Ok(reads)
 }
 
 fn run_source(
@@ -491,4 +499,14 @@ struct SourceRun {
     cursors: BTreeMap<String, String>,
     discovered: Vec<source::DiscoveredStream>,
     outcome: SourceOutcome,
+}
+
+impl SourceRun {
+    /// Whether a stream of this run had no cursor, and so read the backfill.
+    fn read_backfill(&self) -> bool {
+        self.outcome
+            .streams
+            .keys()
+            .any(|stream| !self.cursors.contains_key(stream))
+    }
 }
