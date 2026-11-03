@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 
 use anyhow::{bail, Context as _, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt as _;
 
 use crate::atomic::write_replace;
+use crate::backfill;
 use crate::config::{DataDir, SourceConfig, StateDir};
 use crate::context::Context;
 use crate::cursor::{self, AdvanceOutcome, Cursors};
@@ -81,18 +82,14 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
     let schemes = source::configured_schemes(&context.config.sources)?;
     let generated_at = Utc::now();
     let mut collected = Collected::default();
+    let (mut backfills, reads) = begin_backfills(context, data, options, &mut collected.warnings)?;
 
-    for spec in context
-        .config
-        .sources
-        .iter()
-        .filter(|spec| options.only.is_empty() || options.only.contains(&spec.id))
-    {
+    for (spec, span) in reads {
         lease
             .as_ref()
             .map_or(Ok(()), Lease::check)
             .with_context(|| format!("before fetching {}", spec.id))?;
-        let result = run_source(context, data, spec, options, &cursors, &schemes, &exclusion)?;
+        let result = run_source(context, data, spec, &span, &cursors, &schemes, &exclusion)?;
         collect_source_result(spec, result, &mut collected, &store, &exclusion)?;
     }
 
@@ -155,6 +152,10 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
         .map_or(Ok(()), Lease::check)
         .context("before moving the cursors")?;
     let cursors = cursor::advance(&data.cursors(), &window.id, &manifest)?;
+    // A source whose backfill reads are all stored reads the configured backfill next time.
+    if backfills.finish(&manifest) {
+        backfill::write(&data.backfill(), &backfills)?;
+    }
     if let Some(lease) = lease {
         // The next run starts at once rather than waiting out the takeover window; a failure
         // here costs that run the wait and nothing else.
@@ -202,11 +203,60 @@ fn validate_selection(sources: &[SourceConfig], only: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Where one source's read in this fetch ends, and how many hours back its backfill reaches.
+struct Span {
+    window_end: DateTime<Utc>,
+    backfill_hours: u32,
+}
+
+/// Notes where each selected source's backfill starts, and writes it before any source runs, so
+/// a fetch that stops before it publishes its window leaves the next one reading from there.
+/// Returns the state and each source's span; a backfill that reaches further than configured
+/// gets a warning.
+fn begin_backfills<'a>(
+    context: &'a Context,
+    data: &DataDir,
+    options: &FetchOptions,
+    warnings: &mut Vec<String>,
+) -> Result<(backfill::Backfills, Vec<(&'a SourceConfig, Span)>)> {
+    let mut backfills = backfill::load(&data.backfill())?;
+    backfills
+        .sources
+        .retain(|id, _| context.config.sources.iter().any(|spec| spec.id == *id));
+    let mut reads = Vec::new();
+    for spec in context
+        .config
+        .sources
+        .iter()
+        .filter(|spec| options.only.is_empty() || options.only.contains(&spec.id))
+    {
+        let reach = backfills.begin(
+            &spec.id,
+            options.window_end,
+            context.config.ingest.backfill_hours,
+        );
+        if let Some(start) = reach.unstored_since {
+            warnings.push(format!(
+                "source {}: its backfill reaches back to {}, where a read an earlier fetch did not store began",
+                spec.id,
+                start.to_rfc3339_opts(SecondsFormat::Secs, true)
+            ));
+        }
+        let span = Span {
+            window_end: options.window_end,
+            backfill_hours: reach.hours,
+        };
+        reads.push((spec, span));
+    }
+    backfill::write(&data.backfill(), &backfills)?;
+    Ok((backfills, reads))
+}
+
 fn run_source(
     context: &Context,
     data: &DataDir,
     spec: &SourceConfig,
-    options: &FetchOptions,
+    span: &Span,
     cursors: &Cursors,
     schemes: &crate::pointer::Schemes,
     exclusion: &Exclusion,
@@ -237,8 +287,8 @@ fn run_source(
             scheme,
         },
         config: source::config_json(spec)?,
-        window_end: options.window_end,
-        backfill_hours: context.config.ingest.backfill_hours,
+        window_end: span.window_end,
+        backfill_hours: span.backfill_hours,
         cursors: requested_cursors.clone(),
         discovered: discovered.clone(),
         state_dir,

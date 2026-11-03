@@ -324,6 +324,198 @@ fn fetch_advances_ok_streams_only() -> Result<()> {
     Ok(())
 }
 
+/// The `backfill_hours` the source was asked for in a fetch ending at `window_end`.
+fn requested_backfill(
+    tree: &Path,
+    state: &Path,
+    window_end: &str,
+    environment: &[(&str, &str)],
+) -> Result<u64> {
+    let request = state
+        .parent()
+        .context("the state directory has a parent")?
+        .join(format!("request-{window_end}.json"));
+    let mut fetch = command(tree, state)?;
+    fetch
+        .args(["fetch", "--window-end", window_end])
+        .env("ECHO_REQUEST_OUT", &request);
+    for (name, value) in environment {
+        fetch.env(name, value);
+    }
+    fetch.output().context("running ctx fetch")?;
+    let request: Value = serde_json::from_slice(
+        &fs::read(&request).with_context(|| format!("reading {}", request.display()))?,
+    )?;
+    request
+        .get("backfill_hours")
+        .and_then(Value::as_u64)
+        .context("the request names its backfill hours")
+}
+
+#[test]
+fn a_stream_whose_first_read_failed_reads_its_next_backfill_from_where_that_began() -> Result<()> {
+    let root = scratch("backfill-failed-stream")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    // C0EXAMPLE02 has no cursor, so it reads the backfill window, from 2026-10-24T18:00:00Z;
+    // it fails, so nothing of that read is stored.
+    let first = requested_backfill(
+        &tree,
+        &state,
+        "2026-10-25T18:00:00Z",
+        &[("ECHO_FAIL_STREAM", "C0EXAMPLE02")],
+    )?;
+    // Three hours later, a window of the configured length would start at 21:00 and step over
+    // the three hours before it; the backfill reaches back to 18:00 the day before.
+    let second = requested_backfill(&tree, &state, "2026-10-25T21:00:00Z", &[])?;
+    // That read was stored, so the next fetch reads the configured window again.
+    let third = requested_backfill(&tree, &state, "2026-10-25T22:00:00Z", &[])?;
+    remove_scratch(&root)?;
+
+    assert_eq!((first, second, third), (24, 27, 24));
+    Ok(())
+}
+
+#[test]
+fn a_backfill_reaches_back_to_the_first_read_that_was_not_stored() -> Result<()> {
+    let root = scratch("backfill-repeated-failure")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    let failing = [("ECHO_FAIL_STREAM", "C0EXAMPLE02")];
+    let first = requested_backfill(&tree, &state, "2026-10-25T18:00:00Z", &failing)?;
+    let second = requested_backfill(&tree, &state, "2026-10-25T19:00:00Z", &failing)?;
+    // Half an hour more than a whole hour: the window reaches back past that start rather than
+    // short of it.
+    let third = requested_backfill(&tree, &state, "2026-10-25T20:30:00Z", &[])?;
+    remove_scratch(&root)?;
+
+    assert_eq!((first, second, third), (24, 25, 27));
+    Ok(())
+}
+
+#[test]
+fn a_source_that_failed_before_naming_its_streams_reads_its_next_backfill_from_where_it_began(
+) -> Result<()> {
+    let root = scratch("backfill-no-hello")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    requested_backfill(
+        &tree,
+        &state,
+        "2026-10-25T18:00:00Z",
+        &[("ECHO_NO_HELLO", "1")],
+    )?;
+    let second = requested_backfill(&tree, &state, "2026-10-25T20:00:00Z", &[])?;
+    remove_scratch(&root)?;
+
+    assert_eq!(second, 26);
+    Ok(())
+}
+
+#[test]
+fn the_fetch_after_an_interrupted_one_reads_its_backfill_from_where_that_began() -> Result<()> {
+    let root = scratch("backfill-interrupted")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    let request = root.join("interrupted-request.json");
+    let mut interrupted = command(&tree, &state)?;
+    interrupted
+        .args(["fetch", "--window-end", "2026-10-25T18:00:00Z"])
+        .env("ECHO_REQUEST_OUT", &request)
+        .env("ECHO_SLEEP", "60");
+    let mut interrupted = interrupted.spawn().context("starting fetch")?;
+    wait_for_file(&request)?;
+    interrupted.kill().context("stopping the fetch")?;
+    let _ = interrupted
+        .wait()
+        .context("waiting for the stopped fetch")?;
+    let next = requested_backfill(&tree, &state, "2026-10-25T19:00:00Z", &[])?;
+    remove_scratch(&root)?;
+
+    assert_eq!(next, 25);
+    Ok(())
+}
+
+#[test]
+fn a_failed_stream_that_has_a_cursor_leaves_the_backfill_alone() -> Result<()> {
+    let root = scratch("backfill-cursor-failure")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    requested_backfill(&tree, &state, "2026-10-25T18:00:00Z", &[])?;
+    // C0EXAMPLE02 holds its cursor, so the next fetch reads on from it, not from the backfill.
+    requested_backfill(
+        &tree,
+        &state,
+        "2026-10-25T19:00:00Z",
+        &[("ECHO_FAIL_STREAM", "C0EXAMPLE02")],
+    )?;
+    let third = requested_backfill(&tree, &state, "2026-10-25T21:00:00Z", &[])?;
+    remove_scratch(&root)?;
+
+    assert_eq!(third, 24);
+    Ok(())
+}
+
+#[test]
+fn a_source_no_longer_configured_leaves_no_backfill_behind() -> Result<()> {
+    let root = scratch("backfill-removed-source")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    requested_backfill(
+        &tree,
+        &state,
+        "2026-10-25T18:00:00Z",
+        &[("ECHO_FAIL_STREAM", "C0EXAMPLE02")],
+    )?;
+    let held: Value = serde_json::from_slice(&fs::read(state.join("example/backfill.json"))?)?;
+    fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"other\"\nkind = \"echo\"\nscheme = \"echo\"\nstreams = [\"C0EXAMPLE01\"]\n",
+    )?;
+    fetch(&tree, &state, "2026-10-25T19:00:00Z")?;
+    let left: Value = serde_json::from_slice(&fs::read(state.join("example/backfill.json"))?)?;
+    remove_scratch(&root)?;
+
+    assert_eq!(
+        held.pointer("/sources/echo").and_then(Value::as_str),
+        Some("2026-10-24T18:00:00Z")
+    );
+    assert_eq!(left.pointer("/sources"), Some(&serde_json::json!({})));
+    Ok(())
+}
+
+#[test]
+fn a_widened_backfill_is_named_in_the_window() -> Result<()> {
+    let root = scratch("backfill-warning")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    requested_backfill(
+        &tree,
+        &state,
+        "2026-10-25T18:00:00Z",
+        &[("ECHO_FAIL_STREAM", "C0EXAMPLE02")],
+    )?;
+    let second = fetch(&tree, &state, "2026-10-25T21:00:00Z")?;
+    let window = window_id(&second)?;
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(state.join(format!("example/windows/{window}/manifest.json")))
+            .context("reading the window manifest")?,
+    )?;
+    remove_scratch(&root)?;
+
+    let warnings = manifest
+        .get("warnings")
+        .and_then(Value::as_array)
+        .context("the manifest lists its warnings")?;
+    assert!(
+        warnings.iter().filter_map(Value::as_str).any(|warning| {
+            warning.starts_with("source echo:") && warning.contains("2026-10-24T18:00:00Z")
+        }),
+        "{warnings:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn an_older_window_end_does_not_move_a_newer_cursor() -> Result<()> {
     let root = scratch("older-window-end")?;

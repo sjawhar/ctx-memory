@@ -441,6 +441,13 @@ impl DataDir {
         self.root.join("cursors.json")
     }
 
+    /// Where each source's backfill starts while an earlier fetch's read of it is not stored
+    /// ([`crate::backfill`]).
+    #[must_use]
+    pub fn backfill(&self) -> PathBuf {
+        self.root.join("backfill.json")
+    }
+
     #[must_use]
     pub fn marker(&self) -> PathBuf {
         self.root.join("marker.json")
