@@ -400,3 +400,203 @@ fn a_refused_renewal_says_so_in_one_line() -> Result<()> {
     );
     Ok(())
 }
+
+/// A `ctx serve` with the lease environment whose standard error goes to a file, as Cloud
+/// Logging collects it.
+struct Logged {
+    child: std::process::Child,
+    tailnet: String,
+    log: PathBuf,
+    client: reqwest::blocking::Client,
+}
+
+/// One answer: its status, its `Retry-After` header when it has one, and its body.
+struct Answer {
+    status: u16,
+    retry_after: Option<String>,
+    body: Value,
+}
+
+impl Logged {
+    fn start(tree: &Path, extra: &[&str], cloud: &Cloud) -> Result<Self> {
+        let log = tree
+            .parent()
+            .context("the fixture has a root")?
+            .join("serve.log");
+        let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+        let mut child = binary()
+            .args([
+                "--memory",
+                tree_text,
+                "serve",
+                "--tailnet-listen",
+                "127.0.0.1:0",
+            ])
+            .args(extra)
+            .envs(support::tree_env(tree)?)
+            .envs(cloud.environment())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&log)?)
+            .spawn()
+            .context("starting ctx serve")?;
+        let stdout = child.stdout.take().context("ctx serve has no stdout")?;
+        let lines = support::read_lines(stdout);
+        let tailnet = loop {
+            let Ok(line) = lines.recv() else {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("ctx serve stopped before it listened");
+            };
+            if let Some(address) = line.strip_prefix("tailnet-listen ") {
+                break address.trim().to_owned();
+            }
+        };
+        Ok(Self {
+            child,
+            tailnet,
+            log,
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()?,
+        })
+    }
+
+    fn post(&self, path: &str, body: &Value) -> Result<Answer> {
+        let response = self
+            .client
+            .post(format!("http://{}{path}", self.tailnet))
+            .header("Tailscale-User-Login", "ada@example.com")
+            .json(body)
+            .send()?;
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()?;
+        Ok(Answer {
+            status,
+            retry_after,
+            body: response.json()?,
+        })
+    }
+
+    /// Stops the server and returns what it wrote on standard error.
+    fn stop_and_read_log(mut self) -> Result<String> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Ok(std::fs::read_to_string(&self.log)?)
+    }
+}
+
+impl Drop for Logged {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A rollout starts the new copy before the old one has given the write lease up: on Cloud Run
+/// the old copy's container may be stopped before it frees the lease, which the new copy then
+/// waits out for up to 120 seconds. Each write it refused there printed `write failed:`, and
+/// the alert that matches that line paged at every deploy. A copy in its first minutes that
+/// finds another copy holding the lease defers the write instead: `503` with `Retry-After`,
+/// the seconds until it may take the lease over, and one `write deferred:` line, for a record
+/// write and a marker advance alike.
+#[test]
+fn a_new_copy_defers_a_write_while_the_copy_it_replaces_holds_the_lease() -> Result<()> {
+    let cloud = Cloud::start()?;
+    let tree = fixture_clone("lease-handover-deferred")?;
+    let window = fetch_window(&tree)?;
+    let holder = Lease::acquire(BUCKET, "server", "server@old-copy")?;
+    let outcome = (|| -> Result<(Answer, Answer, String)> {
+        let server = Logged::start(&tree, &["--pull-interval", "3600"], &cloud)?;
+        let put = server.post(
+            "/v1/records/put",
+            &json!({ "path": "decisions/cadence.md", "content": cited_record(), "session": "s" }),
+        )?;
+        let advance = server.post(
+            "/v1/marker/advance",
+            &json!({ "window": window, "session": "s" }),
+        )?;
+        Ok((put, advance, server.stop_and_read_log()?))
+    })();
+    let held = holder.check();
+    remove_fixture(&tree)?;
+
+    let (put, advance, logged) = outcome?;
+    held?;
+    for (route, answer) in [("/v1/records/put", &put), ("/v1/marker/advance", &advance)] {
+        assert_eq!(answer.status, 503, "{route}: {}", answer.body);
+        assert!(
+            answer.body.to_string().contains("server@old-copy"),
+            "{route}: the answer does not name the holder: {}",
+            answer.body
+        );
+        let pause: u64 = answer
+            .retry_after
+            .as_deref()
+            .with_context(|| format!("{route} was answered with no Retry-After: {logged}"))?
+            .parse()?;
+        assert!(
+            (1..=120).contains(&pause),
+            "{route}: Retry-After is not the seconds until a takeover: {pause}"
+        );
+        assert!(
+            logged
+                .lines()
+                .any(|line| line.starts_with(&format!("write deferred: {route} 503 "))),
+            "{route} logged no write deferred: line: {logged}"
+        );
+    }
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line.starts_with("write failed: ")),
+        "a handover was logged as a failed write: {logged}"
+    );
+    Ok(())
+}
+
+/// Past its first minutes, a copy that finds another copy holding the lease is one of two live
+/// writers, which is a fault: the write fails as it always did, `503` with no `Retry-After`
+/// and a `write failed:` line for the alert.
+#[test]
+fn a_copy_past_its_handover_fails_a_write_another_copy_holds_the_lease_for() -> Result<()> {
+    let cloud = Cloud::start()?;
+    let tree = fixture_clone("lease-handover-over")?;
+    fetch_window(&tree)?;
+    let holder = Lease::acquire(BUCKET, "server", "server@old-copy")?;
+    let outcome = (|| -> Result<(Answer, String)> {
+        let server = Logged::start(
+            &tree,
+            &["--pull-interval", "3600", "--handover", "0"],
+            &cloud,
+        )?;
+        let put = server.post(
+            "/v1/records/put",
+            &json!({ "path": "decisions/cadence.md", "content": cited_record(), "session": "s" }),
+        )?;
+        Ok((put, server.stop_and_read_log()?))
+    })();
+    let held = holder.check();
+    remove_fixture(&tree)?;
+
+    let (put, logged) = outcome?;
+    held?;
+    assert_eq!(put.status, 503, "{}", put.body);
+    assert_eq!(put.retry_after, None, "a fault was answered as a handover");
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.starts_with("write failed: /v1/records/put 503 ")),
+        "no write failed: line: {logged}"
+    );
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line.starts_with("write deferred: ")),
+        "a fault was logged as a handover: {logged}"
+    );
+    Ok(())
+}
