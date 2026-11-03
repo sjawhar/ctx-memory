@@ -434,6 +434,10 @@ struct RulesPayload<'a> {
     path: String,
     bytes: usize,
     text: &'a str,
+    /// The record the rules page names in its `cycle_log` field as the tree's cycle log, where
+    /// each ingest cycle writes its entry, so the runner can tell that entry from the records a
+    /// cycle wrote for its windows; `null` when the page names none.
+    cycle_log: Option<&'a str>,
     /// The tree's own record schemas, so a writer sees which fields its record type requires
     /// before it writes, rather than after the server refuses the write.
     schemas: Vec<records_schema::SchemaFile>,
@@ -1030,6 +1034,7 @@ fn run_rules(run: &mut Run<'_, '_>) -> Result<Outcome> {
         path: document.rel.to_string_lossy().into_owned(),
         bytes: document.raw.len(),
         text: &document.raw,
+        cycle_log: document.front.extra_str("cycle_log"),
         schemas: records_schema::files(&run.context.tree)?,
     };
     // The rules page and each schema are the tree's own text, printed without the control

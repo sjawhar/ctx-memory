@@ -36,6 +36,7 @@ serde-saphyr = "2"
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "signal", "time", "sync", "macros"] }
 toml = "0.8"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }

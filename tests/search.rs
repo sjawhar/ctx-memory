@@ -461,6 +461,71 @@ fn search_does_not_join_numbers_or_two_letter_abbreviations() -> Result<()> {
     Ok(())
 }
 
+/// A name written with an accent in one place and without it in another: the index folds
+/// diacritics in its words, and a joined form folds them too (Unicode NFKD with the combining
+/// marks dropped), so `cafematic` finds a record that writes `Café-Matic`, `Creme-Line` finds
+/// one that writes `Crèmeline`, and each hit counts the query's term as matched.
+#[test]
+fn search_folds_diacritics_in_a_joined_name() -> Result<()> {
+    let root = test_root("joined-diacritics")?;
+    write(
+        &root,
+        "purchases/grinder.md",
+        "---\ntype: purchase\ntitle: Café-Matic 3 grinder\n---\nA burr grinder.\n",
+    )?;
+    write(
+        &root,
+        "purchases/frother.md",
+        "---\ntype: purchase\ntitle: Crèmeline frother\n---\nA milk frother.\n",
+    )?;
+    write(
+        &root,
+        "purchases/toaster.md",
+        "---\ntype: purchase\ntitle: Toaster\n---\nA plain toaster.\n",
+    )?;
+    let joined = ctx(&root, &["search", "cafematic"]);
+    let accented_joined = ctx(&root, &["search", "Cafématic"]);
+    let hyphenated = ctx(&root, &["search", "Creme-Line"]);
+    remove_test_root(&root)?;
+
+    let joined = joined?;
+    assert_eq!(hit_paths(&joined)?, ["purchases/grinder.md"]);
+    assert_eq!(first_hit_terms(&joined), Some((1, 1)));
+    assert_eq!(hit_paths(&accented_joined?)?, ["purchases/grinder.md"]);
+    let hyphenated = hyphenated?;
+    assert_eq!(hit_paths(&hyphenated)?, ["purchases/frother.md"]);
+    assert_eq!(first_hit_terms(&hyphenated), Some((1, 1)));
+    Ok(())
+}
+
+/// Folding a joined name's spelling is for finding it, never for the words searched for: the
+/// tokenizer folds diacritics only in Latin letters, so a joined word of another script is
+/// searched for as written. A Hangul name found by its two halves, and a Cyrillic one written with
+/// `ё` and a hyphen found by its joined form, both still meet their records.
+#[test]
+fn search_joins_names_outside_latin_as_they_are_written() -> Result<()> {
+    let root = test_root("joined-non-latin")?;
+    write(
+        &root,
+        "notes/notebook.md",
+        "---\ntype: note\ntitle: 가나다라 공책\n---\nA notebook.\n",
+    )?;
+    write(
+        &root,
+        "notes/lamp.md",
+        "---\ntype: note\ntitle: Ёжиктуман lamp\n---\nA desk lamp.\n",
+    )?;
+    let spaced = ctx(&root, &["search", "가나 다라"]);
+    let hyphenated = ctx(&root, &["search", "Ёжик-Туман"]);
+    remove_test_root(&root)?;
+
+    assert_eq!(hit_paths(&spaced?)?, ["notes/notebook.md"]);
+    let hyphenated = hyphenated?;
+    assert_eq!(hit_paths(&hyphenated)?, ["notes/lamp.md"]);
+    assert_eq!(first_hit_terms(&hyphenated), Some((1, 1)));
+    Ok(())
+}
+
 /// A query that names a compound beside plain words matches each word as it would alone: the
 /// joined or hyphenated name counts as one matched term, and a record that holds only one of the
 /// query's words is still found, as one term of two.

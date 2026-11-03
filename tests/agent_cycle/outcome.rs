@@ -96,6 +96,9 @@ struct Around<'a> {
     /// Every `ctx marker show` answers, with status 0, text that is not JSON once a session has
     /// run.
     marker_unreadable: bool,
+    /// What `ctx rules --json` answers: a rules page that names no cycle log when `None`, and a
+    /// read that fails when empty.
+    rules: Option<&'a str>,
     /// A capture beside the retry's transcript directory when the runner starts, as an earlier
     /// attempt of the same execution whose capture no seal could move leaves it.
     old_retry_capture: Option<&'a str>,
@@ -172,6 +175,9 @@ fn stage(dir: &Path, attempts: &[Attempt<'_>], around: &Around<'_>) -> Result<()
     if around.marker_unreadable {
         std::fs::write(dir.join("marker-unreadable"), "")?;
     }
+    if let Some(rules) = around.rules {
+        std::fs::write(dir.join("rules"), rules)?;
+    }
     let first_pending = pending_answer(&[(FIRST_PENDING, 1)]);
     let reads = if around.pending.is_empty() {
         &[first_pending.as_str()][..]
@@ -194,15 +200,10 @@ fn run_after_launch(
 ) -> Result<Verdict> {
     stage(dir, attempts, around)?;
     // What the script holds when its sessions start, and stand-ins for what reaches past this
-    // machine: ctx-agent's checks pass, chown changes nothing, `ctx pending` answers what
-    // pending-<sessions run so far> holds (pending-0 when there is no such file; an empty file
-    // fails the read), and `ctx marker show` answers MARKER_BEFORE, or what marker-0 names, until
-    // a session whose marker-<session> names the window it moved the marker to has run (an empty
-    // name is no marker), fails once a session has run when marker-fails is there, and answers
-    // text that is not JSON once a session has run when marker-unreadable is there. A session
-    // leaves its events in the capture beside its transcript directory, where the real
-    // run_session's omp writes them. `timeout` runs the command it is handed, so a context read
-    // reaches the `ctx` stand-in and not a real one.
+    // machine: ctx-agent's checks pass, chown changes nothing, `ctx` answers as `ctx_stand_in`
+    // says, and a session leaves its events in the capture beside its transcript directory, where
+    // the real run_session's omp writes them. `timeout` runs the command it is handed, so a
+    // context read reaches the `ctx` stand-in and not a real one.
     let prelude = format!(
         r#"set -eu
 {refuse}
@@ -229,37 +230,7 @@ pending="$(cat "$VERDICT_DIR/pending-0")"
 as_agent_user() {{ case "$*" in *context.json*) return 1 ;; esac; }}
 chown() {{ :; }}
 timeout() {{ shift; "$@"; }}
-ctx() {{
-	ran="$(cat "$VERDICT_DIR/sessions" 2>/dev/null || echo 0)"
-	case "$*" in
-	*pending*)
-		answer="$VERDICT_DIR/pending-$ran"
-		[ -f "$answer" ] || answer="$VERDICT_DIR/pending-0"
-		if [ ! -s "$answer" ]; then
-			printf '%s\n' '{{"error":"the server could not be reached"}}'
-			return 1
-		fi
-		cat "$answer"
-		return
-		;;
-	esac
-	if [ "$ran" -gt 0 ] && [ -f "$VERDICT_DIR/marker-fails" ]; then
-		printf '%s\n' '{{"error":"the server could not be reached"}}'
-		return 3
-	fi
-	if [ "$ran" -gt 0 ] && [ -f "$VERDICT_DIR/marker-unreadable" ]; then echo 'Bad Gateway'; return 0; fi
-	marker={MARKER_BEFORE}
-	session=0
-	while [ "$session" -le "$ran" ]; do
-		[ ! -f "$VERDICT_DIR/marker-$session" ] || marker="$(cat "$VERDICT_DIR/marker-$session")"
-		session=$((session + 1))
-	done
-	if [ -z "$marker" ]; then
-		printf '%s\n' '{{"version":1,"command":"marker show","data":{{"marker":null}}}}'
-	else
-		printf '{{"version":1,"command":"marker show","data":{{"marker":{{"version":1,"window":"%s"}}}}}}\n' "$marker"
-	fi
-}}
+{ctx}
 run_session() {{
 	attempt=$(($(cat "$VERDICT_DIR/sessions" 2>/dev/null || echo 0) + 1))
 	echo "$attempt" >"$VERDICT_DIR/sessions"
@@ -278,6 +249,7 @@ run_session() {{
         prepare_context = script_function("prepare_context")?,
         shell_rule = script_function("shell_rule")?,
         cycle_prompt = script_function("cycle_prompt")?,
+        ctx = ctx_stand_in(),
         pass = pass.unwrap_or_default(),
     );
     let output = Command::new("sh")
@@ -300,6 +272,71 @@ run_session() {{
         )
         .unwrap_or_default(),
     })
+}
+
+/// The `ctx` the runner's post-session code calls, as a shell function. `ctx pending` answers
+/// what `pending-<sessions run so far>` holds (`pending-0` when there is no such file; an empty
+/// file fails the read). `ctx rules` answers what the `rules` file holds (a page that names no
+/// cycle log when there is none; an empty file fails the read). `ctx marker show` answers
+/// [`MARKER_BEFORE`], or what `marker-0` names, until a session whose `marker-<session>` names the
+/// window it moved the marker to has run (an empty name is no marker); once a session has run, it
+/// fails when `marker-fails` is there and answers text that is not JSON when `marker-unreadable`
+/// is there.
+fn ctx_stand_in() -> String {
+    format!(
+        r#"ctx() {{
+	ran="$(cat "$VERDICT_DIR/sessions" 2>/dev/null || echo 0)"
+	case "$*" in
+	*pending*)
+		answer="$VERDICT_DIR/pending-$ran"
+		[ -f "$answer" ] || answer="$VERDICT_DIR/pending-0"
+		if [ ! -s "$answer" ]; then
+			printf '%s\n' '{{"error":"the server could not be reached"}}'
+			return 1
+		fi
+		cat "$answer"
+		return
+		;;
+	*rules*)
+		if [ ! -f "$VERDICT_DIR/rules" ]; then
+			printf '%s\n' '{{"version":1,"command":"rules","data":{{"path":"rules.md","cycle_log":null}}}}'
+		elif [ ! -s "$VERDICT_DIR/rules" ]; then
+			printf '%s\n' '{{"error":"the server could not be reached"}}'
+			return 1
+		else
+			cat "$VERDICT_DIR/rules"
+		fi
+		return
+		;;
+	esac
+	if [ "$ran" -gt 0 ] && [ -f "$VERDICT_DIR/marker-fails" ]; then
+		printf '%s\n' '{{"error":"the server could not be reached"}}'
+		return 3
+	fi
+	if [ "$ran" -gt 0 ] && [ -f "$VERDICT_DIR/marker-unreadable" ]; then echo 'Bad Gateway'; return 0; fi
+	marker={MARKER_BEFORE}
+	session=0
+	while [ "$session" -le "$ran" ]; do
+		[ ! -f "$VERDICT_DIR/marker-$session" ] || marker="$(cat "$VERDICT_DIR/marker-$session")"
+		session=$((session + 1))
+	done
+	if [ -z "$marker" ]; then
+		printf '%s\n' '{{"version":1,"command":"marker show","data":{{"marker":null}}}}'
+	else
+		printf '{{"version":1,"command":"marker show","data":{{"marker":{{"version":1,"window":"%s"}}}}}}\n' "$marker"
+	fi
+}}"#
+    )
+}
+
+/// A `ctx rules --json` answer whose rules page names `cycle_log` as its cycle log (none when
+/// `None`), in the shape the CLI prints it.
+fn rules_naming(cycle_log: Option<&str>) -> String {
+    json!({
+        "version": 1, "command": "rules",
+        "data": {"path": "rules.md", "bytes": 0, "text": "", "cycle_log": cycle_log, "schemas": []}
+    })
+    .to_string()
 }
 
 /// omp's stdout for a session whose messages are `messages`, one event per line, as the pinned
@@ -428,13 +465,26 @@ fn refused() -> String {
 /// the pinned omp writes them (`live_session.rs` reads a live session's). A write the server
 /// refused fails with its findings, as runner/ctx-record.ts reports one.
 pub(crate) fn wrote(calls: &[(&str, bool)], last: Value) -> String {
+    let calls: Vec<(&str, &[&str], bool)> = calls
+        .iter()
+        .map(|&(tool, accepted)| (tool, &["decisions/example.md"][..], accepted))
+        .collect();
+    wrote_to(&calls, last)
+}
+
+/// [`wrote`], where each call names the record paths it writes, or the one it removes.
+pub(crate) fn wrote_to(calls: &[(&str, &[&str], bool)], last: Value) -> String {
     let mut messages = vec![prompt()];
-    for (index, &(tool, accepted)) in calls.iter().enumerate() {
+    for (index, &(tool, paths, accepted)) in calls.iter().enumerate() {
         let id = format!("toolu_{index}");
         let arguments = if tool == "ctx_record_rm" {
-            json!({"path": "decisions/example.md"})
+            json!({"path": paths.first()})
         } else {
-            json!({"records": [{"path": "decisions/example.md", "content": "---\ntype: decision\n---\n"}]})
+            let records: Vec<Value> = paths
+                .iter()
+                .map(|path| json!({"path": path, "content": "---\ntype: decision\n---\n"}))
+                .collect();
+            json!({"records": records})
         };
         let (text, details) = if accepted {
             ("stored", json!({"exitCode": 0}))
@@ -1021,20 +1071,22 @@ const FIRST: &str = "20261102T080000Z-0001";
 const SECOND: &str = "20261102T090000Z-0002";
 const THIRD: &str = "20261102T100000Z-0003";
 
-/// How many record writes the server accepted in the session whose omp stdout is `events`, as
-/// `run-cycle.sh` counts them: its `record_writes` function, run by `sh` over the capture.
-pub(crate) fn record_writes(events: &str) -> Result<usize> {
+/// How many record writes the server accepted in the session whose omp stdout is `events`, less
+/// those that wrote only `cycle_log` (no cycle log when empty), as `run-cycle.sh` counts them: its
+/// `record_writes` function, run by `sh` over the capture.
+pub(crate) fn record_writes(events: &str, cycle_log: &str) -> Result<usize> {
     let dir = scratch("record-writes")?;
     let capture = dir.join("events.json");
     std::fs::write(&capture, events)?;
     let output = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "set -eu\n{}\nrecord_writes \"$1\"",
+            "set -eu\n{}\nrecord_writes \"$1\" \"$2\"",
             script_function("record_writes")?
         ))
         .arg("sh")
         .arg(&capture)
+        .arg(cycle_log)
         .output();
     remove_scratch(&dir)?;
     let output = output.context("running run-cycle.sh's record_writes")?;
@@ -1403,6 +1455,101 @@ fn a_cycle_on_a_tree_with_no_marker_is_judged_by_where_the_marker_ends() -> Resu
                 verdict.stderr
             );
         }
+    }
+    Ok(())
+}
+
+/// A rules page that names a cycle log has the cycle write an entry there every cycle (the ingest
+/// skill's step 7), so a write to the cycle log says nothing about the windows. A cycle whose only
+/// accepted writes put or remove the cycle log is judged as one that wrote nothing, and fails when
+/// the marker passed a window with new messages. A write to any other record, alone or in one
+/// batch with the log, still counts; so does a write to that path in a tree whose rules page names
+/// no cycle log, or whose rules page the runner could not read, which it says in one line.
+#[test]
+fn writes_to_the_cycle_log_alone_do_not_count_as_records_written() -> Result<()> {
+    const LOG: &str = "logs/cycles.md";
+    let pending = pending_answer(&[(FIRST, 4)]);
+    let named = rules_naming(Some(LOG));
+    let unnamed = rules_naming(None);
+    let done = || answer("Handled 1 window.");
+    let only_log = wrote_to(
+        &[
+            ("ctx_record_put", &[LOG][..], true),
+            ("ctx_record_put", &[LOG][..], true),
+        ],
+        done(),
+    );
+    let removed_log = wrote_to(&[("ctx_record_rm", &[LOG][..], true)], done());
+    let log_and_record = wrote_to(
+        &[
+            ("ctx_record_put", &[LOG][..], true),
+            ("ctx_record_put", &["decisions/a.md"][..], true),
+        ],
+        done(),
+    );
+    let batch = wrote_to(
+        &[("ctx_record_put", &[LOG, "decisions/a.md"][..], true)],
+        done(),
+    );
+    for (events, rules, skipped, what) in [
+        (
+            &only_log,
+            named.as_str(),
+            true,
+            "the cycle wrote only its cycle log",
+        ),
+        (
+            &removed_log,
+            named.as_str(),
+            true,
+            "the cycle only removed its cycle log",
+        ),
+        (
+            &log_and_record,
+            named.as_str(),
+            false,
+            "the cycle wrote its cycle log and a record",
+        ),
+        (
+            &batch,
+            named.as_str(),
+            false,
+            "the cycle wrote its cycle log and a record in one batch",
+        ),
+        (
+            &only_log,
+            unnamed.as_str(),
+            false,
+            "the rules page names no cycle log",
+        ),
+        (
+            &only_log,
+            "",
+            false,
+            "the runner could not read the rules page",
+        ),
+    ] {
+        let verdict = verdict(
+            None,
+            &[Attempt { status: 0, events }],
+            &Around {
+                marker_moves: &[(1, FIRST)],
+                pending: &[&pending],
+                rules: Some(rules),
+                ..Around::default()
+            },
+        )?;
+        if skipped {
+            ensure_failed_saying(&verdict, SKIPPED, what)?;
+        } else {
+            ensure_succeeded(&verdict, what)?;
+        }
+        let unread = verdict.lines_saying("could not read the cycle log").len();
+        ensure!(
+            unread == usize::from(rules.is_empty()),
+            "{what}, and the runner said {unread} time(s) that it could not read the cycle log: {}",
+            verdict.stderr
+        );
     }
     Ok(())
 }

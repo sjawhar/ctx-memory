@@ -182,6 +182,37 @@ fn rules_prints_each_schema_the_tree_owns() -> Result<()> {
     Ok(())
 }
 
+/// A rules page that keeps a cycle log names it in its `cycle_log` field, so a program can tell a
+/// cycle's log entry from its records: `ctx rules --json` reports the field, and `null` when the
+/// page names none.
+#[test]
+fn rules_reports_the_cycle_log_the_rules_page_names() -> Result<()> {
+    let tree = scratch()?;
+    std::fs::write(tree.join("ctx.toml"), "version = 1\n")?;
+    std::fs::write(
+        tree.join("rules.md"),
+        "---\ntype: rules\ncycle_log: logs/cycles.md\n---\n# Rules\n",
+    )?;
+    let named = ctx(&tree, &["--json", "rules"]);
+    std::fs::write(tree.join("rules.md"), "---\ntype: rules\n---\n# Rules\n")?;
+    let unnamed = ctx(&tree, &["--json", "rules"]);
+    remove_scratch(&tree)?;
+
+    let named = named?;
+    assert_eq!(
+        named.pointer("/data/cycle_log"),
+        Some(&serde_json::json!("logs/cycles.md")),
+        "{named}"
+    );
+    let unnamed = unnamed?;
+    assert_eq!(
+        unnamed.pointer("/data/cycle_log"),
+        Some(&serde_json::Value::Null),
+        "{unnamed}"
+    );
+    Ok(())
+}
+
 #[test]
 fn dossier_page_resolves_a_unique_basename() -> Result<()> {
     let tree = fixture_tree()?;

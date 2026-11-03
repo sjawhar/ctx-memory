@@ -315,6 +315,7 @@ fn the_ingest_skill_defines_the_ingest_notes_and_reads_them_in_step_1() -> Resul
         "Its ingest notes are an optional record of any type, such as `ingest-notes.md`, that the \
          rules page links as its ingest notes",
         "Both bind this procedure",
+        "the cycle log the rules page names in its `cycle_log` field",
         "the cycle never writes them",
     ] {
         assert!(

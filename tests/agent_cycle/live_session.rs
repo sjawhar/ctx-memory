@@ -848,12 +848,17 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
     ensure!(!error && text.contains("stored"), "the rm failed: {text}");
     // run-cycle.sh counts the writes the server accepted from omp's own events, to tell a cycle
     // that wrote records from one that moved the marker past its windows without writing any:
-    // the two puts and the removal, not the refused put.
-    let writes = record_writes(&end.stdout)?;
-    ensure!(
-        writes == 3,
-        "run-cycle.sh counts {writes} accepted record writes in this session, not 3"
-    );
+    // the two puts and the removal, not the refused put. A tree whose rules page names
+    // decisions/probe.md as its cycle log has only the batch count: the first put and the removal
+    // touch that path alone, which the runner reads from omp's own tool_execution_start events.
+    for (cycle_log, expected) in [("", 3), ("decisions/probe.md", 1)] {
+        let writes = record_writes(&end.stdout, cycle_log)?;
+        ensure!(
+            writes == expected,
+            "run-cycle.sh counts {writes} accepted record writes in this session with cycle log \
+             {cycle_log:?}, not {expected}"
+        );
+    }
     the_record_tool_calls_are_one_job_log_line_each(&end.stdout)
 }
 
