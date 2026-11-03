@@ -37,6 +37,8 @@ fn tree_with_source(label: &str, stub: &str, extra: &str) -> Result<(PathBuf, St
         ),
     )?;
     std::fs::write(tree.join("ctx.toml"), config)?;
+    // A clone holds no empty directory, so the fixture's `decisions/` is made here.
+    std::fs::create_dir_all(tree.join("decisions"))?;
     std::fs::write(
         tree.join("decisions/tracked.md"),
         "---\ntype: question\nstatus: open\ntitle: Who owns the cadence\nowner: unassigned\ntracked_by:\n  - https://tracker.example/issues/7\n---\nNobody has said.\n",
