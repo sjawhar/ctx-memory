@@ -602,3 +602,24 @@ fn only_a_deferred_write_is_sent_again() -> Result<()> {
     }
     Ok(())
 }
+
+/// `marker advance newest` names no window: the server resolves `newest` when it moves the
+/// marker. Sent again after a pause, it could move the marker past a window the fetch completed
+/// during that pause, which no session read. So a deferred `newest` is never sent again; the
+/// advance fails and the caller names the window it handled.
+#[test]
+fn a_deferred_advance_to_newest_is_not_sent_again() -> Result<()> {
+    let server = FakeHttp::start()?;
+    deferral(&server, "/v1/marker/advance", &["1"])?;
+
+    let client = run_client(
+        &["marker", "advance", "newest"],
+        None,
+        &[("CTX_SERVER", &server.url(""))],
+    )?;
+
+    assert_ne!(client.exit_code, 0, "{}", client.stdout);
+    assert_eq!(server.hits("/v1/marker/advance")?, 1, "{}", client.stderr);
+    assert!(!client.stderr.contains(SENT_AGAIN), "{}", client.stderr);
+    Ok(())
+}

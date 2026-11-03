@@ -170,17 +170,23 @@ impl Client {
 
     /// Moves the agent marker through the server.
     ///
+    /// An advance to a window named by its id is sent again while the server defers it, as a
+    /// record write is. An advance to `newest` is not: `newest` is resolved when the server
+    /// moves the marker, and a window completed during the pause would be passed over unread.
+    ///
     /// # Errors
     ///
     /// Returns an error when the server cannot be reached or refuses the window.
     pub fn marker_advance(&self, window: &str, session: &str) -> Result<marker::Marker> {
-        let (status, value) = self.answer_write(
-            MARKER_ROUTE,
-            &MarkerRequest {
-                window: window.to_owned(),
-                session: Some(session.to_owned()),
-            },
-        )?;
+        let request = MarkerRequest {
+            window: window.to_owned(),
+            session: Some(session.to_owned()),
+        };
+        let (status, value) = if window == "newest" {
+            self.answer(MARKER_ROUTE, &request)?
+        } else {
+            self.answer_write(MARKER_ROUTE, &request)?
+        };
         if !status.is_success() {
             bail!("{}", error_text(status, &value));
         }
@@ -272,11 +278,11 @@ impl Client {
     /// Sends one write and reads the answer, sending it again while the server defers it.
     ///
     /// A server copy that a rollout just started answers a write `503` with `Retry-After` until
-    /// it takes the write lease over from the copy it replaces: it wrote nothing, so the write
-    /// is sent again after that pause. The server defers only from the lease check it makes
-    /// before it touches anything, and a put or a marker advance that already landed changes
-    /// nothing when it is sent again. A write waits at most [`DEFERRAL_BOUND`] in all; a pause
-    /// that would take it past that is not waited, and the write fails, saying why.
+    /// it takes the write lease over from the copy it replaces. It sends that header only from
+    /// the lease check it makes before the write has changed anything, so the write is sent
+    /// again after that pause and is applied once at most. The pauses a write waits add up to
+    /// at most [`DEFERRAL_BOUND`]: a pause that would take it past that is not waited, and the
+    /// write fails, saying why. Each try still has the client's own request timeout.
     fn answer_write(
         &self,
         path: &str,
