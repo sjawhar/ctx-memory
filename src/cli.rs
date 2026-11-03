@@ -137,6 +137,18 @@ pub enum Command {
         #[arg(long, default_value_t = 0)]
         offset: usize,
     },
+    /// Print what the tree's context source says about the subjects one window names.
+    Context {
+        /// The completed window's id.
+        window: String,
+        /// Send at most this many subjects (at most 30): what is left of a cycle's budget.
+        #[arg(long, value_name = "N")]
+        max_subjects: Option<usize>,
+        /// Let the context source run at most this many seconds (at most 60): what is left of
+        /// a cycle's time.
+        #[arg(long, value_name = "SECONDS")]
+        seconds: Option<u64>,
+    },
     /// Inspect or advance the agent marker.
     Marker {
         #[command(subcommand)]
@@ -277,6 +289,7 @@ impl Command {
                 command: CursorCommand::Show,
             } => "cursor show".to_owned(),
             Self::Pending { .. } => "pending".to_owned(),
+            Self::Context { .. } => "context".to_owned(),
             Self::Marker {
                 command: MarkerCommand::Show,
             } => "marker show".to_owned(),
@@ -365,6 +378,14 @@ impl Command {
             Self::Marker {
                 command: MarkerCommand::Advance { window },
             } => Remote::MarkerAdvance { window },
+            Self::Context {
+                window,
+                max_subjects,
+                seconds,
+            } => Remote::Context {
+                window,
+                limits: crate::context_source::Limits::capped(*max_subjects, *seconds),
+            },
             // `--write` replaces the window's `delta.json`, `delta.md` and
             // `open-snapshot.json`, which the fetch job owns.
             Self::Delta { write: true, .. }
@@ -400,6 +421,12 @@ pub enum Remote<'a> {
     Rm { path: &'a str },
     /// `marker advance`: `/v1/marker/advance`, under the server's write lease.
     MarkerAdvance { window: &'a str },
+    /// `context`: `GET /v1/windows/{id}/context`, which only the callers the tree's
+    /// `[context_source]` names may read.
+    Context {
+        window: &'a str,
+        limits: crate::context_source::Limits,
+    },
 }
 
 #[derive(Serialize)]
@@ -625,6 +652,15 @@ fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
         Command::Delta { window, write } => run_delta(run, window.as_deref(), *write),
         Command::Cursor { command } => run_cursor(run, command),
         Command::Pending { limit, offset } => run_pending(run, *limit, *offset),
+        Command::Context {
+            window,
+            max_subjects,
+            seconds,
+        } => run_context(
+            run,
+            window,
+            crate::context_source::Limits::capped(*max_subjects, *seconds),
+        ),
         Command::Marker { command } => run_marker(run, command),
         Command::Resolve { thread, pointers } => run_resolve(run, pointers, *thread),
         Command::Cite {
@@ -930,6 +966,21 @@ fn run_cursor(run: &mut Run<'_, '_>, command: &CursorCommand) -> Result<Outcome>
             })?;
         }
     }
+    Ok(Outcome::Pass)
+}
+
+/// `ctx context <window>` on a tree of this machine's own: the context source runs here, as
+/// the server would run it. A tree with none answers an empty list.
+fn run_context(
+    run: &mut Run<'_, '_>,
+    window: &str,
+    limits: crate::context_source::Limits,
+) -> Result<Outcome> {
+    let payload = crate::context_source::prepare(run.context, window, limits)?.map_or_else(
+        || crate::context_source::WindowContext::empty(window),
+        crate::context_source::read,
+    );
+    run.emit("context", &payload, crate::context_source::print)?;
     Ok(Outcome::Pass)
 }
 

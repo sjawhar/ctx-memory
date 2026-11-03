@@ -18,7 +18,7 @@ use crate::credentials;
 use crate::marker;
 use crate::output::{self, Outcome, Sink};
 use crate::protocol::{
-    Captured, CommandRequest, Committed, DeleteRequest, Draft, MarkerRequest, MarkerResponse,
+    self, Captured, CommandRequest, Committed, DeleteRequest, Draft, MarkerRequest, MarkerResponse,
     PutBatchRequest, PutRequest, RecordFile, Refused, COMMAND_ROUTE, DELETE_ROUTE, MARKER_ROUTE,
     PUT_BATCH_ROUTE, PUT_ROUTE,
 };
@@ -185,6 +185,48 @@ impl Client {
         Ok(answer.marker)
     }
 
+    /// Reads what the server's context source says about one window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server cannot be reached, refuses the caller or the window,
+    /// or answers with something other than a window's context. A context source that failed
+    /// is no error: the answer says it is `unavailable`.
+    pub fn context(
+        &self,
+        window: &str,
+        limits: crate::context_source::Limits,
+    ) -> Result<crate::context_source::WindowContext> {
+        let path = format!(
+            "{}?max_subjects={}&seconds={}",
+            protocol::context_path(window),
+            limits.max_subjects,
+            limits.seconds
+        );
+        let mut request = self.http.get(format!("{}{path}", self.base));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(session) = &self.session {
+            request = request.header(session_id::HEADER, session);
+        }
+        let response = request
+            .send()
+            .with_context(|| format!("asking {}{path}", self.base))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .with_context(|| format!("reading the answer to {path} ({status})"))?;
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            let start: String = text.trim().chars().take(200).collect();
+            bail!("the server answered {status} to {path}, not in JSON: {start}");
+        };
+        if !status.is_success() {
+            bail!("{}", error_text(status, &value));
+        }
+        serde_json::from_value(value).context("decoding the context the server answered with")
+    }
+
     fn write(&self, path: &str, body: &impl Serialize) -> Result<Written> {
         let (status, value) = self.answer(path, body)?;
         if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
@@ -346,6 +388,17 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             output::emit(sink, cli.json, "marker advance", &payload, |_, out| {
                 marker::print(Some(&marker), out)
             })?;
+            Ok(Some(Outcome::Pass))
+        }
+        Remote::Context { window, limits } => {
+            let answer = client()?.context(window, limits)?;
+            output::emit(
+                sink,
+                cli.json,
+                "context",
+                &answer,
+                crate::context_source::print,
+            )?;
             Ok(Some(Outcome::Pass))
         }
         Remote::Forward => {

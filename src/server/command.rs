@@ -363,6 +363,11 @@ fn allowed(argv: &[String], parsed: Option<&cli::Cli>) -> Result<(), String> {
              /v1/records/put-batch and /v1/records/delete, the marker to /v1/marker/advance",
             parsed.command.name()
         )),
+        Remote::Context { .. } => Err(
+            "context has its own endpoint, GET /v1/windows/{id}/context, which only the callers \
+             context_source.callers names may read"
+                .to_owned(),
+        ),
         Remote::Local => Err(format!(
             "`{}` is not a remote command: a remote caller holds no write lease, and this one \
              changes files the fetch job owns or is the server's own work",

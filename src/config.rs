@@ -27,6 +27,10 @@ pub struct TreeConfig {
     pub ingest: IngestConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
+    /// The optional program that says what a system the graph does not ingest, such as an
+    /// issue tracker, knows about the subjects a window names ([`crate::context_source`]).
+    #[serde(default)]
+    pub context_source: Option<ContextSourceConfig>,
     /// Where a credential comes from on a machine without Secret Manager.
     #[serde(default)]
     pub credentials: crate::credentials::Config,
@@ -42,6 +46,7 @@ impl Default for TreeConfig {
             dossier: DossierConfig::default(),
             ingest: IngestConfig::default(),
             sources: Vec::new(),
+            context_source: None,
             credentials: crate::credentials::Config::new(),
         }
     }
@@ -75,6 +80,31 @@ impl Default for IngestConfig {
 
 const fn default_backfill_hours() -> u32 {
     24
+}
+
+/// `[context_source]` in `ctx.toml`: the program the server runs to read a window's context,
+/// and what counts as a subject of a window ([`crate::context_source`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSourceConfig {
+    /// The program and its arguments, run with no shell: the first word is looked up on
+    /// `PATH`.
+    pub command: Vec<String>,
+    /// Who may read a window's context: account emails, or `@domain` for every account in one
+    /// domain, as `--allow-principal` takes them. The ingest cycle's own identity, and nobody
+    /// else's: what the program answers is for the cycle that handles the window.
+    pub callers: Vec<String>,
+    /// A regular expression whose every match in a window's messages is a subject, such as
+    /// an issue key (`\b[A-Z][A-Z0-9]+-[0-9]+\b`).
+    #[serde(default)]
+    pub key_pattern: Option<String>,
+    /// A web address in a window's messages that starts with one of these is a subject.
+    #[serde(default)]
+    pub link_prefixes: Vec<String>,
+    /// Seconds the program may run, at most and by default
+    /// [`crate::context_source::TOTAL_SECONDS`].
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +192,9 @@ impl TreeConfig {
             }
         }
         crate::exclude::Exclusion::new(&self.ingest.exclude).context("ingest.exclude")?;
+        if let Some(source) = &self.context_source {
+            crate::context_source::validate(source).context("context_source")?;
+        }
         Ok(())
     }
 }

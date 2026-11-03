@@ -82,7 +82,10 @@ fn poll_until_ready(
     }
 }
 
-fn read_pipe_until<R>(mut pipe: R, deadline: Instant) -> std::io::Result<Vec<u8>>
+/// Reads `pipe` to its end, or fails once the deadline passes or it has held more than `limit`
+/// bytes. A failure drops the pipe, so a writer that goes on writing gets `EPIPE` rather than
+/// filling this process's memory.
+fn read_pipe_until<R>(mut pipe: R, deadline: Instant, limit: usize) -> std::io::Result<Vec<u8>>
 where
     R: Read + AsRawFd,
 {
@@ -101,15 +104,30 @@ where
         let bytes = chunk.get(..bytes_read).ok_or_else(|| {
             std::io::Error::other("pipe returned more bytes than the read buffer can hold")
         })?;
+        if buffer.len().saturating_add(bytes.len()) > limit {
+            return Err(std::io::Error::other(format!(
+                "output exceeds {limit} bytes"
+            )));
+        }
         buffer.extend_from_slice(bytes);
     }
 }
 
+/// Writes `input` to `pipe` by the deadline. The pipe is made nonblocking first: a write of more
+/// than the pipe holds to a child that never reads would otherwise block past the deadline,
+/// since `POLLOUT` promises room for one byte, not for the whole write.
 fn write_pipe_until<W>(mut pipe: W, input: &[u8], deadline: Instant) -> std::io::Result<()>
 where
     W: Write + AsRawFd,
 {
     let descriptor = pipe.as_raw_fd();
+    // `descriptor` is the open pipe `pipe` owns for this whole call.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
     let mut written = 0;
     while written < input.len() {
         poll_until_ready(descriptor, libc::POLLOUT, deadline)?;
@@ -119,7 +137,18 @@ where
         let remaining = input
             .get(written..)
             .ok_or_else(|| std::io::Error::other("stdin write offset exceeds input length"))?;
-        let just_written = pipe.write(remaining)?;
+        let just_written = match pipe.write(remaining) {
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
         if just_written == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
@@ -234,10 +263,30 @@ pub fn run_with_stdin(
 /// Returns an error when the program cannot start, stdin cannot be written, a pipe cannot be
 /// read, or the process group exceeds the deadline.
 pub fn run_command(
+    command: Command,
+    program: &str,
+    stdin: &[u8],
+    timeout: Duration,
+) -> Result<Output> {
+    run_command_limited(command, program, stdin, timeout, usize::MAX, usize::MAX)
+}
+
+/// Run a prepared command as [`run_command`] does, reading at most `stdout_limit` bytes of its
+/// standard output and `stderr_limit` of its standard error. A stream past its limit is an
+/// error naming the limit: the pipe is closed, so the program stops on its next write or
+/// runs into the deadline.
+///
+/// # Errors
+///
+/// Returns an error when the program cannot start, stdin cannot be written, a pipe cannot be
+/// read or holds more than its limit, or the process group exceeds the deadline.
+pub fn run_command_limited(
     mut command: Command,
     program: &str,
     stdin: &[u8],
     timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
 ) -> Result<Output> {
     let child_stdin = if stdin.is_empty() {
         Stdio::null()
@@ -265,8 +314,8 @@ pub fn run_command(
     let started = Instant::now();
     let deadline =
         run_deadline(started, timeout).ok_or_else(|| anyhow!("{program}: timeout is too large"))?;
-    let stdout_reader = thread::spawn(move || read_pipe_until(stdout_pipe, deadline));
-    let stderr_reader = thread::spawn(move || read_pipe_until(stderr_pipe, deadline));
+    let stdout_reader = thread::spawn(move || read_pipe_until(stdout_pipe, deadline, stdout_limit));
+    let stderr_reader = thread::spawn(move || read_pipe_until(stderr_pipe, deadline, stderr_limit));
     if !stdin.is_empty() {
         let stdin_pipe = child
             .stdin

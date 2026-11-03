@@ -18,6 +18,15 @@ pub const PUT_BATCH_ROUTE: &str = "/v1/records/put-batch";
 pub const DELETE_ROUTE: &str = "/v1/records/delete";
 /// The route that moves the agent marker.
 pub const MARKER_ROUTE: &str = "/v1/marker/advance";
+/// The route that answers what the tree's context source says about one window, with the
+/// window id in place of `{id}`.
+pub const CONTEXT_ROUTE: &str = "/v1/windows/{id}/context";
+
+/// [`CONTEXT_ROUTE`] for one window.
+#[must_use]
+pub fn context_path(window: &str) -> String {
+    CONTEXT_ROUTE.replace("{id}", window)
+}
 
 /// The body of [`COMMAND_ROUTE`].
 #[derive(Debug, Deserialize, Serialize)]

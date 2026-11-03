@@ -166,10 +166,15 @@ impl CycleRig {
     }
 
     fn command(&self) -> Result<Command> {
+        self.command_for(&repo().join("runner/run-cycle.sh"))
+    }
+
+    /// [`Self::command`] running `script` in place of the repository's `run-cycle.sh`.
+    fn command_for(&self, script: &std::path::Path) -> Result<Command> {
         let path = std::env::var("PATH").context("PATH is not set")?;
         let mut command = Command::new("sh");
         command
-            .arg(repo().join("runner/run-cycle.sh"))
+            .arg(script)
             .current_dir(self.workspace())
             .env("PWD", self.workspace())
             .env("PATH", format!("{}:{path}", self.bin.display()))
@@ -1135,4 +1140,272 @@ fn the_runner_refuses_a_maintenance_pass_it_does_not_know() -> Result<()> {
     }
     rig.remove()?;
     result
+}
+
+/// Runs `run-cycle.sh`'s `prepare_context` on a pending answer naming window `w1`, with `ctx`
+/// answering as `ctx_script` and the session user's `test` answering `agent_test`, in a scratch
+/// share. Answers the run, the prompt sentence it set, and the file it wrote.
+fn run_prepare_context(
+    label: &str,
+    ctx_script: &str,
+    agent_test: &str,
+    lock_sessions: bool,
+) -> Result<(std::process::Output, String, Option<String>)> {
+    run_prepare_context_for(label, &["w1"], ctx_script, agent_test, lock_sessions)
+}
+
+/// [`run_prepare_context`] for a pending answer naming `windows`.
+fn run_prepare_context_for(
+    label: &str,
+    windows: &[&str],
+    ctx_script: &str,
+    agent_test: &str,
+    lock_sessions: bool,
+) -> Result<(std::process::Output, String, Option<String>)> {
+    let root = scratch(label)?;
+    let bin = root.join("bin");
+    let sessions = root.join("data/agent-sessions");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir_all(&sessions)?;
+    write_executable(&bin.join("ctx"), ctx_script)?;
+    write_executable(&bin.join("chown"), "#!/bin/sh\nexit 0\n")?;
+    if lock_sessions {
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o555))?;
+    }
+    let pending = serde_json::json!({
+        "ok": true,
+        "data": { "windows": windows.iter().map(|w| serde_json::json!({ "window": w })).collect::<Vec<_>>() },
+    })
+    .to_string();
+    let path = std::env::var("PATH").context("PATH is not set")?;
+    let script = format!(
+        "set -eu\nCTX_DATA_DIR='{}'\nCLOUD_RUN_EXECUTION=ctx-agent-test-1\nAGENT_USER=ctx-agent\n\
+         CONTEXT_BYTES=49152\ncontext_seconds_left=60\ncontext_subjects_left=30\n\
+         context_file=\"$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION.context.json\"\n\
+         as_agent_user() {{ {agent_test}; }}\n{}\n{}\n{}\n\
+         pending='{pending}'\n\
+         prepare_context \"$pending\"\nprintf '%s' \"$context_prompt\"\n",
+        root.join("data").display(),
+        script_function("refuse")?,
+        script_function("write_context")?,
+        script_function("prepare_context")?,
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .output()
+        .context("running prepare_context")?;
+    let written = std::fs::read_to_string(sessions.join("ctx-agent-test-1.context.json")).ok();
+    let prompt = String::from_utf8_lossy(&output.stdout).into_owned();
+    remove_scratch(&root)?;
+    Ok((output, prompt, written))
+}
+
+/// The runner reads each pending window's context with `ctx context` and writes it to a file
+/// beside the session directories, which the prompt then names as quoted material.
+#[test]
+fn the_runner_writes_each_windows_context_for_the_session() -> Result<()> {
+    let (output, prompt, written) = run_prepare_context(
+        "context-written",
+        "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"data\":{\"window\":\"w1\",\"subjects\":[\"K-1\"],\"items\":[{\"ref\":\"K-1\",\"title\":\"t\",\"status\":\"done\",\"links\":[]}]}}'\n",
+        "return 1",
+        false,
+    )?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&written.context("no context file was written")?)?;
+    ensure!(
+        written.pointer("/windows/0/items/0/ref") == Some(&serde_json::json!("K-1")),
+        "the file does not hold the window's items: {written}"
+    );
+    ensure!(
+        prompt.contains("ctx-agent-test-1.context.json") && prompt.contains("quoted material"),
+        "the prompt does not name the context file as quoted material: {prompt}"
+    );
+    Ok(())
+}
+
+/// A context file the session's user could rewrite would let one session feed the next what to
+/// believe, so the runner refuses to start a session beside one.
+#[test]
+fn the_runner_refuses_a_context_file_the_session_can_write() -> Result<()> {
+    let (output, _, _) = run_prepare_context(
+        "context-writable",
+        "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"data\":{\"window\":\"w1\",\"subjects\":[],\"items\":[]}}'\n",
+        "return 0",
+        false,
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        !output.status.success()
+            && stderr.contains("can rewrite")
+            && stderr.contains("context.json"),
+        "the runner went on beside a context file the session can write: {stderr}"
+    );
+    Ok(())
+}
+
+/// Context is optional: a `ctx context` that fails leaves `unavailable` in the file, and a file
+/// that cannot be written leaves the cycle without one. Either way the runner goes on.
+#[test]
+fn the_runner_goes_on_when_context_fails() -> Result<()> {
+    let (failed, prompt, written) =
+        run_prepare_context("context-failed", "#!/bin/sh\nexit 7\n", "return 1", false)?;
+    ensure!(
+        failed.status.success(),
+        "a failed context read failed the cycle: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&written.context("no context file was written")?)?;
+    ensure!(
+        written
+            .pointer("/windows/0/unavailable")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "a failed read did not mark the window unavailable: {written}"
+    );
+    ensure!(
+        !prompt.is_empty(),
+        "the prompt does not name the context file"
+    );
+
+    let (unwritable, prompt, written) = run_prepare_context(
+        "context-unwritable",
+        "#!/bin/sh\nexit 7\n",
+        "return 1",
+        true,
+    )?;
+    ensure!(
+        unwritable.status.success(),
+        "a context file that could not be written failed the cycle: {}",
+        String::from_utf8_lossy(&unwritable.stderr)
+    );
+    ensure!(written.is_none() && prompt.is_empty(), "prompt {prompt:?}");
+    ensure!(
+        String::from_utf8_lossy(&unwritable.stderr).contains("goes on without context"),
+        "the runner did not say it went on without context"
+    );
+    Ok(())
+}
+
+/// The cycle's subjects are one budget across its windows: once a read has used them all, the
+/// windows after it are not read and say why, and the cycle goes on. The file is one line of
+/// compact JSON.
+#[test]
+fn the_runner_spends_one_subject_budget_across_windows() -> Result<()> {
+    let thirty: Vec<String> = (0..30).map(|n| format!("\"K-{n}\"")).collect();
+    let stub = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"window\":\"w\",\"subjects\":[{}],\"items\":[]}}}}'\n",
+        thirty.join(",")
+    );
+    let (output, _, written) =
+        run_prepare_context_for("context-budget", &["w1", "w2"], &stub, "return 1", false)?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written = written.context("no context file was written")?;
+    ensure!(
+        written.trim_end().lines().count() == 1,
+        "the context file is not one line of compact JSON: {written}"
+    );
+    let written: serde_json::Value = serde_json::from_str(&written)?;
+    ensure!(
+        written
+            .pointer("/windows/1/unavailable")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| reason.contains("budget")),
+        "the second window was not marked as past the cycle's budget: {written}"
+    );
+    ensure!(
+        String::from_utf8_lossy(&output.stderr).contains("budget for context is spent"),
+        "the runner did not say the budget was spent"
+    );
+    Ok(())
+}
+
+/// The whole runner, with the session user able to write only its own transcript directory as
+/// the deployment guarantees, reads each window's context with `ctx context` before it starts
+/// omp, and the prompt omp is started with names the context file. The key file goes to the
+/// scratch directory, since the test is not root.
+#[test]
+fn the_runner_reads_context_before_the_session_and_names_it_in_the_prompt() -> Result<()> {
+    let rig = CycleRig::new("context-full-run")?;
+    rig.pretend_root()?;
+    let calls = rig.root.join("calls");
+    write_executable(
+        &rig.bin.join("setpriv"),
+        "#!/bin/sh\nwhile [ \"${1#--}\" != \"$1\" ]; do shift; done\n\
+         case \"$1\" in\n\
+         /usr/bin/test) if [ \"$2\" = -w ]; then case \"$3\" in */agent-sessions/ctx-agent-test-1) exit 0 ;; *) exit 1 ;; esac; fi ;;\n\
+         find) exit 0 ;;\n\
+         esac\nexec \"$@\"\n",
+    )?;
+    write_executable(
+        &rig.bin.join("ctx"),
+        &format!(
+            "#!/bin/sh\nprintf 'ctx %s\\n' \"$*\" >> '{calls}'\ncase \"$*\" in\n\
+             *context*) printf '%s\\n' '{{\"ok\":true,\"data\":{{\"window\":\"20261102T110000Z-0001\",\"subjects\":[\"K-1\"],\"items\":[]}}}}' ;;\n\
+             *pending*) printf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[{{\"window\":\"20261102T110000Z-0001\"}}]}}}}' ;;\n\
+             *) printf '%s\\n' '{{\"ok\":true}}' ;;\nesac\n",
+            calls = calls.display()
+        ),
+    )?;
+    write_executable(
+        &rig.bin.join("omp"),
+        &format!(
+            "#!/bin/sh\nprintf 'omp\\n' >> '{}'\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            calls.display(),
+            rig.omp_log.display()
+        ),
+    )?;
+    let script = runner("run-cycle.sh")?.replace(
+        "KEY_FILE=/run/ctx-agent/model-key",
+        &format!("KEY_FILE='{}'", rig.root.join("run/model-key").display()),
+    );
+    let copy = rig.root.join("run-cycle.sh");
+    std::fs::write(&copy, script)?;
+    // The provider file names the key file the runner writes, so it moves with it.
+    rig.replace_models(&runner("models.example.yml")?.replace(
+        "/run/ctx-agent/model-key",
+        &rig.root.join("run/model-key").display().to_string(),
+    ))?;
+    let output = rig
+        .command_for(&copy)?
+        .output()
+        .context("running run-cycle.sh")?;
+    let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+    let omp_args = std::fs::read_to_string(&rig.omp_log).unwrap_or_default();
+    let context_file = rig
+        .data
+        .join("agent-sessions/ctx-agent-test-1.context.json");
+    let mode = std::fs::metadata(&context_file).map(|m| m.permissions().mode() & 0o777);
+    rig.remove()?;
+
+    let lines: Vec<&str> = recorded.lines().collect();
+    let context_at = lines
+        .iter()
+        .position(|line| line.starts_with("ctx ") && line.contains(" context "));
+    let omp_at = lines.iter().position(|line| *line == "omp");
+    ensure!(
+        matches!((context_at, omp_at), (Some(c), Some(o)) if c < o),
+        "ctx context did not run before omp: {recorded:?}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        omp_args.contains("ctx-agent-test-1.context.json") && omp_args.contains("quoted material"),
+        "the session's prompt does not name the context file: {omp_args}"
+    );
+    ensure!(
+        matches!(mode, Ok(0o644)),
+        "the context file's mode is {mode:?}, not 0644"
+    );
+    Ok(())
 }
