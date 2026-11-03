@@ -140,6 +140,60 @@ enum Wrote {
     Refused(String),
 }
 
+/// Another copy holds a lease it renewed too recently for this one to take it over.
+///
+/// Typed, so a server that meets it while it is new can tell a rollout's handover — the copy
+/// it replaces still holds the lease — from any other reason it may not write.
+#[derive(Debug)]
+pub struct HeldElsewhere {
+    object: String,
+    holder: String,
+    /// How long ago the holder last renewed, by this copy's clock.
+    age: Duration,
+}
+
+impl HeldElsewhere {
+    /// Whole seconds until this copy may take the lease over, rounded up, from 1 to 120. A
+    /// holder whose clock runs ahead of this copy's reads as renewed in the future; the answer
+    /// is then the whole takeover window, never more.
+    #[must_use]
+    pub fn takeover_in(&self) -> u64 {
+        let left = (Duration::seconds(TAKEOVER) - self.age)
+            .num_milliseconds()
+            .clamp(0, TAKEOVER * 1000);
+        u64::try_from((left + 999) / 1000).unwrap_or(1).max(1)
+    }
+}
+
+impl std::fmt::Display for HeldElsewhere {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the {} lease is held by {} (renewed {} seconds ago); another copy may take it over only after {TAKEOVER} seconds without a renewal",
+            self.object,
+            self.holder,
+            self.age.num_seconds()
+        )
+    }
+}
+
+impl std::error::Error for HeldElsewhere {}
+
+/// The lease object changed while this copy was taking it: its holder gave it up between this
+/// copy's two reads, or another copy wrote it between this copy's read and its write. The next
+/// try reads it afresh. Typed, so a server that meets it while it is new defers the write for a
+/// moment, as it does for [`HeldElsewhere`].
+#[derive(Debug)]
+pub struct ChangedWhileTaken(String);
+
+impl std::fmt::Display for ChangedWhileTaken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ChangedWhileTaken {}
+
 impl Lease {
     /// Takes the lease named `object` in `bucket`, or reports who holds it.
     ///
@@ -166,7 +220,9 @@ impl Lease {
             None => (0, None),
             Some(generation) => {
                 let written = held.written()?.ok_or_else(|| {
-                    anyhow!("the {object} lease was released while it was read; try again")
+                    ChangedWhileTaken(format!(
+                        "the {object} lease was released while it was read; try again"
+                    ))
                 })?;
                 (generation, Some(written))
             }
@@ -174,16 +230,22 @@ impl Lease {
         if let Some(written) = &previous {
             let age = now - written.renewed_at;
             if age < Duration::seconds(TAKEOVER) {
-                bail!(
-                    "the {object} lease is held by {} (renewed {} seconds ago); another copy may take it over only after {TAKEOVER} seconds without a renewal",
-                    written.holder,
-                    age.num_seconds()
-                );
+                return Err(HeldElsewhere {
+                    object: object.to_owned(),
+                    holder: written.holder.clone(),
+                    age,
+                }
+                .into());
             }
         }
         let generation = match held.write(expected, now)? {
             Wrote::Generation(generation) => generation,
-            Wrote::Refused(detail) => bail!("another copy took the {object} lease first: {detail}"),
+            Wrote::Refused(detail) => {
+                return Err(ChangedWhileTaken(format!(
+                    "another copy took the {object} lease first: {detail}"
+                ))
+                .into())
+            }
         };
         held.set(State {
             generation,

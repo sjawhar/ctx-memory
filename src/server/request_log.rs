@@ -68,7 +68,14 @@ struct Facts {
     query_chars: Option<usize>,
     exit_code: Option<u8>,
     refusals: Vec<String>,
+    /// The write was deferred by a rollout's handover: `503` with `Retry-After`, nothing wrong.
+    deferred: bool,
 }
+
+/// Put on an answer by a write deferred during a rollout's handover, so its line says
+/// `deferred` and files it as a warning: `503` with `Retry-After`, nothing wrong.
+#[derive(Clone, Copy, Debug)]
+pub struct Deferred;
 
 impl Note {
     /// The caller, once identified.
@@ -121,6 +128,11 @@ impl Note {
     /// The kinds of the findings that refused a write, in the order the answer gives them.
     pub fn refused<'kind>(&self, kinds: impl IntoIterator<Item = &'kind str>) {
         self.facts().refusals = kinds.into_iter().map(str::to_owned).collect();
+    }
+
+    /// The write was deferred by a rollout's handover rather than failed.
+    fn deferred(&self) {
+        self.facts().deferred = true;
     }
 
     /// The facts, whatever a holder that panicked left: each field is written whole.
@@ -176,6 +188,9 @@ pub async fn log(State(door): State<Door>, mut request: Request, next: Next) -> 
     } else {
         response.body().size_hint().exact()
     };
+    if response.extensions().get::<Deferred>().is_some() {
+        pending.note.deferred();
+    }
     pending.log(Some((response.status(), bytes)));
     response
 }
@@ -231,7 +246,11 @@ fn line<'facts>(
     let status = answer.map(|(status, _)| status);
     Line {
         time: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        severity: status.map_or("WARNING", severity),
+        severity: match status {
+            Some(_) if facts.deferred => "WARNING",
+            Some(status) => severity(status),
+            None => "WARNING",
+        },
         door,
         caller: facts.caller.as_deref(),
         session: facts.session.as_deref(),
@@ -241,7 +260,13 @@ fn line<'facts>(
         query_chars: facts.query_chars,
         result: status.map_or_else(
             || "unanswered".to_owned(),
-            |status| result(status, facts.exit_code),
+            |status| {
+                if facts.deferred && status == StatusCode::SERVICE_UNAVAILABLE {
+                    "deferred".to_owned()
+                } else {
+                    result(status, facts.exit_code)
+                }
+            },
         ),
         refusals: (!facts.refusals.is_empty()).then_some(facts.refusals.as_slice()),
         status: status.map(|status| status.as_u16()),
@@ -612,6 +637,21 @@ mod tests {
             severity(StatusCode::INTERNAL_SERVER_ERROR),
             "ERROR",
             "a server error is an error"
+        );
+        let deferred = Note::default();
+        deferred.deferred();
+        let line = printed(&line(
+            Door::Tailnet,
+            &facts(&deferred),
+            Some("record put"),
+            Some((StatusCode::SERVICE_UNAVAILABLE, None)),
+            0,
+        ));
+        assert_eq!(line.get("result"), Some(&serde_json::json!("deferred")));
+        assert_eq!(
+            line.get("severity"),
+            Some(&serde_json::json!("WARNING")),
+            "a handover is no server error"
         );
     }
 }

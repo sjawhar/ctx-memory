@@ -14,8 +14,8 @@ use std::future::IntoFuture as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use axum::extract::{Request, State};
@@ -105,6 +105,12 @@ pub struct ServeArgs {
     /// deltas `ctx open` reads, before they bind.
     #[arg(long, value_name = "SECONDS", default_value_t = 90)]
     pub index_wait: u64,
+
+    /// Seconds from when the listeners open during which a write that finds the lease held by
+    /// another copy is a rollout's handover: answered `503` with `Retry-After` and logged
+    /// `write deferred:`, not `write failed:`, while this copy has never held the lease.
+    #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+    pub handover: u64,
 }
 
 /// Everything the request handlers share: one loaded tree behind one lock, the write lease
@@ -127,6 +133,9 @@ pub struct Shared {
     /// waited for that build would make every later request wait behind it, which is the
     /// whole of what this copy must not do.
     index: tokio::sync::watch::Sender<bool>,
+    /// When this copy's handover ends: when its listeners open, plus `--handover` seconds.
+    /// Unset until then, and then nothing is a handover.
+    handover: OnceLock<Instant>,
     places: Places,
 }
 
@@ -224,6 +233,9 @@ fn path_ends_here(text: &str, end: usize) -> bool {
 struct WriteLease {
     /// The lease, once a write has taken it. A check that failed gave it up.
     held: Option<Lease>,
+    /// This copy has held the lease. Another copy that holds it after that took it over from
+    /// this one, which is a fault, never a handover.
+    taken: bool,
     /// This copy gave the lease up because it is stopping. No write takes it again: one that
     /// did would write beside the copy that replaces this one.
     released: bool,
@@ -252,14 +264,48 @@ impl Shared {
             context: Mutex::new(context),
             lease: Mutex::new(WriteLease {
                 held: None,
+                taken: false,
                 released: false,
             }),
             health: Mutex::new(health),
             following: Mutex::new(Following::default()),
             tainted: AtomicBool::new(false),
             index: tokio::sync::watch::channel(false).0,
+            handover: OnceLock::new(),
             places,
         })
+    }
+
+    /// Starts this copy's handover, which a copy does as its listeners bind: for `window`, a
+    /// write that finds the lease held by another copy is the copy this one replaces still
+    /// holding it, not two writers.
+    fn open_handover(&self, window: Duration) {
+        // A window too long for the clock to hold is no window anyone means: no handover.
+        if let Some(ends) = Instant::now().checked_add(window) {
+            let _ = self.handover.set(ends);
+        }
+    }
+
+    /// The seconds a caller should wait before it asks again, when `error` — why
+    /// [`Shared::hold_lease`] refused — is a rollout's handover: another copy holds the lease,
+    /// or changed it while this copy was taking it, this copy has never held it, and its handover has
+    /// not ended. `None` for anything else, which is a write that failed.
+    fn deferral(&self, error: &anyhow::Error) -> Option<u64> {
+        let pause = if let Some(held) = error.downcast_ref::<lease::HeldElsewhere>() {
+            held.takeover_in()
+        } else if error.downcast_ref::<lease::ChangedWhileTaken>().is_some() {
+            1
+        } else {
+            return None;
+        };
+        {
+            let lease = unpoisoned(&self.lease);
+            if lease.taken || lease.released {
+                return None;
+            }
+        }
+        let ends = *self.handover.get()?;
+        (Instant::now() < ends).then_some(pause)
     }
 
     /// Waits until the index build this copy started as it came up is over, however it went.
@@ -403,6 +449,7 @@ impl Shared {
             return Ok(());
         }
         lease.held = lease::for_role("server")?;
+        lease.taken |= lease.held.is_some();
         Ok(())
     }
 
@@ -566,6 +613,9 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     warm_index(Arc::clone(&shared));
     let open = warm_open(Arc::clone(&shared));
     wait_for_warm_up(&shared, open, arguments.index_wait).await;
+    // A rollout moves traffic to this copy before it stops the copy this one replaces, which
+    // holds the write lease until it stops, so this copy's handover starts as it can be reached.
+    shared.open_handover(Duration::from_secs(arguments.handover));
     let mut servers = Vec::new();
     // A container runtime stops this copy with SIGTERM before the copy that replaces it
     // writes. Every listener stops on that signal, and the lease is given up afterwards.

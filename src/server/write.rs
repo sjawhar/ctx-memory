@@ -27,7 +27,9 @@ use crate::protocol::{
 };
 use crate::redact::credentials_in;
 
-use self::response::{bad_request, failed, log_failure, not_written, unauthorized, unheld};
+use self::response::{
+    bad_request, deferred, failed, log_failure, not_written, unauthorized, unheld,
+};
 use self::transaction::{apply, ApplyError};
 
 mod response;
@@ -40,14 +42,40 @@ enum Applied {
     Refused(Vec<Finding>),
     Conflict(String),
     /// This copy may not write: another copy holds the write lease.
-    Unheld(String),
+    Unheld(Unheld),
 }
 
 /// What one marker advance did.
 enum Moved {
     Marker(marker::Marker),
     /// This copy may not write: another copy holds the write lease.
-    Unheld(String),
+    Unheld(Unheld),
+}
+
+/// Why a write found it may not take the write lease, before it changed anything.
+struct Unheld {
+    why: String,
+    /// The seconds a caller waits before it asks again, when this is a rollout's handover
+    /// ([`Shared::deferral`]); `None` when it is a write that failed.
+    pause: Option<u64>,
+}
+
+impl Unheld {
+    fn of(shared: &Shared, error: &anyhow::Error) -> Self {
+        Self {
+            why: format!("{error:#}"),
+            pause: shared.deferral(error),
+        }
+    }
+}
+
+/// The answer to a write that may not take the write lease: deferred during a rollout's
+/// handover, failed otherwise.
+fn refuse(shared: &Shared, route: &str, refusal: &Unheld) -> Response {
+    match refusal.pause {
+        Some(pause) => deferred(shared, route, &refusal.why, pause),
+        None => unheld(shared, route, &refusal.why),
+    }
 }
 
 /// What the caller asked to change.
@@ -254,7 +282,7 @@ async fn advance(shared: &Arc<Shared>, caller: Caller, request: MarkerRequest) -
 fn move_marker(shared: &Shared, window: &str, by: &str) -> Result<Moved> {
     let context = shared.tree()?;
     if let Err(error) = shared.hold_lease() {
-        return Ok(Moved::Unheld(format!("{error:#}")));
+        return Ok(Moved::Unheld(Unheld::of(shared, &error)));
     }
     Ok(Moved::Marker(marker::advance(&context, window, by)?))
 }
@@ -265,7 +293,7 @@ fn answer_advance(shared: &Shared, moved: Result<Moved>) -> Response {
         Ok(Moved::Marker(marker)) => {
             (StatusCode::OK, Json(MarkerResponse { marker })).into_response()
         }
-        Ok(Moved::Unheld(why)) => unheld(shared, MARKER_ROUTE, &why),
+        Ok(Moved::Unheld(refusal)) => refuse(shared, MARKER_ROUTE, &refusal),
         Err(error) if error.downcast_ref::<marker::Refused>().is_some() => {
             bad_request(shared, MARKER_ROUTE, &format!("{error:#}"))
         }
@@ -348,7 +376,7 @@ fn answer_write(
             (StatusCode::UNPROCESSABLE_ENTITY, Json(Refused { findings })).into_response()
         }
         Ok(Applied::Conflict(why)) => not_written(shared, route, StatusCode::CONFLICT, &why),
-        Ok(Applied::Unheld(why)) => unheld(shared, route, &why),
+        Ok(Applied::Unheld(refusal)) => refuse(shared, route, &refusal),
         Err(ApplyError::Caller(error)) => bad_request(shared, route, &format!("{error:#}")),
         Err(ApplyError::Server(error)) => failed(shared, route, &format!("{error:#}")),
         Err(ApplyError::Unheld(error)) => unheld(shared, route, &format!("{error:#}")),
