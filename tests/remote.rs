@@ -7,7 +7,9 @@
 
 mod support;
 
+use std::io::Write as _;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde_json::json;
@@ -33,12 +35,25 @@ fn metadata(token: &str) -> Result<FakeHttp> {
 /// Runs `ctx search quarterly` as a remote client in exactly `environment`: no tree, and no
 /// identity, token or proxy setting the test does not give it.
 fn search(environment: &[(&str, &str)]) -> Result<Local> {
+    run_client(&["search", "quarterly"], None, environment)
+}
+
+/// Runs `ctx` with `args` as a remote client in exactly `environment`, with `input` on standard
+/// input when there is one: no tree, and no identity, token or proxy setting the test does not
+/// give it.
+fn run_client(args: &[&str], input: Option<&str>, environment: &[(&str, &str)]) -> Result<Local> {
     let cwd = support::scratch("remote-client-cwd")?;
     let mut command = support::binary();
     command
-        .args(["search", "quarterly"])
+        .args(args)
         .current_dir(&cwd)
-        .stdin(Stdio::null());
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for name in [
         "CTX_MEMORY",
         "CTX_SERVER",
@@ -62,7 +77,15 @@ fn search(environment: &[(&str, &str)]) -> Result<Local> {
         command.env_remove(name);
     }
     command.envs(environment.iter().copied());
-    let output = command.output().context("running ctx as a remote client");
+    let output = (|| -> Result<std::process::Output> {
+        let mut child = command.spawn().context("running ctx as a remote client")?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(input.as_bytes())?;
+        }
+        child
+            .wait_with_output()
+            .context("waiting for ctx as a remote client")
+    })();
     support::remove_scratch(&cwd)?;
     let output = output?;
     Ok(Local {
@@ -405,5 +428,177 @@ fn a_server_s_error_is_printed_without_control_characters() -> Result<()> {
         "{:?}",
         client.stderr
     );
+    Ok(())
+}
+
+/// The words of the one line a client writes on standard error each time it sends a deferred
+/// write again.
+const SENT_AGAIN: &str = "sending it again in";
+
+/// What the server answers a write with while it hands its write lease over: `503`, with how
+/// many seconds to wait in `Retry-After`.
+fn deferral(server: &FakeHttp, route: &str, pauses: &[&str]) -> Result<()> {
+    let body = json!({ "error": "the server lease is held by server@old-copy" }).to_string();
+    for (n, pause) in pauses.iter().enumerate() {
+        if n == 0 {
+            server.json_with_headers(route, 503, &[("Retry-After", pause)], &body)?;
+        } else {
+            server.then_json_with_headers(route, 503, &[("Retry-After", pause)], &body)?;
+        }
+    }
+    Ok(())
+}
+
+/// A rollout starts the new copy of the server before the old one has given the write lease
+/// up, and the new copy answers a write `503` with `Retry-After` until it takes the lease.
+/// The ingest cycle's write failed there and the cycle carried on with its records unwritten;
+/// each write route now sends the write again after the pause the server asks for, saying so
+/// once per try on standard error, and lands it.
+#[test]
+fn every_write_is_sent_again_after_the_pause_a_deferring_server_asks_for() -> Result<()> {
+    let marker = json!({
+        "marker": {
+            "version": 1,
+            "window": "20260102T000000Z-0000",
+            "advanced_at": "2026-01-02T01:00:00Z",
+            "by": "ada@example.com (s)"
+        }
+    })
+    .to_string();
+    let committed = json!({ "commit": "c0ffee" }).to_string();
+    let batch = json!([{ "path": "decisions/cadence.md", "content": "a record" }]).to_string();
+    let writes: [(&[&str], Option<&str>, &str, &str); 4] = [
+        (
+            &["record", "put", "decisions/cadence.md", "-"],
+            Some("a record"),
+            "/v1/records/put",
+            committed.as_str(),
+        ),
+        (
+            &["record", "put", "--batch", "-"],
+            Some(batch.as_str()),
+            "/v1/records/put-batch",
+            committed.as_str(),
+        ),
+        (
+            &["record", "rm", "decisions/cadence.md"],
+            None,
+            "/v1/records/delete",
+            committed.as_str(),
+        ),
+        (
+            &["marker", "advance", "20260102T000000Z-0000"],
+            None,
+            "/v1/marker/advance",
+            marker.as_str(),
+        ),
+    ];
+    for (args, input, route, answer) in writes {
+        let server = FakeHttp::start()?;
+        deferral(&server, route, &["1", "1"])?;
+        server.then_json(route, 200, answer)?;
+
+        let started = Instant::now();
+        let client = run_client(args, input, &[("CTX_SERVER", &server.url(""))])?;
+        let took = started.elapsed();
+
+        assert_eq!(client.exit_code, 0, "{route}: {}", client.stderr);
+        assert_eq!(server.hits(route)?, 3, "{route}: {}", client.stderr);
+        assert_eq!(
+            client
+                .stderr
+                .lines()
+                .filter(|line| line.contains(SENT_AGAIN))
+                .count(),
+            2,
+            "{route}: one line per try sent again: {}",
+            client.stderr
+        );
+        assert!(
+            took >= Duration::from_secs(2),
+            "{route}: the client did not wait the pauses the server asked for: {took:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A write waits at most 180 seconds in all. A pause that would take it past that is not
+/// waited: the write fails at once, says why, and says nothing was written.
+#[test]
+fn a_deferred_write_is_given_up_once_the_next_pause_would_pass_the_bound() -> Result<()> {
+    let server = FakeHttp::start()?;
+    deferral(&server, "/v1/records/put", &["1", "179"])?;
+    server.then_json(
+        "/v1/records/put",
+        200,
+        &json!({ "commit": "c0ffee" }).to_string(),
+    )?;
+
+    let started = Instant::now();
+    let client = run_client(
+        &["record", "put", "decisions/cadence.md", "-"],
+        Some("a record"),
+        &[("CTX_SERVER", &server.url(""))],
+    )?;
+    let took = started.elapsed();
+
+    assert_ne!(client.exit_code, 0, "{}", client.stdout);
+    assert_eq!(server.hits("/v1/records/put")?, 2, "{}", client.stderr);
+    assert_eq!(
+        client
+            .stderr
+            .lines()
+            .filter(|line| line.contains(SENT_AGAIN))
+            .count(),
+        1,
+        "{}",
+        client.stderr
+    );
+    for words in ["180 s", "nothing was written", "server@old-copy"] {
+        assert!(
+            client.stderr.contains(words),
+            "the error does not say {words:?}: {}",
+            client.stderr
+        );
+    }
+    assert!(
+        took < Duration::from_secs(60),
+        "the client waited a pause past its bound: {took:?}"
+    );
+    Ok(())
+}
+
+/// Only a deferral is sent again. A `503` with no `Retry-After` is the server saying it cannot
+/// tell whether the write landed, which a second send could write twice; and a read is never
+/// sent again, whatever it is answered.
+#[test]
+fn only_a_deferred_write_is_sent_again() -> Result<()> {
+    let server = FakeHttp::start()?;
+    server.json(
+        "/v1/records/put",
+        503,
+        &json!({ "error": "the write's outcome is unknown" }).to_string(),
+    )?;
+    server.json_with_headers(
+        "/v1/command",
+        503,
+        &[("Retry-After", "1")],
+        &json!({ "error": "busy" }).to_string(),
+    )?;
+
+    let unknown = run_client(
+        &["record", "put", "decisions/cadence.md", "-"],
+        Some("a record"),
+        &[("CTX_SERVER", &server.url(""))],
+    )?;
+    let read = search(&[("CTX_SERVER", &server.url(""))])?;
+
+    assert_ne!(unknown.exit_code, 0, "{}", unknown.stdout);
+    assert_eq!(server.hits("/v1/records/put")?, 1, "{}", unknown.stderr);
+    assert_ne!(read.exit_code, 0, "{}", read.stdout);
+    assert_eq!(server.hits("/v1/command")?, 1, "{}", read.stderr);
+    for client in [&unknown, &read] {
+        assert!(!client.stderr.contains(SENT_AGAIN), "{}", client.stderr);
+    }
     Ok(())
 }
