@@ -27,6 +27,9 @@ pub(crate) struct Attempt<'a> {
 pub(crate) struct Verdict {
     pub(crate) status: ExitStatus,
     pub(crate) stderr: String,
+    /// What the runner wrote to standard output: its line about how each session exited, and the
+    /// line that starts a fresh session.
+    stdout: String,
     /// How many sessions the runner started.
     pub(crate) sessions: usize,
     /// What the retry's transcript directory keeps as `events.jsonl` once the runner is done.
@@ -34,10 +37,11 @@ pub(crate) struct Verdict {
 }
 
 impl Verdict {
-    /// The `run-cycle:` lines on standard error that hold `needle`.
+    /// The `run-cycle:` lines on standard output and standard error that hold `needle`.
     pub(crate) fn lines_saying(&self, needle: &str) -> Vec<&str> {
-        self.stderr
+        self.stdout
             .lines()
+            .chain(self.stderr.lines())
             .filter(|line| line.starts_with("run-cycle: ") && line.contains(needle))
             .collect()
     }
@@ -206,6 +210,7 @@ fn run_after_launch(
     // context read reaches the `ctx` stand-in and not a real one.
     let prelude = format!(
         r#"set -eu
+{error_class}
 {refuse}
 {complete}
 {seal}
@@ -243,6 +248,7 @@ run_session() {{
 }}
 "#,
         refuse = script_function("refuse")?,
+        error_class = script_function("error_class_def")?,
         complete = script_function("pass_complete_line")?,
         seal = script_function("seal_session")?,
         write_context = script_function("write_context")?,
@@ -266,6 +272,7 @@ run_session() {{
     Ok(Verdict {
         status: output.status,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         sessions,
         retry_kept: std::fs::read_to_string(
             dir.join("data/agent-sessions/ctx-agent-test-1-retry/events.jsonl"),
@@ -1024,6 +1031,280 @@ fn a_refused_cycle_gets_one_fresh_session_judged_like_the_first() -> Result<()> 
         verdict.sessions == 1,
         "the runner retried a session that was stopped by its time limit, not refused: {}",
         verdict.stderr
+    );
+    Ok(())
+}
+
+/// A model turn that ended in an error other than a refusal, as the pinned omp writes one: no stop
+/// details, omp's classifier id (0 for an error it could not classify, which it does not retry;
+/// the failed cycle of 2026-11-03 ended on one) and, when the provider answered with one, the HTTP
+/// status. The error's prose holds `SECRET`, which stands for what a provider or gateway may say
+/// and the runner must never repeat.
+fn model_error(status: Option<u16>) -> Value {
+    let mut turn = json!({
+        "role": "assistant", "content": [], "stopReason": "error", "errorId": 0,
+        "errorMessage": format!("{} SECRET: the gateway said something odd", status.unwrap_or(0)),
+        "usage": {"input": 2, "output": 3, "cacheRead": 172_972, "cacheWrite": 17_722}
+    });
+    if let (Some(status), Some(fields)) = (status, turn.as_object_mut()) {
+        fields.insert("errorStatus".to_owned(), json!(status));
+    }
+    turn
+}
+
+/// A session that ran a tool and then ended on [`model_error`].
+fn ended_on_a_model_error(status: Option<u16>) -> String {
+    events(&[
+        prompt(),
+        tool_call("toolu_0"),
+        tool_result("toolu_0", "Tree rules", false),
+        model_error(status),
+    ])
+}
+
+/// What the runner's line about a session a model error ended says, and what every retry line says.
+const MODEL_ERROR: &str = "ended on a model error";
+const FRESH_SESSION: &str = "starting one fresh session";
+
+/// The one `run-cycle:` line saying the session ended on a model error, checked to start the fresh
+/// session and to hold none of the error's prose.
+fn model_error_line(verdict: &Verdict) -> Result<String> {
+    let lines = verdict.lines_saying(MODEL_ERROR);
+    ensure!(
+        lines.len() == 1,
+        "the runner did not say in one line that the session ended on a model error: {}{}",
+        verdict.stdout,
+        verdict.stderr
+    );
+    let line = lines
+        .first()
+        .map(|line| (*line).to_owned())
+        .unwrap_or_default();
+    ensure!(
+        line.contains(FRESH_SESSION)
+            && !verdict.stdout.contains("SECRET")
+            && !verdict.stderr.contains("SECRET"),
+        "the model error's line does not start a fresh session, or the runner repeated the error's \
+         prose: {}{}",
+        verdict.stdout,
+        verdict.stderr
+    );
+    Ok(line)
+}
+
+/// A cycle whose session ended on a model error that is not a refusal, an error omp gave up on,
+/// gets one fresh session, as a refused cycle does, and one `run-cycle:` line naming the error's
+/// class and status and none of its prose. The fresh session is judged like the first: one that
+/// finishes makes the cycle a success; one the time limit stopped fails it with that line; a
+/// second model error is the cycle's outcome, with status 1 and no third session.
+#[test]
+fn a_cycle_that_ended_on_a_model_error_gets_one_fresh_session() -> Result<()> {
+    let finished = finished("Handled 2 windows.");
+    let after_tool = stopped_after_a_tool_call();
+    let unclassified = ended_on_a_model_error(None);
+    let overloaded = ended_on_a_model_error(Some(529));
+    let first_errored_then = |first: &str, second: &str| -> Result<Verdict> {
+        runner_verdict(
+            None,
+            &[
+                Attempt {
+                    status: 1,
+                    events: first,
+                },
+                Attempt {
+                    status: 0,
+                    events: second,
+                },
+            ],
+        )
+    };
+
+    let verdict = first_errored_then(&unclassified, &finished)?;
+    ensure!(
+        verdict.sessions == 2,
+        "a cycle a model error ended did not get its fresh session ({} sessions): {}",
+        verdict.sessions,
+        verdict.stderr
+    );
+    ensure_succeeded(
+        &verdict,
+        "the fresh session of a cycle a model error ended finished",
+    )?;
+    let line = model_error_line(&verdict)?;
+    ensure!(
+        line.contains("(errorClass other)"),
+        "the line does not name the class of an error omp recorded no status for: {line}"
+    );
+
+    let verdict = first_errored_then(&overloaded, &finished)?;
+    ensure_succeeded(
+        &verdict,
+        "the fresh session of a cycle an overloaded model ended finished",
+    )?;
+    let line = model_error_line(&verdict)?;
+    ensure!(
+        line.contains("(errorClass overloaded, errorStatus 529)"),
+        "the line does not name the class and status of a 529: {line}"
+    );
+
+    let verdict = first_errored_then(&unclassified, &after_tool)?;
+    ensure_failed_saying(
+        &verdict,
+        TIME_LIMIT,
+        "the fresh session of a cycle a model error ended was stopped by its time limit",
+    )?;
+
+    let verdict = runner_verdict(
+        None,
+        &[
+            Attempt {
+                status: 1,
+                events: &unclassified,
+            },
+            Attempt {
+                status: 1,
+                events: &overloaded,
+            },
+        ],
+    )?;
+    ensure!(
+        verdict.sessions == 2
+            && verdict.status.code() == Some(1)
+            && verdict.lines_saying(FRESH_SESSION).len() == 1,
+        "a cycle two model errors ended did not fail with status 1 after two sessions and one \
+         retry ({} sessions, {}): {}",
+        verdict.sessions,
+        verdict.status,
+        verdict.stderr
+    );
+    Ok(())
+}
+
+/// A refusal is a turn whose stop reason is "error" too, and it still takes the refusal's path:
+/// the retry line names the refusal, never a model error.
+#[test]
+fn a_refusal_still_takes_the_refusal_path() -> Result<()> {
+    let refused = refused();
+    let finished = finished("Handled 2 windows.");
+    let verdict = runner_verdict(
+        None,
+        &[
+            Attempt {
+                status: 1,
+                events: &refused,
+            },
+            Attempt {
+                status: 0,
+                events: &finished,
+            },
+        ],
+    )?;
+    ensure_succeeded(&verdict, "the refused cycle's fresh session finished")?;
+    ensure!(
+        verdict.sessions == 2
+            && verdict.lines_saying("model refusal").len() == 1
+            && verdict.lines_saying(MODEL_ERROR).is_empty(),
+        "a refusal did not take the refusal's path: {}",
+        verdict.stderr
+    );
+    Ok(())
+}
+
+/// A model error after the session moved the marker past every window it was handed leaves no
+/// window for a fresh session, so there is none, and the cycle fails on the error. One that left a
+/// window it was handed unpassed gets its fresh session, which starts at that window.
+#[test]
+fn a_model_error_after_the_marker_passed_every_window_gets_no_retry() -> Result<()> {
+    let handed = pending_answer(&[(FIRST, 4), (SECOND, 0)]);
+    let wrote_then_errored = wrote(&[("ctx_record_put", true)], model_error(Some(500)));
+    let wrote_and_finished = wrote(&[("ctx_record_put", true)], answer("Handled 1 window."));
+    let attempts = [
+        Attempt {
+            status: 1,
+            events: &wrote_then_errored,
+        },
+        Attempt {
+            status: 0,
+            events: &wrote_and_finished,
+        },
+    ];
+
+    let passed_all = verdict(
+        None,
+        &attempts,
+        &Around {
+            pending: &[&handed],
+            marker_moves: &[(1, SECOND)],
+            ..Around::default()
+        },
+    )?;
+    ensure!(
+        passed_all.sessions == 1
+            && passed_all.status.code() == Some(1)
+            && passed_all.lines_saying(FRESH_SESSION).is_empty(),
+        "a cycle whose marker passed every window it was handed before a model error was retried, \
+         or did not fail with status 1 ({} sessions, {}): {}",
+        passed_all.sessions,
+        passed_all.status,
+        passed_all.stderr
+    );
+
+    let passed_some = verdict(
+        None,
+        &attempts,
+        &Around {
+            pending: &[&handed],
+            marker_moves: &[(1, FIRST)],
+            ..Around::default()
+        },
+    )?;
+    ensure!(
+        passed_some.sessions == 2,
+        "a cycle a model error ended with a window left did not get its fresh session ({} \
+         sessions): {}",
+        passed_some.sessions,
+        passed_some.stderr
+    );
+    ensure_succeeded(
+        &passed_some,
+        "the fresh session of a cycle a model error ended with a window left finished",
+    )?;
+    model_error_line(&passed_some).map(|_| ())
+}
+
+/// A maintenance pass a model error ended gets one fresh session, as a refused pass does: it moves
+/// no marker, so running it again is safe, and the fresh session is judged like the first.
+#[test]
+fn a_maintenance_pass_that_ended_on_a_model_error_gets_one_fresh_session() -> Result<()> {
+    let errored = ended_on_a_model_error(Some(503));
+    let done = finished(&report(Some(&pass_complete_line("waiting-on")?)));
+    let verdict = runner_verdict(
+        Some("waiting-on"),
+        &[
+            Attempt {
+                status: 1,
+                events: &errored,
+            },
+            Attempt {
+                status: 0,
+                events: &done,
+            },
+        ],
+    )?;
+    ensure!(
+        verdict.sessions == 2,
+        "a pass a model error ended did not get its fresh session ({} sessions): {}",
+        verdict.sessions,
+        verdict.stderr
+    );
+    ensure_succeeded(
+        &verdict,
+        "the fresh session of a pass a model error ended finished with its report",
+    )?;
+    let line = model_error_line(&verdict)?;
+    ensure!(
+        line.contains("(errorClass server_error, errorStatus 503)"),
+        "the line does not name the class and status of a 503: {line}"
     );
     Ok(())
 }

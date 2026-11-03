@@ -77,7 +77,9 @@ const MODEL_KEY: &str = "live-probe-model-key";
 /// A scripted stand-in for the model API, an Anthropic Messages API. The answer to a request is
 /// the step at the index of the number of tool results the request carries, so a retry or a side
 /// request (omp asks for skill summaries) never advances the script. A step with `delay_ms` holds
-/// its answer back that long, as a slow model does.
+/// its answer back that long, as a slow model does. A step with `stream_error` answers `200` and
+/// starts the message, then sends an `error` event of that type in the stream, as a gateway that
+/// fails after the response has begun does.
 struct FakeModel {
     port: u16,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -333,7 +335,13 @@ fn serve_one(
             "usage": {"input_tokens": 1, "output_tokens": 1}
         }
     })];
-    let stop_reason = if let (Some(tool), Some(input)) = (answer.get("tool"), answer.get("input")) {
+    let stop_reason = if let Some(kind) = answer.get("stream_error") {
+        events.push(json!({
+            "type": "error",
+            "error": {"type": kind, "message": "the gateway failed mid-stream: SECRET"}
+        }));
+        None
+    } else if let (Some(tool), Some(input)) = (answer.get("tool"), answer.get("input")) {
         events.push(json!({
             "type": "content_block_start", "index": 0,
             "content_block": {"type": "tool_use", "id": format!("toolu_{done}"), "name": tool, "input": {}}
@@ -342,7 +350,7 @@ fn serve_one(
             "type": "content_block_delta", "index": 0,
             "delta": {"type": "input_json_delta", "partial_json": input.to_string()}
         }));
-        "tool_use"
+        Some("tool_use")
     } else {
         events.push(json!({
             "type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}
@@ -351,15 +359,17 @@ fn serve_one(
             "type": "content_block_delta", "index": 0,
             "delta": {"type": "text_delta", "text": answer.get("text").cloned().unwrap_or(Value::Null)}
         }));
-        "end_turn"
+        Some("end_turn")
     };
-    events.push(json!({"type": "content_block_stop", "index": 0}));
-    events.push(json!({
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-        "usage": {"output_tokens": 1}
-    }));
-    events.push(json!({"type": "message_stop"}));
+    if let Some(stop_reason) = stop_reason {
+        events.push(json!({"type": "content_block_stop", "index": 0}));
+        events.push(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+            "usage": {"output_tokens": 1}
+        }));
+        events.push(json!({"type": "message_stop"}));
+    }
 
     if let Some(delay) = answer.get("delay_ms").and_then(Value::as_u64) {
         std::thread::sleep(Duration::from_millis(delay));
@@ -1330,5 +1340,90 @@ fn a_live_session_whose_model_answers_with_nothing_fails_the_job() -> Result<()>
             end.stdout
         );
     }
+    Ok(())
+}
+
+/// A gateway that fails inside a started stream with an error type omp does not know ends the
+/// pinned omp's session at once: omp records the turn with stop reason "error", errorId 0 and no
+/// status, does not retry it (retry.* covers only errors it classifies as transient), and exits 1.
+/// That is the turn the failed cycle of 2026-11-03 ended on. The runner gives such a session one
+/// fresh session, which here finishes, and its job log names the error's class, `other`, and none
+/// of the gateway's prose.
+#[test]
+#[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
+fn a_live_session_a_gateway_error_ends_gets_one_fresh_session() -> Result<()> {
+    let omp = pinned_omp()?;
+    let model = FakeModel::start(vec![json!({"stream_error": "unknown_gateway_error"})])?;
+    let root = scratch("live-model-error")?;
+    let end = run_omp(&omp, &root, &model, "Run the scripted probe.", &[], &[]);
+    remove_scratch(&root)?;
+    let end = end?;
+    let last = end
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|event| {
+            field_at(event, "/type") == "message_end"
+                && field_at(event, "/message/role") == "assistant"
+        })
+        .context("the pinned omp wrote no model turn")?;
+    ensure!(
+        end.status.code() == Some(1)
+            && field_at(&last, "/message/stopReason") == "error"
+            && field_at(&last, "/message/errorId") == 0,
+        "the pinned omp no longer ends the session, with status 1 and an unclassified error turn, \
+         on a gateway error it does not know (it exited with {}, last turn {last}), so this probe \
+         no longer covers the case the runner retries: {}",
+        end.status,
+        end.stderr
+    );
+
+    let log = summarized(&end.stdout)?;
+    let text = serde_json::to_string(&log)?;
+    let classes: Vec<Value> = lines_of(&log, "message_end")?
+        .iter()
+        .map(|turn| field_at(turn, "/message/errorClass").clone())
+        .filter(|class| !class.is_null())
+        .collect();
+    ensure!(
+        classes == vec![json!("other")] && !text.contains("SECRET"),
+        "the job log does not name the gateway error's class, other, once and none of its prose: \
+         {text}"
+    );
+
+    let finished = format!(
+        "{}\n{}\n",
+        json!({"type": "session", "version": 3, "id": "retry-session"}),
+        json!({"type": "message_end", "message": {
+            "role": "assistant", "stopReason": "stop",
+            "content": [{"type": "text", "text": "Handled 1 window."}]
+        }})
+    );
+    let verdict = runner_verdict(
+        None,
+        &[
+            Attempt {
+                status: 1,
+                events: &end.stdout,
+            },
+            Attempt {
+                status: 0,
+                events: &finished,
+            },
+        ],
+    )?;
+    ensure!(
+        verdict.status.success()
+            && verdict.sessions == 2
+            && verdict
+                .lines_saying("ended on a model error (errorClass other)")
+                .len()
+                == 1,
+        "the runner did not give the session the gateway error ended one fresh session that \
+         finished ({}, {} sessions): {}",
+        verdict.status,
+        verdict.sessions,
+        verdict.stderr
+    );
     Ok(())
 }

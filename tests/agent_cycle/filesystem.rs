@@ -686,16 +686,18 @@ fn sealing_moves_the_event_capture_into_the_transcript() -> Result<()> {
     Ok(())
 }
 
-/// A refused ingest cycle or maintenance pass gets one fresh session. `run-cycle.sh` runs as its
-/// container's PID 1 and cannot hand its own process to omp, so the retry's structure is read from
-/// the script, the way the transcript sealing is: a run that reaches omp needs a locked share this
-/// pretend-root harness cannot build. What the retry decides is run in `outcome.rs`. The
-/// invariants the retry rests on: omp is started from a function, so the same launch serves both
-/// attempts; the retry fires only on a non-zero exit, only when the session's own transcript shows
-/// a model refusal, and never for a pass that moved the marker; it starts over in its own
-/// directory; and it is one retry, not a loop, so a second refusal is the outcome.
+/// An ingest cycle or maintenance pass the model stopped, by a refusal or by a turn that ended in
+/// an error, gets one fresh session. `run-cycle.sh` runs as its container's PID 1 and cannot hand
+/// its own process to omp, so the retry's structure is read from the script, the way the
+/// transcript sealing is: a run that reaches omp needs a locked share this pretend-root harness
+/// cannot build. What the retry decides is run in `outcome.rs`. The invariants the retry rests on:
+/// omp is started from a function, so the same launch serves both attempts; the retry fires only
+/// on a non-zero exit, never for a pass that moved the marker, and only when the session's own
+/// transcript shows a model refusal, or a last turn that stopped with an error while a window the
+/// session was handed is still unpassed; it starts over in its own directory; and it is one retry,
+/// not a loop, so a second refusal or error is the outcome.
 #[test]
-fn the_cycle_retries_once_after_a_model_refusal() -> Result<()> {
+fn the_cycle_retries_once_after_a_model_refusal_or_error() -> Result<()> {
     let script = runner("run-cycle.sh")?;
     let code: Vec<&str> = script
         .lines()
@@ -736,16 +738,28 @@ fn the_cycle_retries_once_after_a_model_refusal() -> Result<()> {
         "run-cycle.sh writes the whole captured stdout to the job log, where Cloud Logging drops \
          events over its line limit and in bursts, rather than its summary"
     );
-    let retry = code
+    let guard = code
         .iter()
-        .find(|line| {
-            line.contains("session_refused \"$session_dir.events.json\"")
+        .position(|line| {
+            line.starts_with("if ")
+                && line.contains("\"$status\" -ne 0")
                 && line.contains("[ -z \"$marker_moved\" ]")
         })
-        .context("the retry is not guarded by a refused session that left the marker alone")?;
+        .context("the retry is not guarded by a failed session that left the marker alone")?;
+    let decision = code.get(guard..guard + 8).unwrap_or_default();
     ensure!(
-        retry.contains("\"$status\" -ne 0"),
-        "the retry runs even when the first session succeeded"
+        decision
+            .iter()
+            .any(|line| line.contains("session_refused \"$session_dir.events.json\""))
+            && decision.iter().any(|line| {
+                line.contains("[ \"$stop\" = error ]") && line.contains("! marker_passed_every_window")
+            }),
+        "the retry is not decided by a refusal, or by a model error with a window left, under that \
+         guard"
+    );
+    ensure!(
+        has("if [ -n \"$retry_reason\" ]; then"),
+        "the fresh session does not start on the retry's reason alone"
     );
     ensure!(
         has("-retry\"") && has("session_dir=\"$CTX_DATA_DIR/agent-sessions/$execution-retry\""),
