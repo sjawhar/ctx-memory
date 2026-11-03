@@ -140,6 +140,41 @@ enum Wrote {
     Refused(String),
 }
 
+/// Another copy holds a lease it renewed too recently for this one to take it over.
+///
+/// Typed, so a server that meets it while it is new can tell a rollout's handover — the copy
+/// it replaces still holds the lease — from any other reason it may not write.
+#[derive(Debug)]
+pub struct HeldElsewhere {
+    object: String,
+    holder: String,
+    /// How long ago the holder last renewed, by this copy's clock.
+    age: Duration,
+}
+
+impl HeldElsewhere {
+    /// Whole seconds until this copy may take the lease over, rounded up, and at least 1.
+    #[must_use]
+    pub fn takeover_in(&self) -> u64 {
+        let left = (Duration::seconds(TAKEOVER) - self.age).num_milliseconds();
+        u64::try_from((left + 999) / 1000).unwrap_or(1).max(1)
+    }
+}
+
+impl std::fmt::Display for HeldElsewhere {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the {} lease is held by {} (renewed {} seconds ago); another copy may take it over only after {TAKEOVER} seconds without a renewal",
+            self.object,
+            self.holder,
+            self.age.num_seconds()
+        )
+    }
+}
+
+impl std::error::Error for HeldElsewhere {}
+
 impl Lease {
     /// Takes the lease named `object` in `bucket`, or reports who holds it.
     ///
@@ -174,11 +209,12 @@ impl Lease {
         if let Some(written) = &previous {
             let age = now - written.renewed_at;
             if age < Duration::seconds(TAKEOVER) {
-                bail!(
-                    "the {object} lease is held by {} (renewed {} seconds ago); another copy may take it over only after {TAKEOVER} seconds without a renewal",
-                    written.holder,
-                    age.num_seconds()
-                );
+                return Err(HeldElsewhere {
+                    object: object.to_owned(),
+                    holder: written.holder.clone(),
+                    age,
+                }
+                .into());
             }
         }
         let generation = match held.write(expected, now)? {

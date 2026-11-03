@@ -1,6 +1,6 @@
 //! HTTP failure answers and their stable operational log line.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 
 use crate::redact::one_line;
@@ -60,5 +60,35 @@ pub(super) fn failure_line(route: &str, status: StatusCode, reason: &str) -> Str
         "{WRITE_FAILED}{route} {} {}",
         status.as_u16(),
         one_line(reason)
+    )
+}
+
+/// What every line about a write deferred by a rollout's handover starts with. It is not
+/// [`WRITE_FAILED`]: the write did not happen, but the caller is told when to ask again and
+/// nothing is wrong, so an alert on failed writes does not match it.
+const WRITE_DEFERRED: &str = "write deferred: ";
+
+/// Another copy of the server still holds the write lease while this new copy takes over
+/// from it, so this copy wrote nothing. The answer is `503` with `Retry-After`, the seconds
+/// until this copy may take the lease over, and the line on standard error is
+/// `write deferred: <route> 503 <reason>`.
+pub(super) fn deferred(shared: &Shared, route: &str, message: &str, pause: u64) -> Response {
+    let status = StatusCode::SERVICE_UNAVAILABLE;
+    eprintln!("{}", deferred_line(route, status, message, pause));
+    let mut response = super::command::error_response(shared, status, message);
+    response
+        .headers_mut()
+        .insert(axum::http::header::RETRY_AFTER, HeaderValue::from(pause));
+    response
+}
+
+/// The line [`deferred`] prints, one line as [`one_line`] makes it.
+pub(super) fn deferred_line(route: &str, status: StatusCode, reason: &str, pause: u64) -> String {
+    format!(
+        "{WRITE_DEFERRED}{route} {} {}",
+        status.as_u16(),
+        one_line(&format!(
+            "a handover: this copy may take the write lease over in {pause} s: {reason}"
+        ))
     )
 }

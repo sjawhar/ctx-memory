@@ -6,7 +6,7 @@
 //! Cloud takes an identity token from the metadata server, and a dev box reaches the server
 //! over the tailnet, where Tailscale itself says who is calling.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -173,13 +173,16 @@ impl Client {
     ///
     /// Returns an error when the server cannot be reached or refuses the window.
     pub fn marker_advance(&self, window: &str, session: &str) -> Result<marker::Marker> {
-        let value = self.post(
+        let (status, value) = self.answer_write(
             MARKER_ROUTE,
             &MarkerRequest {
                 window: window.to_owned(),
                 session: Some(session.to_owned()),
             },
         )?;
+        if !status.is_success() {
+            bail!("{}", error_text(status, &value));
+        }
         let answer: MarkerResponse = serde_json::from_value(value)
             .context("decoding the marker the server answered with")?;
         Ok(answer.marker)
@@ -228,7 +231,7 @@ impl Client {
     }
 
     fn write(&self, path: &str, body: &impl Serialize) -> Result<Written> {
-        let (status, value) = self.answer(path, body)?;
+        let (status, value) = self.answer_write(path, body)?;
         if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             // A refusal carries the findings that refused the write. Without them the caller
             // has nothing to act on, and the answer is not a refusal this client knows.
@@ -262,15 +265,52 @@ impl Client {
     /// act on: it is reported with the start of the body.
     fn answer(&self, path: &str, body: &impl Serialize) -> Result<(reqwest::StatusCode, Value)> {
         let response = self.send(path, body)?;
-        let status = response.status();
-        let text = response
-            .text()
-            .with_context(|| format!("reading the answer to {path} ({status})"))?;
-        if let Ok(value) = serde_json::from_str(&text) {
-            return Ok((status, value));
+        read_answer(path, response)
+    }
+
+    /// Sends one write and reads the answer, sending it again while the server defers it.
+    ///
+    /// A server copy that a rollout just started answers a write `503` with `Retry-After` until
+    /// it takes the write lease over from the copy it replaces: it wrote nothing, so the write
+    /// is sent again after that pause. The server defers only from the lease check it makes
+    /// before it touches anything, and a put or a marker advance that already landed changes
+    /// nothing when it is sent again. A write waits at most [`DEFERRAL_BOUND`] in all; a pause
+    /// that would take it past that is not waited, and the write fails, saying why.
+    fn answer_write(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<(reqwest::StatusCode, Value)> {
+        let started = Instant::now();
+        loop {
+            let response = self.send(path, body)?;
+            let pause = deferral_pause(&response);
+            let (status, value) = read_answer(path, response)?;
+            let Some(pause) = pause else {
+                return Ok((status, value));
+            };
+            let waited = started.elapsed();
+            if waited.saturating_add(pause) > DEFERRAL_BOUND {
+                bail!(
+                    "{}; it asked for the write again in {} s, which would take it past the {} s \
+                     a write waits for a server handing its write lease over ({} s waited), so \
+                     nothing was written",
+                    error_text(status, &value),
+                    pause.as_secs(),
+                    DEFERRAL_BOUND.as_secs(),
+                    waited.as_secs()
+                );
+            }
+            eprintln!(
+                "{}",
+                redact::one_line(&format!(
+                    "ctx: {path}: {}; sending it again in {} s",
+                    error_text(status, &value),
+                    pause.as_secs()
+                ))
+            );
+            std::thread::sleep(pause);
         }
-        let start: String = text.trim().chars().take(200).collect();
-        bail!("the server answered {status} to {path}, not in JSON: {start}")
     }
 
     fn send(&self, path: &str, body: &impl Serialize) -> Result<reqwest::blocking::Response> {
@@ -285,6 +325,44 @@ impl Client {
             .send()
             .with_context(|| format!("asking {}{path}", self.base))
     }
+}
+
+/// The longest a write waits in all for a server copy that defers it while it takes the write
+/// lease over: more than the 120 seconds a takeover can take, with room for the old copy to stop.
+const DEFERRAL_BOUND: Duration = Duration::from_secs(180);
+
+/// The pause a server asks for when it defers a write: `503` with `Retry-After` in whole
+/// seconds, at least 1 so the client never sends again at once. Any other answer, a `503`
+/// with no `Retry-After` among them — an outcome the server cannot tell — is not deferred.
+fn deferral_pause(response: &reqwest::blocking::Response) -> Option<Duration> {
+    if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    let seconds: u64 = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds.max(1)))
+}
+
+/// Reads an answer: its status, and its body as JSON, or why it is not JSON.
+fn read_answer(
+    path: &str,
+    response: reqwest::blocking::Response,
+) -> Result<(reqwest::StatusCode, Value)> {
+    let status = response.status();
+    let text = response
+        .text()
+        .with_context(|| format!("reading the answer to {path} ({status})"))?;
+    if let Ok(value) = serde_json::from_str(&text) {
+        return Ok((status, value));
+    }
+    let start: String = text.trim().chars().take(200).collect();
+    bail!("the server answered {status} to {path}, not in JSON: {start}")
 }
 
 /// What a write did, as the client reports it.

@@ -472,25 +472,25 @@ fn every_write_is_sent_again_after_the_pause_a_deferring_server_asks_for() -> Re
             &["record", "put", "decisions/cadence.md", "-"],
             Some("a record"),
             "/v1/records/put",
-            &committed,
+            committed.as_str(),
         ),
         (
             &["record", "put", "--batch", "-"],
-            Some(&batch),
+            Some(batch.as_str()),
             "/v1/records/put-batch",
-            &committed,
+            committed.as_str(),
         ),
         (
             &["record", "rm", "decisions/cadence.md"],
             None,
             "/v1/records/delete",
-            &committed,
+            committed.as_str(),
         ),
         (
             &["marker", "advance", "20260102T000000Z-0000"],
             None,
             "/v1/marker/advance",
-            &marker,
+            marker.as_str(),
         ),
     ];
     for (args, input, route, answer) in writes {

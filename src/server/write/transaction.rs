@@ -16,7 +16,7 @@ use super::validation::{
     check, credential_findings, in_the_way, inside_the_tree, instruction_file, is_rules_page,
     too_long, unloaded,
 };
-use super::{Applied, Change, Edit, Shared};
+use super::{Applied, Change, Edit, Shared, Unheld};
 
 /// Why one write did not happen.
 ///
@@ -73,7 +73,7 @@ pub(super) fn apply(
     // check made before the wait for the tree could be stale by the time the write starts, and
     // a copy that may not write leaves the tree and the remote exactly as it found them.
     if let Err(error) = shared.hold_lease() {
-        return Ok(Applied::Unheld(format!("{error:#}")));
+        return Ok(Applied::Unheld(Unheld::of(shared, &error)));
     }
     let root = tree.tree.root.clone();
     let repo = Repo::open_with_credential(&root, &tree.config.credentials, Access::Write)?;
