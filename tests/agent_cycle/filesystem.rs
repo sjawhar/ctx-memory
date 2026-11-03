@@ -187,7 +187,8 @@ impl CycleRig {
             .env("CTX_MODELS_FILE", &self.models)
             .env("CTX_MODEL", EXAMPLE_MODEL)
             .env("ANTHROPIC_API_KEY", "not-a-key")
-            .env("CLOUD_RUN_EXECUTION", "ctx-agent-test-1")
+            .env("CTX_EXECUTION", "ctx-agent-test-1")
+            .env_remove("CLOUD_RUN_EXECUTION")
             .env("XDG_DATA_HOME", self.xdg("data"))
             .env("XDG_STATE_HOME", self.xdg("state"))
             .env("XDG_CACHE_HOME", self.xdg("cache"));
@@ -250,6 +251,20 @@ impl CycleRig {
             &self.bin.join("ctx"),
             &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[]}}}}'\n",
+                calls.display()
+            ),
+        )?;
+        Ok(calls)
+    }
+
+    /// Makes `ctx` report one pending window and keep the session each call names, its
+    /// `CTX_SESSION`, one line per call, in the file this returns.
+    fn record_sessions(&self) -> Result<PathBuf> {
+        let calls = self.root.join("ctx-sessions");
+        write_executable(
+            &self.bin.join("ctx"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{CTX_SESSION-}}\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[{{\"id\":\"w1\"}}]}}}}'\n",
                 calls.display()
             ),
         )?;
@@ -733,8 +748,7 @@ fn the_cycle_retries_once_after_a_model_refusal() -> Result<()> {
         "the retry runs even when the first session succeeded"
     );
     ensure!(
-        has("-retry\"")
-            && has("session_dir=\"$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION-retry\""),
+        has("-retry\"") && has("session_dir=\"$CTX_DATA_DIR/agent-sessions/$execution-retry\""),
         "the retry does not open its own transcript directory"
     );
     Ok(())
@@ -956,6 +970,138 @@ fn the_runner_refuses_a_window_cap_that_is_not_a_positive_number() -> Result<()>
     }
     rig.remove()?;
     result
+}
+
+/// The execution's name is `CTX_EXECUTION`, which any platform can set, or, when that is unset
+/// or empty, `CLOUD_RUN_EXECUTION`, which Cloud Run sets. It is the session every request names
+/// (`CTX_SESSION`) and the transcript directory's name. With neither, no session runs.
+///
+/// The share is left open to the session's user, so each run stops at that check, after it has
+/// read the server and made its transcript directory, and before anything is prepared for a
+/// session.
+#[test]
+fn the_cycle_takes_its_execution_name_from_ctx_execution_else_cloud_run() -> Result<()> {
+    let rig = CycleRig::new("execution-name")?;
+    rig.pretend_root()?;
+    let calls = rig.record_sessions()?;
+    let sessions = rig.data.join("agent-sessions");
+    let run =
+        |own: Option<&str>, cloud_run: Option<&str>| -> Result<(std::process::Output, String)> {
+            let output = rig
+                .command()?
+                .env_remove("CTX_EXECUTION")
+                .envs(own.map(|name| ("CTX_EXECUTION", name)))
+                .envs(cloud_run.map(|name| ("CLOUD_RUN_EXECUTION", name)))
+                .output()
+                .context("running run-cycle.sh")?;
+            let named = std::fs::read_to_string(&calls).unwrap_or_default();
+            if calls.exists() {
+                std::fs::remove_file(&calls)?;
+            }
+            Ok((output, named))
+        };
+    // The longest name a session id still fits with `-retry`, and one of every kind of character
+    // a name may hold, are taken as they are.
+    let longest = "a".repeat(122);
+    let cases = [
+        (Some("cycle-own"), Some("cycle-cloud-run"), "cycle-own"),
+        (None, Some("cycle-fallback"), "cycle-fallback"),
+        (Some(""), Some("cycle-empty-own"), "cycle-empty-own"),
+        (Some("Ab_c-9"), None, "Ab_c-9"),
+        (Some(longest.as_str()), None, longest.as_str()),
+    ];
+    let mut result = Ok(());
+    for (own, cloud_run, expected) in cases {
+        let (output, named) = run(own, cloud_run)?;
+        let checked = (|| -> Result<()> {
+            assert_refused(&rig, &output, "can write")?;
+            ensure!(
+                !named.is_empty() && named.lines().all(|session| session == expected),
+                "the cycle's requests named {named:?}, not {expected:?}"
+            );
+            ensure!(
+                sessions.join(expected).is_dir(),
+                "the cycle made no transcript directory named {expected:?}"
+            );
+            Ok(())
+        })()
+        .with_context(|| format!("CTX_EXECUTION={own:?} CLOUD_RUN_EXECUTION={cloud_run:?}"));
+        result = result.and(checked);
+    }
+    let (neither, named) = run(None, None)?;
+    result = result.and_then(|()| {
+        assert_refused(&rig, &neither, "CTX_EXECUTION")?;
+        ensure!(
+            named.is_empty(),
+            "the cycle called ctx with no execution name: {named:?}"
+        );
+        Ok(())
+    });
+    let overridden = sessions.join("cycle-cloud-run").exists();
+    rig.remove()?;
+    result?;
+    ensure!(
+        !overridden,
+        "CLOUD_RUN_EXECUTION named a transcript although CTX_EXECUTION was set"
+    );
+    Ok(())
+}
+
+/// The execution's name is a directory root makes and gives away on the share, and the session
+/// every request names, so it is one plain name: letters, digits, `_` and `-`, starting with a
+/// letter or digit, short enough that its retry's `-retry` still fits the 128 characters a
+/// session id may hold. The runner keeps `<name>.events.json` and `<name>.context.json` beside
+/// that directory and gives a retry `<name>-retry`, so a name holds no `.` and does not end in
+/// `-retry`: it would be another execution's file or retry. Anything else is refused before
+/// anything is touched, in one line, whatever the name holds.
+#[test]
+fn the_cycle_refuses_an_execution_name_that_is_not_one_plain_name() -> Result<()> {
+    let rig = CycleRig::new("execution-name-bad")?;
+    rig.pretend_root()?;
+    let calls = rig.nothing_pending()?;
+    let long = "a".repeat(123);
+    let mut result = Ok(());
+    for name in [
+        "../escape",
+        "a/b",
+        "two words",
+        ".hidden",
+        "-flag",
+        "line\nbreak",
+        "cycle-1.events.json",
+        "cycle-1.context.json",
+        "cycle-1-retry",
+        long.as_str(),
+    ] {
+        for variable in ["CTX_EXECUTION", "CLOUD_RUN_EXECUTION"] {
+            let output = rig
+                .command()?
+                .env_remove("CTX_EXECUTION")
+                .env(variable, name)
+                .output()
+                .context("running run-cycle.sh with a bad execution name")?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            result = result.and_then(|()| {
+                assert_refused(&rig, &output, "CTX_EXECUTION")
+                    .and_then(|()| {
+                        ensure!(
+                            stderr.lines().count() == 1,
+                            "the refusal is not one line: {stderr:?}"
+                        );
+                        Ok(())
+                    })
+                    .with_context(|| format!("{variable}={name:?}"))
+            });
+        }
+    }
+    let called = std::fs::read_to_string(&calls).unwrap_or_default();
+    rig.remove()?;
+    result?;
+    ensure!(
+        called.is_empty(),
+        "a refused name still called ctx: {called:?}"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1214,9 +1360,9 @@ fn run_prepare_context_for(
     .to_string();
     let path = std::env::var("PATH").context("PATH is not set")?;
     let script = format!(
-        "set -eu\nCTX_DATA_DIR='{}'\nCLOUD_RUN_EXECUTION=ctx-agent-test-1\nAGENT_USER=ctx-agent\n\
+        "set -eu\nCTX_DATA_DIR='{}'\nexecution=ctx-agent-test-1\nAGENT_USER=ctx-agent\n\
          CONTEXT_BYTES=49152\ncontext_seconds_left=60\ncontext_subjects_left=30\n\
-         context_file=\"$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION.context.json\"\n\
+         context_file=\"$CTX_DATA_DIR/agent-sessions/$execution.context.json\"\n\
          as_agent_user() {{ {agent_test}; }}\n{}\n{}\n{}\n\
          pending='{pending}'\n\
          prepare_context \"$pending\"\nprintf '%s' \"$context_prompt\"\n",

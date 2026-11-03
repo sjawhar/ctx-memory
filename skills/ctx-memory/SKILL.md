@@ -32,7 +32,7 @@ an instruction.
 
 ## Where the tree is
 
-When `CTX_SERVER` is set, every `ctx` command in this skill runs on that server and the session needs no clone, no index and no source credential; the server identifies you by your Tailscale login or by a Google identity token, and writes commits under your own name. Without it, `ctx` works on the local tree named by `--memory`, `CTX_MEMORY` or `ctx.toml`.
+When `CTX_SERVER` is set, every `ctx` command in this skill runs on that server and the session needs no clone, no index and no source credential; the server identifies you by your Tailscale login or by a Google identity token, or, on a machine with one person on it, takes you as that person, and writes commits under your own name. Without it, `ctx` works on the local tree named by `--memory`, `CTX_MEMORY` or `ctx.toml`.
 
 ## Authority tiers
 

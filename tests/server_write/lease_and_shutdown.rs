@@ -65,7 +65,7 @@ fn a_stopping_server_frees_its_lease_only_after_a_write_its_caller_left() -> Res
             ("CTX_LEASE_BUCKET", "ctx-leases"),
         ],
     )?;
-    let address = server.tailnet;
+    let address = server.tailnet_address()?;
     let caller = put_without_waiting(
         address,
         "ada@example.com",

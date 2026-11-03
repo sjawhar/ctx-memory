@@ -1,20 +1,22 @@
 //! Who called the server, and how they proved it.
 //!
-//! Two ports, two rules. Cloud Run ingress carries a Google identity token, which is checked
+//! Three ports, three rules. Cloud Run ingress carries a Google identity token, which is checked
 //! against Google's published keys for the audience this server was given; a header is never
 //! trusted there. The loopback port behind the Tailscale sidecar carries the login header
 //! Tailscale Serve sets for a signed-in user device and strips for a tagged one. A tagged node
 //! is identified, when the deployment allows its tag, by asking tailscaled's local API who the
 //! address in `X-Forwarded-For` is: Tailscale Serve overwrites that header with the tailnet
 //! address the request came from, and only the sidecar can reach the loopback port. A request
-//! with neither has no caller.
+//! with neither has no caller. The local port, on a machine with one person on it, asks for no
+//! proof: every request there is the one caller the server was started with, unless a web page
+//! in the machine's browser sent it.
 
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
 use axum::http::HeaderMap;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
@@ -57,6 +59,9 @@ pub enum Via {
     Tailscale,
     /// A tagged tailnet node, by a tag the deployment allows; tailscaled named its tags.
     TailscaleTag,
+    /// The local listener of a machine with one person on it, who was named when the server
+    /// started.
+    Local,
 }
 
 /// The claims this server reads from a Google identity token.
@@ -467,6 +472,105 @@ fn login(headers: &HeaderMap) -> Result<Caller> {
     })
 }
 
+/// Reads the one caller of the local listener from `Name <email>`, the form git writes an
+/// author in.
+///
+/// # Errors
+///
+/// Returns an error when the text is not one name and one address in that form, which git
+/// would refuse as an author or read as someone else: a part that begins or ends with a
+/// character git strips there ([`git_strips`]) is written without it, and a name of nothing
+/// else is refused.
+pub fn local(text: &str) -> Result<Caller> {
+    let refused = || anyhow!("{text:?} is not `Name <email>`, the form git writes an author in");
+    let (name, email) = text
+        .trim()
+        .strip_suffix('>')
+        .and_then(|inner| inner.split_once('<'))
+        .ok_or_else(refused)?;
+    let name = name.trim();
+    let well_formed = !text.contains(char::is_control)
+        && !name.is_empty()
+        && !name.contains(['<', '>'])
+        && !email.contains(['<', '>'])
+        && !email.contains(char::is_whitespace)
+        && email.split_once('@').is_some_and(|(user, domain)| {
+            !user.is_empty() && !domain.is_empty() && !domain.contains('@')
+        })
+        && ![name, email]
+            .iter()
+            .any(|part| part.starts_with(git_strips) || part.ends_with(git_strips));
+    if !well_formed {
+        return Err(refused());
+    }
+    Ok(Caller {
+        name: name.to_owned(),
+        email: email.to_owned(),
+        via: Via::Local,
+    })
+}
+
+/// The characters git strips from each end of an author's name and address (`crud` in git's
+/// `ident.c`).
+fn git_strips(c: char) -> bool {
+    c <= ' ' || matches!(c, ',' | ':' | ';' | '<' | '>' | '"' | '\\' | '\'')
+}
+
+/// Refuses a request at the local listener that a web page made.
+///
+/// That port asks for no proof, which holds for the processes of the one person on the
+/// machine, but a page from anywhere on the web runs in that person's browser too. A browser
+/// names the page's origin in `Origin` on every request a page posts to another origin, so a
+/// request that carries `Origin` is refused. A page's `<img>`, `<script>` or no-cors `fetch` is
+/// a GET that carries no `Origin`, but a browser adds the Fetch Metadata headers
+/// (`Sec-Fetch-Site` and the rest) to every request it sends to a loopback address, so a
+/// request that carries any `Sec-Fetch-*` header is refused too. A page whose own host name was
+/// pointed at this machine (DNS rebinding) is of the port's origin, and could read its answers,
+/// but it still names its own host in `Host`, so a `Host` other than `localhost` or a loopback
+/// address is refused as well. The `ctx` client sends neither `Origin` nor any `Sec-Fetch-*`
+/// header, and names the loopback address it was given.
+///
+/// # Errors
+///
+/// Returns an error naming the header that shows a web page sent the request.
+pub fn local_request(headers: &HeaderMap) -> Result<()> {
+    if headers.contains_key(ORIGIN) {
+        bail!("the local listener answers no web page, and this request carries an Origin header");
+    }
+    if let Some(name) = headers
+        .keys()
+        .find(|name| name.as_str().starts_with("sec-fetch-"))
+    {
+        bail!(
+            "the local listener answers no web page, and this request carries {name}, a header \
+             only a browser sends"
+        );
+    }
+    let Some(host) = headers.get(HOST) else {
+        return Ok(());
+    };
+    if !host.to_str().is_ok_and(names_this_machine) {
+        bail!(
+            "the local listener answers only requests to localhost or a loopback address, and \
+             this one names {host:?} as its Host"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `host`, a `Host` header's value, is `localhost` or a loopback address, with or
+/// without a port.
+fn names_this_machine(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(address, _)| address),
+        None => host.split_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn local_part(email: &str) -> &str {
     email.split('@').next().unwrap_or(email)
 }
@@ -479,9 +583,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        local_part, tag, tags, tailscale, Allowed, TailnetTags, Via, FORWARDED_FOR_HEADER,
-        TAILSCALE_LOGIN_HEADER,
+        local, local_part, local_request, tag, tags, tailscale, Allowed, TailnetTags, Via,
+        FORWARDED_FOR_HEADER, TAILSCALE_LOGIN_HEADER,
     };
+    use axum::http::header::{HOST, ORIGIN};
     use axum::http::HeaderMap;
 
     #[tokio::test]
@@ -507,6 +612,106 @@ mod tests {
     #[test]
     fn a_login_without_a_domain_is_its_own_name() {
         assert_eq!(local_part("ada"), "ada");
+    }
+
+    #[test]
+    fn the_local_caller_is_a_name_and_an_email() -> anyhow::Result<()> {
+        let caller = local("  Ada Lovelace  <ada@example.org> ")?;
+        assert_eq!(caller.name, "Ada Lovelace");
+        assert_eq!(caller.email, "ada@example.org");
+        assert_eq!(caller.via, Via::Local);
+        Ok(())
+    }
+
+    /// Each part git needs for an author is there, once, and holds nothing that would change
+    /// what git reads: no angle bracket in the name, no second address, no line break.
+    #[test]
+    fn a_local_caller_that_is_not_a_name_and_an_email_is_refused() {
+        for text in [
+            "",
+            "ada@example.org",
+            "Ada Lovelace",
+            "<ada@example.org>",
+            "Ada Lovelace <>",
+            "Ada Lovelace <ada>",
+            "Ada Lovelace <@example.org>",
+            "Ada Lovelace <ada@>",
+            "Ada Lovelace <ada@example.org> again",
+            "Ada <Lovelace> <ada@example.org>",
+            "Ada Lovelace <ada@example.org",
+            "Ada Lovelace <ada <ada@example.org>>",
+            "Ada Lovelace <ada example@example.org>",
+            "Ada\nLovelace <ada@example.org>",
+            "Ada Lovelace <ada@example.org\n>",
+            "' <ada@example.org>",
+            "Ada, <ada@example.org>",
+            "Ada Lovelace <\"ada\"@example.org>",
+            "Ada Lovelace <ada@example.org;>",
+            "Ada <ada<x@example.org>",
+            "Ada <a@b@example.org>",
+            "Ada > Lovelace <ada@example.org>",
+        ] {
+            let refused = local(text).err().map(|error| error.to_string());
+            assert!(
+                refused
+                    .as_deref()
+                    .is_some_and(|why| why.contains("Name <email>")),
+                "{text:?}: {refused:?}"
+            );
+        }
+    }
+
+    /// The `ctx` client names the loopback address it was given and sends neither `Origin` nor
+    /// any `Sec-Fetch-*` header; a web page in the browser sends `Origin` on a post, the browser
+    /// adds the `Sec-Fetch-*` headers to every request to a loopback address, and a page reached
+    /// by DNS rebinding names its own host.
+    #[test]
+    fn the_local_listener_answers_no_web_page() -> anyhow::Result<()> {
+        for host in [
+            None,
+            Some("127.0.0.1:4100"),
+            Some("127.0.0.1"),
+            Some("LOCALHOST:4100"),
+            Some("[::1]:4100"),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(host) = host {
+                headers.insert(HOST, host.parse()?);
+            }
+            assert!(local_request(&headers).is_ok(), "{host:?}");
+        }
+        for host in [
+            "example.org:4100",
+            "127.0.0.1.example.org:4100",
+            "localhost.example.org",
+            "[2001:db8::1]:4100",
+            "0.0.0.0:4100",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(HOST, host.parse()?);
+            assert!(local_request(&headers).is_err(), "{host:?}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "127.0.0.1:4100".parse()?);
+        headers.insert(ORIGIN, "https://example.org".parse()?);
+        assert!(local_request(&headers).is_err());
+        // An `<img>`, a `<script>` or a no-cors `fetch` from any page is a GET without `Origin`.
+        for (name, value) in [
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "no-cors"),
+            ("sec-fetch-dest", "image"),
+            ("sec-fetch-user", "?1"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(HOST, "127.0.0.1:4100".parse()?);
+            headers.insert(name, value.parse()?);
+            let refused = local_request(&headers).err().map(|error| error.to_string());
+            assert!(
+                refused.as_deref().is_some_and(|why| why.contains(name)),
+                "{name}: {refused:?}"
+            );
+        }
+        Ok(())
     }
 
     /// A fake tailscaled local API on a unix socket: `whois?addr=` answers each known address
