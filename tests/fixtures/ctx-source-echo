@@ -13,7 +13,19 @@ window_end=$(printf '%s' "$request" | sed -n 's/.*"window_end":"\([^"]*\)".*/\1/
 state_dir=$(printf '%s' "$request" | sed -n 's/.*"state_dir":"\([^"]*\)".*/\1/p')
 
 if [ -n "${ECHO_SLEEP-}" ]; then
-    sleep "$ECHO_SLEEP"
+    sleep "$ECHO_SLEEP" &
+    sleeper=$!
+fi
+
+# With ECHO_PID_OUT the source names its process, which leads its process group, and the
+# `sleep` it has started, so a test can tell whether each is still running.
+if [ -n "${ECHO_PID_OUT-}" ]; then
+    printf '%s %s\n' "$$" "${sleeper-}" > "$ECHO_PID_OUT.tmp"
+    mv "$ECHO_PID_OUT.tmp" "$ECHO_PID_OUT"
+fi
+
+if [ -n "${sleeper-}" ]; then
+    wait "$sleeper"
 fi
 
 # With ECHO_WAIT_FOR the source goes on only once that file exists, so a test holds a fetch
