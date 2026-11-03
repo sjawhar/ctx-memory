@@ -5,6 +5,14 @@ on: { pull_request: {}, workflow_call: {} }
 permissions:
   contents: read
 
+# A newer push to a pull request cancels that pull request's run, waiting or running: every
+# sjawhar repository shares one limit of 40 GitHub-hosted jobs at a time. release.yml's call for a
+# tag is a group of its own (its run id) and is never cancelled. It must not share the caller's
+# group, which would make the call wait for its own caller.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest

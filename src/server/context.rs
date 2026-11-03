@@ -60,7 +60,7 @@ pub async fn window_context(
         let prepared = {
             let context = running.tree()?;
             if let Some(source) = &context.config.context_source {
-                if !Allowed::parse(&source.callers)?.admits(&caller.email) {
+                if !Allowed::callers(&source.callers)?.admits(&caller.email) {
                     return Ok(Ended::Forbidden(caller.email));
                 }
             }

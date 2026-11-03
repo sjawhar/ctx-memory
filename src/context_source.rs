@@ -150,7 +150,7 @@ pub fn validate(config: &ContextSourceConfig) -> Result<()> {
     {
         bail!("command must name a program");
     }
-    crate::server::identity::Allowed::parse(&config.callers)
+    crate::server::identity::Allowed::callers(&config.callers)
         .context("callers must name who may read a window's context")?;
     if let Some(pattern) = config.key_pattern.as_deref() {
         let compiled = Regex::new(pattern).context("key_pattern")?;
