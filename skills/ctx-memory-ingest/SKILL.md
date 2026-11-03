@@ -124,7 +124,7 @@ automated notification noise unless a person acts on it.
    marker; handle them all, oldest first. When the cycle names a window cap, add it to
    `ctx pending --json` as `--limit <N>`: the answer then holds only the N oldest, and the rest
    wait for the next cycle. When it lists none, say so and stop. If a stream reports an
-   error, report it to whoever runs the cycle (and in the cycle log, if the rules page names
+   error, report it to whoever runs the cycle (and in the cycle log of step 7, if there is
    one); that stream's cursor stays where it is, so the next fetch re-reads it. A window
    whose `new_messages` count is zero is still handled: there is nothing to record
    for it, but advance the marker past it (step 11) so it does not sit in front of the windows
@@ -159,11 +159,11 @@ automated notification noise unless a person acts on it.
    record" below, then search for the entity, event or open item (`ctx search`,
    `ctx dossier`, `ctx open`) and update it when it exists. Link every new record from a
    parent or index so it is reachable.
-7. Record the cycle in the tree's cycle log, if the rules page names one, as data only: the
-   window id, the counts, and what was minted, updated and closed, as wikilinks. Do not
-   narrate how you decided, what you weighed, what you set aside, or what you read and left
-   unchanged; that account of your own reasoning belongs in no record, and a long retelling of
-   it on the cycle's last turn is what makes the model refuse it. With no cycle log named,
+7. Record the cycle in the cycle log the rules page names in its `cycle_log` field, if any, as
+   data only: the window id, the counts, and what was minted, updated and closed, as wikilinks.
+   Do not narrate how you decided, what you weighed, what you set aside, or what you read and
+   left unchanged; that account of your own reasoning belongs in no record, and a long retelling
+   of it on the cycle's last turn is what makes the model refuse it. With no cycle log named,
    write no record about the cycle.
 8. Verify. Check each new quote against its source with `ctx resolve <pointer>`, adding
    `--thread` when the record cites a thread pointer.

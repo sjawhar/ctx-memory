@@ -974,31 +974,59 @@ check_pass_marker() {
 	fi
 }
 
-# How many record writes the server accepted in the session whose captured stdout is in $1: the
-# calls of the record tools, ctx_record_put and ctx_record_rm, that omp reports as ended without
-# an error, each a tool_execution_end event of its own. A refused write is an error and wrote
-# nothing. A window's text reaches the capture only as a string inside an event, never as an event
-# of its own, and a line that is not JSON is passed over.
+# How many record writes the server accepted in the session whose captured stdout is in $1, less
+# those that wrote only the cycle log $2 (none when it is empty or not given): the calls of the
+# record tools, ctx_record_put and ctx_record_rm, that omp reports as ended without an error, each
+# a tool_execution_end event of its own. A refused write is an error and wrote nothing. The record
+# paths a call names are in the tool_execution_start event of the same call: a put's `records`, a
+# removal's `path`. A call that names only the cycle log is the cycle's entry in its log (the
+# ingest skill's step 7), which says nothing about whether the cycle wrote its windows' records; a
+# call that names it beside another record is a write like any other. A window's text reaches the
+# capture only as a string inside an event, never as an event of its own, and a line that is not
+# JSON is passed over.
 record_writes() {
-	jq -Rn '[inputs | fromjson? | objects
-		| select(.type == "tool_execution_end"
-			and (.toolName == "ctx_record_put" or .toolName == "ctx_record_rm")
-			and .isError != true)] | length' "$1"
+	jq -Rn --arg log "${2-}" '
+		reduce (inputs | fromjson? | objects) as $event ({paths: {}, writes: 0};
+			($event.toolCallId | tostring) as $id
+			| if $event.type == "tool_execution_start" then
+				.paths[$id] = [$event.args | objects | ((.records // []) | arrays | .[] | objects | .path), .path | strings]
+			elif $event.type == "tool_execution_end"
+				and ($event.toolName == "ctx_record_put" or $event.toolName == "ctx_record_rm")
+				and $event.isError != true then
+				(.paths[$id] // []) as $named
+				| if $log != "" and ($named | length) > 0 and all($named[]; . == $log) then . else .writes += 1 end
+			else . end)
+		| .writes' "$1"
 }
 
 # What a cycle's sessions were handed and what they wrote, for check_skipped_windows: each
 # session's windows, as one line of JSON holding each window's id and new message count from the
 # `ctx pending` answer the session was started on, and how many record writes the server accepted
-# across them. tally_session adds the session that just ended; a maintenance pass handles no
-# window, so it adds nothing.
+# across them, less those to the cycle log. tally_session adds the session that just ended; a
+# maintenance pass handles no window, so it adds nothing.
+#
+# The cycle log is the record the rules page names in its `cycle_log` field, which
+# `ctx rules --json` reports; it is read once, after the first session, from the rules page the
+# server holds, which no session can change. A read that fails leaves the cycle with no cycle log,
+# so every write counts, as it does in a tree whose rules page names none, and says so.
 cycle_windows=
 cycle_writes=0
+cycle_log=
+cycle_log_read=
 tally_session() {
 	[ -z "$pass" ] || return 0
+	if [ -z "$cycle_log_read" ]; then
+		cycle_log_read=1
+		if ! rules="$(ctx rules --json)" ||
+			! cycle_log="$(printf '%s' "$rules" | jq -r '.data.cycle_log | strings')"; then
+			cycle_log=
+			echo "run-cycle: could not read the cycle log the rules page names; every record write counts" >&2
+		fi
+	fi
 	listed="$(printf '%s' "$pending" | jq -c '[.data.windows[]? | {window, new_messages}]')" || listed='[]'
 	cycle_windows="$cycle_windows$listed
 "
-	written="$(record_writes "$session_dir.events.json")" || written=0
+	written="$(record_writes "$session_dir.events.json" "$cycle_log")" || written=0
 	cycle_writes=$((cycle_writes + written))
 }
 
