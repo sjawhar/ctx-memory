@@ -29,10 +29,13 @@ fn tree_with_source(label: &str, stub: &str, extra: &str) -> Result<(PathBuf, St
         &format!("#!/bin/sh\ncat > '{}'\n{stub}\n", request.display()),
     )?;
     let mut config = std::fs::read_to_string(tree.join("ctx.toml"))?;
-    config.push_str(&format!(
+    std::fmt::Write::write_fmt(
+        &mut config,
+        format_args!(
         "\n[context_source]\ncommand = ['{}']\ncallers = ['{CYCLE}']\nkey_pattern = 'C0EXAMPLE[0-9]+'\nlink_prefixes = ['https://tracker.example/']\n{extra}",
         program.display()
-    ));
+        ),
+    )?;
     std::fs::write(tree.join("ctx.toml"), config)?;
     std::fs::write(
         tree.join("decisions/tracked.md"),
@@ -125,7 +128,7 @@ fn a_context_source_that_hangs_answers_unavailable() -> Result<()> {
         "{}",
         reply.body
     );
-    assert!(items(&reply)?.is_empty());
+    assert_eq!(items(&reply)?.len(), 0, "{}", reply.body);
     assert!(took.as_secs() < 30, "the answer took {took:?}");
     Ok(())
 }
@@ -159,7 +162,7 @@ fn a_context_source_that_fails_or_floods_answers_unavailable() -> Result<()> {
             "{label}: {}",
             reply.body
         );
-        assert!(items(&reply)?.is_empty(), "{label}: {}", reply.body);
+        assert_eq!(items(&reply)?.len(), 0, "{label}: {}", reply.body);
     }
     Ok(())
 }
@@ -179,7 +182,7 @@ fn the_answer_stays_under_its_byte_cap() -> Result<()> {
     let items = items(&reply)?;
     let bytes = serde_json::to_vec(items)?.len();
     assert!(bytes <= 48 * 1024, "the items take {bytes} bytes");
-    assert!(!items.is_empty());
+    assert_ne!(items.len(), 0, "{}", reply.body);
     for item in items {
         assert!(item
             .get("title")
@@ -207,7 +210,7 @@ fn a_tree_with_no_context_source_answers_an_empty_list() -> Result<()> {
     remove_fixture(&tree)?;
 
     assert_eq!(reply.status, 200, "{}", reply.body);
-    assert!(items(&reply)?.is_empty());
+    assert_eq!(items(&reply)?.len(), 0, "{}", reply.body);
     assert!(reply.body.get("unavailable").is_none(), "{}", reply.body);
     Ok(())
 }
