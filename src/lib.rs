@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod atomic;
+pub mod backfill;
 pub mod cli;
 pub mod config;
 pub mod context;

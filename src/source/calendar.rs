@@ -2,13 +2,14 @@
 //!
 //! Each configured calendar is one stream whose cursor is a Calendar sync token: a fetch asks
 //! for what changed since the last run, and a first fetch lists every event from the backfill
-//! window onwards. Either way it records no event that starts [`HORIZON`] or more past the window
-//! end, reckoned to the second. A record's timestamp is the event's start, so an event that starts
-//! after the window ends is a context record.
+//! window onwards. Either way it records no instance of a recurring series that starts
+//! [`HORIZON`] or more past the window end, reckoned to the second, and lists no event that far
+//! ahead by time. A record's timestamp is the event's start, so an event that starts after the
+//! window ends is a context record.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, SubsecRound as _, TimeZone as _, Utc};
@@ -29,10 +30,12 @@ use super::{
 ///
 /// A listing expands each recurring series into its instances, and a series with no end runs for
 /// decades. Reading this far keeps a trip booked for next year and the next instance or two of a
-/// yearly series, and stops every other series here. A fetch that follows a sync token also makes
-/// the horizon listing: the events that came within this reach since its cursor's window, which
-/// the token does not name unless they changed. So each series yields its next instance as the
-/// horizon reaches it.
+/// yearly series, and stops every other series here. A listing by time asks for nothing later; a
+/// sync token takes no time bounds, so from its listing only a series' instances past the horizon
+/// are dropped, and a one-off event it names, which has changed, is recorded wherever it now
+/// starts. A fetch that follows a sync token also makes the horizon listing: the events that came
+/// within this reach since its cursor's window, which the token does not name unless they
+/// changed. So each series yields its next instance as the horizon reaches it.
 ///
 /// Where the reach of the fetch that wrote a cursor ended is reckoned from the cursor's time and
 /// this value, so raising it leaves the events between the old reach and the new one unrecorded
@@ -235,8 +238,9 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
 }
 
 /// Reads one calendar: incrementally when the cursor names a sync token, else from the time it
-/// names or the backfill window. Either way it records no event that starts at or after the
-/// horizon, [`HORIZON`] past the window end to the second.
+/// names or the backfill window. Either way it records no instance of a recurring series that
+/// starts at or after the horizon, [`HORIZON`] past the window end to the second; a listing by
+/// time records no event past it at all.
 fn collect_calendar<C: CalendarApi + ?Sized>(
     request: &FetchRequest,
     calendar: &str,
@@ -267,6 +271,7 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
         Some(TokenCursor::Time(start)) => list_from(start)?,
         None => list_from(backfill)?,
     };
+    let named_by_token = matches!(cursor, Some(TokenCursor::Token { .. })) && !page.expired;
     let mut horizon_listing = None;
     if page.expired {
         // Google refused the sync token, so the calendar is listed again. Only the time the
@@ -319,7 +324,14 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
         )
     };
     for event in &page.items {
-        if let Some(start) = recorded_start(event, &(..horizon))? {
+        // Only a recurring series runs for decades. A one-off event a sync token names has
+        // changed, so it is recorded wherever it now starts, as one moved past the horizon.
+        let kept = if named_by_token && event.get("recurringEventId").is_none() {
+            (Bound::Unbounded, Bound::Unbounded)
+        } else {
+            (Bound::Unbounded, Bound::Excluded(horizon))
+        };
+        if let Some(start) = recorded_start(event, &kept)? {
             collected.records.push(record(event, start)?);
         }
     }
@@ -734,6 +746,14 @@ mod tests {
         })
     }
 
+    /// `event` as one instance of a recurring series, as a listing that expands series has it.
+    fn instance(mut event: Value) -> Value {
+        if let Some(fields) = event.as_object_mut() {
+            fields.insert("recurringEventId".to_owned(), json!("SERIES-EXAMPLE"));
+        }
+        event
+    }
+
     fn pointers(records: &[Record]) -> Vec<String> {
         records
             .iter()
@@ -978,25 +998,26 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_listing_keeps_only_what_starts_before_the_horizon() -> Result<()> {
+    fn a_sync_listing_keeps_only_the_series_instances_that_start_before_the_horizon() -> Result<()>
+    {
         // The horizon is 2027-11-29T18:00:00Z, and an all-day event starts at midnight UTC.
         let api = api(vec![listing(
             "sync-3",
             vec![
-                all_day("EVENT-HORIZON-DAY", "2027-11-29", "2027-11-30"),
-                all_day("EVENT-DAY-AFTER", "2027-11-30", "2027-12-01"),
-                event(
+                instance(all_day("EVENT-HORIZON-DAY", "2027-11-29", "2027-11-30")),
+                instance(all_day("EVENT-DAY-AFTER", "2027-11-30", "2027-12-01")),
+                instance(event(
                     "EVENT-AT-HORIZON",
                     "2027-11-29T18:00:00Z",
                     "2027-11-29T19:00:00Z",
                     None,
-                ),
-                event(
+                )),
+                instance(event(
                     "EVENT-JUST-BEFORE",
                     "2027-11-29T17:59:59Z",
                     "2027-11-29T19:00:00Z",
                     None,
-                ),
+                )),
             ],
         )]);
         let request = request(Some("sync-2@2026-10-25T18:00:00Z"))?;
@@ -1009,6 +1030,82 @@ mod tests {
                 "gcal:team@example.com/EVENT-JUST-BEFORE"
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_one_off_event_the_sync_token_names_is_recorded_wherever_it_now_starts() -> Result<()> {
+        // The trip moved from next summer to a date past the horizon, 2027-11-29T18:00:00Z. A
+        // one-off event the token names has changed, and only a series runs for decades, so the
+        // record follows the move at once; the series instance on the same day does not.
+        let api = api(vec![listing(
+            "sync-3",
+            vec![
+                event(
+                    "EVENT-TRIP",
+                    "2029-01-22T09:00:00Z",
+                    "2029-01-26T18:00:00Z",
+                    None,
+                ),
+                instance(event(
+                    "EVENT-SERIES_20290122",
+                    "2029-01-22T09:00:00Z",
+                    "2029-01-22T10:00:00Z",
+                    None,
+                )),
+            ],
+        )]);
+        let request = request(Some("sync-2@2026-10-25T18:00:00Z"))?;
+        let messages = run_fetch(&api, &request)?;
+
+        let records = records(&messages);
+        assert_eq!(pointers(&records), ["gcal:team@example.com/EVENT-TRIP"]);
+        assert_eq!(starts(&records), ["2029-01-22T09:00:00Z"]);
+        assert!(records.iter().all(|record| record.context));
+        Ok(())
+    }
+
+    #[test]
+    fn a_listing_by_time_keeps_only_what_starts_before_the_horizon() -> Result<()> {
+        // Google answers to a day past the horizon, so a one-off event there comes back too; the
+        // horizon listing records it once the horizon reaches it.
+        let page = || {
+            listing(
+                "sync-3",
+                vec![
+                    event(
+                        "EVENT-BEFORE",
+                        "2027-11-29T12:00:00Z",
+                        "2027-11-29T13:00:00Z",
+                        None,
+                    ),
+                    event(
+                        "EVENT-IN-MARGIN",
+                        "2027-11-30T12:00:00Z",
+                        "2027-11-30T13:00:00Z",
+                        None,
+                    ),
+                ],
+            )
+        };
+        for (case, cursor, pages) in [
+            ("first listing", None, vec![page()]),
+            ("time cursor", Some("2026-10-24T00:00:00Z"), vec![page()]),
+            (
+                "resync after 410",
+                Some("sync-2@2026-10-24T00:00:00Z"),
+                vec![gone(), page()],
+            ),
+        ] {
+            let api = api(pages);
+            let messages = run_fetch(&api, &request(cursor)?)?;
+
+            assert_eq!(
+                pointers(&records(&messages)),
+                ["gcal:team@example.com/EVENT-BEFORE"],
+                "{case}"
+            );
+        }
         Ok(())
     }
 
@@ -1079,24 +1176,25 @@ mod tests {
     }
 
     #[test]
-    fn an_event_past_the_horizon_is_recorded_once_it_comes_within_it() -> Result<()> {
-        let far = event(
+    fn a_series_instance_past_the_horizon_is_recorded_once_it_comes_within_it() -> Result<()> {
+        let far = instance(event(
             "EVENT-FAR",
             "2027-11-28T12:00:00Z",
             "2027-11-28T13:00:00Z",
             None,
-        );
+        ));
+        // The series changed, so the token names every instance it expands.
         let first_api = api(vec![listing("sync-3", vec![far.clone()])]);
         let mut first = request(Some("sync-2@2026-10-22T18:00:00Z"))?;
         first.window_end = at("2026-10-23T18:00:00Z")?;
         let first_messages = run_fetch(&first_api, &first)?;
-        // The event starts after this fetch's horizon, 2027-11-27T18:00:00Z.
+        // The instance starts after this fetch's horizon, 2027-11-27T18:00:00Z.
         assert!(records(&first_messages).is_empty());
         let first_cursor = cursor(&first_messages).context("the first fetch moved on")?;
         assert_eq!(first_cursor, "sync-3@2026-10-23T18:00:00Z");
 
-        // Nothing about the event changed, so the sync token names it no more; the horizon
-        // listing, of what came within the horizon since the cursor's window, does.
+        // Nothing about the series changed since, so the sync token names it no more; the
+        // horizon listing, of what came within the horizon since the cursor's window, does.
         let second_api = api(vec![
             listing("sync-4", Vec::new()),
             listing("listing-token", vec![far]),
@@ -1132,15 +1230,16 @@ mod tests {
     }
 
     #[test]
-    fn an_event_at_the_horizon_of_a_window_ending_within_a_second_is_recorded_once() -> Result<()> {
+    fn an_instance_at_the_horizon_of_a_window_ending_within_a_second_is_recorded_once() -> Result<()>
+    {
         // `ctx fetch` ends its window at the current time, to the nanosecond, while the cursor
         // keeps the time to the second.
-        let boundary = event(
+        let boundary = instance(event(
             "EVENT-BOUNDARY",
             "2027-11-27T18:00:00Z",
             "2027-11-27T19:00:00Z",
             None,
-        );
+        ));
         let first_api = api(vec![listing("sync-3", vec![boundary.clone()])]);
         let mut first = request(Some("sync-2@2026-10-23T18:00:00Z"))?;
         first.window_end = at("2026-10-23T18:00:00.400Z")?;
