@@ -56,7 +56,8 @@ pub(super) fn maintenance_passes() -> Result<Vec<String>> {
         .collect())
 }
 
-/// What the scheduled session is told to follow, as `(name, text)`: both skills, and the
+/// What the scheduled session is told to follow, as `(name, text)`: both skills, the references
+/// the ingest skill sends a cycle to (such as how to work a window a page at a time), and the
 /// instructions of every maintenance pass the ingest skill keeps.
 pub(super) fn session_instructions() -> Result<Vec<(String, String)>> {
     let skills = repo().join("skills");
@@ -64,13 +65,15 @@ pub(super) fn session_instructions() -> Result<Vec<(String, String)>> {
         skills.join("ctx-memory-ingest/SKILL.md"),
         skills.join("ctx-memory/SKILL.md"),
     ];
-    let maintenance = skills.join("ctx-memory-ingest/maintenance");
-    let mut passes: Vec<PathBuf> = std::fs::read_dir(&maintenance)
-        .with_context(|| format!("reading {}", maintenance.display()))?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<_>>()?;
-    passes.sort();
-    paths.extend(passes);
+    for dir in ["references", "maintenance"] {
+        let dir = skills.join("ctx-memory-ingest").join(dir);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<_>>()?;
+        files.sort();
+        paths.extend(files);
+    }
     paths
         .into_iter()
         .map(|path| {

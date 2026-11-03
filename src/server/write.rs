@@ -20,10 +20,12 @@ use super::command;
 use super::identity::Caller;
 use super::request_log::Note;
 use super::{Listener, Shared};
+use crate::context::Context;
 use crate::marker;
 use crate::protocol::{
-    Committed, DeleteRequest, Finding, MarkerRequest, MarkerResponse, PutBatchRequest, PutRequest,
-    RecordFile, Refused, DELETE_ROUTE, MARKER_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE,
+    Committed, DeleteRequest, Finding, MarkerRequest, MarkerResponse, PageRequest, PageResponse,
+    PutBatchRequest, PutRequest, RecordFile, Refused, DELETE_ROUTE, MARKER_ROUTE, PAGE_ROUTE,
+    PUT_BATCH_ROUTE, PUT_ROUTE,
 };
 use crate::redact::credentials_in;
 
@@ -45,9 +47,9 @@ enum Applied {
     Unheld(Unheld),
 }
 
-/// What one marker advance did.
+/// What one marker move did: the marker moved or a page was recorded, and this is the answer.
 enum Moved {
-    Marker(marker::Marker),
+    Done(Response),
     /// This copy may not write: another copy holds the write lease.
     Unheld(Unheld),
 }
@@ -200,7 +202,53 @@ pub async fn marker_advance(
     body: Bytes,
 ) -> Response {
     match admit::<MarkerRequest>(&listener, MARKER_ROUTE, &headers, &body, &note).await {
-        Ok((caller, request)) => advance(&listener.shared, caller, request).await,
+        Ok((caller, MarkerRequest { session, window })) => {
+            move_marker(
+                &listener.shared,
+                caller,
+                MARKER_ROUTE,
+                session,
+                move |context, by| {
+                    let marker = marker::advance(context, &window, by)?;
+                    Ok((StatusCode::OK, Json(MarkerResponse { marker })).into_response())
+                },
+            )
+            .await
+        }
+        Err(refused) => *refused,
+    }
+}
+
+/// Answers `POST /v1/marker/page`: records a page of the window after the marker, beside the
+/// marker and under the same lease, as [`marker_advance`] moves the marker. A window or a page
+/// the caller names wrongly is answered 400.
+pub async fn marker_page(
+    State(listener): State<Listener>,
+    Extension(note): Extension<Note>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match admit::<PageRequest>(&listener, PAGE_ROUTE, &headers, &body, &note).await {
+        Ok((
+            caller,
+            PageRequest {
+                session,
+                through,
+                window,
+            },
+        )) => {
+            move_marker(
+                &listener.shared,
+                caller,
+                PAGE_ROUTE,
+                session,
+                move |context, by| {
+                    let page = marker::page(context, &window, through, by)?;
+                    Ok((StatusCode::OK, Json(PageResponse { page })).into_response())
+                },
+            )
+            .await
+        }
         Err(refused) => *refused,
     }
 }
@@ -231,18 +279,25 @@ async fn admit<Body: DeserializeOwned>(
         })
 }
 
-/// Moves the marker for a caller already identified, as [`marker_advance`] says.
-async fn advance(shared: &Arc<Shared>, caller: Caller, request: MarkerRequest) -> Response {
-    // A local advance names the session that moved the marker; through the server the marker
-    // names the signed-in caller and the session it says it is. The marker is on the share
-    // every copy and the fetch job read, so a session holding a credential is refused as a
-    // write's is, without repeating it.
-    let session = session_label(request.session.as_deref());
+/// Moves the marker, or records a page of the window after it, for a caller already
+/// identified: `change` does it on the tree, under the write lease, as `by`.
+async fn move_marker(
+    shared: &Arc<Shared>,
+    caller: Caller,
+    route: &'static str,
+    session: Option<String>,
+    change: impl FnOnce(&Context, &str) -> Result<Response> + Send + 'static,
+) -> Response {
+    // A local move names the session that made it; through the server the marker and the page
+    // name the signed-in caller and the session it says it is. Both are on the share every copy
+    // and the fetch job read, so a session holding a credential is refused as a write's is,
+    // without repeating it.
+    let session = session_label(session.as_deref());
     match session.as_deref().map(credentials_in).transpose() {
         Ok(Some(kinds)) if !kinds.is_empty() => {
             return bad_request(
                 shared,
-                MARKER_ROUTE,
+                route,
                 &format!(
                     "the session holds what has the shape of {}; a credential never goes into \
                      the marker: take it out, and revoke it if it is real",
@@ -251,7 +306,7 @@ async fn advance(shared: &Arc<Shared>, caller: Caller, request: MarkerRequest) -
             );
         }
         Ok(_) => {}
-        Err(error) => return failed(shared, MARKER_ROUTE, &format!("{error:#}")),
+        Err(error) => return failed(shared, route, &format!("{error:#}")),
     }
     let by = match session {
         Some(session) => format!("{} ({session})", caller.email),
@@ -263,41 +318,39 @@ async fn advance(shared: &Arc<Shared>, caller: Caller, request: MarkerRequest) -
     // The answer, and the `write failed:` line of a marker that did not move, are made in the
     // blocking task: hyper drops a request whose caller hung up, not the task, and the line
     // must still come.
-    let advancing = Arc::clone(shared);
+    let moving = Arc::clone(shared);
     let answered = tokio::task::spawn_blocking(move || {
-        let moved = move_marker(&advancing, &request.window, &by);
-        answer_advance(&advancing, moved)
+        let moved = held_change(&moving, &by, change);
+        answer_move(&moving, route, moved)
     })
     .await;
     answered.unwrap_or_else(|error| {
-        failed(
-            shared,
-            MARKER_ROUTE,
-            &format!("advancing the marker failed: {error}"),
-        )
+        failed(shared, route, &format!("moving the marker failed: {error}"))
     })
 }
 
-/// Moves the marker to `window` under the write lease, once the tree is this request's.
-fn move_marker(shared: &Shared, window: &str, by: &str) -> Result<Moved> {
+/// Runs `change` as `by` under the write lease, once the tree is this request's.
+fn held_change(
+    shared: &Shared,
+    by: &str,
+    change: impl FnOnce(&Context, &str) -> Result<Response>,
+) -> Result<Moved> {
     let context = shared.tree()?;
     if let Err(error) = shared.hold_lease() {
         return Ok(Moved::Unheld(Unheld::of(shared, &error)));
     }
-    Ok(Moved::Marker(marker::advance(&context, window, by)?))
+    Ok(Moved::Done(change(&context, by)?))
 }
 
-/// The answer to one marker advance, with its `write failed:` line when the marker did not move.
-fn answer_advance(shared: &Shared, moved: Result<Moved>) -> Response {
+/// The answer to one marker move, with its `write failed:` line when the marker did not move.
+fn answer_move(shared: &Shared, route: &str, moved: Result<Moved>) -> Response {
     match moved {
-        Ok(Moved::Marker(marker)) => {
-            (StatusCode::OK, Json(MarkerResponse { marker })).into_response()
-        }
-        Ok(Moved::Unheld(refusal)) => refuse(shared, MARKER_ROUTE, &refusal),
+        Ok(Moved::Done(response)) => response,
+        Ok(Moved::Unheld(refusal)) => refuse(shared, route, &refusal),
         Err(error) if error.downcast_ref::<marker::Refused>().is_some() => {
-            bad_request(shared, MARKER_ROUTE, &format!("{error:#}"))
+            bad_request(shared, route, &format!("{error:#}"))
         }
-        Err(error) => failed(shared, MARKER_ROUTE, &format!("{error:#}")),
+        Err(error) => failed(shared, route, &format!("{error:#}")),
     }
 }
 

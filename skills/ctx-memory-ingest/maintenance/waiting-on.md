@@ -43,4 +43,4 @@ The pass reads no window, mints no record and never moves the marker.
 4. Report how many open records you checked and how many you changed, and for each change
    its path, the old and the new `waiting_on`, and the pointer that settled it. End the report
    with the completion line your prompt names: the runner fails a pass whose last message does
-   not end with it. Then stop: do not run `ctx marker advance`.
+   not end with it. Then stop: do not run `ctx marker advance` or `ctx marker page`.

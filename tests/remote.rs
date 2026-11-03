@@ -467,7 +467,18 @@ fn every_write_is_sent_again_after_the_pause_a_deferring_server_asks_for() -> Re
     .to_string();
     let committed = json!({ "commit": "c0ffee" }).to_string();
     let batch = json!([{ "path": "decisions/cadence.md", "content": "a record" }]).to_string();
-    let writes: [(&[&str], Option<&str>, &str, &str); 4] = [
+    let page = json!({
+        "page": {
+            "version": 1,
+            "window": "20260102T000000Z-0000",
+            "worked": 3,
+            "last": { "ts": "2026-01-01T23:00:00Z", "pointer": "echo:C0EXAMPLE03/record" },
+            "recorded_at": "2026-01-02T01:00:00Z",
+            "by": "ada@example.com (s)"
+        }
+    })
+    .to_string();
+    let writes: [(&[&str], Option<&str>, &str, &str); 5] = [
         (
             &["record", "put", "decisions/cadence.md", "-"],
             Some("a record"),
@@ -491,6 +502,12 @@ fn every_write_is_sent_again_after_the_pause_a_deferring_server_asks_for() -> Re
             None,
             "/v1/marker/advance",
             marker.as_str(),
+        ),
+        (
+            &["marker", "page", "20260102T000000Z-0000", "3"],
+            None,
+            "/v1/marker/page",
+            page.as_str(),
         ),
     ];
     for (args, input, route, answer) in writes {

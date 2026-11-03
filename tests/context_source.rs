@@ -17,15 +17,17 @@ const CYCLE: &str = "cycle@example.com";
 /// question is tracked by a link, with one fetched window. Returns the tree, the window id and
 /// the file the stub writes its standard input to.
 fn tree_with_source(label: &str, stub: &str, extra: &str) -> Result<(PathBuf, String, PathBuf)> {
-    tree_with_source_for(label, stub, extra, &format!("'{CYCLE}'"))
+    tree_with_source_for(label, stub, extra, &format!("'{CYCLE}'"), &["C0EXAMPLE01"])
 }
 
-/// [`tree_with_source`] whose `callers` are `callers`, a TOML list body.
+/// [`tree_with_source`] whose `callers` are `callers`, a TOML list body, and whose echo source
+/// reads `streams`, one message each.
 fn tree_with_source_for(
     label: &str,
     stub: &str,
     extra: &str,
     callers: &str,
+    streams: &[&str],
 ) -> Result<(PathBuf, String, PathBuf)> {
     let tree = fixture_clone(label)?;
     let root = tree
@@ -38,7 +40,15 @@ fn tree_with_source_for(
         &program,
         &format!("#!/bin/sh\ncat > '{}'\n{stub}\n", request.display()),
     )?;
-    let mut config = std::fs::read_to_string(tree.join("ctx.toml"))?;
+    let streams = streams
+        .iter()
+        .map(|stream| format!("\"{stream}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut config = std::fs::read_to_string(tree.join("ctx.toml"))?.replace(
+        "streams = [\"C0EXAMPLE01\"]",
+        &format!("streams = [{streams}]"),
+    );
     std::fmt::Write::write_fmt(
         &mut config,
         format_args!(
@@ -116,6 +126,62 @@ fn the_context_source_is_sent_the_windows_subjects() -> Result<()> {
         serde_json::json!(["https://chat.example/archives/C1/p1"])
     );
     assert!(reply.body.get("unavailable").is_none(), "{}", reply.body);
+    Ok(())
+}
+
+/// A window worked in pages has the context of the page `ctx pending` lists: its subjects come
+/// from that page's messages alone, and once that page is recorded, from the next page's.
+#[test]
+fn a_window_worked_in_pages_is_sent_the_subjects_of_its_page() -> Result<()> {
+    let (tree, window, request) = tree_with_source_for(
+        "context-pages",
+        r#"printf '%s' '{"items":[]}'"#,
+        "\n[ingest]\npage_messages = 2\n",
+        &format!("'{CYCLE}'"),
+        &[
+            "C0EXAMPLE01",
+            "C0EXAMPLE02",
+            "C0EXAMPLE03",
+            "C0EXAMPLE04",
+            "C0EXAMPLE05",
+        ],
+    )?;
+    let server = Server::start(&tree, &[])?;
+    let first = ask(&server, &window, Some(CYCLE))?;
+    let first_sent = std::fs::read_to_string(&request).unwrap_or_default();
+    let recorded = server.post_as(
+        CYCLE,
+        "/v1/marker/page",
+        &serde_json::json!({ "window": window, "through": 2, "session": "cycle-1" }),
+    )?;
+    let second = ask(&server, &window, Some(CYCLE))?;
+    let second_sent = std::fs::read_to_string(&request).unwrap_or_default();
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert_eq!(recorded.status, 200, "{}", recorded.body);
+    assert_eq!(second.status, 200, "{}", second.body);
+    let subjects = |sent: &str| -> Result<Value> {
+        let sent: Value = serde_json::from_str(sent).context("the program got no JSON request")?;
+        Ok(sent.get("subjects").cloned().unwrap_or_default())
+    };
+    assert_eq!(
+        subjects(&first_sent)?,
+        serde_json::json!([
+            "C0EXAMPLE01",
+            "C0EXAMPLE02",
+            "https://tracker.example/issues/7"
+        ])
+    );
+    assert_eq!(
+        subjects(&second_sent)?,
+        serde_json::json!([
+            "C0EXAMPLE03",
+            "C0EXAMPLE04",
+            "https://tracker.example/issues/7"
+        ])
+    );
     Ok(())
 }
 
@@ -260,6 +326,7 @@ fn a_tagged_cycle_named_by_its_tag_reads_the_context() -> Result<()> {
         r#"printf '%s' '{"items":[]}'"#,
         "",
         "'tag:ctx-ingest'",
+        &["C0EXAMPLE01"],
     )?;
     let root = tree.parent().context("the fixture has a root")?.to_owned();
     let api = support::fake_tailscaled::FakeTailscaled::start(

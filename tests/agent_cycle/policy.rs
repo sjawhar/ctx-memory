@@ -61,14 +61,15 @@ fn admits(pattern: &str, command: &str) -> Result<bool> {
 }
 
 /// Parses `words` as ctx's arguments, adding a placeholder for each required argument a
-/// pattern or a skill leaves out (`ctx search`).
+/// pattern or a skill leaves out (`ctx search`). The placeholder is `1`, which parses wherever
+/// one stands: a path, an id or a count (`ctx marker page <window> <through>`).
 fn parse_filled(words: &[&str]) -> Result<(Cli, Vec<String>)> {
     let mut argv: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
     loop {
         match parse_argv(&argv) {
             Ok(cli) => return Ok((cli, argv)),
             Err(error) if error.kind() == ErrorKind::MissingRequiredArgument && argv.len() < 8 => {
-                argv.push("x".to_owned());
+                argv.push("1".to_owned());
             }
             Err(error) => bail!("`ctx {}` does not parse: {error}", argv.join(" ")),
         }
@@ -177,6 +178,7 @@ fn the_shell_admits_only_the_ctx_subcommands_the_cycle_needs() -> Result<()> {
         "cite verify",
         "dossier",
         "marker advance",
+        "marker page",
         "open",
         "pending",
         "record show",

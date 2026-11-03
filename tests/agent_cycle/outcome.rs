@@ -91,6 +91,11 @@ struct Around<'a> {
     /// first session. A later entry wins, and an empty window is no marker at all, as on a tree
     /// no cycle has handled.
     marker_moves: &'a [(usize, &'a str)],
+    /// The page recorded of the window after the marker once a session has run:
+    /// `(session, window, worked)`, as a session that ran `ctx marker page` leaves it, and 0 for
+    /// the page recorded before the first session. A later entry wins, and `ctx marker show`
+    /// carries it as its `page`.
+    page_moves: &'a [(usize, &'a str, usize)],
     /// What `ctx pending --json` answers: the first entry before the first session (the read the
     /// runner hands the session), the second once one session has run (the retry's read). A read
     /// past the last entry answers the first, and an empty entry is a read that fails.
@@ -138,14 +143,36 @@ fn verdict(pass: Option<&str>, attempts: &[Attempt<'_>], around: &Around<'_>) ->
 /// A `ctx pending --json` answer listing `windows`, each `(window id, new messages)`, in the
 /// shape the CLI prints it.
 fn pending_answer(windows: &[(&str, usize)]) -> String {
+    let windows: Vec<Listed<'_>> = windows
+        .iter()
+        .map(|&(window, new_messages)| (window, new_messages, None))
+        .collect();
+    paged_answer(&windows)
+}
+
+/// One window a `ctx pending` answer lists: its id, its new messages, and, when it is listed as
+/// a page, `(worked, through)`: the messages earlier pages hold, and those and the ones this page
+/// lists.
+type Listed<'a> = (&'a str, usize, Option<(usize, usize)>);
+
+/// [`pending_answer`] whose windows may each be listed as a page.
+fn paged_answer(windows: &[Listed<'_>]) -> String {
     let windows: Vec<Value> = windows
         .iter()
-        .map(|(window, new_messages)| {
-            json!({
+        .map(|&(window, new_messages, page)| {
+            let mut entry = json!({
                 "window": window, "dir": format!("windows/{window}"),
                 "window_end": "2026-11-01T01:00:00Z", "status": "ok",
-                "new_messages": new_messages, "listed_messages": new_messages
-            })
+                "new_messages": new_messages,
+                "listed_messages": page.map_or(new_messages, |(worked, through)| through - worked)
+            });
+            if let (Some((worked, through)), Some(fields)) = (page, entry.as_object_mut()) {
+                fields.insert(
+                    "page".to_owned(),
+                    json!({"worked": worked, "through": through, "last": through == new_messages}),
+                );
+            }
+            entry
         })
         .collect();
     json!({
@@ -172,6 +199,12 @@ fn stage(dir: &Path, attempts: &[Attempt<'_>], around: &Around<'_>) -> Result<()
     }
     for (session, window) in around.marker_moves {
         std::fs::write(dir.join(format!("marker-{session}")), window)?;
+    }
+    for (session, window, worked) in around.page_moves {
+        std::fs::write(
+            dir.join(format!("page-{session}")),
+            format!("{window} {worked}"),
+        )?;
     }
     if around.marker_read_fails {
         std::fs::write(dir.join("marker-fails"), "")?;
@@ -286,7 +319,8 @@ run_session() {{
 /// file fails the read). `ctx rules` answers what the `rules` file holds (a page that names no
 /// cycle log when there is none; an empty file fails the read). `ctx marker show` answers
 /// [`MARKER_BEFORE`], or what `marker-0` names, until a session whose `marker-<session>` names the
-/// window it moved the marker to has run (an empty name is no marker); once a session has run, it
+/// window it moved the marker to has run (an empty name is no marker), with the page that the
+/// newest `page-<session>` so far records, `<window> <worked>`; once a session has run, it
 /// fails when `marker-fails` is there and answers text that is not JSON when `marker-unreadable`
 /// is there.
 fn ctx_stand_in() -> String {
@@ -322,15 +356,20 @@ fn ctx_stand_in() -> String {
 	fi
 	if [ "$ran" -gt 0 ] && [ -f "$VERDICT_DIR/marker-unreadable" ]; then echo 'Bad Gateway'; return 0; fi
 	marker={MARKER_BEFORE}
+	page=
 	session=0
 	while [ "$session" -le "$ran" ]; do
 		[ ! -f "$VERDICT_DIR/marker-$session" ] || marker="$(cat "$VERDICT_DIR/marker-$session")"
+		[ ! -f "$VERDICT_DIR/page-$session" ] || page="$(cat "$VERDICT_DIR/page-$session")"
 		session=$((session + 1))
 	done
+	if [ -n "$page" ]; then
+		page="$(printf ',"page":{{"version":1,"window":"%s","worked":%s}}' ${{page}})"
+	fi
 	if [ -z "$marker" ]; then
-		printf '%s\n' '{{"version":1,"command":"marker show","data":{{"marker":null}}}}'
+		printf '{{"version":1,"command":"marker show","data":{{"marker":null%s}}}}\n' "$page"
 	else
-		printf '{{"version":1,"command":"marker show","data":{{"marker":{{"version":1,"window":"%s"}}}}}}\n' "$marker"
+		printf '{{"version":1,"command":"marker show","data":{{"marker":{{"version":1,"window":"%s"}}%s}}}}\n' "$marker" "$page"
 	fi
 }}"#
     )
@@ -1526,6 +1565,111 @@ fn only_a_cycle_that_wrote_nothing_past_new_messages_fails_for_skipping() -> Res
             ensure_succeeded(&verdict, what)?;
         }
     }
+    Ok(())
+}
+
+/// A cycle that records a page of a window has moved past that page's messages as surely as one
+/// that moves the marker past a window: no later cycle lists them again. So the runner counts a
+/// recorded page as progress past those messages. A cycle that recorded one and wrote no record
+/// fails, in the one line that names the windows skipped, with the window and the messages its
+/// pages moved past; a cycle that wrote a record, or recorded no new page, does not.
+#[test]
+fn a_cycle_that_recorded_a_page_without_a_record_fails() -> Result<()> {
+    // The runner's read lists the second page of a window of ten: messages 4 to 6.
+    let second_page = paged_answer(&[(FIRST, 10, Some((3, 6)))]);
+    let nothing = finished("Handled one page.");
+    let put = wrote(&[("ctx_record_put", true)], answer("Handled one page."));
+    for (events, pages, skipped, what) in [
+        (
+            &nothing,
+            &[(0, FIRST, 3), (1, FIRST, 6)][..],
+            true,
+            "the session recorded a page and wrote no record",
+        ),
+        (
+            &put,
+            &[(0, FIRST, 3), (1, FIRST, 6)][..],
+            false,
+            "the session recorded a page after writing a record",
+        ),
+        (
+            &nothing,
+            &[(0, FIRST, 3)][..],
+            false,
+            "the session recorded no page and moved no marker",
+        ),
+    ] {
+        let verdict = verdict(
+            None,
+            &[Attempt { status: 0, events }],
+            &Around {
+                page_moves: pages,
+                pending: &[&second_page],
+                ..Around::default()
+            },
+        )?;
+        if skipped {
+            ensure_failed_saying(&verdict, SKIPPED, what)?;
+            let line = verdict.lines_saying(SKIPPED).concat();
+            ensure!(
+                line.contains(&format!(
+                    "{FIRST} (messages 4 to 6 of 10 new, recorded as pages)"
+                )),
+                "{what}, yet the line does not name the window and the messages its page moved \
+                 past: {line}"
+            );
+        } else {
+            ensure_succeeded(&verdict, what)?;
+        }
+    }
+    Ok(())
+}
+
+/// The pages a refused session and its retry recorded are one cycle's: the messages named run
+/// from the first read's page on, through the page the retry recorded last, and an empty window
+/// the marker passed on the way is not named.
+#[test]
+fn a_refused_cycle_is_judged_for_pages_across_both_sessions() -> Result<()> {
+    let first_read = paged_answer(&[(FIRST, 0, None), (SECOND, 9, Some((0, 3)))]);
+    let retry_read = paged_answer(&[(SECOND, 9, Some((3, 6)))]);
+    let refused = refused();
+    let finished = finished("Handled two pages.");
+    let verdict = verdict(
+        None,
+        &[
+            Attempt {
+                status: 1,
+                events: &refused,
+            },
+            Attempt {
+                status: 0,
+                events: &finished,
+            },
+        ],
+        &Around {
+            marker_moves: &[(1, FIRST)],
+            page_moves: &[(1, SECOND, 3), (2, SECOND, 6)],
+            pending: &[&first_read, &retry_read],
+            ..Around::default()
+        },
+    )?;
+    ensure!(
+        verdict.sessions == 2,
+        "a refused cycle did not get its fresh session: {}",
+        verdict.stderr
+    );
+    ensure_failed_saying(
+        &verdict,
+        SKIPPED,
+        "neither session wrote a record, and both recorded a page",
+    )?;
+    let line = verdict.lines_saying(SKIPPED).concat();
+    ensure!(
+        line.contains(&format!(
+            "{SECOND} (messages 1 to 6 of 9 new, recorded as pages)"
+        )) && !line.contains(FIRST),
+        "the line does not name the pages both sessions recorded, and only them: {line}"
+    );
     Ok(())
 }
 

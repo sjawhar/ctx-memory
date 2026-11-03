@@ -20,8 +20,8 @@ use crate::marker;
 use crate::output::{self, Outcome, Sink};
 use crate::protocol::{
     self, Captured, CommandRequest, Committed, DeleteRequest, Draft, MarkerRequest, MarkerResponse,
-    PutBatchRequest, PutRequest, RecordFile, Refused, COMMAND_ROUTE, DELETE_ROUTE, MARKER_ROUTE,
-    PUT_BATCH_ROUTE, PUT_ROUTE,
+    PageRequest, PageResponse, PutBatchRequest, PutRequest, RecordFile, Refused, COMMAND_ROUTE,
+    DELETE_ROUTE, MARKER_ROUTE, PAGE_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE,
 };
 use crate::redact;
 use crate::session_id;
@@ -193,6 +193,29 @@ impl Client {
         let answer: MarkerResponse = serde_json::from_value(value)
             .context("decoding the marker the server answered with")?;
         Ok(answer.marker)
+    }
+
+    /// Records a page of the window after the marker through the server.
+    ///
+    /// It is sent again while the server defers it, as a record write is: it names its window
+    /// and its page, and the same page recorded twice is recorded once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server cannot be reached or refuses the page.
+    pub fn marker_page(&self, window: &str, through: usize, session: &str) -> Result<marker::Page> {
+        let request = PageRequest {
+            session: Some(session.to_owned()),
+            through,
+            window: window.to_owned(),
+        };
+        let (status, value) = self.answer_write(PAGE_ROUTE, &request)?;
+        if !status.is_success() {
+            bail!("{}", error_text(status, &value));
+        }
+        let answer: PageResponse = serde_json::from_value(value)
+            .context("decoding the page record the server answered with")?;
+        Ok(answer.page)
     }
 
     /// Reads what the server's context source says about one window.
@@ -475,6 +498,15 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             let payload = json!({ "marker": marker });
             output::emit(sink, cli.json, "marker advance", &payload, |_, out| {
                 marker::print(Some(&marker), out)
+            })?;
+            Ok(Some(Outcome::Pass))
+        }
+        Remote::MarkerPage { window, through } => {
+            // The shape a local page record answers with, and its text.
+            let page = client()?.marker_page(window, through, &session)?;
+            let payload = json!({ "page": page });
+            output::emit(sink, cli.json, "marker page", &payload, |_, out| {
+                marker::print_page(&page, out)
             })?;
             Ok(Some(Outcome::Pass))
         }

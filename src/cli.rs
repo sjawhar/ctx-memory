@@ -127,16 +127,13 @@ pub enum Command {
         #[command(subcommand)]
         command: CursorCommand,
     },
-    /// List the completed windows the agent has not handled yet.
+    /// List the completed windows the agent has not handled yet, at most one page of their
+    /// new messages.
     Pending {
         /// Handle at most this many windows, oldest first, and leave the rest for the next
         /// cycle. Omitted, every pending window is listed.
         #[arg(long)]
         limit: Option<usize>,
-        /// Leave out this many of the oldest new messages: the `next_offset` an answer that
-        /// left messages out gave, to list the next part.
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
     },
     /// Print what the tree's context source says about the subjects one window names.
     Context {
@@ -150,7 +147,7 @@ pub enum Command {
         #[arg(long, value_name = "SECONDS")]
         seconds: Option<u64>,
     },
-    /// Inspect or advance the agent marker.
+    /// Inspect or advance the agent marker, or record a page of the window after it.
     Marker {
         #[command(subcommand)]
         command: MarkerCommand,
@@ -269,10 +266,14 @@ pub enum CursorCommand {
 
 #[derive(Subcommand)]
 pub enum MarkerCommand {
-    /// Print the window the agent has handled up to.
+    /// Print the window the agent has handled up to, and the page of the window after it.
     Show,
     /// Move the marker to a completed window after the commit that handled it.
     Advance { window: String },
+    /// Record that the agent has worked the window after the marker through its `through`
+    /// oldest new messages, after the commit that wrote their records: the `page.through` of the
+    /// page `ctx pending` lists.
+    Page { window: String, through: usize },
 }
 
 impl Command {
@@ -297,6 +298,9 @@ impl Command {
             Self::Marker {
                 command: MarkerCommand::Advance { .. },
             } => "marker advance".to_owned(),
+            Self::Marker {
+                command: MarkerCommand::Page { .. },
+            } => "marker page".to_owned(),
             Self::Resolve { .. } => "resolve".to_owned(),
             Self::Cite {
                 command: CiteCommand::Verify { .. },
@@ -379,6 +383,12 @@ impl Command {
             Self::Marker {
                 command: MarkerCommand::Advance { window },
             } => Remote::MarkerAdvance { window },
+            Self::Marker {
+                command: MarkerCommand::Page { window, through },
+            } => Remote::MarkerPage {
+                window,
+                through: *through,
+            },
             Self::Context {
                 window,
                 max_subjects,
@@ -422,6 +432,8 @@ pub enum Remote<'a> {
     Rm { path: &'a str },
     /// `marker advance`: `/v1/marker/advance`, under the server's write lease.
     MarkerAdvance { window: &'a str },
+    /// `marker page`: `/v1/marker/page`, under the server's write lease.
+    MarkerPage { window: &'a str, through: usize },
     /// `context`: `GET /v1/windows/{id}/context`, which only the callers the tree's
     /// `[context_source]` names may read.
     Context {
@@ -492,6 +504,14 @@ struct CursorShowPayload {
 #[derive(Serialize)]
 struct MarkerShowPayload {
     marker: Option<Marker>,
+    /// The page record of the window after the marker, when a page of it is recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<marker::Page>,
+}
+
+#[derive(Serialize)]
+struct MarkerPagePayload {
+    page: marker::Page,
 }
 
 #[derive(Serialize)]
@@ -658,7 +678,7 @@ fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
         ),
         Command::Delta { window, write } => run_delta(run, window.as_deref(), *write),
         Command::Cursor { command } => run_cursor(run, command),
-        Command::Pending { limit, offset } => run_pending(run, *limit, *offset),
+        Command::Pending { limit } => run_pending(run, *limit),
         Command::Context {
             window,
             max_subjects,
@@ -996,8 +1016,8 @@ fn run_context(
     Ok(Outcome::Pass)
 }
 
-fn run_pending(run: &mut Run<'_, '_>, limit: Option<usize>, offset: usize) -> Result<Outcome> {
-    let payload = marker::pending(run.context, limit, offset)?;
+fn run_pending(run: &mut Run<'_, '_>, limit: Option<usize>) -> Result<Outcome> {
+    let payload = marker::pending(run.context, limit)?;
     run.emit("pending", &payload, marker::print_pending)?;
     Ok(Outcome::Pass)
 }
@@ -1007,9 +1027,14 @@ fn run_marker(run: &mut Run<'_, '_>, command: &MarkerCommand) -> Result<Outcome>
         MarkerCommand::Show => {
             let payload = MarkerShowPayload {
                 marker: marker::show(run.context)?,
+                page: marker::show_page(run.context)?,
             };
             run.emit("marker show", &payload, |payload, out| {
-                marker::print(payload.marker.as_ref(), out)
+                marker::print(payload.marker.as_ref(), out)?;
+                payload
+                    .page
+                    .as_ref()
+                    .map_or(Ok(()), |page| marker::print_page(page, out))
             })?;
         }
         MarkerCommand::Advance { window } => {
@@ -1023,9 +1048,23 @@ fn run_marker(run: &mut Run<'_, '_>, command: &MarkerCommand) -> Result<Outcome>
             give_back(lease, run.sink.err);
             let payload = MarkerShowPayload {
                 marker: Some(moved?),
+                page: None,
             };
             run.emit("marker advance", &payload, |payload, out| {
                 marker::print(payload.marker.as_ref(), out)
+            })?;
+        }
+        MarkerCommand::Page { window, through } => {
+            // The page record is on the share beside the marker, and the server writes it under
+            // its write lease, as it moves the marker.
+            let lease = lease::for_role("server").context(
+                "ctx marker page records what the server records, so it takes the server lease",
+            )?;
+            let recorded = marker::page(run.context, window, *through, &session_id::caller());
+            give_back(lease, run.sink.err);
+            let payload = MarkerPagePayload { page: recorded? };
+            run.emit("marker page", &payload, |payload, out| {
+                marker::print_page(&payload.page, out)
             })?;
         }
     }

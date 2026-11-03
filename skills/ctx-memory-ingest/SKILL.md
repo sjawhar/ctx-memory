@@ -73,9 +73,9 @@ sources quote verbatim, and what a source keeps between fetches — belong to th
 Read them if a question needs them; never write them.
 
 `ctx pending --json` leaves out the messages the deployment excludes, and one answer holds at
-most what fits in one reply. When its `later_windows` is above zero or it has a
-`next_offset`, read `skill://ctx-memory-ingest/references/large-windows.md`. A message a source
-delivered again unchanged is not new and is in no delta.
+most one page. When its `later_windows` is above zero or a window it lists has a `page`, read
+`skill://ctx-memory-ingest/references/large-windows.md`. A message a source delivered again
+unchanged is not new and is in no delta.
 
 ## Boundaries
 
@@ -185,7 +185,8 @@ automated notification noise unless a person acts on it.
     window's records are written (step 9) and its quotes verified (step 8), and before you
     start the next window, run `ctx marker advance <that window id>`, and for an empty window
     as soon as you have seen it is empty (step 2). The marker covers every window up to the
-    one named, and it refuses a window older than the one the marker already holds.
+    one named and refuses an older one. Work a window with a `page` as large-windows.md
+    says.
 
 ## Record rules
 

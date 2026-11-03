@@ -2312,6 +2312,145 @@ fn remote_marker_advance_answers_as_local_does() -> Result<()> {
     Ok(())
 }
 
+/// A fixture tree whose echo source delivers five messages into one fetched window, two to a
+/// page. Returns the tree and the window.
+fn tree_of_pages(label: &str) -> Result<(std::path::PathBuf, String)> {
+    let tree = support::fixture_clone(label)?;
+    let config = std::fs::read_to_string(tree.join("ctx.toml"))?.replace(
+        "streams = [\"C0EXAMPLE01\"]",
+        "streams = [\"C0EXAMPLE01\", \"C0EXAMPLE02\", \"C0EXAMPLE03\", \"C0EXAMPLE04\", \"C0EXAMPLE05\"]",
+    );
+    std::fs::write(
+        tree.join("ctx.toml"),
+        format!("{config}\n[ingest]\npage_messages = 2\n"),
+    )?;
+    support::git(&tree, &["add", "."])?;
+    support::commit(&tree, "pages of two messages")?;
+    support::git(&tree, &["push", "--quiet", "origin", "main"])?;
+    let window = support::fetch_window(&tree)?;
+    Ok((tree, window))
+}
+
+/// Each `page` of `pages`, as `(worked, through, last)`.
+fn spans(pages: &[Value]) -> Vec<(u64, u64, bool)> {
+    pages
+        .iter()
+        .map(|page| {
+            (
+                page.get("worked").and_then(Value::as_u64).unwrap_or(99),
+                page.get("through").and_then(Value::as_u64).unwrap_or(99),
+                page.get("last")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// A window larger than a page is worked a page a cycle through the server, as the scheduled
+/// cycle reaches it: each cycle's `ctx pending` lists the next page, `ctx marker page` records it
+/// through `/v1/marker/page` in the signed-in caller's name, and `ctx marker show` names the page
+/// reached. The marker refuses to pass the window before its last page, with an error that says
+/// what to run, and passes it once the answer lists that page. The request log names each page
+/// record `marker page`.
+#[test]
+fn a_large_window_is_worked_a_page_a_cycle_through_the_server() -> Result<()> {
+    let (tree, window) = tree_of_pages("remote-pages")?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let mut server = ingress_server(&tree, &keys)?;
+    let metadata = metadata_identity("ada@example.com")?;
+    let environment = cloud_env(&server, &metadata)?;
+    let elsewhere = support::scratch("remote-pages-cwd")?;
+    let ctx = |arguments: &[&str]| {
+        support::ctx_remote(&elsewhere, &borrowed(&environment), arguments, None)
+    };
+    let envelope = |output: &support::Local| -> Result<Value> {
+        serde_json::from_str(output.stdout.trim())
+            .with_context(|| format!("decoding {}{}", output.stdout, output.stderr))
+    };
+    let mut pages = Vec::new();
+    let mut refused = Vec::new();
+    let mut shown = Vec::new();
+    let advanced = loop {
+        let pending = envelope(&ctx(&["--json", "pending"])?)?;
+        let page = pending
+            .pointer("/data/windows/0/page")
+            .cloned()
+            .with_context(|| format!("the window is not listed as a page: {pending}"))?;
+        let through = page
+            .get("through")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        pages.push(page.clone());
+        if page.get("last").and_then(Value::as_bool) == Some(true) {
+            break ctx(&["--json", "marker", "advance", &window])?;
+        }
+        let early = ctx(&["--json", "marker", "advance", &window])?;
+        refused.push((early.exit_code, early.stdout, early.stderr));
+        let recorded = ctx(&["--json", "marker", "page", &window, &through.to_string()])?;
+        assert_eq!(
+            recorded.exit_code, 0,
+            "{}{}",
+            recorded.stdout, recorded.stderr
+        );
+        let show = envelope(&ctx(&["--json", "marker", "show"])?)?;
+        shown.push(show.pointer("/data/page").cloned().unwrap_or_default());
+        assert!(pages.len() < 10, "the pages end");
+    };
+    let after = envelope(&ctx(&["--json", "marker", "show"])?)?;
+    let log = server.stop_and_read_stdout()?;
+    support::remove_scratch(&elsewhere)?;
+    remove_fixture(&tree)?;
+
+    assert_eq!(
+        spans(&pages),
+        vec![(0, 2, false), (2, 4, false), (4, 5, true)]
+    );
+    assert_eq!(refused.len(), 2);
+    for (code, stdout, stderr) in &refused {
+        assert_ne!(
+            *code, 0,
+            "the marker passed the window before its last page"
+        );
+        assert!(
+            format!("{stdout}{stderr}").contains("ctx marker page"),
+            "the refusal does not say what to run: {stdout}{stderr}"
+        );
+    }
+    for (page, worked) in shown.iter().zip([2, 4]) {
+        assert_eq!(
+            page.get("window").and_then(Value::as_str),
+            Some(window.as_str())
+        );
+        assert_eq!(page.get("worked").and_then(Value::as_u64), Some(worked));
+        assert!(
+            page.get("by")
+                .and_then(Value::as_str)
+                .is_some_and(|by| by.starts_with("ada@example.com")),
+            "the page does not name the signed-in caller: {page}"
+        );
+    }
+    assert_eq!(
+        advanced.exit_code, 0,
+        "{}{}",
+        advanced.stdout, advanced.stderr
+    );
+    assert_eq!(
+        after.pointer("/data/marker/window").and_then(Value::as_str),
+        Some(window.as_str())
+    );
+    assert!(after.pointer("/data/page").is_none(), "{after}");
+    let page_lines = log
+        .iter()
+        .filter(|line| line.contains("\"command\":\"marker page\""))
+        .count();
+    assert_eq!(
+        page_lines, 2,
+        "the request log does not name each page record: {log:?}"
+    );
+    Ok(())
+}
+
 /// Cloud Run, a load balancer or a proxy can answer in place of the server, in text or HTML.
 /// The client read the body as JSON before it looked at the status, so the caller learned only
 /// that the body did not decode, and never that the answer was a 503.

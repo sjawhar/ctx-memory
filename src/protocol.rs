@@ -18,6 +18,8 @@ pub const PUT_BATCH_ROUTE: &str = "/v1/records/put-batch";
 pub const DELETE_ROUTE: &str = "/v1/records/delete";
 /// The route that moves the agent marker.
 pub const MARKER_ROUTE: &str = "/v1/marker/advance";
+/// The route that records a page of the window after the marker.
+pub const PAGE_ROUTE: &str = "/v1/marker/page";
 /// The route that answers what the tree's context source says about one window, with the
 /// window id in place of `{id}`.
 pub const CONTEXT_ROUTE: &str = "/v1/windows/{id}/context";
@@ -95,6 +97,16 @@ pub struct MarkerRequest {
     pub window: String,
 }
 
+/// The body of [`PAGE_ROUTE`]: the window after the marker, and how many of its new messages,
+/// oldest first, the agent has worked.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PageRequest {
+    #[serde(default)]
+    pub session: Option<String>,
+    pub through: usize,
+    pub window: String,
+}
+
 /// One reason a write was refused, in the shape [`PUT_ROUTE`] answers with.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Finding {
@@ -122,6 +134,12 @@ pub struct MarkerResponse {
     /// route has always answered it with its keys sorted.
     #[serde(serialize_with = "as_json_value")]
     pub marker: marker::Marker,
+}
+
+/// The answer to a page record.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PageResponse {
+    pub page: marker::Page,
 }
 
 /// Writes `value` as a `serde_json::Value` writes it, with every map's keys sorted.
