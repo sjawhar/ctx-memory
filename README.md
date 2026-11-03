@@ -4,10 +4,29 @@
 
 ## Install
 
-Each `v*` tag publishes `ctx` as a GitHub release: a static build for x86_64 and aarch64 Linux (`ctx-x86_64-unknown-linux-musl.tar.gz`, `ctx-aarch64-unknown-linux-musl.tar.gz`) and a build for Apple silicon macOS (`ctx-aarch64-apple-darwin.tar.gz`), each holding the `ctx` binary alone, and `ctx-memory-<version>-share.tar.gz`, the tag's `skills/` and `runner/` trees for an image or a machine that installs them beside the binary ([docs/deployment.md](docs/deployment.md)). The release carries `SHA256SUMS` and a GitHub build attestation of each archive. [`.github/workflows/release.yml`](.github/workflows/release.yml) builds them from the tagged commit once it passes CI. With [mise](https://mise.jdx.dev):
+Each `v*` tag publishes `ctx` as a GitHub release: a static build for x86_64 and aarch64 Linux (`ctx-x86_64-unknown-linux-musl.tar.gz`, `ctx-aarch64-unknown-linux-musl.tar.gz`) and a build for Apple silicon macOS (`ctx-aarch64-apple-darwin.tar.gz`), each holding the `ctx` binary alone, and `ctx-memory-<version>-share.tar.gz`, the tag's `skills/` and `runner/` trees for an image or a machine that installs them beside the binary ([docs/deployment.md](docs/deployment.md)). The release carries `SHA256SUMS` and a GitHub build attestation of each archive. [`.github/workflows/release.yml`](.github/workflows/release.yml) builds them from the tagged commit once it passes CI.
+
+With [mise](https://mise.jdx.dev): install mise first and activate it in your shell ([mise's getting started guide](https://mise.jdx.dev/getting-started.html)), then install the latest release:
 
 ```bash
-mise use -g github:sjawhar/ctx-memory@0.2.1
+mise use -g github:sjawhar/ctx-memory@latest
+ctx --version
+```
+
+mise skips a release newer than its `minimum_release_age` setting, so for a day or so after a release it installs the one before; to take the newest at once, name its version from the [releases page](https://github.com/sjawhar/ctx-memory/releases/latest), for example `@0.2.9`.
+
+Without mise, download the latest release, check it against `SHA256SUMS`, and put `ctx` on your `PATH`. This needs `curl` and `tar`; on macOS use `ctx-aarch64-apple-darwin.tar.gz` and `shasum -a 256 -c` in place of `sha256sum -c`:
+
+```bash
+archive=ctx-$(uname -m)-unknown-linux-musl.tar.gz
+base=https://github.com/sjawhar/ctx-memory/releases/latest/download
+curl -fsSLO "$base/$archive"
+curl -fsSLO "$base/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+mkdir -p ~/.local/bin
+tar -xzf "$archive" -C ~/.local/bin ctx
+export PATH="$HOME/.local/bin:$PATH"   # add this line to your shell profile too
+ctx --version
 ```
 
 From source:
@@ -16,11 +35,30 @@ From source:
 cargo install --locked --git https://github.com/sjawhar/ctx-memory
 ```
 
-The skills under [`skills/`](skills/) — `ctx-memory`, how an agent reads and writes a tree, and `ctx-memory-ingest`, the ingest cycle's procedure — install as a plugin. The repository is an Oh My Pi plugin package (`package.json`): a plugin tree that installs it, for example as `github:sjawhar/ctx-memory#v0.2.1`, gives every session both skills. It is also a Claude Code plugin marketplace (`.claude-plugin/`):
+The skills under [`skills/`](skills/) — `ctx-memory`, how an agent reads and writes a tree, and `ctx-memory-ingest`, the ingest cycle's procedure — install as a plugin. The repository is an Oh My Pi plugin package (`package.json`): a plugin tree that installs it, for example as `github:sjawhar/ctx-memory#v<version>` (the latest release's tag), gives every session both skills. It is also a Claude Code plugin marketplace (`.claude-plugin/`):
 
 ```
 /plugin install ctx-memory --marketplace sjawhar/ctx-memory
 ```
+
+### Join a team server
+
+A team that runs a ctx server ([Remote mode](#remote-mode)) on its Tailscale network reaches it by name over that network. To use it:
+
+1. Install Tailscale: follow [Tailscale's install guide](https://tailscale.com/download) for your system (on Linux, `curl -fsSL https://tailscale.com/install.sh | sh`).
+2. Join your team's tailnet: run `sudo tailscale up` and sign in with your team account in the browser it opens.
+3. Point `ctx` at the server. Use your team's server name and tailnet name; ask a teammate if you do not know them:
+
+   ```bash
+   export CTX_SERVER=http://<server>.<tailnet>.ts.net   # add this line to your shell profile too
+   ```
+
+4. Check that it works. Both commands print results from the team's tree:
+
+   ```bash
+   ctx search <word>
+   ctx rules
+   ```
 
 ## Quick start
 
