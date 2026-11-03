@@ -32,7 +32,8 @@ pub(crate) fn summarized(events: &str) -> Result<Vec<Value>> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "{}\nsummarize_events",
+            "{}\n{}\nsummarize_events",
+            script_function("error_class_def")?,
             script_function("summarize_events")?
         ))
         .env("CTX_SESSION", SESSION)
@@ -852,7 +853,8 @@ fn run_session_with_stand_ins(root: &Path) -> Result<Streamed> {
         ),
     )?;
     let script = format!(
-        "set -eu\n{summarize}\n{run}\nAGENT_USER=ctx-agent\nagent_group=0\nCTX_MODEL=gateway/example-model\nSESSION_MINUTES=50\nprompt='Run the probe.'\nsession_dir=\"$1/data/agent-sessions/{SESSION}\"\nstatus=0\nrun_session >\"$1/job.log\" || status=$?\nexit \"$status\"\n",
+        "set -eu\n{classes}\n{summarize}\n{run}\nAGENT_USER=ctx-agent\nagent_group=0\nCTX_MODEL=gateway/example-model\nSESSION_MINUTES=50\nprompt='Run the probe.'\nsession_dir=\"$1/data/agent-sessions/{SESSION}\"\nstatus=0\nrun_session >\"$1/job.log\" || status=$?\nexit \"$status\"\n",
+        classes = script_function("error_class_def")?,
         summarize = script_function("summarize_events")?,
         run = script_function("run_session")?,
     );

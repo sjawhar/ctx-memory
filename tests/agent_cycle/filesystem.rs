@@ -831,8 +831,9 @@ fn the_refusal_pattern_matches_a_real_refusal_and_not_an_escaped_copy() -> Resul
 /// runs after the session, which this pretend-root harness cannot reach (it writes the model key
 /// to `/run/ctx-agent`, root's). The invariants: the marker is read before and after a pass, the
 /// two are compared, a move fails the job, and all of it is a pass alone, so a cycle (which moves
-/// the marker per window) is untouched. A cycle reads the marker once, after its sessions, into a
-/// variable of its own, to find the windows it skipped (`outcome.rs` runs that check).
+/// the marker per window) is untouched. A cycle reads the marker once after its sessions, into a
+/// variable of its own, to find the windows it skipped (`outcome.rs` runs that check), and once
+/// after a first session a model error ended, to tell whether a window is left for a fresh one.
 #[test]
 fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
     let script = runner("run-cycle.sh")?;
@@ -847,15 +848,17 @@ fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
         code.iter()
             .filter(|line| line.contains("=\"$(ctx marker show --json)\""))
             .count()
-            == 3,
-        "run-cycle.sh must read the marker into a variable before and after the pass, and after \
-         the cycle, and nowhere else"
+            == 4,
+        "run-cycle.sh must read the marker into a variable before and after the pass, after a \
+         session a model error ended, and after the cycle, and nowhere else"
     );
     ensure!(
         has("marker_before=\"$(ctx marker show --json)\"")
             && has("marker_after=\"$(ctx marker show --json)\"")
+            && has("marker_now=\"$(ctx marker show --json)\"")
             && has("cycle_marker=\"$(ctx marker show --json)\""),
-        "run-cycle.sh does not capture the marker on each side of the pass and after the cycle"
+        "run-cycle.sh does not capture the marker on each side of the pass, after a model error \
+         and after the cycle"
     );
     let compared = code
         .iter()
