@@ -175,6 +175,26 @@ impl std::fmt::Display for HeldElsewhere {
 
 impl std::error::Error for HeldElsewhere {}
 
+/// The holder gave the lease up between this copy's read of its generation and of its content:
+/// the lease is free, and the next try takes it. Typed, so a server that meets it while it is
+/// new defers the write for a moment, as it does for [`HeldElsewhere`].
+#[derive(Debug)]
+pub struct ReleasedWhileRead {
+    object: String,
+}
+
+impl std::fmt::Display for ReleasedWhileRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the {} lease was released while it was read; try again",
+            self.object
+        )
+    }
+}
+
+impl std::error::Error for ReleasedWhileRead {}
+
 impl Lease {
     /// Takes the lease named `object` in `bucket`, or reports who holds it.
     ///
@@ -200,8 +220,8 @@ impl Lease {
         let (expected, previous) = match held.generation()? {
             None => (0, None),
             Some(generation) => {
-                let written = held.written()?.ok_or_else(|| {
-                    anyhow!("the {object} lease was released while it was read; try again")
+                let written = held.written()?.ok_or_else(|| ReleasedWhileRead {
+                    object: object.to_owned(),
                 })?;
                 (generation, Some(written))
             }

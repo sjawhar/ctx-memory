@@ -408,6 +408,9 @@ struct Logged {
     tailnet: String,
     log: PathBuf,
     client: reqwest::blocking::Client,
+    /// The request log on standard output, read for the life of the server so it never writes
+    /// into a pipe nobody reads.
+    _stdout: std::sync::mpsc::Receiver<String>,
 }
 
 /// One answer: its status, its `Retry-After` header when it has one, and its body.
@@ -458,6 +461,7 @@ impl Logged {
             client: reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()?,
+            _stdout: lines,
         })
     }
 

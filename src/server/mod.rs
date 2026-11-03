@@ -98,6 +98,7 @@ pub struct Shared {
     /// Every request waits for it before it takes the tree: the build reads the whole share
     /// when the state directory holds no index, and a request that took the tree and then
     /// waited for that build would make every later request wait behind it, which is the
+    /// whole of what this copy must not do.
     index: tokio::sync::watch::Sender<bool>,
     /// When this copy's handover ends: the listeners bound, plus `--handover` seconds. Unset
     /// until they bind, and then nothing is a handover.
@@ -254,10 +255,16 @@ impl Shared {
 
     /// The seconds a caller should wait before it asks again, when `error` — why
     /// [`Shared::hold_lease`] refused — is a rollout's handover: another copy holds the lease,
-    /// this copy has never held it, and its handover has not ended. `None` for anything else,
-    /// which is a write that failed.
+    /// or gave it up while this copy read it, this copy has never held it, and its handover has
+    /// not ended. `None` for anything else, which is a write that failed.
     fn deferral(&self, error: &anyhow::Error) -> Option<u64> {
-        let held = error.downcast_ref::<lease::HeldElsewhere>()?;
+        let pause = if let Some(held) = error.downcast_ref::<lease::HeldElsewhere>() {
+            held.takeover_in()
+        } else if error.downcast_ref::<lease::ReleasedWhileRead>().is_some() {
+            1
+        } else {
+            return None;
+        };
         {
             let lease = unpoisoned(&self.lease);
             if lease.taken || lease.released {
@@ -265,7 +272,7 @@ impl Shared {
             }
         }
         let ends = *self.handover.get()?;
-        (Instant::now() < ends).then(|| held.takeover_in())
+        (Instant::now() < ends).then_some(pause)
     }
 
     /// Waits until the index build this copy started as it came up is over, however it went.

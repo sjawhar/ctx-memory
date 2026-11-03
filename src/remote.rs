@@ -6,6 +6,7 @@
 //! Cloud takes an identity token from the metadata server, and a dev box reaches the server
 //! over the tailnet, where Tailscale itself says who is calling.
 
+use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -301,7 +302,9 @@ impl Client {
                     waited.as_secs()
                 );
             }
-            eprintln!(
+            // A closed standard error must not stop the write, which `eprintln!` would do.
+            let _ = writeln!(
+                std::io::stderr(),
                 "{}",
                 redact::one_line(&format!(
                     "ctx: {path}: {}; sending it again in {} s",
@@ -332,8 +335,9 @@ impl Client {
 const DEFERRAL_BOUND: Duration = Duration::from_secs(180);
 
 /// The pause a server asks for when it defers a write: `503` with `Retry-After` in whole
-/// seconds, at least 1 so the client never sends again at once. Any other answer, a `503`
-/// with no `Retry-After` among them — an outcome the server cannot tell — is not deferred.
+/// seconds, at least 1 so the client never sends again at once. Any other answer is not a
+/// deferral, a `503` with no `Retry-After` among them: that one may be an outcome the server
+/// cannot tell, which a second send could write twice.
 fn deferral_pause(response: &reqwest::blocking::Response) -> Option<Duration> {
     if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
         return None;
