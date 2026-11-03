@@ -539,27 +539,8 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     // deltas are read here too, beside the index build and under the same bound, so the
     // first caller finds them read ([`warm_open`]).
     warm_index(Arc::clone(&shared));
-    let mut open = warm_open(Arc::clone(&shared));
-    if arguments.index_wait > 0 {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(arguments.index_wait);
-        if tokio::time::timeout_at(deadline, shared.index_ready())
-            .await
-            .is_err()
-        {
-            eprintln!(
-                "the record index is still being built after {}s: binding the listeners now, \
-                 and a request waits for the rest of it",
-                arguments.index_wait
-            );
-        }
-        if tokio::time::timeout_at(deadline, &mut open).await.is_err() {
-            eprintln!(
-                "the window deltas ctx open reads are still being read after {}s: binding the \
-                 listeners now, and an open reads the ones not read yet itself",
-                arguments.index_wait
-            );
-        }
-    }
+    let open = warm_open(Arc::clone(&shared));
+    wait_for_warm_up(&shared, open, arguments.index_wait).await;
     let mut servers = Vec::new();
     // A container runtime stops this copy with SIGTERM before the copy that replaces it
     // writes. Both listeners stop on that signal, and the lease is given up afterwards.
@@ -786,6 +767,32 @@ fn warm_index(shared: Arc<Shared>) {
         }
         shared.index_done();
     });
+}
+
+/// Waits for the index build and the read [`warm_open`] started, both together for no longer
+/// than `index_wait` seconds, and says on standard error which of them is still running when
+/// that time is up. Neither is stopped then: the listeners bind, and each goes on beside them.
+/// `0` waits for nothing.
+async fn wait_for_warm_up(shared: &Shared, open: tokio::task::JoinHandle<()>, index_wait: u64) {
+    if index_wait == 0 {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(index_wait);
+    if tokio::time::timeout_at(deadline, shared.index_ready())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "the record index is still being built after {index_wait}s: binding the listeners \
+             now, and a request waits for the rest of it"
+        );
+    }
+    if tokio::time::timeout_at(deadline, open).await.is_err() {
+        eprintln!(
+            "the window deltas ctx open reads are still being read after {index_wait}s: binding \
+             the listeners now, and an open reads the ones not read yet itself"
+        );
+    }
 }
 
 /// Reads every window's delta `ctx open` reads into this process's cache of them
