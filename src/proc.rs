@@ -113,11 +113,21 @@ where
     }
 }
 
+/// Writes `input` to `pipe` by the deadline. The pipe is made nonblocking first: a write of more
+/// than the pipe holds to a child that never reads would otherwise block past the deadline,
+/// since `POLLOUT` promises room for one byte, not for the whole write.
 fn write_pipe_until<W>(mut pipe: W, input: &[u8], deadline: Instant) -> std::io::Result<()>
 where
     W: Write + AsRawFd,
 {
     let descriptor = pipe.as_raw_fd();
+    // `descriptor` is the open pipe `pipe` owns for this whole call.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
     let mut written = 0;
     while written < input.len() {
         poll_until_ready(descriptor, libc::POLLOUT, deadline)?;
@@ -127,7 +137,18 @@ where
         let remaining = input
             .get(written..)
             .ok_or_else(|| std::io::Error::other("stdin write offset exceeds input length"))?;
-        let just_written = pipe.write(remaining)?;
+        let just_written = match pipe.write(remaining) {
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
         if just_written == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -27,13 +27,22 @@ enum Ended {
     Refused(Refused),
 }
 
+/// What a caller may narrow a call to: what is left of its cycle's subjects and seconds.
+#[derive(serde::Deserialize)]
+pub struct Asked {
+    max_subjects: Option<usize>,
+    seconds: Option<u64>,
+}
+
 /// Answers `GET /v1/windows/{id}/context`.
 pub async fn window_context(
     State(listener): State<Listener>,
     Extension(note): Extension<Note>,
     Path(window): Path<String>,
+    Query(asked_limits): Query<Asked>,
     headers: HeaderMap,
 ) -> Response {
+    let limits = context_source::Limits::capped(asked_limits.max_subjects, asked_limits.seconds);
     let shared = &listener.shared;
     note.command("context".to_owned());
     let caller = match listener.caller(&headers).await {
@@ -55,7 +64,7 @@ pub async fn window_context(
                     return Ok(Ended::Forbidden(caller.email));
                 }
             }
-            match context_source::prepare(&context, &asked) {
+            match context_source::prepare(&context, &asked, limits) {
                 Ok(prepared) => prepared,
                 Err(error) => match error.downcast::<Refused>() {
                     Ok(refused) => return Ok(Ended::Refused(refused)),

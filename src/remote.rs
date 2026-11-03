@@ -192,8 +192,17 @@ impl Client {
     /// Returns an error when the server cannot be reached, refuses the caller or the window,
     /// or answers with something other than a window's context. A context source that failed
     /// is no error: the answer says it is `unavailable`.
-    pub fn context(&self, window: &str) -> Result<crate::context_source::WindowContext> {
-        let path = protocol::context_path(window);
+    pub fn context(
+        &self,
+        window: &str,
+        limits: crate::context_source::Limits,
+    ) -> Result<crate::context_source::WindowContext> {
+        let path = format!(
+            "{}?max_subjects={}&seconds={}",
+            protocol::context_path(window),
+            limits.max_subjects,
+            limits.seconds
+        );
         let mut request = self.http.get(format!("{}{path}", self.base));
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
@@ -381,8 +390,8 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             })?;
             Ok(Some(Outcome::Pass))
         }
-        Remote::Context { window } => {
-            let answer = client()?.context(window)?;
+        Remote::Context { window, limits } => {
+            let answer = client()?.context(window, limits)?;
             output::emit(
                 sink,
                 cli.json,
