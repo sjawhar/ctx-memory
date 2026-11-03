@@ -26,6 +26,9 @@ static RUNNING: [AtomicI32; TRACKED_RUNS] = [const { AtomicI32::new(0) }; TRACKE
 static BOUND: AtomicBool = AtomicBool::new(false);
 
 /// A run's slot in [`RUNNING`], freed once the run is over.
+///
+/// A run is tracked just after it is spawned, so a stop that lands in between misses it. On
+/// Linux its parent-death signal still stops it as this process ends; elsewhere it runs on.
 struct Tracked(Option<&'static AtomicI32>);
 
 impl Tracked {
@@ -56,20 +59,27 @@ extern "C" fn stop_runs(signal: libc::c_int) {
             unsafe { libc::kill(-group, libc::SIGKILL) };
         }
     }
-    // The handler was installed with SA_RESETHAND, so `signal` has its default action again: it
-    // ends the process once it is delivered. `raise` is async-signal-safe.
-    unsafe { libc::raise(signal) };
+    // SA_RESETHAND gave `signal` its default action back and SA_NODEFER left it unblocked, so
+    // `raise` ends the process at once. The first process of a PID namespace, as `ctx` is in a
+    // container whose entry point it is, is not ended by a default action it asks for itself, so
+    // it exits as a shell reports a process that signal ended. `raise` and `_exit` are
+    // async-signal-safe.
+    unsafe {
+        libc::raise(signal);
+        libc::_exit(128 + signal);
+    }
 }
 
 /// Makes the runs of this process stop when it does, for a command such as `ctx fetch` whose
 /// runs (its sources) are of no use once it is gone.
 ///
 /// SIGTERM, SIGINT and SIGHUP kill the process group of every run under way and then end this
-/// process by the same signal. A run gets its own process group, so a terminal's interrupt does
-/// not reach it, and without this a stopped fetch would leave its sources running. A signal this
-/// process started out ignoring, as a background job ignores SIGINT, stays ignored. On Linux each
-/// later run is also killed by the kernel when this process ends any other way, SIGKILL
-/// included; that reaches only the program itself, not what it started.
+/// process by the same signal, or, as the first process of a PID namespace, exit with 128 plus
+/// its number. A run gets its own process group, so a terminal's interrupt does not reach it, and
+/// without this a stopped fetch would leave its sources running. A signal this process started
+/// out ignoring, as a background job ignores SIGINT, stays ignored. On Linux each later run is
+/// also killed by the kernel when this process ends any other way, SIGKILL included; that
+/// reaches only the program itself, not what it started.
 ///
 /// # Errors
 ///
@@ -90,7 +100,7 @@ pub fn stop_runs_with_this_process() -> Result<()> {
         }
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = stop_runs as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        action.sa_flags = libc::SA_RESETHAND;
+        action.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
         // `action` is a valid `sigaction` that outlives both calls.
         unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
         if unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) } == -1 {
