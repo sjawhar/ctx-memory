@@ -15,16 +15,30 @@ ctx --version
 
 mise skips a release newer than its `minimum_release_age` setting, so for a day or so after a release it installs the one before; to take the newest at once, name its version from the [releases page](https://github.com/sjawhar/ctx-memory/releases/latest), for example `@0.2.9`.
 
-Without mise, download the latest release, check it against `SHA256SUMS`, and put `ctx` on your `PATH`. This needs `curl` and `tar`; on macOS use `ctx-aarch64-apple-darwin.tar.gz` and `shasum -a 256 -c` in place of `sha256sum -c`:
+Without mise, download the latest release, check it against `SHA256SUMS`, and put `ctx` on your `PATH`. This needs `curl` and `tar`. On Linux:
 
 ```bash
 archive=ctx-$(uname -m)-unknown-linux-musl.tar.gz
 base=https://github.com/sjawhar/ctx-memory/releases/latest/download
-curl -fsSLO "$base/$archive"
-curl -fsSLO "$base/SHA256SUMS"
-sha256sum -c --ignore-missing SHA256SUMS
-mkdir -p ~/.local/bin
-tar -xzf "$archive" -C ~/.local/bin ctx
+curl -fsSLO "$base/$archive" &&
+  curl -fsSLO "$base/SHA256SUMS" &&
+  grep " $archive$" SHA256SUMS | sha256sum -c - &&
+  mkdir -p "$HOME/.local/bin" &&
+  tar -xzf "$archive" -C "$HOME/.local/bin" ctx
+export PATH="$HOME/.local/bin:$PATH"   # add this line to your shell profile too
+ctx --version
+```
+
+On Apple silicon macOS (there is no Intel macOS release; install from source there):
+
+```bash
+archive=ctx-aarch64-apple-darwin.tar.gz
+base=https://github.com/sjawhar/ctx-memory/releases/latest/download
+curl -fsSLO "$base/$archive" &&
+  curl -fsSLO "$base/SHA256SUMS" &&
+  grep " $archive$" SHA256SUMS | shasum -a 256 -c - &&
+  mkdir -p "$HOME/.local/bin" &&
+  tar -xzf "$archive" -C "$HOME/.local/bin" ctx
 export PATH="$HOME/.local/bin:$PATH"   # add this line to your shell profile too
 ctx --version
 ```
@@ -46,17 +60,17 @@ The skills under [`skills/`](skills/) — `ctx-memory`, how an agent reads and w
 A team that runs a ctx server ([Remote mode](#remote-mode)) on its Tailscale network reaches it by name over that network. To use it:
 
 1. Install Tailscale: follow [Tailscale's install guide](https://tailscale.com/download) for your system (on Linux, `curl -fsSL https://tailscale.com/install.sh | sh`).
-2. Join your team's tailnet: run `sudo tailscale up` and sign in with your team account in the browser it opens.
-3. Point `ctx` at the server. Use your team's server name and tailnet name; ask a teammate if you do not know them:
+2. Join your team's tailnet and sign in with your team account. On Linux, run `sudo tailscale up`, then open the URL it prints. On macOS, complete the onboarding flow in the Tailscale app.
+3. Point `ctx` at the server. Replace `<server>` and `<tailnet>` with your team's server name and tailnet name; ask a teammate if you do not know them:
 
    ```bash
-   export CTX_SERVER=http://<server>.<tailnet>.ts.net   # add this line to your shell profile too
+   export CTX_SERVER='http://<server>.<tailnet>.ts.net'   # add this line to your shell profile too
    ```
 
 4. Check that it works. Both commands print results from the team's tree:
 
    ```bash
-   ctx search <word>
+   ctx search "a word from your team's tree"
    ctx rules
    ```
 
