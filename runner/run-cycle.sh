@@ -75,9 +75,10 @@
 #                        optional: the most pending windows one session handles, oldest first. The
 #                        prompt passes it to `ctx pending` as --limit, and the windows past it wait
 #                        for the next cycle, so no one session reads a whole backlog at once. A
-#                        refused cycle's second session is capped the same, so a retried execution
-#                        can touch up to twice this many across its two sessions. Unset, a session
-#                        handles every pending window
+#                        retried cycle's second session (after a model refusal or a model error)
+#                        is capped the same, so a retried execution can touch up to twice this
+#                        many across its two sessions. Unset, a session handles every pending
+#                        window
 #   ANTHROPIC_API_KEY    the key the session's model calls carry, as a secret environment
 #                        variable of the job; this script moves it to a file and unsets it
 #   CTX_EXECUTION        a name unique to this execution, which names the session directory and,
@@ -664,6 +665,37 @@ else
 	cycle_prompt
 fi
 
+# The class of a model turn that ended in an error, as a jq definition: `error_class` reads a message
+# omp wrote and answers one word of a fixed list, so the job log can say why the model stopped
+# without holding the error's prose, which can quote the request. A status omp recorded decides
+# first: 529 overloaded, 429 rate_limited, 408 and 504 timeout, another 5xx server_error, another
+# 4xx other (a request the provider rejected, which fails the same way again). Without one, the
+# first class whose words the error message holds, in this order: overloaded (overloaded, 529,
+# capacity), rate_limited (rate limit, too many requests, 429), timeout (timed out, timeout,
+# deadline exceeded, stream stall), connection (a reset, refused or closed socket or connection, a
+# network failure, a stream that ended early), server_error (a 5xx code, a server, internal or API
+# error, an unavailable service, a bad gateway); else other. summarize_events and the retry's
+# `run-cycle:` line both use it.
+error_class_def() {
+	# The text is a jq program, whose $names are jq's, not the shell's.
+	# shellcheck disable=SC2016
+	printf '%s\n' '
+		def error_class:
+			(.errorStatus | if type == "number" then . else null end) as $status
+			| (.errorMessage | if type == "string" then . else "" end) as $text
+			| if $status == 529 then "overloaded"
+			elif $status == 429 then "rate_limited"
+			elif $status == 408 or $status == 504 then "timeout"
+			elif $status != null and $status >= 500 and $status < 600 then "server_error"
+			elif $status != null and $status >= 400 and $status < 500 then "other"
+			elif ($text | test("overloaded|\\b529\\b|capacity"; "i")) then "overloaded"
+			elif ($text | test("rate.?limit|too many requests|\\b429\\b"; "i")) then "rate_limited"
+			elif ($text | test("timed? ?out|timeout|deadline exceeded|stream stall"; "i")) then "timeout"
+			elif ($text | test("econnreset|econnrefused|epipe|socket|connection|network|fetch failed|other side closed|hang up|stream ended before|terminated"; "i")) then "connection"
+			elif ($text | test("\\b5[0-9][0-9]\\b|server.?error|internal.?error|api_error|service.?unavailable|bad gateway"; "i")) then "server_error"
+			else "other" end;'
+}
+
 # The job log's lines, from omp's event stream on standard input: one line of JSON for each event
 # it reports, written as that event arrives (docs/deployment.md, "What the job log holds").
 #   - A tool call, when it ends: "type":"tool_call", the tool, the ctx subcommand and the record
@@ -672,7 +704,8 @@ fi
 #     stream ends) and how long it took.
 #   - A model turn, when the model's message ends: "type":"message_end", as omp names the event, so
 #     a log query or alert that read omp's own events still matches, with the stop reason, the
-#     error's status and id, the type and category of the provider's stop details (a refusal's
+#     error's status and id, the error's class for a turn that ended in an error other than a
+#     refusal (error_class_def), the type and category of the provider's stop details (a refusal's
 #     among them), the number of tool calls it asked for and its token use.
 # No line holds a record's text, a quote, a search query, an error's or a refusal's prose, or
 # anything a message or a tool's output said. Only fields of a fixed shape are copied: a record path
@@ -686,7 +719,7 @@ fi
 # at which Cloud Logging stops reading a line as JSON. An event the program cannot read is passed
 # over.
 summarize_events() {
-	jq -nRc --unbuffered --arg session "${CTX_SESSION-}" --arg data "${CTX_DATA_DIR-}" '
+	jq -nRc --unbuffered --arg session "${CTX_SESSION-}" --arg data "${CTX_DATA_DIR-}" "$(error_class_def)"'
 		def name_shaped: type == "string" and test("^[A-Za-z][A-Za-z0-9_-]{0,63}$");
 		def record_path: type == "string" and test("^[A-Za-z0-9_][A-Za-z0-9_./-]{0,250}[.]md$");
 		def shown: if record_path then . else "(withheld)" end;
@@ -762,6 +795,10 @@ summarize_events() {
 				session: $session,
 				message: ({role: "assistant", stopReason: ($message.stopReason | if name_shaped then . else null end)}
 					+ ($message | {errorStatus, errorId} | with_entries(select(.value | type == "number")))
+					+ (if $message.stopReason == "error"
+						and ((($message.stopDetails | objects | .type) // null) != "refusal") then
+						{errorClass: ($message | error_class)}
+					else {} end)
 					+ (if ($message.stopDetails | type) == "object" then
 						{stopDetails: ($message.stopDetails | {type, category} | with_entries(select(.value != null))
 							| map_values(if name_shaped then . else "(withheld)" end))}
@@ -1099,19 +1136,56 @@ judge_session
 tally_session
 check_pass_marker
 
-# One fresh session for a refused cycle or maintenance pass: a refusal is the model's answer to
-# the turn it was sent, so the same conversation sent again is refused again, while a session that
-# starts over works through its job from the beginning. A cycle's reads what is still pending: the
-# marker the refused session moved per window stands, so the retry starts at the first window that
-# session did not finish. A pass's runs the pass again over the whole tree, which is safe because a
-# pass moves no marker and writes a record only to change it; a pass that did move the marker gets
-# no retry. It is one retry, not a loop: a second refusal is the outcome, and the next hourly cycle
-# takes the windows this one did not finish. A session the time limit stopped fails the job
-# (judge_session) but is not refused, so it gets no retry; the retry is judged, and a pass's marker
-# checked, as the first session's are.
-if [ "$status" -ne 0 ] && [ -z "$marker_moved" ] && session_refused "$session_dir.events.json"; then
-	echo "run-cycle: the session was stopped by a model refusal; starting one fresh session"
-	# The refused attempt's transcript is sealed now, with its capture moved into it, before the
+# Whether the cycle's marker now holds the last window the session that just ended was handed
+# ($pending), so no window of it is left for a fresh session. Window ids are timestamps of one
+# fixed width, so the marker covers every window whose id sorts at or before its own. A pass
+# handles no window, and a marker that cannot be read is not known to have passed anything; both
+# answer no.
+marker_passed_every_window() {
+	[ -z "$pass" ] || return 1
+	marker_now="$(ctx marker show --json)" || return 1
+	held="$(printf '%s' "$marker_now" | jq -r '.data.marker.window? // ""')" || return 1
+	printf '%s' "$pending" | jq -e --arg held "$held" '
+		[.data.windows[]? | .window | strings] as $listed
+		| $held != "" and ($listed | length) > 0 and all($listed[]; . <= $held)' >/dev/null
+}
+
+# The class and HTTP status of the model error that ended the session, in fields of a fixed shape
+# (error_class_def) and never the error's prose: the last model message, as judge_session read it.
+model_error_fields() {
+	printf '%s' "$message" | jq -r "$(error_class_def)"'
+		"errorClass \(error_class)"
+		+ (if (.errorStatus | type) == "number" then ", errorStatus \(.errorStatus | floor)" else "" end)' ||
+		echo "errorClass other"
+}
+
+# One fresh session for a cycle or maintenance pass the model stopped, by a refusal or by a turn
+# that ended in an error. A refusal is the model's answer to the turn it was sent, so the same
+# conversation sent again is refused again, while a session that starts over works through its job
+# from the beginning. A model error is a failed call, a provider or gateway that was overloaded,
+# timed out or dropped the stream: omp retries one it classifies as transient on its own (retry.*
+# in its settings, on by default), and ends the session on one it does not, such as an error it
+# records with errorId 0, so the runner starts over once. A cycle's fresh session reads what is
+# still pending: the marker the first session moved per window stands, so it starts at the first
+# window that session did not finish, and a cycle whose marker already holds the last window the
+# first session was handed gets no retry for an error (marker_passed_every_window). A pass's runs
+# the pass again over the whole tree, which is safe because a pass moves no marker and writes a
+# record only to change it; a pass that did move the marker gets no retry. It is one retry, not a
+# loop: a second refusal or error is the outcome, and the next hourly cycle takes the windows this
+# one did not finish. A session the time limit stopped fails the job (judge_session) but was not
+# stopped by the model, so it gets no retry; the retry is judged, and a pass's marker checked, as
+# the first session's are. A refusal is a stopReason "error" too, so it is told apart first.
+retry_reason=
+if [ "$status" -ne 0 ] && [ -z "$marker_moved" ]; then
+	if session_refused "$session_dir.events.json"; then
+		retry_reason="was stopped by a model refusal"
+	elif [ "$stop" = error ] && ! marker_passed_every_window; then
+		retry_reason="ended on a model error ($(model_error_fields))"
+	fi
+fi
+if [ -n "$retry_reason" ]; then
+	echo "run-cycle: the session $retry_reason; starting one fresh session"
+	# The first attempt's transcript is sealed now, with its capture moved into it, before the
 	# retry opens its own directory: the sweep that seals what an unfinished cycle left open runs
 	# once, above, and a directory left writable here would be the next cycle's to seal.
 	if ! seal_session "$session_dir"; then

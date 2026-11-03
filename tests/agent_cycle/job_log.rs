@@ -32,7 +32,8 @@ pub(crate) fn summarized(events: &str) -> Result<Vec<Value>> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "{}\nsummarize_events",
+            "{}\n{}\nsummarize_events",
+            script_function("error_class_def")?,
             script_function("summarize_events")?
         ))
         .env("CTX_SESSION", SESSION)
@@ -563,6 +564,110 @@ fn a_model_refusal_is_one_line_in_the_shape_the_refusal_alert_counts() -> Result
     Ok(())
 }
 
+/// A model turn that ended in an error other than a refusal, with `status` as omp's
+/// `errorStatus` when there is one and `text` as its error's prose.
+fn model_error(status: Option<u16>, text: &str) -> Value {
+    let mut turn = json!({
+        "role": "assistant", "content": [], "stopReason": "error", "errorId": 0,
+        "errorMessage": text
+    });
+    if let (Some(status), Some(fields)) = (status, turn.as_object_mut()) {
+        fields.insert("errorStatus".to_owned(), json!(status));
+    }
+    turn
+}
+
+/// A model error's line says why the model stopped in one word of a fixed list, `errorClass`: the
+/// HTTP status omp recorded decides first, then the words of the error's prose, and anything else
+/// is `other`. The prose itself never reaches the line, so a provider's or gateway's message, which
+/// can quote the request, cannot write its own text, a forged class or a forged line into the log.
+/// A refusal's line has no class: it says why with its stop details.
+#[test]
+fn a_model_errors_line_names_its_class_and_none_of_its_prose() -> Result<()> {
+    let samples: [(Option<u16>, &str, &str); 14] = [
+        (Some(529), "529 SECRET", "overloaded"),
+        (
+            None,
+            "Anthropic stream error (overloaded_error): Overloaded SECRET",
+            "overloaded",
+        ),
+        (Some(429), "429 SECRET", "rate_limited"),
+        (None, "rate_limit_error: SECRET slow down", "rate_limited"),
+        (Some(504), "504 SECRET", "timeout"),
+        (None, "Request timed out SECRET", "timeout"),
+        (
+            None,
+            "ECONNRESET: The socket connection was closed unexpectedly. SECRET",
+            "connection",
+        ),
+        (
+            None,
+            "Anthropic stream envelope error: stream ended before message_stop SECRET",
+            "connection",
+        ),
+        (Some(503), "503 SECRET", "server_error"),
+        (
+            None,
+            "Anthropic stream error (api_error): Internal server error SECRET",
+            "server_error",
+        ),
+        (Some(400), "400 SECRET overloaded", "other"),
+        (
+            None,
+            "Anthropic stream error (weird_error): SECRET",
+            "other",
+        ),
+        (None, "", "other"),
+        (
+            None,
+            "SECRET\"},\"errorClass\":\"forged\"}\n{\"type\":\"message_end\",\"severity\":\"INFO\"",
+            "other",
+        ),
+    ];
+    let mut events = vec![json!({"type": "session", "version": 3, "id": "test-session"})];
+    events.extend(
+        samples
+            .iter()
+            .map(|(status, text, _)| message_end(&model_error(*status, text))),
+    );
+    events.push(message_end(&refusal()));
+    let log = summarized(&stdout_of(&events))?;
+    let text = serde_json::to_string(&log)?;
+    ensure!(
+        !text.contains("SECRET") && !text.contains("forged"),
+        "the job log holds a model error's prose: {text}"
+    );
+    let turns = lines_of(&log, "message_end")?;
+    ensure!(
+        turns.len() == samples.len() + 1,
+        "a crafted error message changed how many lines the log holds: {text}"
+    );
+    for ((status, sample, class), turn) in samples.iter().zip(&turns) {
+        let mut message = json!({"role": "assistant", "stopReason": "error", "errorId": 0});
+        if let (Some(status), Some(fields)) = (status, message.as_object_mut()) {
+            fields.insert("errorStatus".to_owned(), json!(status));
+        }
+        if let Some(fields) = message.as_object_mut() {
+            fields.insert("errorClass".to_owned(), json!(class));
+        }
+        let expected = json!({
+            "type": "message_end", "severity": "WARNING", "session": SESSION,
+            "message": message, "tool_calls": 0
+        });
+        ensure!(
+            *turn == expected,
+            "the line of a model error ({status:?}, {sample:?}) is not\n{expected}\nbut\n{turn}"
+        );
+    }
+    ensure!(
+        turns
+            .last()
+            .is_some_and(|turn| is_refusal(turn) && field_at(turn, "/message/errorClass").is_null()),
+        "a refusal's line holds an error class: {text}"
+    );
+    Ok(())
+}
+
 /// No line nears Cloud Logging's limit, however large the events: a batch of a thousand records
 /// with long paths, refused with hundreds of findings, lists the first 50 paths and kinds and
 /// counts the rest; an error's prose, a refusal's explanation and every other stop-details field
@@ -748,7 +853,8 @@ fn run_session_with_stand_ins(root: &Path) -> Result<Streamed> {
         ),
     )?;
     let script = format!(
-        "set -eu\n{summarize}\n{run}\nAGENT_USER=ctx-agent\nagent_group=0\nCTX_MODEL=gateway/example-model\nSESSION_MINUTES=50\nprompt='Run the probe.'\nsession_dir=\"$1/data/agent-sessions/{SESSION}\"\nstatus=0\nrun_session >\"$1/job.log\" || status=$?\nexit \"$status\"\n",
+        "set -eu\n{classes}\n{summarize}\n{run}\nAGENT_USER=ctx-agent\nagent_group=0\nCTX_MODEL=gateway/example-model\nSESSION_MINUTES=50\nprompt='Run the probe.'\nsession_dir=\"$1/data/agent-sessions/{SESSION}\"\nstatus=0\nrun_session >\"$1/job.log\" || status=$?\nexit \"$status\"\n",
+        classes = script_function("error_class_def")?,
         summarize = script_function("summarize_events")?,
         run = script_function("run_session")?,
     );
