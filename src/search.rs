@@ -89,7 +89,7 @@ pub fn run(
     // `blendomatic`, and the other way round, but not `U.S.` by `us` nor `1.5` by `15`.
     let joined_terms: Vec<Option<String>> = terms
         .iter()
-        .map(|term| index::joinable(term).then(|| index::without_joiners(term)))
+        .map(|term| index::joinable(term).then(|| index::joined_spelling(term)))
         .collect();
     // Without a filter the index applies the limit; with one it cannot, because the
     // dropped documents must still be counted to tell a filtered result from an absence.
@@ -127,7 +127,7 @@ pub fn run(
                 haystack.contains(term.as_str())
                     || joined.as_deref().is_some_and(|joined| {
                         joined_haystack
-                            .get_or_insert_with(|| index::without_joiners(&haystack))
+                            .get_or_insert_with(|| index::joined_spelling(&haystack))
                             .contains(joined)
                     })
             })

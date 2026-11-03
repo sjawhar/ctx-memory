@@ -19,7 +19,7 @@ use crate::tree::{Doc, Tier, Tree};
 mod joined;
 
 use joined::Joins;
-pub(crate) use joined::{joinable, without_joiners};
+pub(crate) use joined::{joinable, joined_spelling};
 
 /// The tier value stored for a record that declares none. It sorts after every real tier.
 const UNTIERED: i64 = 9;
