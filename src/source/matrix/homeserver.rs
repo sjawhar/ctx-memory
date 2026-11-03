@@ -377,8 +377,8 @@ impl<'c> Reader<'c> {
 
     /// The event another one names in its own content — the message an edit or a redaction is
     /// of, a thread's root — or `None` when the homeserver will not serve it. Its sender wrote
-    /// the id, so any refusal (`4xx`) means there is no such event the user may read, never
-    /// that the room's read failed.
+    /// the id, so a refusal (`4xx`) means there is no such event the user may read, never that
+    /// the room's read failed — unless it refuses the token or the account, which fails it.
     pub(super) fn related_event(&mut self, room: &str, event: &str) -> Step<Option<Value>> {
         self.lookup(room, event, true)
     }
@@ -393,7 +393,11 @@ impl<'c> Reader<'c> {
             Ok(reply) => reply,
             Err(stop) => return Ok(Err(stop)),
         };
-        if reply.is_not_found() || (related && (400..500).contains(&reply.status)) {
+        // A refusal of the token or the account is not about the event: the room's read fails
+        // and its cursor holds.
+        if reply.is_not_found()
+            || (related && (400..500).contains(&reply.status) && !reply.is_auth_failure())
+        {
             return Ok(Ok(None));
         }
         if !reply.is_success() {

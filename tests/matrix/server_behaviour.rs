@@ -4,12 +4,13 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use ctx_memory::source::StreamStatus;
 use serde_json::json;
 
 use crate::fixtures::{
-    cursor_at, cursors, every_stream_ok, guard, homeserver, ms, planned, pointer, records, remove,
-    scratch, texts, untouched, warnings, Fetch, ALICE, BOB, BOOKS, CODES, FAMILY,
+    cursor_at, cursors, ends, every_stream_ok, guard, homeserver, ms, planned, pointer, records,
+    remove, scratch, texts, untouched, warnings, Fetch, ALICE, BOB, BOOKS, CODES, FAMILY,
 };
 use crate::support::fake_matrix::FakeMatrix;
 
@@ -242,6 +243,70 @@ fn a_sync_that_gets_no_answer_leaves_every_room_to_be_read() -> Result<()> {
         warnings(&messages)
             .iter()
             .any(|warning| warning.contains("every room is read this run")),
+        "{:?}",
+        warnings(&messages)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_lookup_the_homeserver_refuses_for_the_token_fails_the_room_and_keeps_its_cursor() -> Result<()>
+{
+    let _environment = guard();
+    let server = homeserver()?;
+    // Read back from the room's end: every page comes before the first lookup, so only the
+    // lookup's own answer can tell the token has stopped working.
+    server.without_timestamp_to_event()?;
+    let old = server.text(FAMILY, ALICE, ms(-60 * 30)?, "Before the window")?;
+    server.send(
+        FAMILY,
+        "m.room.message",
+        ALICE,
+        ms(-60)?,
+        json!({"msgtype": "m.text", "body": "* edited",
+               "m.new_content": {"msgtype": "m.text", "body": "edited"},
+               "m.relates_to": {"rel_type": "m.replace", "event_id": old}}),
+    )?;
+    server.refuse("/event/", 401, "M_UNKNOWN_TOKEN")?;
+    let dir = scratch("lookup-unknown-token")?;
+
+    let messages = Fetch::new(&server, &dir).with("sync", json!("off")).run()?;
+    remove(&dir)?;
+
+    let ended = ends(&messages);
+    let (status, cursor, error) = ended.get(FAMILY).context("the room ended")?;
+    assert_eq!(*status, StreamStatus::Error);
+    assert_eq!(*cursor, None, "the room keeps its cursor");
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("M_UNKNOWN_TOKEN")),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_event_found_by_date_that_the_homeserver_serves_no_context_for_is_read_from_the_end(
+) -> Result<()> {
+    let _environment = guard();
+    let server = homeserver()?;
+    let news = server.text(FAMILY, ALICE, ms(-60)?, "Family news")?;
+    server.refuse("/context/", 404, "M_NOT_FOUND")?;
+    let dir = scratch("no-context")?;
+
+    let messages = Fetch::new(&server, &dir).with("sync", json!("off")).run()?;
+    remove(&dir)?;
+
+    every_stream_ok(&messages, 1);
+    assert_eq!(
+        texts(&messages),
+        [(pointer(FAMILY, &news), "Family news".to_owned())]
+    );
+    assert!(
+        warnings(&messages)
+            .iter()
+            .any(|warning| warning.contains("served no context")),
         "{:?}",
         warnings(&messages)
     );

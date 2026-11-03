@@ -25,6 +25,16 @@ const CREDENTIAL: &str = "matrix";
 /// The Matrix error code of a rate-limited request.
 const LIMIT_EXCEEDED: &str = "M_LIMIT_EXCEEDED";
 
+/// The Matrix error codes that refuse the access token or the account, not the thing asked
+/// for: an unknown or missing token, and a locked, suspended or deactivated account.
+const AUTH_FAILURES: [&str; 5] = [
+    "M_UNKNOWN_TOKEN",
+    "M_MISSING_TOKEN",
+    "M_USER_LOCKED",
+    "M_USER_SUSPENDED",
+    "M_USER_DEACTIVATED",
+];
+
 /// A homeserver read with one access token.
 pub struct MatrixClient {
     base: String,
@@ -72,6 +82,17 @@ impl Reply {
     #[must_use]
     pub fn is_unrecognized(&self) -> bool {
         self.errcode() == Some("M_UNRECOGNIZED")
+    }
+
+    /// Whether the homeserver refused the access token or the account (`401`, or an error code
+    /// that says so), which no later request of the run gets past. A `403 M_FORBIDDEN` refuses
+    /// only the thing asked for.
+    #[must_use]
+    pub fn is_auth_failure(&self) -> bool {
+        self.status == 401
+            || self
+                .errcode()
+                .is_some_and(|code| AUTH_FAILURES.contains(&code))
     }
 
     /// An error naming the status, the Matrix error code and message, and the request.
@@ -339,5 +360,19 @@ mod tests {
             retry_after: None,
         };
         assert!(reply.is_rate_limited());
+    }
+
+    #[test]
+    fn a_refused_token_or_account_is_an_auth_failure_and_a_forbidden_event_is_not() {
+        let reply = |status: u16, code: &str| Reply {
+            status,
+            body: json!({"errcode": code}),
+            retry_after: None,
+        };
+        assert!(reply(401, "M_UNKNOWN_TOKEN").is_auth_failure());
+        assert!(reply(401, "M_MISSING_TOKEN").is_auth_failure());
+        assert!(reply(403, "M_USER_DEACTIVATED").is_auth_failure());
+        assert!(!reply(403, "M_FORBIDDEN").is_auth_failure());
+        assert!(!reply(404, "M_NOT_FOUND").is_auth_failure());
     }
 }

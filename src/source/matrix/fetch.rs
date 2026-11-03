@@ -660,38 +660,48 @@ impl Walk<'_, '_> {
                 self.position = Position::Time(time);
                 self.reached_end = true;
             }
-            Ok(Found::Unsupported) => {
-                if let Some(events) = self.back(None, time)? {
-                    if self.replay(&events, time)? {
-                        self.reached_end = true;
+            Ok(Found::Unsupported) => self.read_back_from_end(time)?,
+            Ok(Found::Event(first)) => {
+                match self.reader.context(room, &first)? {
+                    Err(_) => self.halt = Some(Halt::Stopped),
+                    Ok(None) => {
+                        self.warnings.push(format!(
+                        "the homeserver named {first} as the first event at {} and then served no context for it; reading back from the room's end",
+                        rfc3339(time)
+                    ));
+                        self.read_back_from_end(time)?;
+                    }
+                    Ok(Some(context)) => {
+                        self.learn(&context.state);
+                        let earlier = match context.start {
+                            Some(start) => match self.back(Some(start), time)? {
+                                Some(events) => events,
+                                None => return Ok(()),
+                            },
+                            None => Vec::new(),
+                        };
+                        if self.replay(&earlier, time)?
+                            && matches!(self.step(&context.event)?, Flow::Go)
+                        {
+                            let end = context.end.ok_or_else(|| {
+                            anyhow!("the homeserver's context of {first} in {room} has no end token")
+                        })?;
+                            self.forward(end)?;
+                        }
                     }
                 }
             }
-            Ok(Found::Event(first)) => match self.reader.context(room, &first)? {
-                Err(_) => self.halt = Some(Halt::Stopped),
-                Ok(None) => bail!(
-                    "the homeserver named {first} as the first event in {room} at {} and then served no context for it",
-                    rfc3339(time)
-                ),
-                Ok(Some(context)) => {
-                    self.learn(&context.state);
-                    let earlier = match context.start {
-                        Some(start) => match self.back(Some(start), time)? {
-                            Some(events) => events,
-                            None => return Ok(()),
-                        },
-                        None => Vec::new(),
-                    };
-                    if self.replay(&earlier, time)?
-                        && matches!(self.step(&context.event)?, Flow::Go)
-                    {
-                        let end = context.end.ok_or_else(|| {
-                            anyhow!("the homeserver's context of {first} in {room} has no end token")
-                        })?;
-                        self.forward(end)?;
-                    }
-                }
-            },
+        }
+        Ok(())
+    }
+
+    /// Reads back from the room's end past `time`, then on from there, for a homeserver that
+    /// cannot say where `time` falls in the room.
+    fn read_back_from_end(&mut self, time: DateTime<Utc>) -> Result<()> {
+        if let Some(events) = self.back(None, time)? {
+            if self.replay(&events, time)? {
+                self.reached_end = true;
+            }
         }
         Ok(())
     }
