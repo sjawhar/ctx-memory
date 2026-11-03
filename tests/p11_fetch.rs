@@ -912,10 +912,13 @@ mod stopping {
         fn drop(&mut self) {
             let _ = self.ctx.kill();
             let _ = self.ctx.wait();
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{}", self.source)])
-                .stderr(std::process::Stdio::null())
-                .status();
+            // Only a group this test knows the host id of; an empty `source` names none.
+            if !self.source.is_empty() {
+                let _ = Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", self.source)])
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
     }
 
@@ -1111,6 +1114,11 @@ mod stopping {
             .env("CTX_STATE_DIR", &state)
             .env("PATH", fixture_path()?);
         let mut fetch = start(command, &root, &[libc::SIGTERM], libc::SIG_DFL)?;
+        // The source names itself and its `sleep` by their ids inside the namespace, which name
+        // other processes, or none, on this host. Killing `unshare` (`--kill-child`) ends the
+        // whole namespace, so the guard needs no group to kill.
+        fetch.source.clear();
+        fetch.sleeper.clear();
         // The namespace's first process is `ctx`, the only child of `unshare`. A process that is
         // first in its namespace gets only the signals it has a handler for, and a default
         // action it asks for on itself does nothing.
