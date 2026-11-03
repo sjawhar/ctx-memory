@@ -85,7 +85,8 @@ pub struct ServeArgs {
     #[arg(long, value_name = "SECONDS", default_value_t = 60)]
     pub pull_interval: u64,
 
-    /// Seconds the listeners wait for this copy's record index before they bind.
+    /// Seconds the listeners wait, at most, for this copy's record index and for the window
+    /// deltas `ctx open` reads, before they bind.
     #[arg(long, value_name = "SECONDS", default_value_t = 90)]
     pub index_wait: u64,
 }
@@ -554,7 +555,7 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
         if tokio::time::timeout_at(deadline, &mut open).await.is_err() {
             eprintln!(
                 "the window deltas ctx open reads are still being read after {}s: binding the \
-                 listeners now, and an open waits for the rest of them",
+                 listeners now, and an open reads the ones not read yet itself",
                 arguments.index_wait
             );
         }
@@ -797,7 +798,14 @@ fn warm_index(shared: Arc<Shared>) {
 fn warm_open(shared: Arc<Shared>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let read = tokio::task::spawn_blocking(move || {
-            let windows = shared.tree()?.data()?.windows();
+            let windows = {
+                let tree = shared.tree()?;
+                // `ctx open` reads no delta for a tree with no source, so none is read for it.
+                if tree.config.sources.is_empty() {
+                    return Ok(());
+                }
+                tree.data()?.windows()
+            };
             delta::read_for_open(&windows)
         })
         .await;
