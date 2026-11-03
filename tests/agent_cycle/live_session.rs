@@ -15,7 +15,7 @@ use crate::fixtures::{
     remove_scratch, repo, runner, scratch, write_executable, EXAMPLE_MODEL, EXAMPLE_MODEL_ID,
 };
 use crate::job_log::{field_at, is_refusal, lines_of, summarized, tool_line};
-use crate::outcome::{runner_verdict, Attempt, TIME_LIMIT};
+use crate::outcome::{record_writes, runner_verdict, Attempt, TIME_LIMIT};
 use crate::policy::{maintenance_prompt, pass_complete_line};
 
 /// The arguments `run-cycle.sh` starts omp with, read from the script itself so this test
@@ -846,6 +846,14 @@ fn a_live_session_writes_records_through_the_ctx_record_tools() -> Result<()> {
     );
     let (error, text) = result(3)?;
     ensure!(!error && text.contains("stored"), "the rm failed: {text}");
+    // run-cycle.sh counts the writes the server accepted from omp's own events, to tell a cycle
+    // that wrote records from one that moved the marker past its windows without writing any:
+    // the two puts and the removal, not the refused put.
+    let writes = record_writes(&end.stdout)?;
+    ensure!(
+        writes == 3,
+        "run-cycle.sh counts {writes} accepted record writes in this session, not 3"
+    );
     the_record_tool_calls_are_one_job_log_line_each(&end.stdout)
 }
 

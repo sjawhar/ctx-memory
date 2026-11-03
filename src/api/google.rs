@@ -13,7 +13,6 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 
 use crate::api::client;
@@ -64,25 +63,6 @@ const FILE_REFUSALS: [(u16, &str); 5] = [
     (403, "insufficientFilePermissions"),
     (404, "notFound"),
 ];
-
-/// How far past the moment a run reads an item its own date may lie and still be the time it
-/// changed or arrived: room for this machine's clock to run behind Google's.
-pub const CLOCK_SKEW_MARGIN: TimeDelta = TimeDelta::minutes(10);
-
-/// The latest date an item read now can carry and still be a change that happened: the later of
-/// the window end and now, plus [`CLOCK_SKEW_MARGIN`].
-///
-/// Google takes a file's modified time and a message's arrival date from what a client or a
-/// sender wrote, so either can lie in the future. Such an item has not changed after the window;
-/// its date is wrong. A source that held its cursor for it would hold every later change behind
-/// it until the clock passed the date, so it stores the item in the current window instead. An
-/// item dated at or before this bound and after the window end did change after the window, and
-/// waits for the next one. A source takes the bound once, just after it reads the listing, page
-/// or history that names the item.
-#[must_use]
-pub fn latest_believable(window_end: DateTime<Utc>) -> DateTime<Utc> {
-    window_end.max(Utc::now()) + CLOCK_SKEW_MARGIN
-}
 
 /// A short-lived Google access token.
 #[derive(Clone, Debug, Eq, PartialEq)]

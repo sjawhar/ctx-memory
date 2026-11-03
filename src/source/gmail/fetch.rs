@@ -9,8 +9,9 @@ use serde_json::Value;
 use crate::api::client;
 use crate::api::google::{self, Google};
 use crate::source::{
-    slice_cursor, slice_end, token_cursor, window_start, FetchRequest, Message, Op, ResolveRequest,
-    SliceCursor, StreamStatus, TokenCursor, MAX_SLICE_DAYS, PROTOCOL_VERSION,
+    latest_believable, slice_cursor, slice_end, token_cursor, window_start, FetchRequest, Message,
+    Op, ResolveRequest, SliceCursor, StreamStatus, TokenCursor, CLOCK_SKEW_MARGIN, MAX_SLICE_DAYS,
+    PROTOCOL_VERSION,
 };
 
 use super::render::{message_timestamp, record_from_message_with_scheme, required_string};
@@ -388,7 +389,7 @@ fn collect_from_history<C: GmailApi + ?Sized>(
     warnings: &mut Vec<String>,
 ) -> Result<Collected> {
     // The caller read the history just now; every message it names had arrived by then.
-    let believable = google::latest_believable(window_end);
+    let believable = latest_believable(window_end);
     let mut messages = Vec::new();
     let mut skewed = BTreeSet::new();
     let mut seen = BTreeSet::new();
@@ -456,7 +457,7 @@ fn collect_from_history<C: GmailApi + ?Sized>(
     })
 }
 
-/// The warning for a message dated later than [`google::latest_believable`]. No clock has
+/// The warning for a message dated later than [`latest_believable`]. No clock has
 /// reached that date, so the message did not arrive after the window: its date is wrong.
 /// Holding the cursor for it would hold every later message until the clock passed the date, so
 /// the window stores it at its end, and the record's raw data keeps the date Gmail gave.
@@ -464,7 +465,7 @@ fn skewed_warning(id: &str, arrived: DateTime<Utc>, window_end: DateTime<Utc>) -
     format!(
         "Gmail message {id} is dated {}, more than {} minutes after both the window end and the time this fetch read it; the date is taken for a wrong clock, so this window stores the message at its end ({}) and its raw data keeps the date Gmail gave",
         arrived.to_rfc3339_opts(SecondsFormat::Secs, true),
-        google::CLOCK_SKEW_MARGIN.num_minutes(),
+        CLOCK_SKEW_MARGIN.num_minutes(),
         window_end.to_rfc3339_opts(SecondsFormat::Secs, true)
     )
 }
@@ -638,7 +639,7 @@ pub(super) fn fetch_messages<C: GmailApi + ?Sized>(
     let candidates = api.list_messages(&query)?;
     let (end, believable) = match reach {
         Reach::Slice(end) => (end, None),
-        Reach::WindowEnd(end) => (end, Some(google::latest_believable(end))),
+        Reach::WindowEnd(end) => (end, Some(latest_believable(end))),
     };
     let mut listed = Listed {
         messages: Vec::with_capacity(candidates.len()),

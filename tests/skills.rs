@@ -280,6 +280,60 @@ fn the_ingest_skill_closes_quoted_text_only_with_the_cycles_nonce() -> Result<()
     Ok(())
 }
 
+/// The policy refuses every shell call that is not one plain `ctx` command, and omp tells the
+/// session only `Tool "bash" requires approval but no interactive UI available`. A session read
+/// that as a shell it could not use and stopped with its windows unread. The skill states the
+/// rule whole, and says what that refusal means and what to do instead.
+#[test]
+fn the_ingest_skill_says_what_a_refused_shell_call_means() -> Result<()> {
+    let flat = flat(&skill("ctx-memory-ingest")?);
+    for expected in [
+        "one `ctx` command alone per shell call, with no pipe, no redirection (`2>` too), no `;`, \
+         no `&&` and no `||`",
+        "A refused call fails with `Tool \"bash\" requires approval but no interactive UI \
+         available`",
+        "the shell still works",
+        "run each `ctx` command again on its own",
+    ] {
+        assert!(
+            flat.contains(expected),
+            "the ingest skill never says {expected:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A tree's rules page stays under 8,192 bytes, so a tree keeps the ingest rules that do not fit
+/// there in its ingest notes: an optional record, of any type, that the rules page links. The
+/// skill says what they are, has the cycle read them in step 1 when the rules page links them,
+/// binds the cycle to them as to the rules page, and keeps the cycle from writing them, since
+/// they steer every later cycle.
+#[test]
+fn the_ingest_skill_defines_the_ingest_notes_and_reads_them_in_step_1() -> Result<()> {
+    let flat = flat(&skill("ctx-memory-ingest")?);
+    for expected in [
+        "Its ingest notes are an optional record of any type, such as `ingest-notes.md`, that the \
+         rules page links as its ingest notes",
+        "Both bind this procedure",
+        "the cycle never writes them",
+    ] {
+        assert!(
+            flat.contains(expected),
+            "the ingest skill never says {expected:?}"
+        );
+    }
+    let step_one = flat
+        .split("## Per-cycle procedure 1. ")
+        .nth(1)
+        .and_then(|rest| rest.split(" 2. ").next())
+        .context("the ingest skill has no step 1")?;
+    assert!(
+        step_one.contains("ingest notes") && step_one.contains("`ctx record show <path>`"),
+        "step 1 does not read the ingest notes the rules page links: {step_one}"
+    );
+    Ok(())
+}
+
 /// Six kinds of message made records nobody used: payment receipts, spend alerts, the fetch's
 /// own bookkeeping, a record of one change in a repository, records of what had already
 /// happened, and records about the pipeline itself. The skill names each, and where a fact

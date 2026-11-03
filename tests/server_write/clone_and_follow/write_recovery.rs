@@ -61,7 +61,7 @@ fn a_failed_push_leaves_no_commit_behind() -> Result<()> {
         "/v1/records/put",
         &put_body("decisions/lost.md", &good_record(), "session-lost"),
     )?;
-    let health = server.get(server.tailnet, "/healthz", &[])?;
+    let health = server.get(server.tailnet_address()?, "/healthz", &[])?;
     let local_head = git(&tree, &["rev-parse", "HEAD"])?;
     let status = git(&tree, &["status", "--porcelain"])?;
 
@@ -147,7 +147,7 @@ fn a_conflicting_rebase_is_409_and_leaves_no_rebase_behind() -> Result<()> {
         "/v1/records/put",
         &put_body("decisions/contested.md", &good_record(), "session-raced"),
     )?;
-    let health = server.get(server.tailnet, "/healthz", &[])?;
+    let health = server.get(server.tailnet_address()?, "/healthz", &[])?;
     let rebasing =
         tree.join(".git/rebase-merge").exists() || tree.join(".git/rebase-apply").exists();
     let status = git(&tree, &["status", "--porcelain"])?;
@@ -195,14 +195,14 @@ fn healthz_reports_a_clone_that_cannot_fast_forward() -> Result<()> {
     let bare_text = bare.to_str().context("remote path is not valid UTF-8")?;
     let root = tree.parent().context("the fixture has a root")?;
     let server = Server::start(&tree, &["--pull-interval", "600"])?;
-    let healthy = server.get(server.tailnet, "/healthz", &[])?;
+    let healthy = server.get(server.tailnet_address()?, "/healthz", &[])?;
 
     // A commit here that the remote never took, which on its own still fast-forwards.
     std::fs::create_dir_all(tree.join("decisions"))?;
     std::fs::write(tree.join("decisions/stranded.md"), good_record())?;
     git(&tree, &["add", "decisions/stranded.md"])?;
     commit(&tree, "a commit the remote never took")?;
-    let ahead = server.get(server.tailnet, "/healthz", &[])?;
+    let ahead = server.get(server.tailnet_address()?, "/healthz", &[])?;
 
     // A person merges something, and now the two have each moved on from the other.
     let other = root.join("other");
@@ -217,7 +217,7 @@ fn healthz_reports_a_clone_that_cannot_fast_forward() -> Result<()> {
     git(&other, &["push", "--quiet", "origin", "main"])?;
     git(&tree, &["fetch", "--quiet", "origin"])?;
 
-    let wedged = server.get(server.tailnet, "/healthz", &[])?;
+    let wedged = server.get(server.tailnet_address()?, "/healthz", &[])?;
     drop(server);
     remove_fixture(&tree)?;
 
@@ -276,13 +276,13 @@ fn a_stranded_commit_in_a_clone_ctx_made_is_never_published() -> Result<()> {
         &[("CTX_MEMORY_REMOTE", bare_text)],
     )?;
     strand_a_commit(&clone)?;
-    let wedged = server.get(server.tailnet, "/healthz", &[])?;
+    let wedged = server.get(server.tailnet_address()?, "/healthz", &[])?;
     let later = server.post_as(
         "grace@example.com",
         "/v1/records/put",
         &put_body("decisions/later.md", &good_record(), "session-later"),
     )?;
-    let healthy = server.get(server.tailnet, "/healthz", &[])?;
+    let healthy = server.get(server.tailnet_address()?, "/healthz", &[])?;
     drop(server);
     let listing = git(&bare, &["ls-tree", "-r", "--name-only", "main"])?;
     remove_fixture(&seed)?;
@@ -320,7 +320,7 @@ fn the_follow_loop_throws_away_a_stranded_commit() -> Result<()> {
     let remote_head = git(&bare, &["rev-parse", "main"])?;
     let healed = within(60, || {
         let head = git(&clone, &["rev-parse", "HEAD"])?;
-        let health = server.get(server.tailnet, "/healthz", &[])?;
+        let health = server.get(server.tailnet_address()?, "/healthz", &[])?;
         Ok((head == remote_head && health.status == 200).then_some(()))
     });
     drop(server);
@@ -416,7 +416,7 @@ fn healthz_says_when_the_follow_loop_is_failing() -> Result<()> {
         ],
     )?;
     let failing = within(60, || {
-        let health = server.get(server.tailnet, "/healthz", &[])?;
+        let health = server.get(server.tailnet_address()?, "/healthz", &[])?;
         let ok = health
             .body
             .get("following")
@@ -541,7 +541,7 @@ fn a_clone_git_cannot_open_is_reported_not_passed_over() -> Result<()> {
     let kept = std::fs::read_to_string(&config)?;
     std::fs::write(&config, format!("{kept}[[[ a line git cannot read\n"))?;
     let reported = within(60, || {
-        let health = server.get(server.tailnet, "/healthz", &[])?;
+        let health = server.get(server.tailnet_address()?, "/healthz", &[])?;
         let following = health
             .body
             .get("following")

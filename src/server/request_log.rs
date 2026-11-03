@@ -1,10 +1,10 @@
-//! The request log: one JSON line on standard output for every request either door takes, so
-//! who reads and writes the graph, and how, can be counted.
+//! The request log: one JSON line on standard output for every request any door takes, so who
+//! reads and writes the graph, and how, can be counted.
 //!
 //! Cloud Run parses a line of JSON into the entry's `jsonPayload`, takes `time` as the entry's
 //! timestamp and `severity` as its severity. It logs the requests that reach the
 //! identity-token door itself, but never one that comes through the Tailscale sidecar, which
-//! reaches this process on loopback; this log covers both doors alike.
+//! reaches this process on loopback; this log covers every door alike.
 //!
 //! A line says who called, which command and how it ended, never what the request carried: no
 //! search query (only its length), no record text, no quote, no identity token. A record path
@@ -44,6 +44,9 @@ pub enum Door {
     Tailnet,
     /// The ingress port, where a caller brings a Google identity token.
     IdentityToken,
+    /// The loopback port of a machine with one person on it, where every request is that
+    /// person.
+    Local,
 }
 
 /// What a handler learns about its request that its line reports and its answer does not show:

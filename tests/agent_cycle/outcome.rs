@@ -50,7 +50,7 @@ pub(crate) const TIME_LIMIT: &str = "time limit";
 /// maintenance pass, where the sessions it starts end as `attempts` say, in order, and the marker
 /// never moves.
 pub(crate) fn runner_verdict(pass: Option<&str>, attempts: &[Attempt<'_>]) -> Result<Verdict> {
-    verdict(pass, attempts, None, None)
+    verdict(pass, attempts, &Around::default())
 }
 
 /// [`runner_verdict`], where the marker has moved once session `moved_by` (1 for the first) has
@@ -60,18 +60,49 @@ fn runner_verdict_moving_marker(
     attempts: &[Attempt<'_>],
     moved_by: usize,
 ) -> Result<Verdict> {
-    verdict(pass, attempts, Some(moved_by), None)
+    verdict(
+        pass,
+        attempts,
+        &Around {
+            marker_moves: &[(moved_by, FIRST_PENDING)],
+            ..Around::default()
+        },
+    )
 }
 
-/// Runs the post-session code with `old_retry_capture` beside the retry's transcript directory
-/// when it starts, as an earlier attempt of the same execution whose capture no seal could move
-/// leaves it.
-fn verdict(
-    pass: Option<&str>,
-    attempts: &[Attempt<'_>],
-    moved_by: Option<usize>,
-    old_retry_capture: Option<&str>,
-) -> Result<Verdict> {
+/// The window the marker holds before the runner's sessions start.
+const MARKER_BEFORE: &str = "20261101T000000Z-0000";
+
+/// The one window the runner's own `ctx pending` read lists when a test names none, with one new
+/// message.
+const FIRST_PENDING: &str = "20261101T010000Z-0001";
+
+/// What a test sets up around the runner's sessions. The default: the marker holds
+/// [`MARKER_BEFORE`] throughout, every `ctx pending` read lists [`FIRST_PENDING`], and nothing is
+/// beside the retry's transcript directory.
+#[derive(Default)]
+struct Around<'a> {
+    /// Where the marker is once a session has run: `(session, window)`, 1 for the first session,
+    /// as a session that ran `ctx marker advance` leaves it, and 0 for where it is before the
+    /// first session. A later entry wins, and an empty window is no marker at all, as on a tree
+    /// no cycle has handled.
+    marker_moves: &'a [(usize, &'a str)],
+    /// What `ctx pending --json` answers: the first entry before the first session (the read the
+    /// runner hands the session), the second once one session has run (the retry's read). A read
+    /// past the last entry answers the first, and an empty entry is a read that fails.
+    pending: &'a [&'a str],
+    /// Every `ctx marker show` fails, with status 3, once a session has run.
+    marker_read_fails: bool,
+    /// Every `ctx marker show` answers, with status 0, text that is not JSON once a session has
+    /// run.
+    marker_unreadable: bool,
+    /// A capture beside the retry's transcript directory when the runner starts, as an earlier
+    /// attempt of the same execution whose capture no seal could move leaves it.
+    old_retry_capture: Option<&'a str>,
+}
+
+/// Runs the post-session code with what `around` sets up.
+fn verdict(pass: Option<&str>, attempts: &[Attempt<'_>], around: &Around<'_>) -> Result<Verdict> {
     let script = runner("run-cycle.sh")?;
     let lines: Vec<&str> = script.lines().collect();
     let launch = lines
@@ -92,29 +123,35 @@ fn verdict(
         .context("run-cycle.sh sets no SESSION_MINUTES")?;
 
     let dir = scratch("verdict")?;
-    let outcome = run_after_launch(
-        &dir,
-        pass,
-        minutes,
-        &after_launch,
-        attempts,
-        moved_by,
-        old_retry_capture,
-    );
+    let outcome = run_after_launch(&dir, pass, minutes, &after_launch, attempts, around);
     remove_scratch(&dir)?;
     outcome
 }
 
-fn run_after_launch(
-    dir: &Path,
-    pass: Option<&str>,
-    minutes: &str,
-    after_launch: &str,
-    attempts: &[Attempt<'_>],
-    moved_by: Option<usize>,
-    old_retry_capture: Option<&str>,
-) -> Result<Verdict> {
-    if let Some(capture) = old_retry_capture {
+/// A `ctx pending --json` answer listing `windows`, each `(window id, new messages)`, in the
+/// shape the CLI prints it.
+fn pending_answer(windows: &[(&str, usize)]) -> String {
+    let windows: Vec<Value> = windows
+        .iter()
+        .map(|(window, new_messages)| {
+            json!({
+                "window": window, "dir": format!("windows/{window}"),
+                "window_end": "2026-11-01T01:00:00Z", "status": "ok",
+                "new_messages": new_messages, "listed_messages": new_messages
+            })
+        })
+        .collect();
+    json!({
+        "version": 1, "command": "pending",
+        "data": {"marker": {"version": 1, "window": MARKER_BEFORE}, "windows": windows, "later_windows": 0}
+    })
+    .to_string()
+}
+
+/// Leaves in `dir` what the sessions in `attempts` end with and what `around` sets up, where the
+/// stand-ins of [`run_after_launch`] read them.
+fn stage(dir: &Path, attempts: &[Attempt<'_>], around: &Around<'_>) -> Result<()> {
+    if let Some(capture) = around.old_retry_capture {
         let sessions = dir.join("data/agent-sessions");
         std::fs::create_dir_all(sessions.join("ctx-agent-test-1-retry"))?;
         std::fs::write(sessions.join("ctx-agent-test-1-retry.events.json"), capture)?;
@@ -126,10 +163,46 @@ fn run_after_launch(
             attempt.status.to_string(),
         )?;
     }
+    for (session, window) in around.marker_moves {
+        std::fs::write(dir.join(format!("marker-{session}")), window)?;
+    }
+    if around.marker_read_fails {
+        std::fs::write(dir.join("marker-fails"), "")?;
+    }
+    if around.marker_unreadable {
+        std::fs::write(dir.join("marker-unreadable"), "")?;
+    }
+    let first_pending = pending_answer(&[(FIRST_PENDING, 1)]);
+    let reads = if around.pending.is_empty() {
+        &[first_pending.as_str()][..]
+    } else {
+        around.pending
+    };
+    for (index, answer) in reads.iter().enumerate() {
+        std::fs::write(dir.join(format!("pending-{index}")), answer)?;
+    }
+    Ok(())
+}
+
+fn run_after_launch(
+    dir: &Path,
+    pass: Option<&str>,
+    minutes: &str,
+    after_launch: &str,
+    attempts: &[Attempt<'_>],
+    around: &Around<'_>,
+) -> Result<Verdict> {
+    stage(dir, attempts, around)?;
     // What the script holds when its sessions start, and stand-ins for what reaches past this
-    // machine: ctx-agent's checks pass, chown changes nothing, and `ctx marker show` answers `m1`
-    // until session VERDICT_MARKER_MOVED_BY has run, `m2` after. A session leaves its events in
-    // the capture beside its transcript directory, where the real run_session's omp writes them.
+    // machine: ctx-agent's checks pass, chown changes nothing, `ctx pending` answers what
+    // pending-<sessions run so far> holds (pending-0 when there is no such file; an empty file
+    // fails the read), and `ctx marker show` answers MARKER_BEFORE, or what marker-0 names, until
+    // a session whose marker-<session> names the window it moved the marker to has run (an empty
+    // name is no marker), fails once a session has run when marker-fails is there, and answers
+    // text that is not JSON once a session has run when marker-unreadable is there. A session
+    // leaves its events in the capture beside its transcript directory, where the real
+    // run_session's omp writes them. `timeout` runs the command it is handed, so a context read
+    // reaches the `ctx` stand-in and not a real one.
     let prelude = format!(
         r#"set -eu
 {refuse}
@@ -137,29 +210,55 @@ fn run_after_launch(
 {seal}
 {write_context}
 {prepare_context}
+{shell_rule}
 {cycle_prompt}
 SESSION_MINUTES={minutes}
 AGENT_USER=ctx-agent
 pass='{pass}'
 windows=1
 CTX_DATA_DIR="$VERDICT_DIR/data"
-CLOUD_RUN_EXECUTION=ctx-agent-test-1
-session_dir="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION"
+execution=ctx-agent-test-1
+session_dir="$CTX_DATA_DIR/agent-sessions/$execution"
 mkdir -p "$session_dir"
 nonce=0123456789abcdef0123456789abcdef
 context_prompt=
 CONTEXT_BYTES=49152
 context_seconds_left=60
 context_subjects_left=30
+pending="$(cat "$VERDICT_DIR/pending-0")"
 as_agent_user() {{ case "$*" in *context.json*) return 1 ;; esac; }}
 chown() {{ :; }}
+timeout() {{ shift; "$@"; }}
 ctx() {{
-	marker=m1
-	if [ -n "${{VERDICT_MARKER_MOVED_BY:-}}" ] &&
-		[ "$(cat "$VERDICT_DIR/sessions" 2>/dev/null || echo 0)" -ge "$VERDICT_MARKER_MOVED_BY" ]; then
-		marker=m2
+	ran="$(cat "$VERDICT_DIR/sessions" 2>/dev/null || echo 0)"
+	case "$*" in
+	*pending*)
+		answer="$VERDICT_DIR/pending-$ran"
+		[ -f "$answer" ] || answer="$VERDICT_DIR/pending-0"
+		if [ ! -s "$answer" ]; then
+			printf '%s\n' '{{"error":"the server could not be reached"}}'
+			return 1
+		fi
+		cat "$answer"
+		return
+		;;
+	esac
+	if [ "$ran" -gt 0 ] && [ -f "$VERDICT_DIR/marker-fails" ]; then
+		printf '%s\n' '{{"error":"the server could not be reached"}}'
+		return 3
 	fi
-	printf '{{"ok":true,"data":{{"marker":"%s"}}}}\n' "$marker"
+	if [ "$ran" -gt 0 ] && [ -f "$VERDICT_DIR/marker-unreadable" ]; then echo 'Bad Gateway'; return 0; fi
+	marker={MARKER_BEFORE}
+	session=0
+	while [ "$session" -le "$ran" ]; do
+		[ ! -f "$VERDICT_DIR/marker-$session" ] || marker="$(cat "$VERDICT_DIR/marker-$session")"
+		session=$((session + 1))
+	done
+	if [ -z "$marker" ]; then
+		printf '%s\n' '{{"version":1,"command":"marker show","data":{{"marker":null}}}}'
+	else
+		printf '{{"version":1,"command":"marker show","data":{{"marker":{{"version":1,"window":"%s"}}}}}}\n' "$marker"
+	fi
 }}
 run_session() {{
 	attempt=$(($(cat "$VERDICT_DIR/sessions" 2>/dev/null || echo 0) + 1))
@@ -177,18 +276,14 @@ run_session() {{
         seal = script_function("seal_session")?,
         write_context = script_function("write_context")?,
         prepare_context = script_function("prepare_context")?,
+        shell_rule = script_function("shell_rule")?,
         cycle_prompt = script_function("cycle_prompt")?,
         pass = pass.unwrap_or_default(),
     );
-    let mut command = Command::new("sh");
-    command
+    let output = Command::new("sh")
         .arg("-c")
         .arg(format!("{prelude}\n{after_launch}\n"))
-        .env("VERDICT_DIR", dir);
-    if let Some(moved_by) = moved_by {
-        command.env("VERDICT_MARKER_MOVED_BY", moved_by.to_string());
-    }
-    let output = command
+        .env("VERDICT_DIR", dir)
         .output()
         .context("running run-cycle.sh's post-session code")?;
     let sessions = std::fs::read_to_string(dir.join("sessions"))
@@ -210,13 +305,21 @@ run_session() {{
 /// omp's stdout for a session whose messages are `messages`, one event per line, as the pinned
 /// release writes it: its header, a `message_start` and a `message_end` for each message, and
 /// `agent_end`. omp starts each assistant message with an empty body and a placeholder
-/// `stopReason` of "stop", so only its `message_end` says how that turn ended.
+/// `stopReason` of "stop", so only its `message_end` says how that turn ended. An entry that is
+/// an event of its own, with a `type` (a tool's `tool_execution_start` or `tool_execution_end`),
+/// is written as it is, where it stands, and is not one of the messages.
 fn events(messages: &[Value]) -> String {
     let mut lines = vec![
         json!({"type": "session", "version": 3, "id": "test-session"}),
         json!({"type": "agent_start"}),
     ];
+    let mut conversation = Vec::new();
     for message in messages {
+        if message.get("type").is_some() {
+            lines.push(message.clone());
+            continue;
+        }
+        conversation.push(message);
         let mut start = message.clone();
         if let Some(fields) = start
             .as_object_mut()
@@ -231,7 +334,7 @@ fn events(messages: &[Value]) -> String {
         lines.push(json!({"type": "message_end", "message": message}));
     }
     lines.push(json!({
-        "type": "agent_end", "messages": messages, "isTerminal": true, "yielded": true
+        "type": "agent_end", "messages": conversation, "isTerminal": true, "yielded": true
     }));
     let mut stdout = String::new();
     for line in lines {
@@ -262,7 +365,7 @@ fn tool_result(id: &str, text: &str, error: bool) -> Value {
 }
 
 /// A model turn that ends the session with `text` as its final answer.
-fn answer(text: &str) -> Value {
+pub(crate) fn answer(text: &str) -> Value {
     json!({"role": "assistant", "content": [{"type": "text", "text": text}], "stopReason": "stop"})
 }
 
@@ -317,6 +420,49 @@ fn stopped_while_the_model_answers() -> String {
 
 fn refused() -> String {
     events(&[prompt(), refusal()])
+}
+
+/// A session that called the record tools as `calls` say, each `(tool, accepted)`, and then
+/// ended on `last`: for each call, the model's turn that asks for it, omp's
+/// `tool_execution_start` and `tool_execution_end` events, and the call's result, in the shape
+/// the pinned omp writes them (`live_session.rs` reads a live session's). A write the server
+/// refused fails with its findings, as runner/ctx-record.ts reports one.
+pub(crate) fn wrote(calls: &[(&str, bool)], last: Value) -> String {
+    let mut messages = vec![prompt()];
+    for (index, &(tool, accepted)) in calls.iter().enumerate() {
+        let id = format!("toolu_{index}");
+        let arguments = if tool == "ctx_record_rm" {
+            json!({"path": "decisions/example.md"})
+        } else {
+            json!({"records": [{"path": "decisions/example.md", "content": "---\ntype: decision\n---\n"}]})
+        };
+        let (text, details) = if accepted {
+            ("stored", json!({"exitCode": 0}))
+        } else {
+            (
+                "refused decisions/example.md\n  quote — the quote is not in its source",
+                json!({}),
+            )
+        };
+        let content = json!([{"type": "text", "text": text}]);
+        messages.extend([
+            json!({
+                "role": "assistant", "stopReason": "toolUse",
+                "content": [{"type": "toolCall", "id": id, "name": tool, "arguments": arguments}]
+            }),
+            json!({"type": "tool_execution_start", "toolCallId": id, "toolName": tool, "args": arguments}),
+            json!({
+                "type": "tool_execution_end", "toolCallId": id, "toolName": tool,
+                "result": {"content": content, "details": details}, "isError": !accepted
+            }),
+            json!({
+                "role": "toolResult", "toolCallId": id, "toolName": tool,
+                "content": content, "isError": !accepted
+            }),
+        ]);
+    }
+    messages.push(last);
+    events(&messages)
 }
 
 /// A maintenance pass's final report, ending with the line `ending` (none when `None`).
@@ -852,8 +998,10 @@ fn a_retry_keeps_the_capture_an_earlier_attempt_left_beside_its_directory() -> R
                 events: &finished,
             },
         ],
-        None,
-        Some(old),
+        &Around {
+            old_retry_capture: Some(old),
+            ..Around::default()
+        },
     )?;
     ensure_succeeded(&verdict, "the refused cycle's fresh session finished")?;
     ensure!(
@@ -862,5 +1010,399 @@ fn a_retry_keeps_the_capture_an_earlier_attempt_left_beside_its_directory() -> R
         verdict.retry_kept,
         verdict.stderr
     );
+    Ok(())
+}
+
+/// What the line a cycle that skipped windows fails with says.
+const SKIPPED: &str = "wrote no record";
+
+/// Three windows after [`MARKER_BEFORE`], oldest first.
+const FIRST: &str = "20261102T080000Z-0001";
+const SECOND: &str = "20261102T090000Z-0002";
+const THIRD: &str = "20261102T100000Z-0003";
+
+/// How many record writes the server accepted in the session whose omp stdout is `events`, as
+/// `run-cycle.sh` counts them: its `record_writes` function, run by `sh` over the capture.
+pub(crate) fn record_writes(events: &str) -> Result<usize> {
+    let dir = scratch("record-writes")?;
+    let capture = dir.join("events.json");
+    std::fs::write(&capture, events)?;
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "set -eu\n{}\nrecord_writes \"$1\"",
+            script_function("record_writes")?
+        ))
+        .arg("sh")
+        .arg(&capture)
+        .output();
+    remove_scratch(&dir)?;
+    let output = output.context("running run-cycle.sh's record_writes")?;
+    ensure!(
+        output.status.success(),
+        "record_writes failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)?
+        .trim()
+        .parse()
+        .context("record_writes printed no number")
+}
+
+/// A session that moves the marker past a window with new messages, and writes no record in the
+/// whole cycle, has skipped that window for good: no later cycle reads it again. A session did
+/// exactly that on a real sample, moving the marker past five windows that held new messages
+/// with no record written, and still ended on its final answer, so omp and the runner reported a
+/// success. The runner reads the marker once the cycle is over and fails it, in one line that
+/// names each window the marker passed that held new messages: not an empty one it passed, nor
+/// one still pending. A session that also failed otherwise, at its time limit, still has them
+/// named, since the marker it moved stands.
+#[test]
+fn a_cycle_that_moved_the_marker_past_new_messages_without_a_record_fails() -> Result<()> {
+    let pending = pending_answer(&[(FIRST, 4), (SECOND, 0), (THIRD, 2)]);
+    let around = Around {
+        marker_moves: &[(1, SECOND)],
+        pending: &[&pending],
+        ..Around::default()
+    };
+    let finished = finished("Handled 2 windows.");
+    let skipped = verdict(
+        None,
+        &[Attempt {
+            status: 0,
+            events: &finished,
+        }],
+        &around,
+    )?;
+    ensure_failed_saying(
+        &skipped,
+        SKIPPED,
+        "the session moved the marker past a window with new messages and wrote no record",
+    )?;
+    let line = skipped.lines_saying(SKIPPED).concat();
+    ensure!(
+        line.contains(FIRST) && !line.contains(SECOND) && !line.contains(THIRD),
+        "the line does not name exactly the window with new messages the marker passed: {line}"
+    );
+
+    let cut_short = stopped_after_a_tool_call();
+    let stopped = verdict(
+        None,
+        &[Attempt {
+            status: 0,
+            events: &cut_short,
+        }],
+        &around,
+    )?;
+    ensure_failed_saying(&stopped, TIME_LIMIT, "the time limit stopped the session")?;
+    ensure_failed_saying(
+        &stopped,
+        SKIPPED,
+        "the time limit stopped a session that had moved the marker past new messages unwritten",
+    )
+}
+
+/// A record the cycle wrote, put or removed, is the session working its windows, so the marker
+/// may pass windows with new messages; so may a session that wrote nothing when each window it
+/// passed was empty, or that moved no marker. A write the server refused wrote nothing.
+#[test]
+fn only_a_cycle_that_wrote_nothing_past_new_messages_fails_for_skipping() -> Result<()> {
+    let held = pending_answer(&[(FIRST, 4), (SECOND, 0)]);
+    let empty_first = pending_answer(&[(FIRST, 0), (SECOND, 3)]);
+    let put = wrote(&[("ctx_record_put", true)], answer("Handled 2 windows."));
+    let removed = wrote(
+        &[("ctx_record_put", false), ("ctx_record_rm", true)],
+        answer("Handled 2 windows."),
+    );
+    let refused_write = wrote(&[("ctx_record_put", false)], answer("Handled 2 windows."));
+    let nothing = finished("Handled the windows.");
+    for (events, pending, moves, skipped, what) in [
+        (
+            &put,
+            &held,
+            &[(1, SECOND)][..],
+            false,
+            "the session wrote a record",
+        ),
+        (
+            &removed,
+            &held,
+            &[(1, SECOND)][..],
+            false,
+            "the session removed a record after a refused write",
+        ),
+        (
+            &nothing,
+            &empty_first,
+            &[(1, FIRST)][..],
+            false,
+            "the marker passed only an empty window",
+        ),
+        (
+            &nothing,
+            &held,
+            &[][..],
+            false,
+            "the session moved no marker",
+        ),
+        (
+            &refused_write,
+            &held,
+            &[(1, SECOND)][..],
+            true,
+            "the session's only write was refused",
+        ),
+    ] {
+        let verdict = verdict(
+            None,
+            &[Attempt { status: 0, events }],
+            &Around {
+                marker_moves: moves,
+                pending: &[pending],
+                ..Around::default()
+            },
+        )?;
+        if skipped {
+            ensure_failed_saying(&verdict, SKIPPED, what)?;
+        } else {
+            ensure_succeeded(&verdict, what)?;
+        }
+    }
+    Ok(())
+}
+
+/// A refused cycle's two sessions are one cycle: the windows the marker passed are those either
+/// session's `ctx pending` read listed, and a record either session wrote counts for the cycle.
+#[test]
+fn a_refused_cycle_is_judged_for_skipped_windows_across_both_sessions() -> Result<()> {
+    let first_read = pending_answer(&[(FIRST, 4), (SECOND, 0)]);
+    let retry_read = pending_answer(&[(SECOND, 0), (THIRD, 2)]);
+    let around = Around {
+        marker_moves: &[(1, FIRST), (2, THIRD)],
+        pending: &[&first_read, &retry_read],
+        ..Around::default()
+    };
+    let finished = finished("Handled 2 windows.");
+    let refused = refused();
+    let unwritten = verdict(
+        None,
+        &[
+            Attempt {
+                status: 1,
+                events: &refused,
+            },
+            Attempt {
+                status: 0,
+                events: &finished,
+            },
+        ],
+        &around,
+    )?;
+    ensure!(
+        unwritten.sessions == 2,
+        "a refused cycle did not get its fresh session: {}",
+        unwritten.stderr
+    );
+    ensure_failed_saying(
+        &unwritten,
+        SKIPPED,
+        "neither session wrote a record, and the marker passed windows with new messages",
+    )?;
+    let line = unwritten.lines_saying(SKIPPED).concat();
+    ensure!(
+        line.contains(FIRST) && line.contains(THIRD) && !line.contains(SECOND),
+        "the line does not name each window with new messages either session passed: {line}"
+    );
+
+    let wrote_then_refused = wrote(&[("ctx_record_put", true)], refusal());
+    let written = verdict(
+        None,
+        &[
+            Attempt {
+                status: 1,
+                events: &wrote_then_refused,
+            },
+            Attempt {
+                status: 0,
+                events: &finished,
+            },
+        ],
+        &around,
+    )?;
+    ensure!(
+        written.sessions == 2,
+        "a refused cycle did not get its fresh session: {}",
+        written.stderr
+    );
+    ensure_succeeded(
+        &written,
+        "the refused session wrote a record before the fresh one finished",
+    )
+}
+
+/// A refused cycle whose retry cannot read what is pending still has the first session's read:
+/// the retry goes on without context, its failed answer adds no window, and a window with new
+/// messages that the first session's read listed and the marker passed, with nothing written, is
+/// still named.
+#[test]
+fn a_refused_cycle_whose_retry_cannot_read_pending_is_judged_by_the_first_read() -> Result<()> {
+    let first_read = pending_answer(&[(FIRST, 4), (SECOND, 0)]);
+    let refused = refused();
+    let finished = finished("Handled 1 window.");
+    let verdict = verdict(
+        None,
+        &[
+            Attempt {
+                status: 1,
+                events: &refused,
+            },
+            Attempt {
+                status: 0,
+                events: &finished,
+            },
+        ],
+        &Around {
+            marker_moves: &[(1, FIRST), (2, SECOND)],
+            pending: &[&first_read, ""],
+            ..Around::default()
+        },
+    )?;
+    ensure!(
+        verdict.sessions == 2
+            && verdict
+                .lines_saying("ctx pending failed before the retry")
+                .len()
+                == 1,
+        "the retry did not go on without context after its pending read failed: {}",
+        verdict.stderr
+    );
+    ensure_failed_saying(
+        &verdict,
+        SKIPPED,
+        "the first session passed a window with new messages and neither session wrote a record",
+    )?;
+    let line = verdict.lines_saying(SKIPPED).concat();
+    ensure!(
+        line.contains(FIRST) && !line.contains(SECOND),
+        "the line does not name the window the first session's read listed with new messages: {line}"
+    );
+    Ok(())
+}
+
+/// A cycle that wrote nothing reads the marker once it is over, and a read that fails ends the
+/// job with that read's status and one line saying so, as a pass's marker read does. A cycle that
+/// wrote a record does not read the marker at all.
+#[test]
+fn a_cycle_that_cannot_read_the_marker_afterwards_fails_with_that_status() -> Result<()> {
+    let around = Around {
+        marker_read_fails: true,
+        ..Around::default()
+    };
+    let nothing = finished("Handled 1 window.");
+    let unwritten = verdict(
+        None,
+        &[Attempt {
+            status: 0,
+            events: &nothing,
+        }],
+        &around,
+    )?;
+    ensure_failed_saying(
+        &unwritten,
+        "ctx marker show failed after the cycle (exit 3)",
+        "the marker read after a cycle that wrote nothing failed",
+    )?;
+    ensure!(
+        unwritten.status.code() == Some(3),
+        "the runner did not exit with the failed read's status 3: {}",
+        unwritten.status
+    );
+    let put = wrote(&[("ctx_record_put", true)], answer("Handled 1 window."));
+    let written = verdict(
+        None,
+        &[Attempt {
+            status: 0,
+            events: &put,
+        }],
+        &around,
+    )?;
+    ensure_succeeded(
+        &written,
+        "the cycle wrote a record, so it had no need to read the marker",
+    )
+}
+
+/// A marker answer the runner cannot read as JSON, such as a gateway's error page, leaves it
+/// unable to tell which windows the marker passed: the cycle that wrote nothing fails, with one
+/// line saying so, rather than pass as if no window had been skipped.
+#[test]
+fn a_cycle_whose_marker_answer_cannot_be_read_fails_saying_so() -> Result<()> {
+    let nothing = finished("Handled 1 window.");
+    let verdict = verdict(
+        None,
+        &[Attempt {
+            status: 0,
+            events: &nothing,
+        }],
+        &Around {
+            marker_unreadable: true,
+            ..Around::default()
+        },
+    )?;
+    ensure_failed_saying(
+        &verdict,
+        "could not tell whether the cycle moved the marker past windows it wrote nothing for",
+        "the marker answer after a cycle that wrote nothing was not JSON",
+    )?;
+    ensure!(
+        verdict.status.code() == Some(1),
+        "the runner did not exit 1: {}",
+        verdict.status
+    );
+    Ok(())
+}
+
+/// On a tree no cycle has handled the marker is null. A session that moved it nowhere passed no
+/// window, so the cycle succeeds; one that moved it past a window with new messages, with nothing
+/// written, fails naming that window.
+#[test]
+fn a_cycle_on_a_tree_with_no_marker_is_judged_by_where_the_marker_ends() -> Result<()> {
+    let pending = pending_answer(&[(FIRST, 4)]);
+    let nothing = finished("Handled 1 window.");
+    for (moves, skipped, what) in [
+        (
+            &[(0, "")][..],
+            false,
+            "the session left a tree with no marker without one",
+        ),
+        (
+            &[(0, ""), (1, FIRST)][..],
+            true,
+            "the session moved a tree's first marker past a window with new messages",
+        ),
+    ] {
+        let verdict = verdict(
+            None,
+            &[Attempt {
+                status: 0,
+                events: &nothing,
+            }],
+            &Around {
+                marker_moves: moves,
+                pending: &[&pending],
+                ..Around::default()
+            },
+        )?;
+        if skipped {
+            ensure_failed_saying(&verdict, FIRST, what)?;
+        } else {
+            ensure_succeeded(&verdict, what)?;
+            ensure!(
+                verdict.lines_saying(SKIPPED).is_empty(),
+                "{what}, yet the runner names skipped windows: {}",
+                verdict.stderr
+            );
+        }
+    }
     Ok(())
 }

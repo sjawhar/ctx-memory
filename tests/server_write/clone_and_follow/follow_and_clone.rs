@@ -355,7 +355,7 @@ fn serve_resets_a_dirty_clone_it_made() -> Result<()> {
     leave_a_half_written_write(&clone)?;
 
     let server = Server::start_with_env(&clone, &[], &remote)?;
-    let reply = server.get(server.tailnet, "/healthz", &[])?;
+    let reply = server.get(server.tailnet_address()?, "/healthz", &[])?;
     drop(server);
     let status = git(&clone, &["status", "--porcelain"])?;
     let rules = std::fs::read_to_string(clone.join("rules.md"))?;
@@ -530,7 +530,7 @@ fn serve_clones_the_remote_when_the_path_is_empty() -> Result<()> {
     let head = git(&bare, &["rev-parse", "main"])?;
 
     let server = Server::start_with_env(&empty, &[], &[("CTX_MEMORY_REMOTE", bare_text)])?;
-    let reply = server.get(server.tailnet, "/healthz", &[])?;
+    let reply = server.get(server.tailnet_address()?, "/healthz", &[])?;
     let rules = server.command(&["rules"])?;
     drop(server);
     let cloned = empty.join("ctx.toml").is_file();
@@ -565,6 +565,7 @@ fn healthz_answers_while_a_write_holds_the_tree() -> Result<()> {
         &format!("#!/bin/sh\ntouch '{}'\nsleep 10\n", pushing.display()),
     )?;
     let server = Server::start(&tree, &[])?;
+    let tailnet = server.tailnet_address()?;
     let (written, probed) = std::thread::scope(|scope| -> Result<_> {
         let writing = scope.spawn(|| {
             server.post_as(
@@ -578,7 +579,7 @@ fn healthz_answers_while_a_write_holds_the_tree() -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let started = std::time::Instant::now();
-        let probe = server.get(server.tailnet, "/healthz", &[]);
+        let probe = server.get(tailnet, "/healthz", &[]);
         let elapsed = started.elapsed();
         let written = writing
             .join()
@@ -626,8 +627,9 @@ fn a_probe_during_the_first_follow_pass_answers_from_a_check() -> Result<()> {
     let head = git(&tree, &["rev-parse", "HEAD"])?;
 
     let server = Server::start(&tree, &["--pull-interval", "1"])?;
+    let tailnet = server.tailnet_address()?;
     let probe = within(120, || Ok(pulling.exists().then_some(())))
-        .and_then(|()| server.get(server.tailnet, "/healthz", &[]));
+        .and_then(|()| server.get(tailnet, "/healthz", &[]));
     std::fs::write(&resume, "")?;
     drop(server);
     remove_fixture(&tree)?;

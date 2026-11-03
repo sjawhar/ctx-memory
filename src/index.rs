@@ -3,7 +3,8 @@
 //! Records carry their claims in frontmatter — the quote, the title, the statement, and the
 //! people, dates and source pointers around them — so the index covers the whole of it beside
 //! the markdown body. SQLite's FTS5 does the matching and BM25 the ranking; authority tier
-//! breaks a tie, keeping a direct source ahead of a summary.
+//! breaks a tie, keeping a direct source ahead of a summary. A compound name a record writes
+//! with a hyphen or a dot is also found by its joined form, and the other way round (`joined`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -14,6 +15,11 @@ use serde_json::Value;
 
 use crate::embed::{cosine, Embed, Embedding, MEANING_THRESHOLD};
 use crate::tree::{Doc, Tier, Tree};
+
+mod joined;
+
+use joined::Joins;
+pub(crate) use joined::{joinable, without_joiners};
 
 /// The tier value stored for a record that declares none. It sorts after every real tier.
 const UNTIERED: i64 = 9;
@@ -61,6 +67,20 @@ struct Fields<'a> {
     /// and whatever else the tree's own record types declare.
     attributes: String,
     body: &'a str,
+}
+
+impl Fields<'_> {
+    /// Each column's text, in the order the index stores the columns.
+    fn texts(&self) -> [&str; 6] {
+        [
+            &self.title,
+            &self.quote,
+            self.statement,
+            &self.aliases,
+            &self.attributes,
+            self.body,
+        ]
+    }
 }
 
 /// Appends every scalar in a frontmatter value as its text, skipping the keys that have
@@ -163,26 +183,24 @@ fn fields(doc: &Doc) -> Fields<'_> {
 /// Every text a search may match in one document, in the order the index stores it.
 #[must_use]
 pub fn document_text(doc: &Doc) -> String {
-    let fields = fields(doc);
-    [
-        fields.title.as_str(),
-        fields.quote.as_str(),
-        fields.statement,
-        fields.aliases.as_str(),
-        fields.attributes.as_str(),
-        fields.body,
-    ]
-    .join("\n")
+    fields(doc).texts().join("\n")
 }
 
-/// Builds an FTS5 query from free text: every word, any of which may match.
+/// Builds an FTS5 query from free text: every word, any of which may match, and the join
+/// variants `joins` finds for the words.
 ///
 /// Each word becomes an FTS5 string literal, so query punctuation and the operator words
 /// `AND`, `OR` and `NOT` are searched for rather than obeyed.
-fn match_query(query: &str) -> Option<String> {
-    let terms: Vec<String> = query
+fn match_query(query: &str, joins: &Joins) -> Option<String> {
+    let words: Vec<&str> = query
         .split_whitespace()
         .filter(|term| term.chars().any(char::is_alphanumeric))
+        .collect();
+    let variants = joins.variants(&words);
+    let terms: Vec<String> = words
+        .iter()
+        .copied()
+        .chain(variants.iter().map(String::as_str))
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect();
     (!terms.is_empty()).then(|| terms.join(" OR "))
@@ -190,6 +208,8 @@ fn match_query(query: &str) -> Option<String> {
 
 pub struct Index {
     connection: Connection,
+    /// The joined form of every compound name the tree holds, for the queries that name one.
+    joins: Joins,
     meaning: Option<Meaning>,
     /// Set when meaning search was asked for but is unavailable, so a result is text alone.
     notice: Option<String>,
@@ -237,6 +257,7 @@ impl Index {
         let transaction = connection
             .transaction()
             .context("indexing the tree in one transaction")?;
+        let mut joins = Joins::default();
         {
             let mut insert = transaction
                 .prepare(
@@ -248,6 +269,9 @@ impl Index {
                 .context("preparing the index insert")?;
             for (position, doc) in tree.docs.iter().enumerate() {
                 let fields = fields(doc);
+                for text in fields.texts() {
+                    joins.add(text);
+                }
                 let path = doc.rel.to_string_lossy();
                 let tier = doc
                     .front
@@ -286,6 +310,7 @@ impl Index {
         };
         Ok(Self {
             connection,
+            joins,
             meaning,
             notice,
         })
@@ -335,7 +360,7 @@ impl Index {
 
     /// The text matches for `query`, ranked by BM25 then tier, every match returned.
     fn lexical(&self, query: &str) -> Result<Vec<Hit>> {
-        let Some(match_query) = match_query(query) else {
+        let Some(match_query) = match_query(query, &self.joins) else {
             return Ok(Vec::new());
         };
         let mut statement = self
@@ -497,31 +522,38 @@ fn preview(doc: &Doc) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::match_query;
+    use super::{match_query, Joins};
 
+    fn query(text: &str) -> Option<String> {
+        match_query(text, &Joins::default())
+    }
+
+    /// Two neighbouring words also search for their joined form, which a tree that holds no
+    /// such word matches nowhere, so the ranking of every record is as the words alone give it.
     #[test]
     fn query_words_are_literals_joined_by_or() {
         assert_eq!(
-            match_query("vendor renewal").as_deref(),
-            Some("\"vendor\" OR \"renewal\"")
+            query("vendor renewal").as_deref(),
+            Some("\"vendor\" OR \"renewal\" OR \"vendorrenewal\"")
         );
+        assert_eq!(query("vendor").as_deref(), Some("\"vendor\""));
     }
 
     #[test]
     fn an_operator_word_is_searched_for_not_obeyed() {
-        assert_eq!(match_query("AND").as_deref(), Some("\"AND\""));
+        assert_eq!(query("AND").as_deref(), Some("\"AND\""));
     }
 
     #[test]
     fn a_quoted_term_cannot_escape_its_literal() {
         assert_eq!(
-            match_query("say \"hi\"").as_deref(),
-            Some("\"say\" OR \"\"\"hi\"\"\"")
+            query("say \"hi\"").as_deref(),
+            Some("\"say\" OR \"\"\"hi\"\"\" OR \"sayhi\"")
         );
     }
 
     #[test]
     fn punctuation_only_queries_match_nothing() {
-        assert_eq!(match_query("  -- ").as_deref(), None);
+        assert_eq!(query("  -- ").as_deref(), None);
     }
 }

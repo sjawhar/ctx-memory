@@ -65,7 +65,7 @@ fn ask(server: &Server, window: &str, caller: Option<&str>) -> Result<support::R
         .map(|caller| vec![("Tailscale-User-Login", caller)])
         .unwrap_or_default();
     server.get(
-        server.tailnet,
+        server.tailnet_address()?,
         &format!("/v1/windows/{window}/context"),
         &headers,
     )
@@ -280,8 +280,9 @@ fn a_tagged_cycle_named_by_its_tag_reads_the_context() -> Result<()> {
         ],
     )?;
     let path = format!("/v1/windows/{window}/context");
-    let ingest = server.get(server.tailnet, &path, &[("X-Forwarded-For", "100.64.0.7")])?;
-    let legion = server.get(server.tailnet, &path, &[("X-Forwarded-For", "100.64.0.8")])?;
+    let tailnet = server.tailnet_address()?;
+    let ingest = server.get(tailnet, &path, &[("X-Forwarded-For", "100.64.0.7")])?;
+    let legion = server.get(tailnet, &path, &[("X-Forwarded-For", "100.64.0.8")])?;
     drop(server);
     remove_fixture(&tree)?;
 

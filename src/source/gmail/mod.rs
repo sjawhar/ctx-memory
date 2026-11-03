@@ -8,7 +8,7 @@
 //! long gap takes several runs. A carried ID Gmail no longer holds starts the listing again.
 //!
 //! Mail that arrived after the window end waits for the next window. Mail dated later than any
-//! clock has reached ([`google::latest_believable`]) is stored at the window end with a warning,
+//! clock has reached ([`crate::source::latest_believable`]) is stored at the window end with a warning,
 //! so a wrong date cannot hold the cursor.
 
 mod fetch;

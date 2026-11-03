@@ -113,7 +113,7 @@ impl Exclusion {
 /// The usual two-pointer match: on a mismatch after a star, the star takes one byte more and
 /// the match resumes from there. It never backtracks further than the last star, which is
 /// enough because a star matches any run.
-fn glob(pattern: &[u8], text: &[u8]) -> bool {
+pub(crate) fn glob(pattern: &[u8], text: &[u8]) -> bool {
     let (mut p, mut t) = (0, 0);
     let mut resume: Option<(usize, usize)> = None;
     while t < text.len() {

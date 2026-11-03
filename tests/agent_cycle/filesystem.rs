@@ -9,6 +9,7 @@ use anyhow::{ensure, Context as _, Result};
 use crate::fixtures::{
     remove_scratch, repo, runner, scratch, script_function, write_executable, EXAMPLE_MODEL,
 };
+use crate::outcome::{answer, wrote};
 
 /// Stand-ins for what `run-cycle.sh` calls, so the script runs on a machine without the
 /// image: `ctx` reports one pending window and `omp` records that it was started. The model
@@ -186,7 +187,8 @@ impl CycleRig {
             .env("CTX_MODELS_FILE", &self.models)
             .env("CTX_MODEL", EXAMPLE_MODEL)
             .env("ANTHROPIC_API_KEY", "not-a-key")
-            .env("CLOUD_RUN_EXECUTION", "ctx-agent-test-1")
+            .env("CTX_EXECUTION", "ctx-agent-test-1")
+            .env_remove("CLOUD_RUN_EXECUTION")
             .env("XDG_DATA_HOME", self.xdg("data"))
             .env("XDG_STATE_HOME", self.xdg("state"))
             .env("XDG_CACHE_HOME", self.xdg("cache"));
@@ -209,6 +211,38 @@ impl CycleRig {
         self.command()?.output().context("running run-cycle.sh")
     }
 
+    /// Runs the whole runner, through its session, with `ctx` and `omp` the stand-in programs
+    /// given, after [`Self::pretend_root`]: the session's user can write only its own transcript
+    /// directory, as the deployment guarantees, and the key file goes to the scratch directory,
+    /// since the test is not root.
+    fn run_through_the_session(&self, ctx: &str, omp: &str) -> Result<std::process::Output> {
+        write_executable(
+            &self.bin.join("setpriv"),
+            "#!/bin/sh\nwhile [ \"${1#--}\" != \"$1\" ]; do shift; done\n\
+             case \"$1\" in\n\
+             /usr/bin/test) if [ \"$2\" = -w ]; then case \"$3\" in */agent-sessions/ctx-agent-test-1) exit 0 ;; *) exit 1 ;; esac; fi ;;\n\
+             find) exit 0 ;;\n\
+             esac\nexec \"$@\"\n",
+        )?;
+        write_executable(&self.bin.join("ctx"), ctx)?;
+        write_executable(&self.bin.join("omp"), omp)?;
+        let key_file = self.root.join("run/model-key");
+        let script = runner("run-cycle.sh")?.replace(
+            "KEY_FILE=/run/ctx-agent/model-key",
+            &format!("KEY_FILE='{}'", key_file.display()),
+        );
+        let copy = self.root.join("run-cycle.sh");
+        std::fs::write(&copy, script)?;
+        // The provider file names the key file the runner writes, so it moves with it.
+        self.replace_models(
+            &runner("models.example.yml")?
+                .replace("/run/ctx-agent/model-key", &key_file.display().to_string()),
+        )?;
+        self.command_for(&copy)?
+            .output()
+            .context("running run-cycle.sh")
+    }
+
     /// Makes `ctx` report no pending window and keep each call's arguments, one line per call,
     /// in the file this returns.
     fn nothing_pending(&self) -> Result<PathBuf> {
@@ -217,6 +251,20 @@ impl CycleRig {
             &self.bin.join("ctx"),
             &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[]}}}}'\n",
+                calls.display()
+            ),
+        )?;
+        Ok(calls)
+    }
+
+    /// Makes `ctx` report one pending window and keep the session each call names, its
+    /// `CTX_SESSION`, one line per call, in the file this returns.
+    fn record_sessions(&self) -> Result<PathBuf> {
+        let calls = self.root.join("ctx-sessions");
+        write_executable(
+            &self.bin.join("ctx"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{CTX_SESSION-}}\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[{{\"id\":\"w1\"}}]}}}}'\n",
                 calls.display()
             ),
         )?;
@@ -700,8 +748,7 @@ fn the_cycle_retries_once_after_a_model_refusal() -> Result<()> {
         "the retry runs even when the first session succeeded"
     );
     ensure!(
-        has("-retry\"")
-            && has("session_dir=\"$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION-retry\""),
+        has("-retry\"") && has("session_dir=\"$CTX_DATA_DIR/agent-sessions/$execution-retry\""),
         "the retry does not open its own transcript directory"
     );
     Ok(())
@@ -770,7 +817,8 @@ fn the_refusal_pattern_matches_a_real_refusal_and_not_an_escaped_copy() -> Resul
 /// runs after the session, which this pretend-root harness cannot reach (it writes the model key
 /// to `/run/ctx-agent`, root's). The invariants: the marker is read before and after a pass, the
 /// two are compared, a move fails the job, and all of it is a pass alone, so a cycle (which moves
-/// the marker per window) is untouched.
+/// the marker per window) is untouched. A cycle reads the marker once, after its sessions, into a
+/// variable of its own, to find the windows it skipped (`outcome.rs` runs that check).
 #[test]
 fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
     let script = runner("run-cycle.sh")?;
@@ -785,14 +833,15 @@ fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
         code.iter()
             .filter(|line| line.contains("=\"$(ctx marker show --json)\""))
             .count()
-            == 2,
-        "run-cycle.sh must read the marker into a variable before and after the pass, and \
-         nowhere else, to tell whether it moved"
+            == 3,
+        "run-cycle.sh must read the marker into a variable before and after the pass, and after \
+         the cycle, and nowhere else"
     );
     ensure!(
         has("marker_before=\"$(ctx marker show --json)\"")
-            && has("marker_after=\"$(ctx marker show --json)\""),
-        "run-cycle.sh does not capture the marker on each side of the pass"
+            && has("marker_after=\"$(ctx marker show --json)\"")
+            && has("cycle_marker=\"$(ctx marker show --json)\""),
+        "run-cycle.sh does not capture the marker on each side of the pass and after the cycle"
     );
     let compared = code
         .iter()
@@ -921,6 +970,138 @@ fn the_runner_refuses_a_window_cap_that_is_not_a_positive_number() -> Result<()>
     }
     rig.remove()?;
     result
+}
+
+/// The execution's name is `CTX_EXECUTION`, which any platform can set, or, when that is unset
+/// or empty, `CLOUD_RUN_EXECUTION`, which Cloud Run sets. It is the session every request names
+/// (`CTX_SESSION`) and the transcript directory's name. With neither, no session runs.
+///
+/// The share is left open to the session's user, so each run stops at that check, after it has
+/// read the server and made its transcript directory, and before anything is prepared for a
+/// session.
+#[test]
+fn the_cycle_takes_its_execution_name_from_ctx_execution_else_cloud_run() -> Result<()> {
+    let rig = CycleRig::new("execution-name")?;
+    rig.pretend_root()?;
+    let calls = rig.record_sessions()?;
+    let sessions = rig.data.join("agent-sessions");
+    let run =
+        |own: Option<&str>, cloud_run: Option<&str>| -> Result<(std::process::Output, String)> {
+            let output = rig
+                .command()?
+                .env_remove("CTX_EXECUTION")
+                .envs(own.map(|name| ("CTX_EXECUTION", name)))
+                .envs(cloud_run.map(|name| ("CLOUD_RUN_EXECUTION", name)))
+                .output()
+                .context("running run-cycle.sh")?;
+            let named = std::fs::read_to_string(&calls).unwrap_or_default();
+            if calls.exists() {
+                std::fs::remove_file(&calls)?;
+            }
+            Ok((output, named))
+        };
+    // The longest name a session id still fits with `-retry`, and one of every kind of character
+    // a name may hold, are taken as they are.
+    let longest = "a".repeat(122);
+    let cases = [
+        (Some("cycle-own"), Some("cycle-cloud-run"), "cycle-own"),
+        (None, Some("cycle-fallback"), "cycle-fallback"),
+        (Some(""), Some("cycle-empty-own"), "cycle-empty-own"),
+        (Some("Ab_c-9"), None, "Ab_c-9"),
+        (Some(longest.as_str()), None, longest.as_str()),
+    ];
+    let mut result = Ok(());
+    for (own, cloud_run, expected) in cases {
+        let (output, named) = run(own, cloud_run)?;
+        let checked = (|| -> Result<()> {
+            assert_refused(&rig, &output, "can write")?;
+            ensure!(
+                !named.is_empty() && named.lines().all(|session| session == expected),
+                "the cycle's requests named {named:?}, not {expected:?}"
+            );
+            ensure!(
+                sessions.join(expected).is_dir(),
+                "the cycle made no transcript directory named {expected:?}"
+            );
+            Ok(())
+        })()
+        .with_context(|| format!("CTX_EXECUTION={own:?} CLOUD_RUN_EXECUTION={cloud_run:?}"));
+        result = result.and(checked);
+    }
+    let (neither, named) = run(None, None)?;
+    result = result.and_then(|()| {
+        assert_refused(&rig, &neither, "CTX_EXECUTION")?;
+        ensure!(
+            named.is_empty(),
+            "the cycle called ctx with no execution name: {named:?}"
+        );
+        Ok(())
+    });
+    let overridden = sessions.join("cycle-cloud-run").exists();
+    rig.remove()?;
+    result?;
+    ensure!(
+        !overridden,
+        "CLOUD_RUN_EXECUTION named a transcript although CTX_EXECUTION was set"
+    );
+    Ok(())
+}
+
+/// The execution's name is a directory root makes and gives away on the share, and the session
+/// every request names, so it is one plain name: letters, digits, `_` and `-`, starting with a
+/// letter or digit, short enough that its retry's `-retry` still fits the 128 characters a
+/// session id may hold. The runner keeps `<name>.events.json` and `<name>.context.json` beside
+/// that directory and gives a retry `<name>-retry`, so a name holds no `.` and does not end in
+/// `-retry`: it would be another execution's file or retry. Anything else is refused before
+/// anything is touched, in one line, whatever the name holds.
+#[test]
+fn the_cycle_refuses_an_execution_name_that_is_not_one_plain_name() -> Result<()> {
+    let rig = CycleRig::new("execution-name-bad")?;
+    rig.pretend_root()?;
+    let calls = rig.nothing_pending()?;
+    let long = "a".repeat(123);
+    let mut result = Ok(());
+    for name in [
+        "../escape",
+        "a/b",
+        "two words",
+        ".hidden",
+        "-flag",
+        "line\nbreak",
+        "cycle-1.events.json",
+        "cycle-1.context.json",
+        "cycle-1-retry",
+        long.as_str(),
+    ] {
+        for variable in ["CTX_EXECUTION", "CLOUD_RUN_EXECUTION"] {
+            let output = rig
+                .command()?
+                .env_remove("CTX_EXECUTION")
+                .env(variable, name)
+                .output()
+                .context("running run-cycle.sh with a bad execution name")?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            result = result.and_then(|()| {
+                assert_refused(&rig, &output, "CTX_EXECUTION")
+                    .and_then(|()| {
+                        ensure!(
+                            stderr.lines().count() == 1,
+                            "the refusal is not one line: {stderr:?}"
+                        );
+                        Ok(())
+                    })
+                    .with_context(|| format!("{variable}={name:?}"))
+            });
+        }
+    }
+    let called = std::fs::read_to_string(&calls).unwrap_or_default();
+    rig.remove()?;
+    result?;
+    ensure!(
+        called.is_empty(),
+        "a refused name still called ctx: {called:?}"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1179,9 +1360,9 @@ fn run_prepare_context_for(
     .to_string();
     let path = std::env::var("PATH").context("PATH is not set")?;
     let script = format!(
-        "set -eu\nCTX_DATA_DIR='{}'\nCLOUD_RUN_EXECUTION=ctx-agent-test-1\nAGENT_USER=ctx-agent\n\
+        "set -eu\nCTX_DATA_DIR='{}'\nexecution=ctx-agent-test-1\nAGENT_USER=ctx-agent\n\
          CONTEXT_BYTES=49152\ncontext_seconds_left=60\ncontext_subjects_left=30\n\
-         context_file=\"$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION.context.json\"\n\
+         context_file=\"$CTX_DATA_DIR/agent-sessions/$execution.context.json\"\n\
          as_agent_user() {{ {agent_test}; }}\n{}\n{}\n{}\n\
          pending='{pending}'\n\
          prepare_context \"$pending\"\nprintf '%s' \"$context_prompt\"\n",
@@ -1331,25 +1512,14 @@ fn the_runner_spends_one_subject_budget_across_windows() -> Result<()> {
     Ok(())
 }
 
-/// The whole runner, with the session user able to write only its own transcript directory as
-/// the deployment guarantees, reads each window's context with `ctx context` before it starts
-/// omp, and the prompt omp is started with names the context file. The key file goes to the
-/// scratch directory, since the test is not root.
+/// The whole runner reads each window's context with `ctx context` before it starts omp, and the
+/// prompt omp is started with names the context file.
 #[test]
 fn the_runner_reads_context_before_the_session_and_names_it_in_the_prompt() -> Result<()> {
     let rig = CycleRig::new("context-full-run")?;
     rig.pretend_root()?;
     let calls = rig.root.join("calls");
-    write_executable(
-        &rig.bin.join("setpriv"),
-        "#!/bin/sh\nwhile [ \"${1#--}\" != \"$1\" ]; do shift; done\n\
-         case \"$1\" in\n\
-         /usr/bin/test) if [ \"$2\" = -w ]; then case \"$3\" in */agent-sessions/ctx-agent-test-1) exit 0 ;; *) exit 1 ;; esac; fi ;;\n\
-         find) exit 0 ;;\n\
-         esac\nexec \"$@\"\n",
-    )?;
-    write_executable(
-        &rig.bin.join("ctx"),
+    let output = rig.run_through_the_session(
         &format!(
             "#!/bin/sh\nprintf 'ctx %s\\n' \"$*\" >> '{calls}'\ncase \"$*\" in\n\
              *context*) printf '%s\\n' '{{\"ok\":true,\"data\":{{\"window\":\"20261102T110000Z-0001\",\"subjects\":[\"K-1\"],\"items\":[]}}}}' ;;\n\
@@ -1357,30 +1527,12 @@ fn the_runner_reads_context_before_the_session_and_names_it_in_the_prompt() -> R
              *) printf '%s\\n' '{{\"ok\":true}}' ;;\nesac\n",
             calls = calls.display()
         ),
-    )?;
-    write_executable(
-        &rig.bin.join("omp"),
         &format!(
             "#!/bin/sh\nprintf 'omp\\n' >> '{}'\nprintf '%s\\n' \"$*\" >> '{}'\n",
             calls.display(),
             rig.omp_log.display()
         ),
     )?;
-    let script = runner("run-cycle.sh")?.replace(
-        "KEY_FILE=/run/ctx-agent/model-key",
-        &format!("KEY_FILE='{}'", rig.root.join("run/model-key").display()),
-    );
-    let copy = rig.root.join("run-cycle.sh");
-    std::fs::write(&copy, script)?;
-    // The provider file names the key file the runner writes, so it moves with it.
-    rig.replace_models(&runner("models.example.yml")?.replace(
-        "/run/ctx-agent/model-key",
-        &rig.root.join("run/model-key").display().to_string(),
-    ))?;
-    let output = rig
-        .command_for(&copy)?
-        .output()
-        .context("running run-cycle.sh")?;
     let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
     let omp_args = std::fs::read_to_string(&rig.omp_log).unwrap_or_default();
     let context_file = rig
@@ -1406,6 +1558,75 @@ fn the_runner_reads_context_before_the_session_and_names_it_in_the_prompt() -> R
     ensure!(
         matches!(mode, Ok(0o644)),
         "the context file's mode is {mode:?}, not 0644"
+    );
+    Ok(())
+}
+
+/// The whole runner, through a stand-in session that moves the marker past the one pending window
+/// (`ctx marker advance`, as the session runs it) and ends on its final answer. The window held
+/// new messages, so a session that wrote no record skipped it for good: the cycle exits non-zero
+/// with one line naming it. The same session with one record written exits 0.
+#[test]
+fn a_whole_cycle_that_skipped_a_window_unwritten_exits_non_zero() -> Result<()> {
+    let window = "20261102T080000Z-0001";
+    let run = |label: &str, events: &str| -> Result<std::process::Output> {
+        let rig = CycleRig::new(label)?;
+        rig.pretend_root()?;
+        let marker = rig.root.join("marker");
+        let session = rig.root.join("session-events");
+        std::fs::write(&session, events)?;
+        let output = rig.run_through_the_session(
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n\
+                 *pending*) printf '%s\\n' '{{\"version\":1,\"command\":\"pending\",\"data\":{{\"marker\":null,\"windows\":[{{\"window\":\"{window}\",\"dir\":\"windows/{window}\",\"new_messages\":3,\"listed_messages\":3}}],\"later_windows\":0}}}}' ;;\n\
+                 *'marker advance'*) printf '%s' \"$3\" > '{marker}'; printf '%s\\n' '{{\"version\":1,\"command\":\"marker advance\"}}' ;;\n\
+                 *marker*) if [ -f '{marker}' ]; then printf '{{\"version\":1,\"command\":\"marker show\",\"data\":{{\"marker\":{{\"version\":1,\"window\":\"%s\"}}}}}}\\n' \"$(cat '{marker}')\"; else printf '%s\\n' '{{\"version\":1,\"command\":\"marker show\",\"data\":{{\"marker\":null}}}}'; fi ;;\n\
+                 *context*) printf '%s\\n' '{{\"version\":1,\"command\":\"context\",\"data\":{{\"window\":\"{window}\",\"subjects\":[],\"items\":[]}}}}' ;;\n\
+                 *) printf '%s\\n' '{{\"version\":1}}' ;;\nesac\n",
+                marker = marker.display()
+            ),
+            &format!(
+                "#!/bin/sh\nctx marker advance {window} >/dev/null\ncat '{}'\n",
+                session.display()
+            ),
+        )?;
+        let moved = std::fs::read_to_string(&marker).unwrap_or_default();
+        rig.remove()?;
+        ensure!(
+            moved == window,
+            "the stand-in session did not move the marker past {window}: {moved:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(output)
+    };
+
+    let skipped = run(
+        "skipped-window",
+        &wrote(
+            &[],
+            answer("Handled 1 window; nothing in it needed a record."),
+        ),
+    )?;
+    let stderr = String::from_utf8_lossy(&skipped.stderr);
+    let named: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("run-cycle: ") && line.contains("wrote no record"))
+        .collect();
+    ensure!(
+        !skipped.status.success() && named.len() == 1 && named.concat().contains(window),
+        "the cycle that moved the marker past {window} unwritten did not fail with one line naming it ({}): {stderr}",
+        skipped.status
+    );
+
+    let written = run(
+        "written-window",
+        &wrote(&[("ctx_record_put", true)], answer("Handled 1 window.")),
+    )?;
+    ensure!(
+        written.status.success(),
+        "the cycle that wrote a record for {window} did not exit 0 ({}): {}",
+        written.status,
+        String::from_utf8_lossy(&written.stderr)
     );
     Ok(())
 }

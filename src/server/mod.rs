@@ -18,7 +18,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use axum::http::HeaderMap;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use chrono::{DateTime, Utc};
@@ -62,6 +65,19 @@ pub struct ServeArgs {
     /// The unix socket of tailscaled's local API, asked which node a tagged caller is.
     #[arg(long, env = "CTX_TAILSCALE_SOCKET", value_name = "PATH")]
     pub tailscale_socket: Option<PathBuf>,
+
+    /// Loopback address for a machine with one person on it. Every request there is the
+    /// `--local-caller`, with no proof asked: any process on this machine can read and write as
+    /// that person, though a web page in its browser cannot. It is never for a shared
+    /// deployment, so the server refuses to start with it beside `--listen`, when
+    /// `CTX_LEASE_BUCKET` is set, or on Cloud Run (`K_SERVICE` or `CLOUD_RUN_JOB` set).
+    #[arg(long, value_name = "ADDR")]
+    pub local_listen: Option<SocketAddr>,
+
+    /// Who every request at `--local-listen` is, as `Name <email>`: the author of each commit
+    /// written through it.
+    #[arg(long, env = "CTX_SERVER_LOCAL_CALLER", value_name = "AUTHOR")]
+    pub local_caller: Option<String>,
 
     /// The audience every Google identity token must carry.
     #[arg(long, env = "CTX_SERVER_AUDIENCE")]
@@ -549,10 +565,19 @@ fn panic_line(payload: Option<&str>, location: Option<&str>) -> String {
 }
 
 async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Result<()> {
-    if arguments.listen.is_none() && arguments.tailnet_listen.is_none() {
-        bail!("ctx serve needs --listen, --tailnet-listen, or both");
+    if arguments.listen.is_none()
+        && arguments.tailnet_listen.is_none()
+        && arguments.local_listen.is_none()
+    {
+        bail!("ctx serve needs one or more of --listen, --tailnet-listen and --local-listen");
     }
+    // The tailnet tags and the local door are checked first, before this copy puts its clone
+    // back, builds its index or binds a port.
     let tailnet_tags = tailnet_tags(arguments)?;
+    let local = match arguments.local_listen {
+        Some(address) => Some((address, local_caller(address, arguments)?)),
+        None => None,
+    };
     // A Cloud Run rollout runs the old copy and the new one at once, and the write lease is
     // what keeps one of them the only writer. A copy on Cloud Run with no lease bucket would
     // take no lease and write beside the other, so it does not start. Cloud Run reaches a
@@ -593,7 +618,7 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     shared.open_handover(Duration::from_secs(arguments.handover));
     let mut servers = Vec::new();
     // A container runtime stops this copy with SIGTERM before the copy that replaces it
-    // writes. Both listeners stop on that signal, and the lease is given up afterwards.
+    // writes. Every listener stops on that signal, and the lease is given up afterwards.
     let (stop, _) = tokio::sync::watch::channel(false);
 
     // The deployment's startup probe connects to the ingress port, so it is bound first.
@@ -614,16 +639,8 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
             audience,
             allowed,
         )?);
-        let listener = TcpListener::bind(address)
-            .await
-            .with_context(|| format!("binding {address}"))?;
-        announce(sink, "listen", listener.local_addr()?)?;
-        let router = router(Arc::clone(&shared), Identity::Google(google));
-        servers.push(tokio::spawn(
-            axum::serve(listener, router)
-                .with_graceful_shutdown(stopped(stop.subscribe()))
-                .into_future(),
-        ));
+        let identity = Identity::Google(google);
+        servers.push(serve_door(sink, "listen", address, identity, &shared, &stop).await?);
     }
 
     if let Some(address) = arguments.tailnet_listen {
@@ -635,16 +652,13 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
                 "--tailnet-listen takes a loopback address: the sidecar runs beside this process"
             );
         }
-        let listener = TcpListener::bind(address)
-            .await
-            .with_context(|| format!("binding {address}"))?;
-        announce(sink, "tailnet-listen", listener.local_addr()?)?;
-        let router = router(Arc::clone(&shared), Identity::Tailscale(tailnet_tags));
-        servers.push(tokio::spawn(
-            axum::serve(listener, router)
-                .with_graceful_shutdown(stopped(stop.subscribe()))
-                .into_future(),
-        ));
+        let identity = Identity::Tailscale(tailnet_tags);
+        servers.push(serve_door(sink, "tailnet-listen", address, identity, &shared, &stop).await?);
+    }
+
+    if let Some((address, caller)) = local {
+        let identity = Identity::Local(Arc::new(caller));
+        servers.push(serve_door(sink, "local-listen", address, identity, &shared, &stop).await?);
     }
     let following = follow(Arc::clone(&shared), arguments.pull_interval);
     let signalled = tokio::spawn(async move {
@@ -675,6 +689,71 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     .await
     .context("releasing the write lease")?;
     Ok(())
+}
+
+/// The one caller of `--local-listen` at `address`, read from `--local-caller`.
+///
+/// Every request at that door is this one person, with no proof asked, which holds only on a
+/// machine with one person on it. So the address is a loopback one, and a deployment that
+/// several copies or people share never opens the door: one beside Cloud Run's ingress
+/// (`--listen`), one that leases (`CTX_LEASE_BUCKET`), and one on Cloud Run, which names its
+/// services in `K_SERVICE` and its jobs in `CLOUD_RUN_JOB`.
+fn local_caller(address: SocketAddr, arguments: &ServeArgs) -> Result<Caller> {
+    if !address.ip().is_loopback() {
+        bail!(
+            "--local-listen takes a loopback address: every request there is the \
+             --local-caller, so anything that could reach the port would read and write as them"
+        );
+    }
+    if arguments.listen.is_some() {
+        bail!(
+            "--local-listen is for a machine with one person on it, and --listen is Cloud Run's \
+             ingress, which everyone the deployment allows reaches"
+        );
+    }
+    if lease::bucket().is_some() {
+        bail!(
+            "--local-listen is for a machine with one person on it, and CTX_LEASE_BUCKET is \
+             set, which only a deployment that several copies share needs"
+        );
+    }
+    for variable in ["K_SERVICE", "CLOUD_RUN_JOB"] {
+        if std::env::var_os(variable).is_some() {
+            bail!(
+                "--local-listen is for a machine with one person on it, and {variable} is set: \
+                 this runs on Cloud Run"
+            );
+        }
+    }
+    let caller = arguments.local_caller.as_deref().ok_or_else(|| {
+        anyhow!(
+            "--local-listen needs --local-caller (CTX_SERVER_LOCAL_CALLER): the one person \
+             every request there is"
+        )
+    })?;
+    identity::local(caller).context("--local-caller (CTX_SERVER_LOCAL_CALLER)")
+}
+
+/// Binds one listener, says where ([`announce`]), and serves the routes of `identity` on it
+/// until `stop` says to stop.
+async fn serve_door(
+    sink: &mut Sink<'_>,
+    label: &str,
+    address: SocketAddr,
+    identity: Identity,
+    shared: &Arc<Shared>,
+    stop: &tokio::sync::watch::Sender<bool>,
+) -> Result<tokio::task::JoinHandle<std::io::Result<()>>> {
+    let listener = TcpListener::bind(address)
+        .await
+        .with_context(|| format!("binding {address}"))?;
+    announce(sink, label, listener.local_addr()?)?;
+    let router = router(Arc::clone(shared), identity);
+    Ok(tokio::spawn(
+        axum::serve(listener, router)
+            .with_graceful_shutdown(stopped(stop.subscribe()))
+            .into_future(),
+    ))
 }
 
 /// The longest a stopping copy waits for the request log's last lines to reach standard output.
@@ -970,10 +1049,13 @@ fn announce(sink: &mut Sink<'_>, label: &str, address: SocketAddr) -> Result<()>
 }
 
 /// The routes one listener answers. The listener decides how a caller is identified, and each
-/// request it answers is one line of the request log ([`request_log`]).
+/// request it answers is one line of the request log ([`request_log`]). At the local door every
+/// request, to any path, axum's own `404` and `405` answers included, is first checked for a
+/// web page's ([`no_web_page`]).
 fn router(shared: Arc<Shared>, identity: Identity) -> Router {
     let door = identity.door();
-    Router::new()
+    let local = matches!(identity, Identity::Local(_));
+    let routes = Router::new()
         .route("/healthz", get(command::healthz))
         .route(protocol::COMMAND_ROUTE, post(command::command))
         .route(protocol::PUT_ROUTE, post(write::put))
@@ -981,8 +1063,27 @@ fn router(shared: Arc<Shared>, identity: Identity) -> Router {
         .route(protocol::DELETE_ROUTE, post(write::delete))
         .route(protocol::MARKER_ROUTE, post(write::marker_advance))
         .route(protocol::CONTEXT_ROUTE, get(context::window_context))
-        .with_state(Listener { shared, identity })
-        .layer(axum::middleware::from_fn_with_state(door, request_log::log))
+        .with_state(Listener {
+            shared: Arc::clone(&shared),
+            identity,
+        });
+    let routes = if local {
+        routes.layer(axum::middleware::from_fn_with_state(shared, no_web_page))
+    } else {
+        routes
+    };
+    routes.layer(axum::middleware::from_fn_with_state(door, request_log::log))
+}
+
+/// Answers `401` to a request at the local door that a web page sent
+/// ([`identity::local_request`]), before any route sees it.
+async fn no_web_page(State(shared): State<Arc<Shared>>, request: Request, next: Next) -> Response {
+    match identity::local_request(request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(error) => {
+            command::error_response(&shared, StatusCode::UNAUTHORIZED, &format!("{error:#}"))
+        }
+    }
 }
 
 /// How one listener identifies its callers.
@@ -993,6 +1094,12 @@ pub enum Identity {
     /// The Tailscale sidecar on loopback: the login header it sets for a user device, and,
     /// when the deployment allows tags, a tagged node tailscaled names.
     Tailscale(Option<Arc<identity::TailnetTags>>),
+    /// A machine with one person on it, on loopback: that person, whichever of its processes
+    /// sent the request, unless a web page did, which [`router`] refuses before any route.
+    ///
+    /// Each handler takes the listener's state by value, which clones it for every request, so
+    /// the caller is shared rather than copied there.
+    Local(Arc<Caller>),
 }
 
 impl Identity {
@@ -1001,6 +1108,7 @@ impl Identity {
         match self {
             Self::Google(_) => request_log::Door::IdentityToken,
             Self::Tailscale(_) => request_log::Door::Tailnet,
+            Self::Local(_) => request_log::Door::Local,
         }
     }
 }
@@ -1022,6 +1130,7 @@ impl Listener {
         match &self.identity {
             Identity::Google(google) => google.caller(headers).await,
             Identity::Tailscale(tags) => identity::tailscale(headers, tags.as_deref()).await,
+            Identity::Local(caller) => Ok(Caller::clone(caller)),
         }
     }
 }
