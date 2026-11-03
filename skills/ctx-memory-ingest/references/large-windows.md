@@ -18,7 +18,8 @@ message `page.through` of its `new_messages`.
    giving the page's `through`, and end the cycle. The next cycle's `ctx pending` lists the next
    page. Do not read the next page in this cycle.
 3. When `page.last` is true, this is the window's last page: move the marker past the window
-   with `ctx marker advance <window id>`, as for any window.
+   with `ctx marker advance <window id>`, as for any window. `ctx marker page` refuses a last
+   page.
 
 Record a page only once its records are written and verified. A cycle that stops before then
 leaves the page unrecorded, and the next cycle reads that page again and no page before it; the

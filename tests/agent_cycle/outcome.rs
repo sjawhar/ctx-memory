@@ -1625,6 +1625,51 @@ fn a_cycle_that_recorded_a_page_without_a_record_fails() -> Result<()> {
     Ok(())
 }
 
+/// A cycle that moves the marker past a window its recorded pages already held whole has passed
+/// no message, so writing nothing is no skip; one that moves it past a window whose earlier pages
+/// were recorded passed only the messages after them, and the line names those.
+#[test]
+fn the_marker_passing_recorded_pages_counts_only_the_messages_after_them() -> Result<()> {
+    let nothing = finished("Handled the window.");
+    for (pending, skipped, what) in [
+        (
+            paged_answer(&[(FIRST, 7, Some((7, 7)))]),
+            None,
+            "the marker passed a window every message of which a recorded page held",
+        ),
+        (
+            paged_answer(&[(FIRST, 7, Some((3, 7)))]),
+            Some(format!("{FIRST} (messages 4 to 7 of 7 new)")),
+            "the marker passed the last page of a window and nothing was written",
+        ),
+    ] {
+        let verdict = verdict(
+            None,
+            &[Attempt {
+                status: 0,
+                events: &nothing,
+            }],
+            &Around {
+                marker_moves: &[(1, FIRST)],
+                pending: &[&pending],
+                ..Around::default()
+            },
+        )?;
+        match skipped {
+            Some(named) => {
+                ensure_failed_saying(&verdict, SKIPPED, what)?;
+                let line = verdict.lines_saying(SKIPPED).concat();
+                ensure!(
+                    line.contains(&named),
+                    "{what}, yet the line does not name {named}: {line}"
+                );
+            }
+            None => ensure_succeeded(&verdict, what)?,
+        }
+    }
+    Ok(())
+}
+
 /// The pages a refused session and its retry recorded are one cycle's: the messages named run
 /// from the first read's page on, through the page the retry recorded last, and an empty window
 /// the marker passed on the way is not named.

@@ -307,8 +307,9 @@ fn advance_in(data: &DataDir, window: &str, by: &str, serving: &Serving<'_>) -> 
 /// # Errors
 ///
 /// Returns a [`Refused`] error when the window is not the oldest window after the marker, or
-/// `through` is behind the pages already recorded or past the page an answer lists, and any
-/// other error when marker state or the window cannot be read or the page cannot be persisted.
+/// `through` is behind the pages already recorded, past the page an answer lists, or the end of
+/// the window's last page, and any other error when marker state or the window cannot be read or
+/// the page cannot be persisted.
 pub fn page(context: &Context, window: &str, through: usize, by: &str) -> Result<Page> {
     serving(context, |data, serving| {
         page_in(data, window, through, by, serving)
@@ -373,6 +374,13 @@ fn page_in(
             "the page `ctx pending` lists for window {} ends at message {end} of its {}: record \
              at most that, once its records are written",
             window.id, entry.new_messages
+        )));
+    }
+    if through == entry.new_messages && through > worked {
+        return Err(refused(format!(
+            "message {through} is the last of window {}: its last page is not recorded; once its \
+             records are written, run `ctx marker advance {}`",
+            window.id, window.id
         )));
     }
     let last = if through == worked {
@@ -1217,7 +1225,8 @@ mod tests {
 
     /// A page is recorded for the oldest window after the marker alone, and only as far as the
     /// page an answer lists for it reaches; recording the page already recorded changes nothing
-    /// but who recorded it.
+    /// but who recorded it. A window's last page is not recorded: the marker moves past the
+    /// window instead, so no answer lists a window none of whose messages is left.
     #[test]
     fn a_page_is_recorded_only_as_an_answer_lists_it() -> Result<()> {
         let root = scratch("record")?;
@@ -1236,6 +1245,14 @@ mod tests {
         let passed = page_in(&data, WINDOWS[0], 1, "cycle", &serving);
         let missing = page_in(&data, "20261030T050000Z-0000", 1, "cycle", &serving);
         let next = pending_in(&data, None, &serving)?;
+        page_in(&data, WINDOWS[1], 6, "cycle", &serving)?;
+        let the_last = page_in(&data, WINDOWS[1], 7, "cycle", &serving);
+        let last_message = the_last
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let after_the_last = pending_in(&data, None, &serving)?;
         std::fs::remove_dir_all(&root)?;
 
         assert!(is_refused(behind_an_older_window));
@@ -1244,6 +1261,17 @@ mod tests {
         assert!(is_refused(behind));
         assert!(is_refused(passed));
         assert!(is_refused(missing));
+        assert!(is_refused(the_last), "the last page was recorded");
+        assert!(
+            last_message.contains("ctx marker advance"),
+            "{last_message}"
+        );
+        let page = after_the_last
+            .windows
+            .first()
+            .and_then(|window| window.page)
+            .context("the window is worked in pages")?;
+        assert_eq!((page.worked, page.through, page.last), (6, 7, true));
         assert_eq!(
             (first.worked, first.last.pointer.as_str()),
             (3, pointer(WINDOWS[1], 2).as_str())

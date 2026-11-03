@@ -1104,13 +1104,13 @@ tally_session() {
 # A page of a window that a session recorded (`ctx marker page`) moves past that page's messages
 # the same way: no later cycle lists them again. So once the cycle is over the marker and its page
 # are read again, and when the cycle wrote nothing, every window a session was handed that the
-# marker now covers and that held new messages, and the window whose recorded pages now hold more
-# of its messages than when the cycle first read it, are named in one line, and the cycle fails,
-# for a person to look at. It fails too when nothing in those messages needed a record, which a
-# cycle that wrote nothing cannot be told apart from here. A cycle that wrote a record, or passed
-# only empty windows and recorded no page, is not judged: which messages deserve a record is the
-# session's to decide. Window ids are timestamps of one fixed width, so the marker covers every
-# window whose id sorts at or before its own.
+# marker now covers and that held new messages no recorded page held, and the window whose
+# recorded pages now hold more of its messages than when the cycle first read it, are named in one
+# line, and the cycle fails, for a person to look at. It fails too when nothing in those messages
+# needed a record, which a cycle that wrote nothing cannot be told apart from here. A cycle that
+# wrote a record, or passed only windows with no message left to it and recorded no page, is not
+# judged: which messages deserve a record is the session's to decide. Window ids are timestamps of
+# one fixed width, so the marker covers every window whose id sorts at or before its own.
 check_skipped_windows() {
 	[ -z "$pass" ] || return 0
 	[ "$cycle_writes" -eq 0 ] || return 0
@@ -1128,8 +1128,12 @@ check_skipped_windows() {
 			[add // [] | group_by(.window)[]
 				| {window: .[0].window, new_messages: (.[0].new_messages // 0), worked: (map(.worked // 0) | min)}
 				| select((.window | type) == "string")
-				| if .window <= $held and .new_messages > 0 then
-					"\(.window) (\(.new_messages) new)"
+				| if .window <= $held and .new_messages > .worked then
+					if .worked > 0 then
+						"\(.window) (messages \(.worked + 1) to \(.new_messages) of \(.new_messages) new)"
+					else
+						"\(.window) (\(.new_messages) new)"
+					end
 				elif .window == $paged.window and ($paged.worked | type) == "number" and $paged.worked > .worked then
 					"\(.window) (messages \(.worked + 1) to \($paged.worked) of \(.new_messages) new, recorded as pages)"
 				else empty end] | join(", ")')"; then
