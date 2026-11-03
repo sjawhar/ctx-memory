@@ -26,6 +26,7 @@ use tokio::net::TcpListener;
 
 use crate::config::{DataDir, StateDir};
 use crate::context::Context;
+use crate::delta;
 use crate::git::{Access, Repo};
 use crate::lease::{self, Lease};
 use crate::output::{Outcome, Sink};
@@ -532,16 +533,28 @@ async fn run(context: Context, arguments: &ServeArgs, sink: &mut Sink<'_>) -> Re
     // a container a bounded time to accept a connection and a share whose replay outlasts
     // that still needs serving; a request that arrives then waits for the rest of the build
     // before it takes the tree ([`Shared::index_ready`]).
+    // `ctx open` reads every window's delta on the share the first time a process answers it,
+    // which took the first caller after a restart 12.8 s while the next took 29 ms. Those
+    // deltas are read here too, beside the index build and under the same bound, so the
+    // first caller finds them read ([`warm_open`]).
     warm_index(Arc::clone(&shared));
+    let mut open = warm_open(Arc::clone(&shared));
     if arguments.index_wait > 0 {
-        let wait = Duration::from_secs(arguments.index_wait);
-        if tokio::time::timeout(wait, shared.index_ready())
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(arguments.index_wait);
+        if tokio::time::timeout_at(deadline, shared.index_ready())
             .await
             .is_err()
         {
             eprintln!(
                 "the record index is still being built after {}s: binding the listeners now, \
                  and a request waits for the rest of it",
+                arguments.index_wait
+            );
+        }
+        if tokio::time::timeout_at(deadline, &mut open).await.is_err() {
+            eprintln!(
+                "the window deltas ctx open reads are still being read after {}s: binding the \
+                 listeners now, and an open waits for the rest of them",
                 arguments.index_wait
             );
         }
@@ -772,6 +785,33 @@ fn warm_index(shared: Arc<Shared>) {
         }
         shared.index_done();
     });
+}
+
+/// Reads every window's delta `ctx open` reads into this process's cache of them
+/// ([`delta::read_for_open`]), so the first `ctx open` this copy answers reads none itself.
+///
+/// Which windows directory it reads is taken under the tree lock, and the lock is given back
+/// before the read. The read holds no lock a request takes, so a request that arrives while it
+/// runs is answered as it would have been without it. A failure is one line on standard
+/// error, and the first `ctx open` reads what it needs, as it did before this existed.
+fn warm_open(shared: Arc<Shared>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let read = tokio::task::spawn_blocking(move || {
+            let windows = shared.tree()?.data()?.windows();
+            delta::read_for_open(&windows)
+        })
+        .await;
+        match read {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "reading the window deltas ctx open reads: {}",
+                one_line(&format!("{error:#}"))
+            ),
+            Err(error) => {
+                eprintln!("reading the window deltas ctx open reads: the read stopped: {error}");
+            }
+        }
+    })
 }
 
 /// One pass of the follow loop.
