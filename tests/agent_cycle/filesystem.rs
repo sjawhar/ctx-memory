@@ -9,6 +9,7 @@ use anyhow::{ensure, Context as _, Result};
 use crate::fixtures::{
     remove_scratch, repo, runner, scratch, script_function, write_executable, EXAMPLE_MODEL,
 };
+use crate::outcome::{answer, wrote};
 
 /// Stand-ins for what `run-cycle.sh` calls, so the script runs on a machine without the
 /// image: `ctx` reports one pending window and `omp` records that it was started. The model
@@ -207,6 +208,38 @@ impl CycleRig {
 
     fn run(&self) -> Result<std::process::Output> {
         self.command()?.output().context("running run-cycle.sh")
+    }
+
+    /// Runs the whole runner, through its session, with `ctx` and `omp` the stand-in programs
+    /// given, after [`Self::pretend_root`]: the session's user can write only its own transcript
+    /// directory, as the deployment guarantees, and the key file goes to the scratch directory,
+    /// since the test is not root.
+    fn run_through_the_session(&self, ctx: &str, omp: &str) -> Result<std::process::Output> {
+        write_executable(
+            &self.bin.join("setpriv"),
+            "#!/bin/sh\nwhile [ \"${1#--}\" != \"$1\" ]; do shift; done\n\
+             case \"$1\" in\n\
+             /usr/bin/test) if [ \"$2\" = -w ]; then case \"$3\" in */agent-sessions/ctx-agent-test-1) exit 0 ;; *) exit 1 ;; esac; fi ;;\n\
+             find) exit 0 ;;\n\
+             esac\nexec \"$@\"\n",
+        )?;
+        write_executable(&self.bin.join("ctx"), ctx)?;
+        write_executable(&self.bin.join("omp"), omp)?;
+        let key_file = self.root.join("run/model-key");
+        let script = runner("run-cycle.sh")?.replace(
+            "KEY_FILE=/run/ctx-agent/model-key",
+            &format!("KEY_FILE='{}'", key_file.display()),
+        );
+        let copy = self.root.join("run-cycle.sh");
+        std::fs::write(&copy, script)?;
+        // The provider file names the key file the runner writes, so it moves with it.
+        self.replace_models(
+            &runner("models.example.yml")?
+                .replace("/run/ctx-agent/model-key", &key_file.display().to_string()),
+        )?;
+        self.command_for(&copy)?
+            .output()
+            .context("running run-cycle.sh")
     }
 
     /// Makes `ctx` report no pending window and keep each call's arguments, one line per call,
@@ -770,7 +803,8 @@ fn the_refusal_pattern_matches_a_real_refusal_and_not_an_escaped_copy() -> Resul
 /// runs after the session, which this pretend-root harness cannot reach (it writes the model key
 /// to `/run/ctx-agent`, root's). The invariants: the marker is read before and after a pass, the
 /// two are compared, a move fails the job, and all of it is a pass alone, so a cycle (which moves
-/// the marker per window) is untouched.
+/// the marker per window) is untouched. A cycle reads the marker once, after its sessions, into a
+/// variable of its own, to find the windows it skipped (`outcome.rs` runs that check).
 #[test]
 fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
     let script = runner("run-cycle.sh")?;
@@ -785,14 +819,15 @@ fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
         code.iter()
             .filter(|line| line.contains("=\"$(ctx marker show --json)\""))
             .count()
-            == 2,
-        "run-cycle.sh must read the marker into a variable before and after the pass, and \
-         nowhere else, to tell whether it moved"
+            == 3,
+        "run-cycle.sh must read the marker into a variable before and after the pass, and after \
+         the cycle, and nowhere else"
     );
     ensure!(
         has("marker_before=\"$(ctx marker show --json)\"")
-            && has("marker_after=\"$(ctx marker show --json)\""),
-        "run-cycle.sh does not capture the marker on each side of the pass"
+            && has("marker_after=\"$(ctx marker show --json)\"")
+            && has("cycle_marker=\"$(ctx marker show --json)\""),
+        "run-cycle.sh does not capture the marker on each side of the pass and after the cycle"
     );
     let compared = code
         .iter()
@@ -1331,25 +1366,14 @@ fn the_runner_spends_one_subject_budget_across_windows() -> Result<()> {
     Ok(())
 }
 
-/// The whole runner, with the session user able to write only its own transcript directory as
-/// the deployment guarantees, reads each window's context with `ctx context` before it starts
-/// omp, and the prompt omp is started with names the context file. The key file goes to the
-/// scratch directory, since the test is not root.
+/// The whole runner reads each window's context with `ctx context` before it starts omp, and the
+/// prompt omp is started with names the context file.
 #[test]
 fn the_runner_reads_context_before_the_session_and_names_it_in_the_prompt() -> Result<()> {
     let rig = CycleRig::new("context-full-run")?;
     rig.pretend_root()?;
     let calls = rig.root.join("calls");
-    write_executable(
-        &rig.bin.join("setpriv"),
-        "#!/bin/sh\nwhile [ \"${1#--}\" != \"$1\" ]; do shift; done\n\
-         case \"$1\" in\n\
-         /usr/bin/test) if [ \"$2\" = -w ]; then case \"$3\" in */agent-sessions/ctx-agent-test-1) exit 0 ;; *) exit 1 ;; esac; fi ;;\n\
-         find) exit 0 ;;\n\
-         esac\nexec \"$@\"\n",
-    )?;
-    write_executable(
-        &rig.bin.join("ctx"),
+    let output = rig.run_through_the_session(
         &format!(
             "#!/bin/sh\nprintf 'ctx %s\\n' \"$*\" >> '{calls}'\ncase \"$*\" in\n\
              *context*) printf '%s\\n' '{{\"ok\":true,\"data\":{{\"window\":\"20261102T110000Z-0001\",\"subjects\":[\"K-1\"],\"items\":[]}}}}' ;;\n\
@@ -1357,30 +1381,12 @@ fn the_runner_reads_context_before_the_session_and_names_it_in_the_prompt() -> R
              *) printf '%s\\n' '{{\"ok\":true}}' ;;\nesac\n",
             calls = calls.display()
         ),
-    )?;
-    write_executable(
-        &rig.bin.join("omp"),
         &format!(
             "#!/bin/sh\nprintf 'omp\\n' >> '{}'\nprintf '%s\\n' \"$*\" >> '{}'\n",
             calls.display(),
             rig.omp_log.display()
         ),
     )?;
-    let script = runner("run-cycle.sh")?.replace(
-        "KEY_FILE=/run/ctx-agent/model-key",
-        &format!("KEY_FILE='{}'", rig.root.join("run/model-key").display()),
-    );
-    let copy = rig.root.join("run-cycle.sh");
-    std::fs::write(&copy, script)?;
-    // The provider file names the key file the runner writes, so it moves with it.
-    rig.replace_models(&runner("models.example.yml")?.replace(
-        "/run/ctx-agent/model-key",
-        &rig.root.join("run/model-key").display().to_string(),
-    ))?;
-    let output = rig
-        .command_for(&copy)?
-        .output()
-        .context("running run-cycle.sh")?;
     let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
     let omp_args = std::fs::read_to_string(&rig.omp_log).unwrap_or_default();
     let context_file = rig
@@ -1406,6 +1412,75 @@ fn the_runner_reads_context_before_the_session_and_names_it_in_the_prompt() -> R
     ensure!(
         matches!(mode, Ok(0o644)),
         "the context file's mode is {mode:?}, not 0644"
+    );
+    Ok(())
+}
+
+/// The whole runner, through a stand-in session that moves the marker past the one pending window
+/// (`ctx marker advance`, as the session runs it) and ends on its final answer. The window held
+/// new messages, so a session that wrote no record skipped it for good: the cycle exits non-zero
+/// with one line naming it. The same session with one record written exits 0.
+#[test]
+fn a_whole_cycle_that_skipped_a_window_unwritten_exits_non_zero() -> Result<()> {
+    let window = "20261102T080000Z-0001";
+    let run = |label: &str, events: &str| -> Result<std::process::Output> {
+        let rig = CycleRig::new(label)?;
+        rig.pretend_root()?;
+        let marker = rig.root.join("marker");
+        let session = rig.root.join("session-events");
+        std::fs::write(&session, events)?;
+        let output = rig.run_through_the_session(
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n\
+                 *pending*) printf '%s\\n' '{{\"version\":1,\"command\":\"pending\",\"data\":{{\"marker\":null,\"windows\":[{{\"window\":\"{window}\",\"dir\":\"windows/{window}\",\"new_messages\":3,\"listed_messages\":3}}],\"later_windows\":0}}}}' ;;\n\
+                 *'marker advance'*) printf '%s' \"$3\" > '{marker}'; printf '%s\\n' '{{\"version\":1,\"command\":\"marker advance\"}}' ;;\n\
+                 *marker*) if [ -f '{marker}' ]; then printf '{{\"version\":1,\"command\":\"marker show\",\"data\":{{\"marker\":{{\"version\":1,\"window\":\"%s\"}}}}}}\\n' \"$(cat '{marker}')\"; else printf '%s\\n' '{{\"version\":1,\"command\":\"marker show\",\"data\":{{\"marker\":null}}}}'; fi ;;\n\
+                 *context*) printf '%s\\n' '{{\"version\":1,\"command\":\"context\",\"data\":{{\"window\":\"{window}\",\"subjects\":[],\"items\":[]}}}}' ;;\n\
+                 *) printf '%s\\n' '{{\"version\":1}}' ;;\nesac\n",
+                marker = marker.display()
+            ),
+            &format!(
+                "#!/bin/sh\nctx marker advance {window} >/dev/null\ncat '{}'\n",
+                session.display()
+            ),
+        )?;
+        let moved = std::fs::read_to_string(&marker).unwrap_or_default();
+        rig.remove()?;
+        ensure!(
+            moved == window,
+            "the stand-in session did not move the marker past {window}: {moved:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(output)
+    };
+
+    let skipped = run(
+        "skipped-window",
+        &wrote(
+            &[],
+            answer("Handled 1 window; nothing in it needed a record."),
+        ),
+    )?;
+    let stderr = String::from_utf8_lossy(&skipped.stderr);
+    let named: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("run-cycle: ") && line.contains("wrote no record"))
+        .collect();
+    ensure!(
+        !skipped.status.success() && named.len() == 1 && named.concat().contains(window),
+        "the cycle that moved the marker past {window} unwritten did not fail with one line naming it ({}): {stderr}",
+        skipped.status
+    );
+
+    let written = run(
+        "written-window",
+        &wrote(&[("ctx_record_put", true)], answer("Handled 1 window.")),
+    )?;
+    ensure!(
+        written.status.success(),
+        "the cycle that wrote a record for {window} did not exit 0 ({}): {}",
+        written.status,
+        String::from_utf8_lossy(&written.stderr)
     );
     Ok(())
 }

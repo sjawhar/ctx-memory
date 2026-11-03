@@ -467,15 +467,52 @@ fn a_maintenance_prompt_names_its_instructions_and_the_nonce() -> Result<()> {
     Ok(())
 }
 
-/// Runs `call` after the `run-cycle.sh` functions it needs to build a maintenance pass's prompt,
-/// with `args` as its positional parameters, and answers what it prints.
+/// The policy refuses every shell call that is not one plain `ctx` command, and omp then tells
+/// the session only `Tool "bash" requires approval but no interactive UI available`. A session
+/// read that as a shell it could not use and stopped, after two piped `ctx` calls were refused,
+/// with its windows unread and the job a success. The rule is in the ingest skill, but the
+/// prompt is the one instruction that reaches the session above everything it reads, so each
+/// prompt the runner builds states it: one `ctx` command alone per shell call, with no pipe,
+/// redirection, `;`, `&&` or `||`, and what that refusal means and what to do instead.
+#[test]
+fn each_prompt_states_the_one_command_rule_and_what_its_refusal_means() -> Result<()> {
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let cycle = run_prompt_function(
+        "CTX_DATA_DIR=/data; nonce=\"$1\"; context_prompt=; cycle_prompt; printf %s \"$prompt\"",
+        &[nonce],
+    )?;
+    let pass = maintenance_prompt("waiting-on", nonce)?;
+    for (prompt, what) in [(&cycle, "cycle"), (&pass, "maintenance pass")] {
+        for wanted in [
+            "one ctx command alone per shell call",
+            "no pipe (|)",
+            "2>",
+            "&&",
+            "||",
+            "Tool \"bash\" requires approval but no interactive UI available",
+            "the shell still works",
+            "run each ctx command again on its own",
+        ] {
+            ensure!(
+                prompt.contains(wanted),
+                "the {what} prompt does not say {wanted:?}: {prompt}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Runs `call` after the `run-cycle.sh` functions it needs to build a cycle's or a maintenance
+/// pass's prompt, with `args` as its positional parameters, and answers what it prints.
 fn run_prompt_function(call: &str, args: &[&str]) -> Result<String> {
     let output = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "set -eu\n{}\n{}\n{call}",
+            "set -eu\n{}\n{}\n{}\n{}\n{call}",
+            script_function("shell_rule")?,
             script_function("pass_complete_line")?,
-            script_function("maintenance_prompt")?
+            script_function("maintenance_prompt")?,
+            script_function("cycle_prompt")?
         ))
         .arg("sh")
         .args(args)
