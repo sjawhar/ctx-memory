@@ -24,6 +24,7 @@ use crate::open::{
 };
 use crate::output::{self, Outcome, Sink};
 use crate::plugin::{run_external, PluginEnv};
+use crate::proc;
 use crate::records_schema;
 use crate::redact;
 use crate::remote;
@@ -471,6 +472,8 @@ struct FetchPayload<'a> {
     window: &'a str,
     exit_status: Status,
     sources: &'a BTreeMap<String, SourceManifest>,
+    /// The window's warnings, as its manifest holds them.
+    warnings: &'a [String],
     delta: FetchDeltaPayload,
     cursors: &'a AdvanceOutcome,
 }
@@ -777,6 +780,8 @@ fn run_source(run: &mut Run<'_, '_>, id: &str, op: SourceOperation) -> Result<Ou
             "ctx source run {id} --op fetch is refused: only ctx fetch may rotate the Slack credential"
         ));
     }
+    // As in `ctx fetch`: the source is of no use once this command is gone.
+    proc::stop_runs_with_this_process()?;
     let scheme = source::scheme(spec)?;
     let source = source::open(spec, &scheme)?;
     let source_ref = SourceRef {
@@ -854,11 +859,14 @@ fn run_source(run: &mut Run<'_, '_>, id: &str, op: SourceOperation) -> Result<Ou
 }
 
 fn run_fetch(run: &mut Run<'_, '_>, options: &FetchOptions) -> Result<Outcome> {
+    // A source the fetch runs is of no use once the fetch is gone, so it stops with the fetch.
+    proc::stop_runs_with_this_process()?;
     let outcome = fetch::fetch(run.context, options)?;
     let payload = FetchPayload {
         window: outcome.window.id.as_str(),
         exit_status: outcome.manifest.exit_status,
         sources: &outcome.manifest.sources,
+        warnings: &outcome.manifest.warnings,
         delta: FetchDeltaPayload {
             summary: delta::summary(&outcome.delta),
             new_messages: outcome.delta.new_messages.len(),
@@ -1149,6 +1157,11 @@ fn print_fetch(payload: &FetchPayload<'_>, out: &mut dyn Write) -> std::io::Resu
             }
             writeln!(out)?;
         }
+    }
+    // Each on a line of its own and flattened, as a source's words can be anything, so the fetch
+    // job's log carries what the manifest says without anyone opening it.
+    for warning in payload.warnings {
+        writeln!(out, "warning: {}", crate::redact::one_line(warning))?;
     }
     cursor::print_advance(payload.cursors, out)
 }

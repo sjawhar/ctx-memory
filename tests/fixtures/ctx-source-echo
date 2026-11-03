@@ -5,6 +5,12 @@ request=$(cat)
 if [ -n "${ECHO_REQUEST_OUT-}" ]; then
     printf '%s\n' "$request" > "$ECHO_REQUEST_OUT"
 fi
+# With ECHO_PID_OUT the source names its process, which leads its process group, so a test can
+# tell whether it and what it started are still running.
+if [ -n "${ECHO_PID_OUT-}" ]; then
+    printf '%s\n' "$$" > "$ECHO_PID_OUT.tmp"
+    mv "$ECHO_PID_OUT.tmp" "$ECHO_PID_OUT"
+fi
 
 op=$(printf '%s' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')
 scheme=$(printf '%s' "$request" | sed -n 's/.*"scheme":"\([^"]*\)".*/\1/p' | sed -n '1p')

@@ -1,15 +1,135 @@
 //! Bounded subprocesses.
 //!
-//! A command that is missing or hangs returns an error rather than blocking its caller.
+//! A command that is missing or hangs returns an error rather than blocking its caller. A
+//! process that calls [`stop_runs_with_this_process`] also stops the runs under way when it is
+//! itself stopped or killed.
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+
+/// How many runs a stop reaches at once. A fetch runs one source at a time; a run past this many
+/// is not tracked, and only its parent-death signal stops it.
+const TRACKED_RUNS: usize = 32;
+
+/// The process group of each run under way, 0 for a free slot. The signal handler reads them, so
+/// they are atomics, which a handler may read, not a lock, which it may not take.
+static RUNNING: [AtomicI32; TRACKED_RUNS] = [const { AtomicI32::new(0) }; TRACKED_RUNS];
+
+/// Whether runs end with this process: set once by [`stop_runs_with_this_process`].
+static BOUND: AtomicBool = AtomicBool::new(false);
+
+/// A run's slot in [`RUNNING`], freed once the run is over.
+struct Tracked(Option<&'static AtomicI32>);
+
+impl Tracked {
+    fn start(group: i32) -> Self {
+        Self(RUNNING.iter().find(|slot| {
+            slot.compare_exchange(0, group, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        }))
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0 {
+            slot.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Kills the process group of every run under way, then ends this process by `signal`, as it
+/// would have ended without a handler.
+extern "C" fn stop_runs(signal: libc::c_int) {
+    for slot in &RUNNING {
+        let group = slot.load(Ordering::SeqCst);
+        if group > 0 {
+            // `kill` is async-signal-safe. A negative PID names the whole group, so what the
+            // program started stops with it; a group already gone answers ESRCH.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+    }
+    // The handler was installed with SA_RESETHAND, so `signal` has its default action again: it
+    // ends the process once it is delivered. `raise` is async-signal-safe.
+    unsafe { libc::raise(signal) };
+}
+
+/// Makes the runs of this process stop when it does, for a command such as `ctx fetch` whose
+/// runs (its sources) are of no use once it is gone.
+///
+/// SIGTERM, SIGINT and SIGHUP kill the process group of every run under way and then end this
+/// process by the same signal. A run gets its own process group, so a terminal's interrupt does
+/// not reach it, and without this a stopped fetch would leave its sources running. A signal this
+/// process started out ignoring, as a background job ignores SIGINT, stays ignored. On Linux each
+/// later run is also killed by the kernel when this process ends any other way, SIGKILL
+/// included; that reaches only the program itself, not what it started.
+///
+/// # Errors
+///
+/// Returns an error when a signal's action cannot be read or set.
+pub fn stop_runs_with_this_process() -> Result<()> {
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // A zeroed `sigaction` is a valid value: no handler, an empty mask, no flags.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // `current` is a valid `sigaction` this call fills.
+        if unsafe { libc::sigaction(signal, std::ptr::null(), &raw mut current) } == -1 {
+            return Err(anyhow!(
+                "reading the action of signal {signal}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if current.sa_sigaction == libc::SIG_IGN {
+            continue;
+        }
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = stop_runs as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESETHAND;
+        // `action` is a valid `sigaction` that outlives both calls.
+        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+        if unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) } == -1 {
+            return Err(anyhow!(
+                "handling signal {signal}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    BOUND.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Asks the kernel to kill the child when this process ends, which reaches it however this
+/// process ends, SIGKILL included. Linux sends the signal when the thread that started the child
+/// ends; a run's thread waits for its child, so that is when the process does.
+#[cfg(target_os = "linux")]
+fn die_with_this_process(command: &mut Command) -> Result<()> {
+    let parent = libc::pid_t::try_from(std::process::id())
+        .map_err(|error| anyhow!("converting this process id: {error}"))?;
+    let signal = libc::c_ulong::try_from(libc::SIGKILL)
+        .map_err(|error| anyhow!("converting SIGKILL: {error}"))?;
+    // The closure runs in the child between fork and exec, so it may only call what is
+    // async-signal-safe: `prctl` and `getppid` are, and an error from a raw code allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, signal) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // This process may have ended before the request was made; the child then has
+            // another parent already, and nothing would ever stop it.
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
 
 /// What a bounded run produced. A non-zero exit is data for the caller to handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +413,10 @@ pub fn run_command_limited(
     } else {
         Stdio::piped()
     };
+    #[cfg(target_os = "linux")]
+    if BOUND.load(Ordering::SeqCst) {
+        die_with_this_process(&mut command)?;
+    }
     let mut child = command
         .stdin(child_stdin)
         .stdout(Stdio::piped())
@@ -303,6 +427,11 @@ pub fn run_command_limited(
             std::io::ErrorKind::NotFound => anyhow!("{program}: not found"),
             _ => anyhow!("{program}: {error}"),
         })?;
+    // The child leads its own process group, so its id names the group a stop kills.
+    let _tracked = Tracked::start(
+        i32::try_from(child.id())
+            .map_err(|error| anyhow!("{program}: converting process group: {error}"))?,
+    );
     let stdout_pipe = child
         .stdout
         .take()

@@ -42,10 +42,16 @@ fn tree(root: &Path) -> Result<PathBuf> {
 }
 
 fn command(tree: &Path, state: &Path) -> Result<Command> {
+    ctx(tree, state, &["--json"])
+}
+
+/// `ctx` with `global` flags before its command, on `tree`, with only the echo knobs a test sets.
+fn ctx(tree: &Path, state: &Path, global: &[&str]) -> Result<Command> {
     let tree = tree.to_str().context("tree path is not valid UTF-8")?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_ctx"));
     command
-        .args(["--json", "--memory", tree])
+        .args(global)
+        .args(["--memory", tree])
         .env("CTX_STATE_DIR", state)
         .env("PATH", fixture_path()?);
     for name in [
@@ -58,6 +64,7 @@ fn command(tree: &Path, state: &Path) -> Result<Command> {
         "ECHO_LATE",
         "ECHO_NO_END",
         "ECHO_NO_HELLO",
+        "ECHO_PID_OUT",
         "ECHO_REQUEST_OUT",
         "ECHO_SLEEP",
         "ECHO_WAIT_FOR",
@@ -223,7 +230,7 @@ fn an_interrupted_fetch_leaves_a_staged_window_and_no_cursor() -> Result<()> {
         .args(["fetch", "--window-end", "2026-10-25T18:00:00Z"])
         .env("ECHO_REQUEST_OUT", &request)
         // Long enough that the test stops the fetch while it is staged, however slow the
-        // machine; the source sleeps on alone after that, and exits when it wakes.
+        // machine; the kernel kills the source when the fetch dies, and its `sleep` runs out.
         .env("ECHO_SLEEP", "60");
     let mut fetch = fetch.spawn().context("starting fetch")?;
     wait_for_file(&request)?;
@@ -797,4 +804,229 @@ fn a_fetch_with_a_fresh_state_directory_still_reads_tracked_threads() -> Result<
         "the reply to a tracked thread is lost on a fresh state directory: {pointers:?}"
     );
     Ok(())
+}
+
+#[test]
+fn a_fetch_prints_the_warnings_of_its_window() -> Result<()> {
+    let root = scratch("fetch-warnings")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    let failing = ("ECHO_FAIL_STREAM", "C0EXAMPLE02");
+    requested_backfill(&tree, &state, "2026-10-25T18:00:00Z", &[failing])?;
+    // Stream 02 fails again, so its backfill start is held through both later fetches.
+    let plain = ctx(&tree, &state, &[])?
+        .args(["fetch", "--window-end", "2026-10-25T21:00:00Z"])
+        .env(failing.0, failing.1)
+        .output()
+        .context("running a plain ctx fetch")?;
+    let json = fetch(&tree, &state, "2026-10-25T22:00:00Z")?;
+    remove_scratch(&root)?;
+
+    let warning = "source echo: its backfill reaches back to 2026-10-24T18:00:00Z, where a read an earlier fetch did not store began";
+    let printed = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        printed
+            .lines()
+            .any(|line| line == format!("warning: {warning}")),
+        "{printed}"
+    );
+    let json: Value = serde_json::from_slice(&json.stdout)?;
+    let warnings = json
+        .pointer("/data/warnings")
+        .and_then(Value::as_array)
+        .context("the JSON answer lists the window's warnings")?;
+    assert!(
+        warnings
+            .iter()
+            .any(|listed| listed.as_str() == Some(warning)),
+        "{json}"
+    );
+    Ok(())
+}
+
+/// Stopping a fetch, observed through `/proc`.
+#[cfg(target_os = "linux")]
+mod stopping {
+    use super::*;
+
+    /// The state letter and process group of `pid` in `/proc`, or `None` once it has gone.
+    fn process(pid: &str) -> Option<(char, String)> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name, in parentheses, may hold spaces; the fields after it do not.
+        let (_, after) = stat.rsplit_once(')')?;
+        let mut fields = after.split_whitespace();
+        let state = fields.next()?.chars().next()?;
+        let group = fields.nth(1)?.to_owned();
+        Some((state, group))
+    }
+
+    /// Whether `pid` still runs. A zombie has stopped, and waits only for its parent to read it.
+    fn running(pid: &str) -> bool {
+        process(pid).is_some_and(|(state, _)| state != 'Z')
+    }
+
+    /// Whether any process of process group `group` still runs.
+    fn group_running(group: &str) -> Result<bool> {
+        for entry in fs::read_dir("/proc")? {
+            let name = entry?.file_name();
+            let Some(pid) = name
+                .to_str()
+                .filter(|name| name.bytes().all(|b| b.is_ascii_digit()))
+            else {
+                continue;
+            };
+            if process(pid).is_some_and(|(state, of)| state != 'Z' && of == group) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Waits up to 20 seconds for `stopped` to hold: ample for a signal to land on a loaded
+    /// machine, and far short of the ten minutes the echo source waits.
+    fn eventually(mut stopped: impl FnMut() -> Result<bool>) -> Result<bool> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if stopped()? {
+                return Ok(true);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        stopped()
+    }
+
+    /// The command line of a fetch.
+    const FETCH: &[&str] = &["fetch", "--window-end", "2026-10-25T18:00:00Z"];
+
+    /// `ctx <arguments>` running an echo source that waits ten minutes before it answers, with
+    /// `disposition` for each of `signals` as it starts, and the source's process id once it runs.
+    fn waiting(
+        root: &Path,
+        arguments: &[&str],
+        signals: &[libc::c_int],
+        disposition: libc::sighandler_t,
+    ) -> Result<(std::process::Child, String)> {
+        use std::os::unix::process::CommandExt as _;
+
+        let tree = tree(root)?;
+        let pid_file = root.join("source.pid");
+        let mut fetch = command(&tree, &root.join("state"))?;
+        fetch
+            .args(arguments)
+            .env("ECHO_PID_OUT", &pid_file)
+            // Far longer than `eventually` waits, so a source that stops did not just finish.
+            .env("ECHO_SLEEP", "600")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let signals = signals.to_vec();
+        // The test harness may run with a signal ignored, as a background job runs with SIGINT
+        // ignored, and an ignored signal stays ignored across exec: each fetch starts with the
+        // disposition its case names. `signal` is async-signal-safe.
+        unsafe {
+            fetch.pre_exec(move || {
+                for signal in &signals {
+                    libc::signal(*signal, disposition);
+                }
+                Ok(())
+            });
+        }
+        let fetch = fetch.spawn().context("starting fetch")?;
+        wait_for_file(&pid_file)?;
+        let source = fs::read_to_string(&pid_file)?.trim().to_owned();
+        Ok((fetch, source))
+    }
+
+    fn send(signal: &str, pid: &str) -> Result<()> {
+        let sent = Command::new("kill")
+            .args([format!("-{signal}").as_str(), "--", pid])
+            .status()
+            .context("running kill")?;
+        if !sent.success() {
+            bail!("kill -{signal} {pid} failed");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_fetch_asked_to_stop_stops_its_source_and_what_the_source_started() -> Result<()> {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        for (name, number) in [
+            ("TERM", libc::SIGTERM),
+            ("INT", libc::SIGINT),
+            ("HUP", libc::SIGHUP),
+        ] {
+            let root = scratch(&format!("stop-{name}"))?;
+            let (mut fetch, source) = waiting(&root, FETCH, &[number], libc::SIG_DFL)?;
+            send(name, &fetch.id().to_string())?;
+            let status = fetch.wait().context("waiting for the stopped fetch")?;
+            // The source leads its own process group, and its `sleep` is in that group too.
+            let stopped = eventually(|| Ok(!group_running(&source)?))?;
+            if !stopped {
+                let _ = send("KILL", &format!("-{source}"));
+            }
+            remove_scratch(&root)?;
+
+            assert_eq!(status.signal(), Some(number), "the fetch ends by SIG{name}");
+            assert!(stopped, "SIG{name} left the source's process group running");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_fetch_started_with_an_interrupt_ignored_keeps_ignoring_it() -> Result<()> {
+        let root = scratch("stop-ignored")?;
+        let (mut fetch, source) = waiting(&root, FETCH, &[libc::SIGINT], libc::SIG_IGN)?;
+        send("INT", &fetch.id().to_string())?;
+        thread::sleep(Duration::from_secs(1));
+        let still = fetch.try_wait()?.is_none() && running(&source);
+        send("TERM", &fetch.id().to_string())?;
+        let _ = fetch.wait()?;
+        let stopped = eventually(|| Ok(!group_running(&source)?))?;
+        if !stopped {
+            let _ = send("KILL", &format!("-{source}"));
+        }
+        remove_scratch(&root)?;
+
+        assert!(still, "an ignored SIGINT stopped the fetch or its source");
+        assert!(stopped, "SIGTERM left the source's process group running");
+        Ok(())
+    }
+
+    #[test]
+    fn a_fetch_killed_outright_still_stops_its_source() -> Result<()> {
+        let root = scratch("stop-killed")?;
+        let (mut fetch, source) = waiting(&root, FETCH, &[], libc::SIG_DFL)?;
+        send("KILL", &fetch.id().to_string())?;
+        let _ = fetch.wait()?;
+        // A killed fetch runs no code of its own, so only the source itself is told, by the
+        // kernel; what the source started is left to it.
+        let stopped = eventually(|| Ok(!running(&source)))?;
+        let _ = send("KILL", &format!("-{source}"));
+        remove_scratch(&root)?;
+
+        assert!(stopped, "a killed fetch left its source running");
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_run_asked_to_stop_stops_its_source() -> Result<()> {
+        let root = scratch("stop-source-run")?;
+        let (mut run, source) = waiting(
+            &root,
+            &["source", "run", "echo", "--op", "fetch"],
+            &[libc::SIGTERM],
+            libc::SIG_DFL,
+        )?;
+        send("TERM", &run.id().to_string())?;
+        let _ = run.wait()?;
+        let stopped = eventually(|| Ok(!group_running(&source)?))?;
+        if !stopped {
+            let _ = send("KILL", &format!("-{source}"));
+        }
+        remove_scratch(&root)?;
+
+        assert!(stopped, "SIGTERM left the source's process group running");
+        Ok(())
+    }
 }
