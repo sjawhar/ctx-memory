@@ -1154,6 +1154,31 @@ fn a_cycle_that_ended_on_a_model_error_gets_one_fresh_session() -> Result<()> {
         "the fresh session of a cycle a model error ended was stopped by its time limit",
     )?;
 
+    // omp can exit 0 on a session whose last turn is an error; the runner reads that session as
+    // unfinished, and the model's error stopped it, so it gets its fresh session too.
+    let verdict = runner_verdict(
+        None,
+        &[
+            Attempt {
+                status: 0,
+                events: &unclassified,
+            },
+            Attempt {
+                status: 0,
+                events: &finished,
+            },
+        ],
+    )?;
+    ensure!(
+        verdict.sessions == 2,
+        "a session omp reported as a success but a model error ended got no fresh session: {}",
+        verdict.stderr
+    );
+    ensure_succeeded(
+        &verdict,
+        "the fresh session of a cycle omp reported as a success but a model error ended finished",
+    )?;
+
     let verdict = runner_verdict(
         None,
         &[
