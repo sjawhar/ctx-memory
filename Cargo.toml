@@ -1,6 +1,6 @@
 [package]
 name = "ctx-memory"
-version = "0.2.14"
+version = "0.2.15"
 edition = "2021"
 description = "A markdown-backed context graph for agents."
 license = "MIT"
