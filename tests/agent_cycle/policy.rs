@@ -62,7 +62,7 @@ fn admits(pattern: &str, command: &str) -> Result<bool> {
 
 /// Parses `words` as ctx's arguments, adding a placeholder for each required argument a
 /// pattern or a skill leaves out (`ctx search`). The placeholder is `1`, which parses wherever
-/// one stands: a path, an id or a count (`ctx marker page <window> <through>`).
+/// one stands: a path, an id, a pointer or a count.
 fn parse_filled(words: &[&str]) -> Result<(Cli, Vec<String>)> {
     let mut argv: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
     loop {

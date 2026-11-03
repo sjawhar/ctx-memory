@@ -152,7 +152,7 @@ fn a_window_worked_in_pages_is_sent_the_subjects_of_its_page() -> Result<()> {
     let recorded = server.post_as(
         CYCLE,
         "/v1/marker/page",
-        &serde_json::json!({ "window": window, "through": 2, "session": "cycle-1" }),
+        &serde_json::json!({ "window": window, "ends_at": "echo:C0EXAMPLE02/record", "session": "cycle-1" }),
     )?;
     let second = ask(&server, &window, Some(CYCLE))?;
     let second_sent = std::fs::read_to_string(&request).unwrap_or_default();

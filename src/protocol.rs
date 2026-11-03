@@ -97,13 +97,13 @@ pub struct MarkerRequest {
     pub window: String,
 }
 
-/// The body of [`PAGE_ROUTE`]: the window after the marker, and how many of its new messages,
-/// oldest first, the agent has worked.
+/// The body of [`PAGE_ROUTE`]: the window after the marker, and the pointer of the message the
+/// page the agent has worked ends with, the `page.ends_at` that `ctx pending` listed.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PageRequest {
+    pub ends_at: String,
     #[serde(default)]
     pub session: Option<String>,
-    pub through: usize,
     pub window: String,
 }
 

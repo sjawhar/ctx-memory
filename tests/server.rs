@@ -2377,17 +2377,18 @@ fn a_large_window_is_worked_a_page_a_cycle_through_the_server() -> Result<()> {
             .pointer("/data/windows/0/page")
             .cloned()
             .with_context(|| format!("the window is not listed as a page: {pending}"))?;
-        let through = page
-            .get("through")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
+        let ends_at = page
+            .get("ends_at")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         pages.push(page.clone());
         if page.get("last").and_then(Value::as_bool) == Some(true) {
             break ctx(&["--json", "marker", "advance", &window])?;
         }
         let early = ctx(&["--json", "marker", "advance", &window])?;
         refused.push((early.exit_code, early.stdout, early.stderr));
-        let recorded = ctx(&["--json", "marker", "page", &window, &through.to_string()])?;
+        let recorded = ctx(&["--json", "marker", "page", &window, &ends_at])?;
         assert_eq!(
             recorded.exit_code, 0,
             "{}{}",

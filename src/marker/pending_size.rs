@@ -34,14 +34,17 @@ fn pending_in(data: &DataDir, exclusion: &Exclusion, budget: usize) -> Result<Pe
 /// are written, and says whether another page waits after it.
 fn record_page(data: &DataDir, pending: &Pending, budget: usize) -> Result<bool> {
     let window = pending.windows.first().context("a window waits")?;
-    let page = window.page.context("the window is worked in pages")?;
+    let page = window
+        .page
+        .as_ref()
+        .context("the window is worked in pages")?;
     if page.last {
         return Ok(false);
     }
     super::page_in(
         data,
         &window.window,
-        page.through,
+        page.ends_at.as_deref().context("the page names its end")?,
         "test",
         &serving(&Exclusion::default(), budget),
     )?;
@@ -255,7 +258,10 @@ fn a_window_larger_than_an_answer_lists_what_fits_and_counts_the_rest() -> Resul
         Some(2_000 - first.listed_messages),
         "the answer counts what it left out"
     );
-    let page = first.page.context("the window is worked in pages")?;
+    let page = first
+        .page
+        .as_ref()
+        .context("the window is worked in pages")?;
     assert_eq!(
         (page.worked, page.through, page.last),
         (0, first.listed_messages, false)
@@ -329,7 +335,11 @@ fn an_empty_window_does_not_hold_back_a_large_one() -> Result<()> {
     assert_eq!(pending.windows.len(), 2);
     assert_eq!(pending.later_windows, 0);
     assert!(pending.windows.first().is_some_and(|w| w.page.is_none()));
-    assert!(pending.windows.get(1).and_then(|w| w.page).is_some());
+    assert!(pending
+        .windows
+        .get(1)
+        .and_then(|w| w.page.as_ref())
+        .is_some());
     Ok(())
 }
 
@@ -406,7 +416,7 @@ fn flagged_messages_page_through_and_every_page_moves_on() -> Result<()> {
         let page = pending
             .windows
             .first()
-            .and_then(|window| window.page)
+            .and_then(|window| window.page.as_ref())
             .context("the window is worked in pages")?;
         assert!(
             page.worked == worked && page.through > worked,

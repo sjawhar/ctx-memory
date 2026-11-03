@@ -270,10 +270,10 @@ pub enum MarkerCommand {
     Show,
     /// Move the marker to a completed window after the commit that handled it.
     Advance { window: String },
-    /// Record that the agent has worked the window after the marker through its `through`
-    /// oldest new messages, after the commit that wrote their records: the `page.through` of the
-    /// page `ctx pending` lists.
-    Page { window: String, through: usize },
+    /// Record that the agent has worked the window after the marker through the page `ctx
+    /// pending` lists, after the commit that wrote its records: `ends_at` is the page's
+    /// `page.ends_at`, the pointer of the message the page ends with.
+    Page { window: String, ends_at: String },
 }
 
 impl Command {
@@ -384,11 +384,8 @@ impl Command {
                 command: MarkerCommand::Advance { window },
             } => Remote::MarkerAdvance { window },
             Self::Marker {
-                command: MarkerCommand::Page { window, through },
-            } => Remote::MarkerPage {
-                window,
-                through: *through,
-            },
+                command: MarkerCommand::Page { window, ends_at },
+            } => Remote::MarkerPage { window, ends_at },
             Self::Context {
                 window,
                 max_subjects,
@@ -433,7 +430,7 @@ pub enum Remote<'a> {
     /// `marker advance`: `/v1/marker/advance`, under the server's write lease.
     MarkerAdvance { window: &'a str },
     /// `marker page`: `/v1/marker/page`, under the server's write lease.
-    MarkerPage { window: &'a str, through: usize },
+    MarkerPage { window: &'a str, ends_at: &'a str },
     /// `context`: `GET /v1/windows/{id}/context`, which only the callers the tree's
     /// `[context_source]` names may read.
     Context {
@@ -1054,13 +1051,13 @@ fn run_marker(run: &mut Run<'_, '_>, command: &MarkerCommand) -> Result<Outcome>
                 marker::print(payload.marker.as_ref(), out)
             })?;
         }
-        MarkerCommand::Page { window, through } => {
+        MarkerCommand::Page { window, ends_at } => {
             // The page record is on the share beside the marker, and the server writes it under
             // its write lease, as it moves the marker.
             let lease = lease::for_role("server").context(
                 "ctx marker page records what the server records, so it takes the server lease",
             )?;
-            let recorded = marker::page(run.context, window, *through, &session_id::caller());
+            let recorded = marker::page(run.context, window, ends_at, &session_id::caller());
             give_back(lease, run.sink.err);
             let payload = MarkerPagePayload { page: recorded? };
             run.emit("marker page", &payload, |payload, out| {

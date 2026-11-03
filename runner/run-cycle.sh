@@ -656,7 +656,8 @@ for the next cycle. "
 	prompt="Read skill://ctx-memory-ingest, then run one ingest cycle over the pending windows. \
 ${cap}When ctx pending lists only a page of a window (the window's page field), work that page \
 and no other: once its records are written, record it with ctx marker page <window> \
-<page.through> and end the cycle, and the next cycle gets the next page; on the window's last page \
+'<page.ends_at>', the pointer in single quotes, and end the cycle, and the next cycle gets the \
+next page; on the window's last page \
 (page.last is true), move the marker past the window with ctx marker advance instead. \
 The data directory is $CTX_DATA_DIR; each window ctx pending lists is in its dir under it. \
 $(shell_rule) \

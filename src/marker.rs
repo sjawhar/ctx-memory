@@ -69,12 +69,17 @@ pub struct PageMessage {
     pub pointer: String,
 }
 
-impl Page {
-    /// How many of `messages`, which are oldest first, the recorded pages hold.
-    fn worked_of(&self, messages: &[NewMessage]) -> usize {
+impl PageMessage {
+    /// How many of `messages`, which are oldest first, sort at or before this one: those a page
+    /// that ends with it holds, whether or not it is itself among them.
+    fn holds(&self, messages: &[NewMessage]) -> usize {
         messages.partition_point(|message| {
-            (message.ts, message.pointer.as_str()) <= (self.last.ts, self.last.pointer.as_str())
+            (message.ts, message.pointer.as_str()) <= (self.ts, self.pointer.as_str())
         })
+    }
+
+    fn key(&self) -> (DateTime<Utc>, &str) {
+        (self.ts, self.pointer.as_str())
     }
 }
 
@@ -102,27 +107,34 @@ pub struct PendingWindow {
 }
 
 /// The page of a window one answer lists.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PageView {
     /// How many of the window's new messages, oldest first, the pages already recorded hold.
     /// The answer leaves them out.
     pub worked: usize,
-    /// `worked` and the messages this page lists. Once the page's records are written,
-    /// `ctx marker page <window> <through>` records it.
+    /// `worked` and the messages this page lists.
     pub through: usize,
     /// Whether this page holds the window's newest message. Then no page is recorded: once its
     /// records are written, `ctx marker advance <window>` moves the marker past the window.
     pub last: bool,
+    /// The pointer of the message this page ends with. Once the page's records are written,
+    /// `ctx marker page <window> <ends_at>` records it. `None` when the page lists no message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<String>,
 }
 
 impl PageView {
     /// A page whose fields print as wide as any page's can, so the bytes an answer keeps for a
-    /// window's page are never fewer than the page takes.
-    const WIDEST: Self = Self {
-        worked: usize::MAX,
-        through: usize::MAX,
-        last: false,
-    };
+    /// window's page are never fewer than the page takes: a pointer of the longest a source may
+    /// name, each byte a control character, which travels as the most bytes.
+    fn widest() -> Self {
+        Self {
+            worked: usize::MAX,
+            through: usize::MAX,
+            last: false,
+            ends_at: Some("\u{1}".repeat(crate::source::MAX_POINTER_BYTES)),
+        }
+    }
 }
 
 /// The windows an agent still has to handle, with their combined delta.
@@ -267,12 +279,12 @@ fn advance_in(data: &DataDir, window: &str, by: &str, serving: &Serving<'_>) -> 
         let Some(entry) = listed.windows.first() else {
             continue;
         };
-        if let Some(view) = entry.page.filter(|view| !view.last) {
+        if let Some(view) = entry.page.as_ref().filter(|view| !view.last) {
             return Err(refused(format!(
                 "window {id} holds {} new message(s) no recorded page holds, more than one page \
                  ({} listed): the marker passes it once its last page is worked. Work it a page at \
                  a time as `ctx pending` lists it, and record each page with \
-                 `ctx marker page {id} <through>`",
+                 `ctx marker page {id} <ends_at>`, giving the page's `ends_at`",
                 entry.new_messages - view.worked,
                 entry.listed_messages
             )));
@@ -294,25 +306,29 @@ fn advance_in(data: &DataDir, window: &str, by: &str, serving: &Serving<'_>) -> 
     Ok(marker)
 }
 
-/// Records that the agent has worked the oldest window after the marker through its `through`
-/// oldest new messages, after the commit that wrote their records.
+/// Records that the agent has worked the oldest window after the marker through the new message
+/// whose pointer is `ends_at`, after the commit that wrote the records of the page that ends with
+/// it.
 ///
-/// `through` is the `page.through` of the window in a `ctx pending` answer: the window's
-/// messages up to the end of the page that answer lists. A smaller one records part of that page.
-/// The next answer lists the page after it, so a cycle that stops partway through a page reads
-/// that page again and no page before it. Recording the page already recorded changes only who
-/// recorded it and when. A page is recorded for the oldest window after the marker alone, and the
-/// last page of a window is not recorded: the marker moves past the window instead ([`advance`]).
+/// `ends_at` is the `page.ends_at` of the window in a `ctx pending` answer: the pointer of the
+/// message the page that answer lists ends with. The page is recorded by that message, so an
+/// exclusion added while the session worked its page moves the end of the page nowhere: the
+/// message is found among the window's new messages, the ones an exclusion now leaves out among
+/// them. A message earlier in the page records part of it. The next answer lists the page after
+/// it, so a cycle that stops partway through a page reads that page again and no page before it.
+/// Recording the page already recorded changes only who recorded it and when. A page is recorded
+/// for the oldest window after the marker alone, and the last page of a window is not recorded:
+/// the marker moves past the window instead ([`advance`]).
 ///
 /// # Errors
 ///
 /// Returns a [`Refused`] error when the window is not the oldest window after the marker, or
-/// `through` is behind the pages already recorded, past the page an answer lists, or the end of
-/// the window's last page, and any other error when marker state or the window cannot be read or
-/// the page cannot be persisted.
-pub fn page(context: &Context, window: &str, through: usize, by: &str) -> Result<Page> {
+/// `ends_at` is not one of its new messages, is behind the pages already recorded, is past the
+/// page an answer lists, or ends the window's last page, and any other error when marker state or
+/// the window cannot be read or the page cannot be persisted.
+pub fn page(context: &Context, window: &str, ends_at: &str, by: &str) -> Result<Page> {
     serving(context, |data, serving| {
-        page_in(data, window, through, by, serving)
+        page_in(data, window, ends_at, by, serving)
     })
 }
 
@@ -320,7 +336,7 @@ pub fn page(context: &Context, window: &str, through: usize, by: &str) -> Result
 fn page_in(
     data: &DataDir,
     window: &str,
-    through: usize,
+    ends_at: &str,
     by: &str,
     serving: &Serving<'_>,
 ) -> Result<Page> {
@@ -348,61 +364,76 @@ fn page_in(
             )))
         }
     };
+    // The message the page ends with, among every new message of the window: the session names
+    // it as `ctx pending` listed it, and an exclusion added since may leave it out now.
+    let every = delta::read(&oldest, &Exclusion::default())?;
+    let end_message = every
+        .as_ref()
+        .and_then(|delta| {
+            delta
+                .new_messages
+                .iter()
+                .find(|message| message.pointer == ends_at)
+        })
+        .map(|message| PageMessage {
+            ts: message.ts,
+            pointer: message.pointer.clone(),
+        })
+        .ok_or_else(|| {
+            refused(format!(
+                "{} is not a new message of window {}: give the `page.ends_at` that \
+                 `ctx pending` lists for the window",
+                printable(ends_at),
+                window.id
+            ))
+        })?;
+    if let Some(recorded) = recorded.as_ref() {
+        if end_message.key() < recorded.last.key() {
+            return Err(refused(format!(
+                "the pages recorded for window {} already reach past {}, so a page that ends \
+                 with it is behind them",
+                window.id,
+                printable(&end_message.pointer)
+            )));
+        }
+    }
+    // Where it falls among the messages the tree does not exclude now, which is how the answers
+    // count them.
+    let mut kept = delta::read(&oldest, serving.exclusion)?
+        .map(|delta| delta.new_messages)
+        .unwrap_or_default();
+    delta::oldest_first(&mut kept);
+    let worked_through = end_message.holds(&kept);
     let listed = answer(data, vec![oldest], serving, recorded.as_ref())?;
     let entry = listed
         .windows
         .first()
         .context("an answer over one window lists it")?;
-    let worked = entry.page.map_or(0, |view| view.worked);
+    let worked = entry.page.as_ref().map_or(0, |view| view.worked);
     let end = worked + entry.listed_messages;
-    if through == 0 {
-        return Err(refused(
-            "a page holds at least one message: record the `page.through` that `ctx pending` \
-             lists for the window"
-                .to_owned(),
-        ));
-    }
-    if through < worked {
+    if worked_through > end {
         return Err(refused(format!(
-            "the pages recorded for window {} already hold its {worked} oldest new messages, so \
-             a page through message {through} is behind them",
+            "{} is past the page `ctx pending` lists for window {}, which ends at message {end} \
+             of its {}: record that page's `ends_at` once its records are written",
+            printable(&end_message.pointer),
+            window.id,
+            entry.new_messages
+        )));
+    }
+    if worked_through == entry.new_messages && worked_through > worked {
+        return Err(refused(format!(
+            "{} ends the last page of window {}: its last page is not recorded; once its \
+             records are written, run `ctx marker advance {}`",
+            printable(&end_message.pointer),
+            window.id,
             window.id
         )));
     }
-    if through > end {
-        return Err(refused(format!(
-            "the page `ctx pending` lists for window {} ends at message {end} of its {}: record \
-             at most that, once its records are written",
-            window.id, entry.new_messages
-        )));
-    }
-    if through == entry.new_messages && through > worked {
-        return Err(refused(format!(
-            "message {through} is the last of window {}: its last page is not recorded; once its \
-             records are written, run `ctx marker advance {}`",
-            window.id, window.id
-        )));
-    }
-    let last = if through == worked {
-        recorded
-            .map(|page| page.last)
-            .context("a window with worked messages has a recorded page")?
-    } else {
-        let message = listed
-            .delta
-            .as_ref()
-            .and_then(|delta| delta.new_messages.get(through - worked - 1))
-            .context("the page lists the message it ends with")?;
-        PageMessage {
-            ts: message.ts,
-            pointer: message.pointer.clone(),
-        }
-    };
     let page = Page {
         version: 1,
         window: window.id.to_string(),
-        worked: through,
-        last,
+        worked: worked_through,
+        last: end_message,
         recorded_at: Utc::now(),
         by: by.to_owned(),
     };
@@ -472,7 +503,7 @@ pub fn page_pointers(context: &Context, window: &Window) -> Result<Option<BTreeS
         if listed
             .windows
             .first()
-            .and_then(|entry| entry.page)
+            .and_then(|entry| entry.page.as_ref())
             .is_none()
         {
             return Ok(None);
@@ -523,7 +554,7 @@ fn unworked(
     if let Some(delta) = delta.as_mut() {
         delta::oldest_first(&mut delta.new_messages);
         if let Some(page) = page.filter(|page| page.window == window.id.as_str()) {
-            worked = page.worked_of(&delta.new_messages);
+            worked = page.last.holds(&delta.new_messages);
             delta.skip(worked);
         }
         if let Some(mentions) = serving.mentions {
@@ -584,7 +615,7 @@ fn answer(
         // A window worked in pages carries its page, and what the answer keeps for it is the
         // widest a page can print.
         let paged_bytes = delta::answer_len_of(&PendingWindow {
-            page: Some(PageView::WIDEST),
+            page: Some(PageView::widest()),
             ..entry.clone()
         });
         let entry_bytes = if worked > 0 {
@@ -631,13 +662,25 @@ fn answer(
             count_listed(&mut windows, &deltas, &delta_of, combined);
         }
     }
-    for (window, worked) in windows.iter_mut().zip(worked_of) {
+    for ((window, worked), index) in windows.iter_mut().zip(worked_of).zip(&delta_of) {
         let through = worked + window.listed_messages;
         if worked > 0 || through < window.new_messages {
+            // A window's listed messages are the oldest of what is left of it, so the page ends
+            // with the last of them.
+            let ends_at = window
+                .listed_messages
+                .checked_sub(1)
+                .and_then(|last| {
+                    index
+                        .and_then(|index| deltas.get(index))
+                        .and_then(|delta| delta.new_messages.get(last))
+                })
+                .map(|message| message.pointer.clone());
             window.page = Some(PageView {
                 worked,
                 through,
                 last: through >= window.new_messages,
+                ends_at,
             });
         }
     }
@@ -694,7 +737,7 @@ pub fn print_pending(pending: &Pending, out: &mut dyn Write) -> std::io::Result<
         writeln!(out, "(no pending windows)")?;
     }
     for window in &pending.windows {
-        let Some(page) = window.page else {
+        let Some(page) = window.page.as_ref() else {
             writeln!(
                 out,
                 "{} {} {} new message(s)",
@@ -730,12 +773,13 @@ pub fn print_pending(pending: &Pending, out: &mut dyn Write) -> std::io::Result<
                  marker past it",
                 window.window
             )?;
-        } else {
+        } else if let Some(ends_at) = page.ends_at.as_deref() {
             writeln!(
                 out,
                 "  once its records are written, `ctx marker page {} {}` records the page, and the \
                  next answer lists the next one",
-                window.window, page.through
+                window.window,
+                printable(ends_at)
             )?;
         }
     }
@@ -1055,15 +1099,24 @@ mod tests {
         loop {
             let pending = pending_in(&data, None, &serving)?;
             let window = pending.windows.first().context("the window waits")?;
-            let page = window.page.context("the window is worked in pages")?;
+            let page = window
+                .page
+                .clone()
+                .context("the window is worked in pages")?;
             assert_eq!(window.listed_messages, page.through - page.worked);
+            assert_eq!(
+                page.ends_at.as_deref(),
+                Some(pointer(id, page.through - 1).as_str()),
+                "the page names the message it ends with"
+            );
             cycles.push((page.worked, page.through, page.last, listed(&pending)));
             if page.last {
                 advance_in(&data, id, "cycle", &serving)?;
                 break;
             }
             early.push(is_refused(advance_in(&data, id, "cycle", &serving)));
-            page_in(&data, id, page.through, "cycle", &serving)?;
+            let ends_at = page.ends_at.context("the page names its end")?;
+            page_in(&data, id, &ends_at, "cycle", &serving)?;
             assert!(cycles.len() < 10, "the pages end");
         }
         let after = pending_in(&data, None, &serving)?;
@@ -1107,7 +1160,7 @@ mod tests {
         write_window(&data, id, 7)?;
         let exclusion = Exclusion::default();
         let serving = paged(&exclusion, 3);
-        page_in(&data, id, 3, "first cycle", &serving)?;
+        page_in(&data, id, &pointer(id, 2), "first cycle", &serving)?;
         // The second cycle reads its page, writes some of its records and stops.
         let interrupted = pending_in(&data, None, &serving)?;
         let again = pending_in(&data, None, &serving)?;
@@ -1123,7 +1176,7 @@ mod tests {
         let page = again
             .windows
             .first()
-            .and_then(|window| window.page)
+            .and_then(|window| window.page.clone())
             .context("the window is worked in pages")?;
         assert_eq!((page.worked, page.through, page.last), (3, 6, false));
         Ok(())
@@ -1182,13 +1235,14 @@ mod tests {
             let page = pending
                 .windows
                 .first()
-                .and_then(|window| window.page)
+                .and_then(|window| window.page.clone())
                 .context("the window is worked in pages")?;
             pages.push((page.worked, page.through, page.last, listed(&pending).len()));
             if page.last {
                 break;
             }
-            page_in(&data, id, page.through, "cycle", &serving)?;
+            let ends_at = page.ends_at.context("the page names its end")?;
+            page_in(&data, id, &ends_at, "cycle", &serving)?;
             assert!(pages.len() < 10, "the pages end");
         }
         std::fs::remove_dir_all(&root)?;
@@ -1235,18 +1289,21 @@ mod tests {
         write_window(&data, WINDOWS[1], 7)?;
         let exclusion = Exclusion::default();
         let serving = paged(&exclusion, 3);
-        let behind_an_older_window = page_in(&data, WINDOWS[1], 3, "cycle", &serving);
+        let record =
+            |window: &str, ends_at: &str, by: &str| page_in(&data, window, ends_at, by, &serving);
+        let w1 = |n: usize| pointer(WINDOWS[1], n);
+        let behind_an_older_window = record(WINDOWS[1], &w1(2), "cycle");
         advance_in(&data, WINDOWS[0], "cycle", &serving)?;
-        let of_no_message = page_in(&data, WINDOWS[1], 0, "cycle", &serving);
-        let past_the_page = page_in(&data, WINDOWS[1], 4, "cycle", &serving);
-        let first = page_in(&data, WINDOWS[1], 3, "cycle", &serving)?;
-        let behind = page_in(&data, WINDOWS[1], 2, "cycle", &serving);
-        let again = page_in(&data, WINDOWS[1], 3, "retry", &serving)?;
-        let passed = page_in(&data, WINDOWS[0], 1, "cycle", &serving);
-        let missing = page_in(&data, "20261030T050000Z-0000", 1, "cycle", &serving);
+        let not_a_message = record(WINDOWS[1], "echo:elsewhere/0001", "cycle");
+        let past_the_page = record(WINDOWS[1], &w1(3), "cycle");
+        let first = record(WINDOWS[1], &w1(2), "cycle")?;
+        let behind = record(WINDOWS[1], &w1(1), "cycle");
+        let again = record(WINDOWS[1], &w1(2), "retry")?;
+        let passed = record(WINDOWS[0], &pointer(WINDOWS[0], 0), "cycle");
+        let missing = record("20261030T050000Z-0000", &w1(2), "cycle");
         let next = pending_in(&data, None, &serving)?;
-        page_in(&data, WINDOWS[1], 6, "cycle", &serving)?;
-        let the_last = page_in(&data, WINDOWS[1], 7, "cycle", &serving);
+        record(WINDOWS[1], &w1(5), "cycle")?;
+        let the_last = record(WINDOWS[1], &w1(6), "cycle");
         let last_message = the_last
             .as_ref()
             .err()
@@ -1256,7 +1313,7 @@ mod tests {
         std::fs::remove_dir_all(&root)?;
 
         assert!(is_refused(behind_an_older_window));
-        assert!(is_refused(of_no_message));
+        assert!(is_refused(not_a_message));
         assert!(is_refused(past_the_page));
         assert!(is_refused(behind));
         assert!(is_refused(passed));
@@ -1269,7 +1326,7 @@ mod tests {
         let page = after_the_last
             .windows
             .first()
-            .and_then(|window| window.page)
+            .and_then(|window| window.page.clone())
             .context("the window is worked in pages")?;
         assert_eq!((page.worked, page.through, page.last), (6, 7, true));
         assert_eq!(
@@ -1301,9 +1358,21 @@ mod tests {
         let marker_after_refusal = held(&data)?;
         advance_in(&data, WINDOWS[0], "cycle", &serving)?;
         let onto_it = advance_in(&data, WINDOWS[1], "cycle", &serving);
-        page_in(&data, WINDOWS[1], 3, "cycle", &serving)?;
+        page_in(
+            &data,
+            WINDOWS[1],
+            &pointer(WINDOWS[1], 2),
+            "cycle",
+            &serving,
+        )?;
         let one_page_left = advance_in(&data, WINDOWS[2], "cycle", &serving);
-        page_in(&data, WINDOWS[1], 6, "cycle", &serving)?;
+        page_in(
+            &data,
+            WINDOWS[1],
+            &pointer(WINDOWS[1], 5),
+            "cycle",
+            &serving,
+        )?;
         let last_page_left = advance_in(&data, WINDOWS[2], "cycle", &serving)?;
         let spent = data.marker_page().exists();
         std::fs::remove_dir_all(&root)?;
@@ -1341,7 +1410,7 @@ mod tests {
         let id = WINDOWS[0];
         write_window(&data, id, 7)?;
         let none = Exclusion::default();
-        page_in(&data, id, 3, "cycle", &paged(&none, 3))?;
+        page_in(&data, id, &pointer(id, 2), "cycle", &paged(&none, 3))?;
         let excluded = Exclusion::new(&[pointer(id, 1)])?;
         let pending = pending_in(&data, None, &paged(&excluded, 3))?;
         std::fs::remove_dir_all(&root)?;
@@ -1351,9 +1420,89 @@ mod tests {
             (3..6).map(|n| pointer(id, n)).collect::<Vec<_>>()
         );
         let window = pending.windows.first().context("the window waits")?;
-        let page = window.page.context("the window is worked in pages")?;
+        let page = window
+            .page
+            .clone()
+            .context("the window is worked in pages")?;
         assert_eq!(window.new_messages, 6);
         assert_eq!((page.worked, page.through), (2, 5));
+        Ok(())
+    }
+
+    /// The `ends_at` of the first window's page in `pending`.
+    fn ends_at(pending: &Pending) -> Result<String> {
+        pending
+            .windows
+            .first()
+            .and_then(|window| window.page.as_ref())
+            .and_then(|page| page.ends_at.clone())
+            .context("the window's page names its end")
+    }
+
+    /// A session names its page by the message it ends with, as `ctx pending` listed it, so an
+    /// exclusion that takes effect while it works the page moves the end of the page nowhere.
+    /// One that leaves out a message inside the page, or the very message the page ends with,
+    /// leaves the next page starting right after it, with no message passed unseen. One taken away
+    /// lets a message the session never saw back into its page, and the record is refused.
+    #[test]
+    fn an_exclusion_that_takes_effect_while_a_page_is_worked_passes_no_message() -> Result<()> {
+        let root = scratch("exclusion-mid-session")?;
+        let data = DataDir::new(root.clone());
+        let id = WINDOWS[0];
+        write_window(&data, id, 12)?;
+        let none = Exclusion::default();
+        let inside = Exclusion::new(&[pointer(id, 1)])?;
+        let at_its_end = Exclusion::new(&[pointer(id, 1), pointer(id, 5)])?;
+        let ahead = Exclusion::new(&[pointer(id, 7)])?;
+
+        // The first session reads messages 0 to 2; an exclusion of message 1 takes effect.
+        let first_read = pending_in(&data, None, &paged(&none, 3))?;
+        let first = page_in(&data, id, &ends_at(&first_read)?, "s1", &paged(&inside, 3))?;
+        // The second reads messages 3 to 5; an exclusion of message 5, its page's end, follows.
+        let second_read = pending_in(&data, None, &paged(&inside, 3))?;
+        let second = page_in(
+            &data,
+            id,
+            &ends_at(&second_read)?,
+            "s2",
+            &paged(&at_its_end, 3),
+        )?;
+        let third_list = pending_in(&data, None, &paged(&at_its_end, 3))?;
+        // The third reads its page while message 7 is excluded (6, 8 and 9), and the exclusion
+        // is taken away before it records it: message 7 is back in its page, unseen.
+        let third_read = pending_in(&data, None, &paged(&ahead, 3))?;
+        let unseen = page_in(&data, id, &ends_at(&third_read)?, "s3", &paged(&none, 3));
+        let after = pending_in(&data, None, &paged(&none, 3))?;
+        std::fs::remove_dir_all(&root)?;
+
+        let range = |messages: &[usize]| -> Vec<String> {
+            messages.iter().map(|&n| pointer(id, n)).collect()
+        };
+        assert_eq!(listed(&first_read), range(&[0, 1, 2]));
+        assert_eq!(
+            (first.worked, first.last.pointer.clone()),
+            (2, pointer(id, 2))
+        );
+        assert_eq!(
+            listed(&second_read),
+            range(&[3, 4, 5]),
+            "message 3 was passed when message 1 was excluded mid-page"
+        );
+        assert_eq!(
+            (second.worked, second.last.pointer.clone()),
+            (4, pointer(id, 5))
+        );
+        assert_eq!(
+            listed(&third_list),
+            range(&[6, 7, 8]),
+            "a message was passed when the page's own end was excluded mid-page"
+        );
+        assert_eq!(listed(&third_read), range(&[6, 8, 9]));
+        assert!(
+            is_refused(unseen),
+            "the page was recorded past a message its session never saw"
+        );
+        assert_eq!(listed(&after), range(&[6, 7, 8]));
         Ok(())
     }
 }

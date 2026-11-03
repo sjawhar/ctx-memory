@@ -1717,9 +1717,10 @@ fn page_cycle(rig: &CycleRig, events: &str) -> Result<std::process::Output> {
              answer=\"$(ctx pending --json)\"\n\
              window=\"$(printf '%s' \"$answer\" | jq -r '.data.windows[0].window')\"\n\
              through=\"$(printf '%s' \"$answer\" | jq -r '.data.windows[0].page.through // 0')\"\n\
+             ends_at=\"$(printf '%s' \"$answer\" | jq -r '.data.windows[0].page.ends_at // empty')\"\n\
              last=\"$(printf '%s' \"$answer\" | jq -r '.data.windows[0] | if .page then .page.last else true end')\"\n\
              if [ \"$last\" = true ]; then ctx marker advance \"$window\" >/dev/null; \
-             else ctx marker page \"$window\" \"$through\" >/dev/null; fi\n\
+             else ctx marker page \"$window\" \"$ends_at\" >/dev/null; fi\n\
              printf '%s %s %s\\n' \"$window\" \"$through\" \"$last\" >> '{cycles}'\n\
              cat '{session}'\n",
             prompt = rig.omp_log.display(),
@@ -1774,7 +1775,7 @@ fn the_whole_runner_works_a_large_window_a_page_a_cycle() -> Result<()> {
         String::from_utf8_lossy(&after_the_last.stderr)
     );
     ensure!(
-        prompt.contains("ctx marker page <window> <page.through>"),
+        prompt.contains("ctx marker page <window> '<page.ends_at>'"),
         "the prompt does not tell the session how to record a page: {prompt}"
     );
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout)?;

@@ -554,10 +554,7 @@ fn a_delta_read_prints_the_stored_delta_and_never_computes() -> Result<()> {
 
 /// Runs `ctx` with `args` against the tree.
 fn run(tree: &Path, state: &Path, args: &[&str]) -> Result<Output> {
-    command(tree, state)?
-        .args(args)
-        .output()
-        .with_context(|| format!("running ctx {}", args.join(" ")))
+    run_env(tree, state, args, &[])
 }
 
 /// The streams of a tree whose one window holds `count` new messages, `echo:<stream>/record`,
@@ -601,6 +598,28 @@ fn listed_page(output: &Output) -> Result<(Option<PageSpan>, Vec<String>)> {
     Ok((page, pointers))
 }
 
+/// The `page.ends_at` of the first window one `ctx pending` answer lists: what a session passes
+/// to `ctx marker page`.
+fn page_end(output: &Output) -> Result<String> {
+    data(output)?
+        .pointer("/windows/0/page/ends_at")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("the window's page names the message it ends with")
+}
+
+/// Runs `ctx` with `args` against the tree, with `env` set.
+fn run_env(tree: &Path, state: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<Output> {
+    let mut command = command(tree, state)?;
+    command.args(args);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command
+        .output()
+        .with_context(|| format!("running ctx {}", args.join(" ")))
+}
+
 /// A window of seven new messages, in a tree whose page is three, is worked over three cycles:
 /// each cycle's `ctx pending` lists the next page, the cycle records it with `ctx marker page`,
 /// and `ctx marker show` names how far the pages reach. The marker refuses to pass the window
@@ -619,8 +638,14 @@ fn a_window_larger_than_a_page_is_worked_one_page_a_cycle() -> Result<()> {
     let mut shown = Vec::new();
     let mut repeated = None;
     loop {
-        let (page, pointers) = listed_page(&run(&tree, &state, &["pending"])?)?;
+        let answer = run(&tree, &state, &["pending"])?;
+        let (page, pointers) = listed_page(&answer)?;
         let (worked, through, last) = page.context("the window is listed as a page")?;
+        assert_eq!(
+            page_end(&answer).ok(),
+            pointers.last().cloned(),
+            "the page does not end with the last message it lists"
+        );
         cycles.push(((worked, through, last), pointers.clone()));
         if last {
             let advanced = run(&tree, &state, &["marker", "advance", &window])?;
@@ -633,22 +658,11 @@ fn a_window_larger_than_a_page_is_worked_one_page_a_cycle() -> Result<()> {
         }
         let refused = run(&tree, &state, &["marker", "advance", &window])?;
         early.push((refused.status.code(), error_message(&refused)?));
-        let recorded = run(
-            &tree,
-            &state,
-            &["marker", "page", &window, &through.to_string()],
-        )?;
+        let end = page_end(&answer)?;
+        let recorded = run(&tree, &state, &["marker", "page", &window, &end])?;
         assert_eq!(recorded.status.code(), Some(0), "{recorded:?}");
         let show = data(&run(&tree, &state, &["marker", "show"])?)?;
-        shown.push((
-            show.pointer("/page/window")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            show.pointer("/page/worked").and_then(Value::as_u64),
-            show.pointer("/page/by")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        ));
+        shown.push(show.get("page").cloned().unwrap_or_default());
         assert!(cycles.len() < 10, "the pages end");
     }
     let after = data(&run(&tree, &state, &["marker", "show"])?)?;
@@ -675,21 +689,15 @@ fn a_window_larger_than_a_page_is_worked_one_page_a_cycle() -> Result<()> {
         assert!(message.contains("ctx marker page"), "{message}");
     }
     assert_eq!(early.len(), 2);
-    assert_eq!(
-        shown,
-        vec![
-            (
-                Some(window.clone()),
-                Some(3),
-                Some("test-session".to_owned())
-            ),
-            (
-                Some(window.clone()),
-                Some(6),
-                Some("test-session".to_owned())
-            ),
-        ]
-    );
+    assert_eq!(shown.len(), 2);
+    for (page, worked) in shown.iter().zip([3, 6]) {
+        assert_eq!(
+            page.get("window").and_then(Value::as_str),
+            Some(window.as_str())
+        );
+        assert_eq!(page.get("worked").and_then(Value::as_u64), Some(worked));
+        assert_eq!(page.get("by").and_then(Value::as_str), Some("test-session"));
+    }
     assert_eq!(
         after.pointer("/marker/window").and_then(Value::as_str),
         Some(window.as_str())
@@ -722,12 +730,15 @@ fn a_tree_that_sets_no_page_size_pages_at_500() -> Result<()> {
     let tree = tree_with(&root, &names, "")?;
     let state = root.join("state");
     let window = fetch(&tree, &state, "2026-10-25T18:00:00Z")?;
-    let first = listed_page(&run(&tree, &state, &["pending"])?)?;
-    let recorded = run(&tree, &state, &["marker", "page", &window, "500"])?;
+    let answer = run(&tree, &state, &["pending"])?;
+    let first = listed_page(&answer)?;
+    let first_end = page_end(&answer)?;
+    let recorded = run(&tree, &state, &["marker", "page", &window, &first_end])?;
     let last = listed_page(&run(&tree, &state, &["pending"])?)?;
     remove_scratch(&root)?;
 
     assert_eq!(first.0, Some((0, 500, false)));
+    assert_eq!(first_end, "echo:C0EXAMPLE500/record");
     assert_eq!(first.1.len(), 500);
     assert_eq!(recorded.status.code(), Some(0), "{recorded:?}");
     assert_eq!(last.0, Some((500, 501, true)));
@@ -770,8 +781,9 @@ fn a_window_within_a_page_is_handled_as_before() -> Result<()> {
     Ok(())
 }
 
-/// A page is recorded only for the oldest window after the marker, and only as far as the page
-/// `ctx pending` lists for it reaches: anything else is refused, and records nothing.
+/// A page is recorded only for the oldest window after the marker, only by a message of that
+/// window, and only as far as the page `ctx pending` lists for it reaches: anything else is
+/// refused, and records nothing.
 #[test]
 fn a_page_other_than_the_one_pending_lists_is_refused() -> Result<()> {
     let root = scratch("wrong-page")?;
@@ -781,21 +793,80 @@ fn a_page_other_than_the_one_pending_lists_is_refused() -> Result<()> {
     let state = root.join("state");
     let first = fetch(&tree, &state, "2026-10-25T18:00:00Z")?;
     let second = fetch(&tree, &state, "2026-10-25T19:00:00Z")?;
-    let not_oldest = run(&tree, &state, &["marker", "page", &second, "1"])?;
-    let past_the_page = run(&tree, &state, &["marker", "page", &first, "4"])?;
-    let none = run(&tree, &state, &["marker", "page", &first, "0"])?;
+    let not_oldest = run(
+        &tree,
+        &state,
+        &["marker", "page", &second, "echo:C0EXAMPLE001/record"],
+    )?;
+    let past_the_page = run(
+        &tree,
+        &state,
+        &["marker", "page", &first, "echo:C0EXAMPLE004/record"],
+    )?;
+    let not_a_message = run(
+        &tree,
+        &state,
+        &["marker", "page", &first, "echo:C0EXAMPLE999/record"],
+    )?;
     let recorded = data_dir(&tree, &state)?.join("marker-page.json").exists();
     remove_scratch(&root)?;
 
     for (output, words) in [
         (&not_oldest, "oldest window after the marker"),
         (&past_the_page, "ends at message 3"),
-        (&none, "at least one message"),
+        (&not_a_message, "is not a new message"),
     ] {
         assert_eq!(output.status.code(), Some(2), "{output:?}");
         let message = error_message(output)?;
         assert!(message.contains(words), "{message}");
     }
     assert!(!recorded, "a refused page was recorded");
+    Ok(())
+}
+
+/// A session records its page by the message it ends with, as `ctx pending` listed it, so an
+/// exclusion that takes effect while it works the page passes no message: here `CTX_EXCLUDE`
+/// leaves out a message inside the page between the session's `ctx pending` and its
+/// `ctx marker page`, and the next page still starts right after the page the session saw.
+#[test]
+fn an_exclusion_added_mid_page_moves_the_page_end_nowhere() -> Result<()> {
+    let root = scratch("exclusion-mid-page")?;
+    let names = streams(7);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let tree = tree_with(&root, &names, "page_messages = 3")?;
+    let state = root.join("state");
+    let window = fetch(&tree, &state, "2026-10-25T18:00:00Z")?;
+    let read = run(&tree, &state, &["pending"])?;
+    let seen = listed_page(&read)?;
+    let ends_at = page_end(&read)?;
+    let excluded = [("CTX_EXCLUDE", "echo:C0EXAMPLE002/record")];
+    let recorded = run_env(
+        &tree,
+        &state,
+        &["marker", "page", &window, &ends_at],
+        &excluded,
+    )?;
+    let next = listed_page(&run_env(&tree, &state, &["pending"], &excluded)?)?;
+    remove_scratch(&root)?;
+
+    let pointer = |n: usize| format!("echo:C0EXAMPLE{n:03}/record");
+    assert_eq!(seen.1, (1..=3).map(pointer).collect::<Vec<_>>());
+    assert_eq!(ends_at, pointer(3));
+    assert_eq!(recorded.status.code(), Some(0), "{recorded:?}");
+    assert_eq!(
+        data(&recorded)?
+            .pointer("/page/worked")
+            .and_then(Value::as_u64),
+        Some(2),
+        "the page holds the two messages of it the exclusion leaves"
+    );
+    assert_eq!(
+        next,
+        (
+            Some((2, 5, false)),
+            (4..=6).map(pointer).collect::<Vec<_>>()
+        ),
+        "a message after the page the session saw was passed unseen"
+    );
     Ok(())
 }

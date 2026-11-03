@@ -504,7 +504,12 @@ fn every_write_is_sent_again_after_the_pause_a_deferring_server_asks_for() -> Re
             marker.as_str(),
         ),
         (
-            &["marker", "page", "20260102T000000Z-0000", "3"],
+            &[
+                "marker",
+                "page",
+                "20260102T000000Z-0000",
+                "echo:C0EXAMPLE03/record",
+            ],
             None,
             "/v1/marker/page",
             page.as_str(),

@@ -232,8 +232,8 @@ pub async fn marker_page(
         Ok((
             caller,
             PageRequest {
+                ends_at,
                 session,
-                through,
                 window,
             },
         )) => {
@@ -243,7 +243,7 @@ pub async fn marker_page(
                 PAGE_ROUTE,
                 session,
                 move |context, by| {
-                    let page = marker::page(context, &window, through, by)?;
+                    let page = marker::page(context, &window, &ends_at, by)?;
                     Ok((StatusCode::OK, Json(PageResponse { page })).into_response())
                 },
             )

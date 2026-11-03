@@ -96,13 +96,13 @@ fn a_page_record_keeps_its_route_and_bytes() -> Result<()> {
     assert_eq!(PAGE_ROUTE, "/v1/marker/page");
     same_bytes(
         &PageRequest {
+            ends_at: "slack:C0EXAMPLE01/1700000000.000200".to_owned(),
             session: Some("session-7".to_owned()),
-            through: 200,
             window: "20261028T000000Z-0001".to_owned(),
         },
-        r#"{"session":"session-7","through":200,"window":"20261028T000000Z-0001"}"#,
+        r#"{"ends_at":"slack:C0EXAMPLE01/1700000000.000200","session":"session-7","window":"20261028T000000Z-0001"}"#,
     )?;
-    let bare: PageRequest = serde_json::from_str(r#"{"window":"w","through":1}"#)?;
+    let bare: PageRequest = serde_json::from_str(r#"{"window":"w","ends_at":"echo:a"}"#)?;
     assert_eq!(bare.session, None);
     let at = Utc
         .with_ymd_and_hms(2026, 10, 28, 1, 2, 3)

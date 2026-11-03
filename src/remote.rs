@@ -198,15 +198,15 @@ impl Client {
     /// Records a page of the window after the marker through the server.
     ///
     /// It is sent again while the server defers it, as a record write is: it names its window
-    /// and its page, and the same page recorded twice is recorded once.
+    /// and the message its page ends with, and the same page recorded twice is recorded once.
     ///
     /// # Errors
     ///
     /// Returns an error when the server cannot be reached or refuses the page.
-    pub fn marker_page(&self, window: &str, through: usize, session: &str) -> Result<marker::Page> {
+    pub fn marker_page(&self, window: &str, ends_at: &str, session: &str) -> Result<marker::Page> {
         let request = PageRequest {
+            ends_at: ends_at.to_owned(),
             session: Some(session.to_owned()),
-            through,
             window: window.to_owned(),
         };
         let (status, value) = self.answer_write(PAGE_ROUTE, &request)?;
@@ -501,9 +501,9 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             })?;
             Ok(Some(Outcome::Pass))
         }
-        Remote::MarkerPage { window, through } => {
+        Remote::MarkerPage { window, ends_at } => {
             // The shape a local page record answers with, and its text.
-            let page = client()?.marker_page(window, through, &session)?;
+            let page = client()?.marker_page(window, ends_at, &session)?;
             let payload = json!({ "page": page });
             output::emit(sink, cli.json, "marker page", &payload, |_, out| {
                 marker::print_page(&page, out)

@@ -566,7 +566,9 @@ fn run_omp(
 /// One live session under `run-cycle.sh`'s own flags and `policy.yml`, against the omp
 /// release `runner/omp.lock` pins, with a scripted model that does what an injected instruction
 /// asks: read a URL, search one, start a program through `ctx`, and write a record from a file
-/// at the shell. `ctx rules` and `ctx record show` still run. No model is called.
+/// at the shell. `ctx rules` and `ctx record show` still run, and so does `ctx marker page` with
+/// a page's end in single quotes, as a Matrix pointer, which holds a `$`, must be given.
+/// No model is called.
 #[test]
 #[ignore = "drives the omp release runner/omp.lock pins; CI runs it with CTX_TEST_OMP naming that binary"]
 fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
@@ -586,6 +588,7 @@ fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
         json!({"tool": "bash", "input": {"command": "ctx rules"}}),
         json!({"tool": "bash", "input": {"command": "ctx record show index.md"}}),
         json!({"tool": "bash", "input": {"command": "ctx record put index.md /etc/hostname"}}),
+        json!({"tool": "bash", "input": {"command": "ctx marker page 20261102T080000Z-0001 'matrix:!room:example.org/$event'"}}),
     ])?;
     let root = scratch("live")?;
     let outcome = run_session(&omp, &root, &model, "Run the scripted probe.", &[], &[]);
@@ -660,6 +663,11 @@ fn a_live_session_reads_no_url_and_starts_nothing_but_ctx() -> Result<()> {
         text.contains("This index links every sample record")
             && !text.contains("requires approval"),
         "`ctx record show index.md` did not print the record: {text}"
+    );
+    let (_, text) = result(8)?;
+    ensure!(
+        !text.contains("requires approval") && text.contains("20261102T080000Z-0001"),
+        "`ctx marker page` with a quoted Matrix pointer did not reach ctx: {text}"
     );
     Ok(())
 }
