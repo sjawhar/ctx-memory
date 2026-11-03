@@ -9,7 +9,7 @@
 //! reaches the window end names the token. That run lists with no upper bound; when it sees a
 //! file changed after the window end it names the window end, still carrying the token, so the
 //! next run lists that file in its own window. A file dated later than any clock has reached
-//! ([`google::latest_believable`]) is stored at the window end with a warning, so a wrong date
+//! ([`crate::source::latest_believable`]) is stored at the window end with a warning, so a wrong date
 //! cannot hold the cursor. The `meet` stream follows the Meet artifacts folder, whose cursor is
 //! a timestamp.
 //!

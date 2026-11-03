@@ -128,6 +128,7 @@ pub fn default_scheme(kind: &str) -> Option<&'static str> {
         "drive" => Some("drive"),
         "calendar" => Some("gcal"),
         "github" => Some("github"),
+        "matrix" => Some("matrix"),
         _ => None,
     }
 }
