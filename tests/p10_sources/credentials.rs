@@ -4,7 +4,7 @@
 use anyhow::{Context as _, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use chrono::DateTime;
+use chrono::{DateTime, SecondsFormat};
 use ctx_memory::source;
 use serde_json::{json, Value};
 
@@ -72,6 +72,65 @@ fn calendar_fetch_calls_the_configured_calendar_id() -> Result<()> {
     assert_eq!(token, "sync-2");
     DateTime::parse_from_rfc3339(stored_through)
         .with_context(|| format!("parsing {stored_through}"))?;
+    Ok(())
+}
+
+/// A listing expands a yearly series with no end into decades of instances. Through the real
+/// HTTP client, the fetch asks Google for nothing past the horizon, 400 days past the window end,
+/// and records nothing past it even from a reply that holds more.
+#[test]
+fn a_calendar_fetch_records_a_yearly_series_only_up_to_its_horizon() -> Result<()> {
+    let _environment = environment_lock();
+    let root = scratch("calendar-horizon")?;
+    let instances = (2026..=2056)
+        .map(|year| {
+            json!({
+                "id": format!("BIRTHDAY-EXAMPLE_{year}1103"),
+                "summary": "Ada Lovelace's birthday",
+                "eventType": "birthday",
+                "recurringEventId": "BIRTHDAY-EXAMPLE",
+                "start": {"date": format!("{year}-11-03")},
+                "end": {"date": format!("{year}-11-04")}
+            })
+        })
+        .collect::<Vec<_>>();
+    let server = FakeGoogle::start(vec![(
+        "/calendar/v3/calendars/team%40example.com/events",
+        json!({"items": instances, "nextSyncToken": "sync-2"}),
+    )])?;
+    server.use_in_environment("ya29.calendar-test");
+
+    let spec = source_spec("calendar", "calendars = [\"team@example.com\"]\n")?;
+    let request = fetch_request(
+        &root,
+        "calendar",
+        "gcal",
+        json!({ "calendars": ["team@example.com"] }),
+    )?;
+    let source = source::open(&spec, "gcal")?;
+    let outcome = run_conformance(source.as_ref(), &request);
+    let requests = server.requests()?;
+
+    clear_google_environment();
+    remove_scratch(&root)?;
+
+    assert!(!outcome.has_errors(), "{:#?}", outcome.error);
+    // A fetch with no cursor makes one listing. The window ends 2026-10-25T18:00:00Z; Google is
+    // asked for a day past the horizon, since it places an all-day event by the calendar's time
+    // zone.
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.contains("timeMax=2027-11-30T18%3A00%3A00Z")),
+        "{requests:?}"
+    );
+    let starts = outcome
+        .records
+        .iter()
+        .map(|record| record.ts.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .collect::<Vec<_>>();
+    assert_eq!(starts, ["2026-11-03T00:00:00Z", "2027-11-03T00:00:00Z"]);
     Ok(())
 }
 
