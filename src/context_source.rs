@@ -498,12 +498,16 @@ fn call(
         let reason = format!("the context source {status}");
         return Err(Failure::new(&reason, reason.clone()));
     }
-    let answer: Answer = serde_json::from_str(&output.stdout).map_err(|error| {
-        Failure::new(
-            "the context source printed something other than its JSON answer",
-            format!("its answer did not parse: {error}"),
-        )
-    })?;
+    let answer: Answer = serde_json::from_str::<serde_json::Value>(&output.stdout)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or_else(|| {
+            Failure::new(
+                "the context source printed something other than its JSON answer",
+                "its answer is not one JSON object of the answer's shape",
+            )
+        })?;
     let unavailable = match answer.unavailable {
         None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => None,
         Some(serde_json::Value::String(reason)) if !single_line(&reason, 1).is_empty() => {
@@ -532,8 +536,9 @@ fn clean(raw: Vec<serde_json::Value>, schemes: &Schemes, budget: usize) -> (Vec<
     let mut dropped = 0;
     let mut bytes = 2;
     for raw in raw {
-        let Some(item) = serde_json::from_value::<RawItem>(raw)
-            .ok()
+        let Some(item) = Some(raw)
+            .filter(serde_json::Value::is_object)
+            .and_then(|raw| serde_json::from_value::<RawItem>(raw).ok())
             .and_then(|raw| clean_item(raw, schemes))
         else {
             dropped += 1;

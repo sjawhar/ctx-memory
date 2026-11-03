@@ -135,6 +135,9 @@ fn run_after_launch(
 {refuse}
 {complete}
 {seal}
+{write_context}
+{prepare_context}
+{cycle_prompt}
 SESSION_MINUTES={minutes}
 AGENT_USER=ctx-agent
 pass='{pass}'
@@ -143,7 +146,12 @@ CTX_DATA_DIR="$VERDICT_DIR/data"
 CLOUD_RUN_EXECUTION=ctx-agent-test-1
 session_dir="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION"
 mkdir -p "$session_dir"
-as_agent_user() {{ :; }}
+nonce=0123456789abcdef0123456789abcdef
+context_prompt=
+CONTEXT_BYTES=49152
+context_seconds_left=60
+context_subjects_left=30
+as_agent_user() {{ case "$*" in *context.json*) return 1 ;; esac; }}
 chown() {{ :; }}
 ctx() {{
 	marker=m1
@@ -167,6 +175,9 @@ run_session() {{
         refuse = script_function("refuse")?,
         complete = script_function("pass_complete_line")?,
         seal = script_function("seal_session")?,
+        write_context = script_function("write_context")?,
+        prepare_context = script_function("prepare_context")?,
+        cycle_prompt = script_function("cycle_prompt")?,
         pass = pass.unwrap_or_default(),
     );
     let mut command = Command::new("sh");

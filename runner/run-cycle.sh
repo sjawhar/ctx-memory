@@ -500,40 +500,52 @@ nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 # and the prompt names as quoted material. A read that fails leaves `unavailable` in the file, and
 # the cycle goes on without context: context is optional, and the cycle never fails for it.
 context_file="$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION.context.json"
-# The cycle's bounds for context, across all its windows together: the context source's time,
-# the subjects sent to it, and the size of the file. A read gets what is left of the first two,
-# and a window past either gets `unavailable`.
+# The cycle's bounds for context, across all its windows and both of its sessions together: the
+# context source's time, the subjects sent to it, and the size of each file. A read gets what is
+# left of the first two, and a window past either gets `unavailable`. The budget is set once
+# here, so a retry spends what the first session's read left.
 CONTEXT_SECONDS=60
 CONTEXT_SUBJECTS=30
 CONTEXT_BYTES=49152
+context_seconds_left="$CONTEXT_SECONDS"
+context_subjects_left="$CONTEXT_SUBJECTS"
 # Writes the context of every window in $1 (`ctx pending --json`'s answer) to $context_file as one
 # line of compact JSON, one entry per window, and answers non-zero only when the file itself cannot
-# be written.
+# be written. A read's subjects are reserved before it runs and given back only as far as its
+# answer shows it used fewer, so a read that fails spends what it asked for.
 write_context() {
 	context_entries=
-	context_started="$(date +%s)"
-	subjects_left="$CONTEXT_SUBJECTS"
 	for window in $(printf '%s' "$1" | jq -r '.data.windows[]?.window // empty'); do
-		seconds_left=$((CONTEXT_SECONDS - ($(date +%s) - context_started)))
-		if [ "$seconds_left" -le 0 ] || [ "$subjects_left" -le 0 ]; then
+		if [ "$context_seconds_left" -le 0 ] || [ "$context_subjects_left" -le 0 ]; then
 			echo "run-cycle: the cycle's budget for context is spent; window $window goes without it" >&2
 			entry="$(jq -nc --arg window "$window" '{window: $window, subjects: [], items: [], unavailable: "the cycle'"'"'s budget for context was spent"}')"
-		elif answer="$(timeout "$((seconds_left + 5))" ctx --json context "$window" \
-			--max-subjects "$subjects_left" --seconds "$seconds_left" 2>/dev/null)" &&
-			entry="$(printf '%s' "$answer" | jq -c '.data | select(type == "object")')" && [ -n "$entry" ]; then
-			used="$(printf '%s' "$entry" | jq '.subjects | length')" || used="$subjects_left"
-			subjects_left=$((subjects_left - used))
 		else
-			echo "run-cycle: the context of window $window could not be read; the cycle goes on without it" >&2
-			entry="$(jq -nc --arg window "$window" '{window: $window, subjects: [], items: [], unavailable: "the runner could not read this window'"'"'s context"}')"
+			asked="$context_subjects_left"
+			context_subjects_left=0
+			read_started="$(date +%s)"
+			if answer="$(timeout "$((context_seconds_left + 5))" ctx --json context "$window" \
+				--max-subjects "$asked" --seconds "$context_seconds_left" 2>/dev/null)" &&
+				entry="$(printf '%s' "$answer" | jq -c '.data | select(type == "object")')" && [ -n "$entry" ] &&
+				used="$(printf '%s' "$entry" | jq '.subjects | length')"; then
+				[ "$used" -le "$asked" ] || used="$asked"
+				context_subjects_left=$((asked - used))
+			else
+				echo "run-cycle: the context of window $window could not be read; the cycle goes on without it" >&2
+				entry="$(jq -nc --arg window "$window" '{window: $window, subjects: [], items: [], unavailable: "the runner could not read this window'"'"'s context"}')"
+			fi
+			context_seconds_left=$((context_seconds_left - ($(date +%s) - read_started)))
 		fi
 		context_entries="$context_entries$entry
 "
 	done
 	context_json="$(printf '%s' "$context_entries" | jq -cs '{windows: .}')" || return 1
-	if [ "${#context_json}" -gt "$CONTEXT_BYTES" ]; then
+	if [ "${#context_json}" -ge "$CONTEXT_BYTES" ]; then
 		echo "run-cycle: the context of these windows takes more than $CONTEXT_BYTES bytes; each window's items are left out" >&2
-		context_json="$(printf '%s' "$context_json" | jq -c '.windows |= map(.items = [] | .unavailable = (.unavailable // "the cycle'"'"'s context was too large to keep")) ')" || return 1
+		context_json="$(printf '%s' "$context_json" | jq -c '.windows |= map(.items = [] | .unavailable = (.unavailable // "the cycle'"'"'s context was too large to keep"))')" || return 1
+	fi
+	if [ "${#context_json}" -ge "$CONTEXT_BYTES" ]; then
+		echo "run-cycle: the context of these windows is too large even without items; the file holds no window's context" >&2
+		context_json='{"windows":[],"unavailable":"the cycle'"'"'s context was too large to keep"}'
 	fi
 	rm -f "$context_file" || return 1
 	(umask 022 && printf '%s\n' "$context_json" >"$context_file") || return 1

@@ -1180,7 +1180,7 @@ fn run_prepare_context_for(
     let path = std::env::var("PATH").context("PATH is not set")?;
     let script = format!(
         "set -eu\nCTX_DATA_DIR='{}'\nCLOUD_RUN_EXECUTION=ctx-agent-test-1\nAGENT_USER=ctx-agent\n\
-         CONTEXT_SECONDS=60\nCONTEXT_SUBJECTS=30\nCONTEXT_BYTES=49152\n\
+         CONTEXT_BYTES=49152\ncontext_seconds_left=60\ncontext_subjects_left=30\n\
          context_file=\"$CTX_DATA_DIR/agent-sessions/$CLOUD_RUN_EXECUTION.context.json\"\n\
          as_agent_user() {{ {agent_test}; }}\n{}\n{}\n{}\n\
          pending='{pending}'\n\
@@ -1372,6 +1372,11 @@ fn the_runner_reads_context_before_the_session_and_names_it_in_the_prompt() -> R
     );
     let copy = rig.root.join("run-cycle.sh");
     std::fs::write(&copy, script)?;
+    // The provider file names the key file the runner writes, so it moves with it.
+    rig.replace_models(&runner("models.example.yml")?.replace(
+        "/run/ctx-agent/model-key",
+        &rig.root.join("run/model-key").display().to_string(),
+    ))?;
     let output = rig
         .command_for(&copy)?
         .output()
