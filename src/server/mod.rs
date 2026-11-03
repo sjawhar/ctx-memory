@@ -246,8 +246,7 @@ impl Shared {
     /// write that finds the lease held by another copy is the copy this one replaces still
     /// holding it, not two writers.
     fn open_handover(&self, window: Duration) {
-        // A window longer than a year is no window anyone means, and cannot overflow.
-        let window = window.min(Duration::from_secs(365 * 24 * 60 * 60));
+        // A window too long for the clock to hold is no window anyone means: no handover.
         if let Some(ends) = Instant::now().checked_add(window) {
             let _ = self.handover.set(ends);
         }
