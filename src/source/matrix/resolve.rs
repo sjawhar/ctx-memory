@@ -14,7 +14,10 @@ use crate::api::matrix::MatrixClient;
 use crate::source::{Message, ResolveRequest};
 
 use super::homeserver::{Reader, Stop};
-use super::records::{event_id, kind, parse_pointer, sender, sent_at, thread_root, Kind, Room};
+use super::records::{
+    author_line, event_id, is_event_id, kind, parse_pointer, sender, sent_at, thread_root, Kind,
+    Room,
+};
 use super::rooms::{Decision, Facts, Selection};
 
 /// How many pages of a thread's replies a resolve reads.
@@ -93,7 +96,7 @@ fn thread(reader: &mut Reader<'_>, room: &str, wanted: &str, event: Value) -> Re
     let origin = thread_root(&event).unwrap_or(wanted).to_owned();
     let mut messages = Vec::new();
     if origin != wanted {
-        if let Some(found) = need(reader.event(room, &origin)?)? {
+        if let Some(found) = need(reader.related_event(room, &origin)?)? {
             messages.push(found);
         }
     }
@@ -159,8 +162,8 @@ fn newest_edit(reader: &mut Reader<'_>, room: &str, message: &Value) -> Result<O
     if let Some(bundled) = message.pointer("/unsigned/m.relations/m.replace") {
         let full = if bundled.get("content").is_some() {
             Some(bundled.clone())
-        } else if let Some(id) = event_id(bundled) {
-            need(reader.event(room, id)?)?
+        } else if let Some(id) = event_id(bundled).filter(|id| is_event_id(id)) {
+            need(reader.related_event(room, id)?)?
         } else {
             None
         };
@@ -178,7 +181,8 @@ fn newest_edit(reader: &mut Reader<'_>, room: &str, message: &Value) -> Result<O
         .max_by(|left, right| sent_at(left).cmp(&sent_at(right))))
 }
 
-/// The display name the room holds for `message`'s sender, else their Matrix id.
+/// How a record names `message`'s sender ([`author_line`]), with the display name the room
+/// holds for them.
 fn author(
     reader: &mut Reader<'_>,
     names: &mut Names,
@@ -192,7 +196,7 @@ fn author(
     if let Some(name) = names.get(&key) {
         return Ok(name.clone());
     }
-    let name = need(reader.member_name(room, user)?)?.unwrap_or_else(|| user.to_owned());
-    names.insert(key, name.clone());
-    Ok(name)
+    let line = author_line(need(reader.member_name(room, user)?)?.as_deref(), user);
+    names.insert(key, line.clone());
+    Ok(line)
 }

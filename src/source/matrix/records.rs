@@ -9,7 +9,14 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::api::matrix::encode;
+use crate::pointer::{is_matrix_event_byte, is_matrix_room_byte};
 use crate::record::Record;
+
+/// The longest room or event id the client-server API allows.
+const MAX_ID_BYTES: usize = 255;
+
+/// The most characters of a room or display name a record carries.
+const MAX_NAME_CHARS: usize = 256;
 
 /// The event types a fetch reads: a message, a sticker, a redaction, and an encrypted event,
 /// which it counts but cannot read. Every other type — a state change such as a join or a new
@@ -50,6 +57,7 @@ pub(super) fn kind(event: &Value) -> Kind<'_> {
             .get("redacts")
             .or_else(|| content.and_then(|content| content.get("redacts")))
             .and_then(Value::as_str)
+            .filter(|target| is_event_id(target))
             .map_or(Kind::Other, |target| Kind::Redaction { target }),
         Some("m.room.encrypted") => Kind::Encrypted,
         Some("m.room.message" | "m.sticker") => {
@@ -68,7 +76,8 @@ pub(super) fn kind(event: &Value) -> Kind<'_> {
             {
                 let target = relation
                     .and_then(|relation| relation.get("event_id"))
-                    .and_then(Value::as_str);
+                    .and_then(Value::as_str)
+                    .filter(|target| is_event_id(target));
                 let new = content.and_then(|content| content.get("m.new_content"));
                 return match (target, new) {
                     (Some(target), Some(content)) if content.is_object() => {
@@ -109,13 +118,75 @@ pub(super) fn sent_at(event: &Value) -> Option<DateTime<Utc>> {
         .and_then(DateTime::from_timestamp_millis)
 }
 
-/// The root event of the thread a message is in, when its relation is `m.thread`.
+/// The root event of the thread a message is in, when its relation is `m.thread` and names an
+/// event id.
 #[must_use]
 pub(super) fn thread_root(event: &Value) -> Option<&str> {
     let relation = event.pointer("/content/m.relates_to")?;
     (relation.get("rel_type").and_then(Value::as_str) == Some("m.thread"))
         .then(|| relation.get("event_id").and_then(Value::as_str))
         .flatten()
+        .filter(|root| is_event_id(root))
+}
+
+/// Whether `id` is an event id a record may name: a `$`, then at most 254 bytes the pointer
+/// parser reads as an event id's, not ending in the `.` or `:` it leaves to the prose after a
+/// pointer. A relation names its target in the sender's own content, which no homeserver checks
+/// for an event a federated server sent, so a target that is not one is no relation at all.
+#[must_use]
+pub(super) fn is_event_id(id: &str) -> bool {
+    id.len() <= MAX_ID_BYTES
+        && id.strip_prefix('$').is_some_and(|rest| {
+            !rest.is_empty()
+                && rest.bytes().all(is_matrix_event_byte)
+                && !rest.ends_with(['.', ':'])
+        })
+}
+
+/// Whether `id` is a room id a pointer can name: a `!`, then at most 254 bytes the pointer
+/// parser reads as a room id's.
+#[must_use]
+pub(super) fn is_room_id(id: &str) -> bool {
+    id.len() <= MAX_ID_BYTES
+        && id
+            .strip_prefix('!')
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(is_matrix_room_byte))
+}
+
+/// `text` as one line of at most `max_chars` characters: every control character and run of
+/// white space becomes one space, and a longer text is cut, ending in `…`. Anyone can set a
+/// room's name or their own display name, and both reach the lines the ingest cycle reads.
+#[must_use]
+pub(super) fn one_line(text: &str, max_chars: usize) -> String {
+    let spaced: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let joined = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= max_chars {
+        return joined;
+    }
+    let mut cut: String = joined.chars().take(max_chars).collect();
+    cut.push('…');
+    cut
+}
+
+/// How a record names a message's sender: their display name with their Matrix id beside it,
+/// `Ada (@ada:example.org)`, so a name borrowed from someone else still shows whose account
+/// sent the message; the Matrix id alone when the room holds no name for them.
+#[must_use]
+pub(super) fn author_line(name: Option<&str>, user: &str) -> String {
+    let user = one_line(user, MAX_ID_BYTES);
+    match name.map(|name| one_line(name, MAX_NAME_CHARS)) {
+        Some(name) if !name.is_empty() && name != user => format!("{name} ({user})"),
+        _ => user,
+    }
 }
 
 /// `matrix:<room>/<event>`, with the configured scheme.
@@ -215,13 +286,14 @@ fn strip_reply_fallback<'b>(content: &Value, body: &'b str) -> &'b str {
 pub(super) struct Room<'a> {
     pub(super) scheme: &'a str,
     pub(super) id: &'a str,
+    /// The room's name, else its alias, else its id; a record carries it as [`one_line`].
     pub(super) label: &'a str,
 }
 
 impl Room<'_> {
     /// The record of `message` (an event whose [`kind`] is a message), whose text is `content`
-    /// read as [`text`], dated `ts` and written by `author`. `raw` is the event its text comes
-    /// from: the message itself, or the edit that last changed it.
+    /// read as [`text`], dated `ts` and written by `author` ([`author_line`]). `raw` is the event
+    /// its text comes from: the message itself, or the edit that last changed it.
     pub(super) fn record(
         &self,
         message: &Value,
@@ -260,8 +332,8 @@ impl Room<'_> {
             pointer: pointer(self.scheme, self.id, event),
             stream: self.id.to_owned(),
             ts,
-            label: Some(self.label.to_owned()),
-            author: Some(author.to_owned()),
+            label: Some(one_line(self.label, MAX_NAME_CHARS)),
+            author: Some(one_line(author, MAX_NAME_CHARS + MAX_ID_BYTES + 3)),
             author_id: sender(message).map(str::to_owned),
             thread: thread_root(message).map(|root| pointer(self.scheme, self.id, root)),
             title: None,

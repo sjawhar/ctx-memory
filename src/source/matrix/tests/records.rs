@@ -4,7 +4,10 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
-use super::super::records::{kind, parse_pointer, pointer, text, Kind, Room, REMOVED};
+use super::super::records::{
+    author_line, is_event_id, is_room_id, kind, one_line, parse_pointer, pointer, text,
+    thread_root, Kind, Room, REMOVED,
+};
 
 const ROOM: &str = "!dmroom:example.org";
 
@@ -277,4 +280,78 @@ fn a_removed_message_says_so_and_keeps_its_pointer() -> Result<()> {
     assert_eq!(record.text, REMOVED);
     assert_eq!(record.raw, redaction);
     Ok(())
+}
+
+#[test]
+fn an_event_id_is_a_dollar_and_at_most_255_bytes_of_id_bytes() {
+    for id in [
+        "$Rqnc-F-dvnEYJTyHq_iKxU2bZ1CI92-kuZq3a5lr5Zg",
+        "$abc+def/ghi=",
+        "$legacy1234:example.org",
+    ] {
+        assert!(is_event_id(id), "{id}");
+    }
+    let longest = format!("${}", "a".repeat(254));
+    assert!(is_event_id(&longest));
+    for id in [
+        "",
+        "$",
+        "event",
+        "!room:example.org",
+        "$a\nb",
+        "$a b",
+        "$trailing.",
+        "$trailing:",
+        &format!("${}", "a".repeat(255)),
+    ] {
+        assert!(!is_event_id(id), "{id:?}");
+    }
+    assert!(is_room_id("!room:example.org:8448"));
+    assert!(is_room_id("!-BooksClubRoomV12"));
+    assert!(!is_room_id("!room:[::1]"));
+    assert!(!is_room_id("room:example.org"));
+}
+
+#[test]
+fn a_relation_that_names_no_event_id_is_no_relation() {
+    let long = format!("${}", "a".repeat(3_000));
+    let reply = message(
+        "$reply",
+        &json!({"msgtype": "m.text", "body": "hi",
+                "m.relates_to": {"rel_type": "m.thread", "event_id": long}}),
+    );
+    assert_eq!(thread_root(&reply), None);
+    assert_eq!(kind(&reply), Kind::Message);
+    let edit = message(
+        "$edit",
+        &json!({"msgtype": "m.text", "body": "* hi",
+                "m.new_content": {"msgtype": "m.text", "body": "hi"},
+                "m.relates_to": {"rel_type": "m.replace", "event_id": "$x\ny"}}),
+    );
+    assert_eq!(kind(&edit), Kind::Other);
+    let redaction = json!({"type": "m.room.redaction", "event_id": "$r", "redacts": long});
+    assert_eq!(kind(&redaction), Kind::Other);
+}
+
+#[test]
+fn a_name_is_one_line_cut_short_and_an_author_shows_their_matrix_id() {
+    assert_eq!(
+        one_line("Book club\n## Heading\t- item", 256),
+        "Book club ## Heading - item"
+    );
+    assert_eq!(one_line("a\u{1b}[2Jb", 256), "a [2Jb");
+    assert_eq!(one_line("abcdef", 3), "abc…");
+    assert_eq!(
+        author_line(Some("Ada\nLovelace"), "@ada:example.org"),
+        "Ada Lovelace (@ada:example.org)"
+    );
+    assert_eq!(author_line(None, "@ada:example.org"), "@ada:example.org");
+    assert_eq!(
+        author_line(Some("@ada:example.org"), "@ada:example.org"),
+        "@ada:example.org"
+    );
+    assert_eq!(
+        author_line(Some(" \n "), "@ada:example.org"),
+        "@ada:example.org"
+    );
 }

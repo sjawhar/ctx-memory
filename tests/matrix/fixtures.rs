@@ -275,6 +275,15 @@ pub(super) fn room_reads(server: &FakeMatrix, room: &str) -> Result<Vec<String>>
         .collect())
 }
 
+/// Fails unless the run ended `count` streams, every one of them well.
+pub(super) fn every_stream_ok(messages: &[Message], count: usize) {
+    let ended = ends(messages);
+    assert_eq!(ended.len(), count, "{ended:?}");
+    for (stream, (status, _, error)) in &ended {
+        assert_eq!(*status, StreamStatus::Ok, "{stream}: {error:?}");
+    }
+}
+
 /// Fails unless the run sent no request that reads `room`.
 pub(super) fn untouched(server: &FakeMatrix, room: &str) -> Result<()> {
     assert_eq!(

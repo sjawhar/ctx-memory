@@ -55,7 +55,10 @@ fn a_first_fetch_reads_the_backfill_window_and_names_the_newest_event() -> Resul
         .into_iter()
         .next()
         .context("the fetch sent a record")?;
-    assert_eq!(first_record.author.as_deref(), Some("Bob"));
+    assert_eq!(
+        first_record.author.as_deref(),
+        Some("Bob (@bob:example.org)")
+    );
     assert_eq!(first_record.author_id.as_deref(), Some(BOB));
     assert_eq!(first_record.label.as_deref(), Some("Family"));
     assert_eq!(first_record.stream, FAMILY);
@@ -299,16 +302,21 @@ fn a_full_sync_skips_rooms_with_nothing_new_and_acknowledges_nothing() -> Result
     server.room(BANK, Some("Old thread"))?;
     server.text(FAMILY, ALICE, ms(-120)?, "Family news")?;
     server.text(BOOKS, BOB, ms(-90)?, "Chapter three next week")?;
-    // Quiet since long before the backfill window: it costs no request at all.
+    // Quiet since long before the backfill window: the first run asks only whether it has any
+    // event since, and later runs skip it.
     server.text(BANK, BOB, ms(-60 * 24 * 10)?, "Ten days ago")?;
     let dir = scratch("full")?;
 
     let first = Fetch::new(&server, &dir).run()?;
-    untouched(&server, BANK)?;
+    let bank_reads = room_reads(&server, BANK)?;
+    assert_eq!(bank_reads.len(), 1, "{bank_reads:?}");
+    assert!(bank_reads
+        .iter()
+        .all(|path| path.ends_with("/timestamp_to_event")));
     assert_eq!(
         cursors(&first).get(BANK).map(String::as_str),
         Some("2026-10-24T18:00:00Z"),
-        "a room the full sync skips keeps a cursor that names no event it has not read"
+        "a room with nothing since the backfill start keeps a cursor that names no event"
     );
 
     let fresh = server.text(BOOKS, ALICE, ms(-30)?, "Chapter four, actually")?;
@@ -462,7 +470,7 @@ fn an_edit_changes_the_message_it_names_and_a_redaction_removes_it() -> Result<(
         at("2026-10-25T13:00:00Z")?,
         "an edit keeps its message's date"
     );
-    assert_eq!(edited.author.as_deref(), Some("Alice"));
+    assert_eq!(edited.author.as_deref(), Some("Alice (@alice:example.org)"));
     Ok(())
 }
 
@@ -551,8 +559,8 @@ fn a_rate_limited_request_waits_as_asked_and_a_limit_that_holds_stops_the_run() 
         .filter(|request| request.path.ends_with("/messages"))
         .count();
     assert_eq!(
-        limited, 3,
-        "two refused tries, then the page that reaches the room's end"
+        limited, 4,
+        "two refused tries, then the page back from the first event, then the page forward to the room's end"
     );
 
     server.text(FAMILY, BOB, ms(-30)?, "More news")?;
@@ -801,7 +809,7 @@ fn an_unreadable_state_file_costs_a_full_look_and_no_record() -> Result<()> {
 }
 
 #[test]
-fn a_named_room_excluded_by_its_alias_is_never_read_and_left_out_of_the_sync() -> Result<()> {
+fn a_named_room_excluded_by_its_alias_is_never_read() -> Result<()> {
     let _environment = guard();
     let server = homeserver()?;
     server.room(BANK, Some("Alerts"))?;
@@ -830,7 +838,8 @@ fn a_named_room_excluded_by_its_alias_is_never_read_and_left_out_of_the_sync() -
         .iter()
         .all(|record| record.stream != BANK));
 
-    // Its alias is kept now, so the next full sync leaves the room out whole.
+    // The full sync gives its alias now, so the room is not planned. The sync leaves out only
+    // rooms excluded by id, so a rename or a new alias is seen.
     server.clear_requests()?;
     let synced = Fetch::new(&server, &dir)
         .with("exclude_rooms", json!(["#bank-alerts:example.org"]))
@@ -848,7 +857,7 @@ fn a_named_room_excluded_by_its_alias_is_never_read_and_left_out_of_the_sync() -
             .get("filter")
             .context("the sync has a filter")?,
     )?;
-    assert_eq!(filter.pointer("/room/not_rooms"), Some(&json!([BANK])));
+    assert_eq!(filter.pointer("/room/not_rooms"), Some(&json!([])));
     assert!(texts(&synced)
         .iter()
         .all(|(record, _)| *record == pointer(FAMILY, &news)));

@@ -34,7 +34,7 @@ fn a_pointer_resolves_to_its_message_as_last_edited() -> Result<()> {
     let record = records(&messages);
     assert_eq!(
         record.first().and_then(|record| record.author.as_deref()),
-        Some("Alice")
+        Some("Alice (@alice:example.org)")
     );
     assert_eq!(
         record.first().and_then(|record| record.label.as_deref()),

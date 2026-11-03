@@ -4,7 +4,13 @@
 //! It answers `/joined_rooms`, `/sync` (full and since a token), room state, `/context`,
 //! `/messages` in both directions with tokens that name a gap in a room's timeline,
 //! `/timestamp_to_event`, `/event` and `/relations`, and it can refuse requests for its rate
-//! limit, fail one room's reads, or not serve `/timestamp_to_event` at all. Every room and
+//! limit, fail one room's reads, not serve `/timestamp_to_event` at all, hang up on a route, or
+//! refuse one with a status. Where Synapse's behaviour is what a source has to survive, it
+//! follows Synapse: `/timestamp_to_event` picks by `origin_server_ts`, not by timeline order;
+//! `/messages` takes a page of events before it leaves out those of users the account ignores,
+//! so a page can come back empty and still carry `end`; a request line longer than Twisted's
+//! 16 KiB is answered `400` with no body; a rename is a state event in the timeline, and a full
+//! `/sync` gives the state as it stood before the events its timeline returns. Every room and
 //! event in it is invented.
 
 #![allow(dead_code)]
@@ -13,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
 use super::fake_http::{self, Recorded, Response};
@@ -21,15 +27,47 @@ use super::fake_http::{self, Recorded, Response};
 /// The access token this homeserver accepts.
 pub const TOKEN: &str = "syt_fixture_access_token";
 
+/// The longest request line Twisted, which Synapse runs on, reads before it answers `400`.
+const MAX_REQUEST_LINE: usize = 16 * 1024;
+
 /// One room the account has joined.
 #[derive(Default)]
 struct Room {
+    /// The name the room had before any event of its timeline.
     name: Option<String>,
     alias: Option<String>,
     /// Each member's display name.
     members: BTreeMap<String, String>,
     /// The timeline in order, each event with the stream position it was sent at.
     timeline: Vec<(u64, Value)>,
+}
+
+impl Room {
+    /// The room's name as it stood before timeline index `before`: the newest rename before
+    /// it, else the name it started with.
+    fn name_before(&self, before: usize) -> Option<String> {
+        self.timeline
+            .iter()
+            .take(before)
+            .rev()
+            .find(|(_, event)| {
+                event.get("type").and_then(Value::as_str) == Some("m.room.name")
+                    && event.get("state_key").and_then(Value::as_str) == Some("")
+            })
+            .map_or_else(
+                || self.name.clone(),
+                |(_, event)| {
+                    event
+                        .pointer("/content/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                },
+            )
+    }
+
+    fn current_name(&self) -> Option<String> {
+        self.name_before(self.timeline.len())
+    }
 }
 
 #[derive(Default)]
@@ -45,6 +83,12 @@ struct World {
     failing: BTreeSet<String>,
     /// Whether `/timestamp_to_event` is served.
     no_timestamp_to_event: bool,
+    /// Users the account ignores, whose events no answer carries.
+    ignored: BTreeSet<String>,
+    /// Paths whose requests get no answer at all: the connection closes.
+    hung: BTreeSet<String>,
+    /// Path fragments answered with a refusal: the status and the Matrix error code.
+    refused: Vec<(String, u16, String)>,
 }
 
 /// A loopback homeserver.
@@ -68,7 +112,7 @@ impl FakeMatrix {
                 .lock()
                 .map_err(|_| anyhow!("the fake homeserver's state was poisoned"))?;
             world.requests.push(request.clone());
-            Ok(route(&mut world, request))
+            route(&mut world, request)
         })?;
         Ok(Self { address, world })
     }
@@ -85,7 +129,7 @@ impl FakeMatrix {
             .map_err(|_| anyhow!("the fake homeserver's state was poisoned"))
     }
 
-    /// Joins a room with a name, or none.
+    /// Joins a room with a name, or none, that it has had since before any of its events.
     ///
     /// # Errors
     ///
@@ -124,6 +168,57 @@ impl FakeMatrix {
         Ok(())
     }
 
+    /// Renames a room, as a bridge does when a contact's name syncs: an `m.room.name` state
+    /// event in the timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the room is unknown.
+    pub fn rename(&self, room: &str, sender: &str, ts: i64, name: &str) -> Result<String> {
+        self.append(
+            room,
+            "m.room.name",
+            Some(""),
+            sender,
+            ts,
+            json!({"name": name}),
+        )
+    }
+
+    /// Ignores a user: no `/messages` page and no `/sync` timeline carries their events, though
+    /// a page still counts them against its limit, as Synapse does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state is poisoned.
+    pub fn ignore(&self, user: &str) -> Result<()> {
+        self.lock()?.ignored.insert(user.to_owned());
+        Ok(())
+    }
+
+    /// Closes every connection that asks for a path ending in `path` without an answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state is poisoned.
+    pub fn hang_up(&self, path: &str) -> Result<()> {
+        self.lock()?.hung.insert(path.to_owned());
+        Ok(())
+    }
+
+    /// Answers every request whose decoded path holds `fragment` with `status` and `errcode`,
+    /// as a homeserver that will not show the user an event does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state is poisoned.
+    pub fn refuse(&self, fragment: &str, status: u16, errcode: &str) -> Result<()> {
+        self.lock()?
+            .refused
+            .push((fragment.to_owned(), status, errcode.to_owned()));
+        Ok(())
+    }
+
     /// Appends an event of `kind` with `content`, sent by `sender` at `ts` (milliseconds), and
     /// returns its id. A redaction strips the event it names, as a homeserver does.
     ///
@@ -134,6 +229,18 @@ impl FakeMatrix {
         &self,
         room: &str,
         kind: &str,
+        sender: &str,
+        ts: i64,
+        content: Value,
+    ) -> Result<String> {
+        self.append(room, kind, None, sender, ts, content)
+    }
+
+    fn append(
+        &self,
+        room: &str,
+        kind: &str,
+        state_key: Option<&str>,
         sender: &str,
         ts: i64,
         content: Value,
@@ -159,6 +266,9 @@ impl FakeMatrix {
             "origin_server_ts": ts,
         });
         set(&mut event, "content", content);
+        if let Some(state_key) = state_key {
+            set(&mut event, "state_key", json!(state_key));
+        }
         let timeline = &mut world
             .rooms
             .get_mut(room)
@@ -300,13 +410,32 @@ fn ok(body: &Value) -> Response {
     Response::json(200, body.to_string())
 }
 
-fn route(world: &mut World, request: &Recorded) -> Response {
+fn route(world: &mut World, request: &Recorded) -> Result<Response> {
+    if request.target.len() > MAX_REQUEST_LINE {
+        // Twisted answers a request line it will not read with a bare 400 and no body.
+        return Ok(Response::json(400, ""));
+    }
+    if world
+        .hung
+        .iter()
+        .any(|path| request.path.ends_with(path.as_str()))
+    {
+        bail!("hanging up on {}", request.path);
+    }
     if request.headers.get("authorization").map(String::as_str) != Some(&format!("Bearer {TOKEN}"))
     {
-        return error(401, "M_UNKNOWN_TOKEN");
+        return Ok(error(401, "M_UNKNOWN_TOKEN"));
     }
     if request.method != "GET" {
-        return error(405, "M_UNRECOGNIZED");
+        return Ok(error(405, "M_UNRECOGNIZED"));
+    }
+    let decoded = decode(&request.path);
+    if let Some((_, status, code)) = world
+        .refused
+        .iter()
+        .find(|(fragment, _, _)| decoded.contains(fragment.as_str()))
+    {
+        return Ok(error(*status, code));
     }
     let throttled = world
         .throttled
@@ -314,16 +443,16 @@ fn route(world: &mut World, request: &Recorded) -> Response {
         .find(|(path, (times, _))| *times > 0 && request.path.contains(path.as_str()));
     if let Some((_, (times, wait))) = throttled {
         *times -= 1;
-        return Response::json(
+        return Ok(Response::json(
             429,
             json!({"errcode": "M_LIMIT_EXCEEDED", "error": "Too many requests", "retry_after_ms": wait})
                 .to_string(),
-        );
+        ));
     }
     let params = query(&request.target);
     let segments: Vec<String> = request.path.split('/').map(decode).collect();
     let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
-    match parts.as_slice() {
+    Ok(match parts.as_slice() {
         ["", "_matrix", "client", "v3", "joined_rooms"] => {
             ok(&json!({"joined_rooms": world.rooms.keys().collect::<Vec<_>>()}))
         }
@@ -333,57 +462,72 @@ fn route(world: &mut World, request: &Recorded) -> Response {
             if world.failing.contains(&room)
                 && matches!(rest.first(), Some(&"messages" | &"context"))
             {
-                return error(500, "M_UNKNOWN");
+                return Ok(error(500, "M_UNKNOWN"));
             }
             let Some(data) = world.rooms.get(&room) else {
-                return error(403, "M_FORBIDDEN");
+                return Ok(error(403, "M_FORBIDDEN"));
             };
-            room_route(data, rest, &params)
+            room_route(data, &world.ignored, rest, &params)
         }
         ["", "_matrix", "client", "v1", "rooms", room, "timestamp_to_event"] => {
             if world.no_timestamp_to_event {
-                return error(404, "M_UNRECOGNIZED");
+                return Ok(error(404, "M_UNRECOGNIZED"));
             }
-            let Some(data) = world.rooms.get(*room) else {
-                return error(403, "M_FORBIDDEN");
-            };
-            let at: i64 = params
-                .get("ts")
-                .and_then(|ts| ts.parse().ok())
-                .unwrap_or_default();
-            data.timeline
-                .iter()
-                .map(|(_, event)| event)
-                .find(|event| ts(event) >= at)
-                .map_or_else(
-                    || error(404, "M_NOT_FOUND"),
-                    |event| ok(&json!({"event_id": event["event_id"], "origin_server_ts": event["origin_server_ts"]})),
-                )
+            world
+                .rooms
+                .get(*room)
+                .map_or_else(|| error(403, "M_FORBIDDEN"), |data| first_at(data, &params))
         }
         ["", "_matrix", "client", "v1", "rooms", room, "relations", event, relation] => {
-            let Some(data) = world.rooms.get(*room) else {
-                return error(403, "M_FORBIDDEN");
-            };
-            let mut related: Vec<&Value> = data
-                .timeline
-                .iter()
-                .map(|(_, event)| event)
-                .filter(|candidate| {
-                    candidate
-                        .pointer("/content/m.relates_to/rel_type")
-                        .and_then(Value::as_str)
-                        == Some(*relation)
-                        && candidate
-                            .pointer("/content/m.relates_to/event_id")
-                            .and_then(Value::as_str)
-                            == Some(*event)
-                })
-                .collect();
-            related.reverse();
-            ok(&json!({"chunk": related}))
+            world.rooms.get(*room).map_or_else(
+                || error(403, "M_FORBIDDEN"),
+                |data| relations(data, event, relation),
+            )
         }
         _ => error(404, "M_UNRECOGNIZED"),
-    }
+    })
+}
+
+/// `/timestamp_to_event` forward, as Synapse answers it:
+/// `WHERE origin_server_ts >= ? ORDER BY origin_server_ts ASC LIMIT 1`, so the earliest date,
+/// wherever in the timeline it sits.
+fn first_at(room: &Room, params: &BTreeMap<String, String>) -> Response {
+    let at: i64 = params
+        .get("ts")
+        .and_then(|ts| ts.parse().ok())
+        .unwrap_or_default();
+    room.timeline
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, event))| ts(event) >= at)
+        .min_by_key(|(index, (_, event))| (ts(event), *index))
+        .map_or_else(
+            || error(404, "M_NOT_FOUND"),
+            |(_, (_, event))| {
+                ok(&json!({"event_id": event_id(event), "origin_server_ts": ts(event)}))
+            },
+        )
+}
+
+/// The events that relate to `event` by `relation`, newest first.
+fn relations(room: &Room, event: &str, relation: &str) -> Response {
+    let mut related: Vec<&Value> = room
+        .timeline
+        .iter()
+        .map(|(_, candidate)| candidate)
+        .filter(|candidate| {
+            candidate
+                .pointer("/content/m.relates_to/rel_type")
+                .and_then(Value::as_str)
+                == Some(relation)
+                && candidate
+                    .pointer("/content/m.relates_to/event_id")
+                    .and_then(Value::as_str)
+                    == Some(event)
+        })
+        .collect();
+    related.reverse();
+    ok(&json!({"chunk": related}))
 }
 
 fn ts(event: &Value) -> i64 {
@@ -396,6 +540,13 @@ fn ts(event: &Value) -> i64 {
 fn event_id(event: &Value) -> &str {
     event
         .get("event_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn sender(event: &Value) -> &str {
+    event
+        .get("sender")
         .and_then(Value::as_str)
         .unwrap_or_default()
 }
@@ -416,6 +567,20 @@ fn filter_types(params: &BTreeMap<String, String>, path: &[&str]) -> Option<Vec<
     })
 }
 
+/// The rooms a `/sync` filter leaves out.
+fn filter_not_rooms(params: &BTreeMap<String, String>) -> BTreeSet<String> {
+    params
+        .get("filter")
+        .and_then(|filter| serde_json::from_str::<Value>(filter).ok())
+        .and_then(|filter| filter.pointer("/room/not_rooms").cloned())
+        .and_then(|rooms| rooms.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
 fn wanted(types: Option<&Vec<String>>, event: &Value) -> bool {
     types.is_none_or(|types| {
         event
@@ -428,16 +593,23 @@ fn wanted(types: Option<&Vec<String>>, event: &Value) -> bool {
 fn sync(world: &World, params: &BTreeMap<String, String>) -> Response {
     let timeline_types = filter_types(params, &["room", "timeline"]);
     let state_types = filter_types(params, &["room", "state"]).unwrap_or_default();
+    let not_rooms = filter_not_rooms(params);
     let since = params
         .get("since")
         .and_then(|since| since.strip_prefix('s'))
         .and_then(|since| since.parse::<u64>().ok());
     let mut join = serde_json::Map::new();
     for (id, room) in &world.rooms {
+        if not_rooms.contains(id) {
+            continue;
+        }
+        // A timeline of one event: the newest of the types asked for. Synapse takes it, then
+        // leaves it out when it is an ignored user's, so the timeline can come back empty.
         let newest = room
             .timeline
             .iter()
-            .rfind(|(_, event)| wanted(timeline_types.as_ref(), event));
+            .enumerate()
+            .rfind(|(_, (_, event))| wanted(timeline_types.as_ref(), event));
         let changed = match since {
             Some(since) => room
                 .timeline
@@ -448,10 +620,17 @@ fn sync(world: &World, params: &BTreeMap<String, String>) -> Response {
         if !changed {
             continue;
         }
+        let shown: Vec<&Value> = newest
+            .map(|(_, (_, event))| event)
+            .filter(|event| !world.ignored.contains(sender(event)))
+            .into_iter()
+            .collect();
+        // The state as it stood before the events the timeline returns.
+        let before = newest.map_or(room.timeline.len(), |(index, _)| index);
         let mut state = Vec::new();
         if since.is_none() {
             if let (Some(name), true) = (
-                &room.name,
+                room.name_before(before),
                 state_types.iter().any(|kind| kind == "m.room.name"),
             ) {
                 state.push(
@@ -470,7 +649,7 @@ fn sync(world: &World, params: &BTreeMap<String, String>) -> Response {
         join.insert(
             id.clone(),
             json!({
-                "timeline": {"events": newest.map(|(_, event)| vec![event]).unwrap_or_default(), "limited": true},
+                "timeline": {"events": shown, "limited": true},
                 "state": {"events": state},
             }),
         );
@@ -484,10 +663,7 @@ fn sync(world: &World, params: &BTreeMap<String, String>) -> Response {
 
 /// The member events of the senders of `events`.
 fn member_state(room: &Room, events: &[&Value]) -> Vec<Value> {
-    let senders: BTreeSet<&str> = events
-        .iter()
-        .filter_map(|event| event.get("sender").and_then(Value::as_str))
-        .collect();
+    let senders: BTreeSet<&str> = events.iter().map(|event| sender(event)).collect();
     senders
         .into_iter()
         .filter_map(|user| {
@@ -506,9 +682,14 @@ fn index_of(token: &str) -> Option<usize> {
     token.strip_prefix('t')?.parse().ok()
 }
 
-fn room_route(room: &Room, rest: &[&str], params: &BTreeMap<String, String>) -> Response {
+fn room_route(
+    room: &Room,
+    ignored: &BTreeSet<String>,
+    rest: &[&str],
+    params: &BTreeMap<String, String>,
+) -> Response {
     match rest {
-        ["state", "m.room.name"] => room.name.as_ref().map_or_else(
+        ["state", "m.room.name"] => room.current_name().map_or_else(
             || error(404, "M_NOT_FOUND"),
             |name| ok(&json!({"name": name})),
         ),
@@ -546,12 +727,19 @@ fn room_route(room: &Room, rest: &[&str], params: &BTreeMap<String, String>) -> 
                 "state": member_state(room, &[&found]),
             }))
         }
-        ["messages"] => messages(room, params),
+        ["messages"] => messages(room, ignored, params),
         _ => error(404, "M_UNRECOGNIZED"),
     }
 }
 
-fn messages(room: &Room, params: &BTreeMap<String, String>) -> Response {
+/// One page of `/messages`, as Synapse makes it: `limit` events of the types asked for, taken
+/// from the database, then those of ignored users left out. `end` comes whenever the database
+/// gave events, even when none of them is left.
+fn messages(
+    room: &Room,
+    ignored: &BTreeSet<String>,
+    params: &BTreeMap<String, String>,
+) -> Response {
     let types = filter_types(params, &[]);
     let limit: usize = params
         .get("limit")
@@ -559,7 +747,7 @@ fn messages(room: &Room, params: &BTreeMap<String, String>) -> Response {
         .unwrap_or(10);
     let forward = params.get("dir").map(String::as_str) == Some("f");
     let from = params.get("from").and_then(|from| index_of(from));
-    let mut chunk: Vec<&Value> = Vec::new();
+    let mut taken: Vec<&Value> = Vec::new();
     let mut end = None;
     if forward {
         let Some(mut index) = from else {
@@ -568,9 +756,9 @@ fn messages(room: &Room, params: &BTreeMap<String, String>) -> Response {
         while let Some((_, event)) = room.timeline.get(index) {
             index += 1;
             if wanted(types.as_ref(), event) {
-                chunk.push(event);
+                taken.push(event);
                 end = Some(index);
-                if chunk.len() == limit {
+                if taken.len() == limit {
                     break;
                 }
             }
@@ -581,15 +769,19 @@ fn messages(room: &Room, params: &BTreeMap<String, String>) -> Response {
             index -= 1;
             if let Some((_, event)) = room.timeline.get(index) {
                 if wanted(types.as_ref(), event) {
-                    chunk.push(event);
+                    taken.push(event);
                     end = Some(index);
-                    if chunk.len() == limit {
+                    if taken.len() == limit {
                         break;
                     }
                 }
             }
         }
     }
+    let chunk: Vec<&Value> = taken
+        .into_iter()
+        .filter(|event| !ignored.contains(sender(event)))
+        .collect();
     let state = member_state(room, &chunk);
     let mut body = json!({"chunk": chunk, "start": params.get("from").cloned().unwrap_or_else(|| token(room.timeline.len())), "state": state});
     if let Some(end) = end {

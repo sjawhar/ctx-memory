@@ -471,14 +471,14 @@ fn github_commit_end(text: &str, sha_start: usize) -> Option<usize> {
 
 /// A byte a Matrix room id may hold after its `!`: the opaque id and the server name with its
 /// port. A room id never holds `/`, so the first `/` ends it.
-fn is_matrix_room_byte(byte: u8) -> bool {
+pub(crate) fn is_matrix_room_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'=' | b'~')
 }
 
 /// A byte a Matrix event id may hold after its `$`: URL-safe base64 (room version 4 on),
 /// standard base64 with `+` and `/` (room version 3), and `:` and a server name (versions 1
 /// and 2).
-fn is_matrix_event_byte(byte: u8) -> bool {
+pub(crate) fn is_matrix_event_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(byte, b'-' | b'_' | b'+' | b'/' | b'=' | b'.' | b':' | b'~')
 }

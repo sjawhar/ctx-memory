@@ -6,10 +6,13 @@
 //! reads a room from just after that event (`/context`, then `/messages` oldest first), so an
 //! event a bridge delivers late with an old timestamp is read too, and a room further behind
 //! than one run's budget moves its cursor as far as the run read. A room the stream has no
-//! event of yet is read from the first event at or after the backfill start
-//! (`/timestamp_to_event`).
+//! event of yet is read from the first event dated at or after the backfill start
+//! (`/timestamp_to_event`), and from as far before it in the timeline as events dated after
+//! that time reach: a homeserver finds that event by date, and a late delivery sits after
+//! events dated later than it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -23,20 +26,28 @@ use crate::source::{
     CLOCK_SKEW_MARGIN, PROTOCOL_VERSION,
 };
 
-use super::homeserver::{members, Direction, Found, Reader, Step};
-use super::records::{event_id, kind, sender, sent_at, Kind, Room};
+use super::homeserver::{members, Direction, Found, Reader};
+use super::records::{
+    author_line, event_id, is_event_id, is_room_id, kind, sender, sent_at, Kind, Room,
+};
 use super::rooms::{Decision, Facts, Selection};
 use super::state::State;
 use super::{MatrixConfig, SyncMode};
 
-/// How many pages a room is read backward from its end when the homeserver does not serve
-/// `/timestamp_to_event`. A first fetch of a room busier than this many pages in its backfill
-/// window keeps only its newest events, with a warning.
+/// How many pages a read goes back to find where it starts: from a room's end when the
+/// homeserver does not serve `/timestamp_to_event`, else from the first event dated at or after
+/// the start, for events placed before it and dated after that time.
 const BACKWARD_PAGES: u32 = 20;
 /// How many pages of a room one run reads forward. A room further behind goes on from there in
 /// the next run, so one busy room neither holds a whole room's backlog in memory nor spends the
 /// budget every other room needs.
 const ROOM_PAGES: u32 = 50;
+/// How many events and member names one run looks up for a room: the message an edit or a
+/// redaction names, and a sender no page named. Any member can send edits of made-up events, so
+/// a room that asks for more goes on from there in the next run.
+const ROOM_LOOKUPS: u32 = 100;
+/// How long the source remembers an event it read that made no record of its own.
+pub(super) const UNRECORDED_DAYS: i64 = 90;
 
 /// The times a run reads between.
 pub(super) struct Window {
@@ -80,110 +91,13 @@ pub(super) fn run(
         Ok(rooms) => rooms.into_iter().collect(),
         Err(stop) => bail!("listing the joined rooms: {}", stop.why()),
     };
-    let (mut state, mut warnings) = State::load(&request.state_dir)?;
-    let window = Window::new(request);
+    let (state, mut warnings) = State::load(&request.state_dir)?;
     let prefix = format!("{scheme}:");
-    let excluded: Vec<&String> = joined
-        .iter()
-        .filter(|room| left_out(room, &state.rooms, selection, &exclusion, &prefix))
-        .collect();
-    let prepass = Prepass::run(&mut reader, config.sync, &state, &excluded, &mut warnings);
-    let planned = plan(
-        &joined,
-        &prepass,
-        &mut state,
-        selection,
-        &prefix,
-        &exclusion,
-        &mut warnings,
-    );
-    hello(scheme, &planned, warnings, sink)?;
-
-    // The run starts at the room the last run's budget or the homeserver's rate limit stopped
-    // at and goes round, so every room is read in turn.
-    let start = state
-        .first
-        .take()
-        .and_then(|first| planned.iter().position(|room| *room == first))
-        .unwrap_or(0);
-    let mut first_stopped: Option<String> = None;
-    let mut unread = 0_usize;
-    for room in planned.iter().cycle().skip(start).take(planned.len()) {
-        let cursor = request.cursors.get(room).map(String::as_str);
-        if reader.stopped().is_some() {
-            unread += 1;
-            first_stopped.get_or_insert_with(|| room.clone());
-            state.unsettle(room);
-            emit_stream(
-                room,
-                Ok((Vec::new(), Vec::new(), window.unmoved(cursor))),
-                sink,
-            )?;
-            continue;
-        }
-        if let Some(cursor) = prepass.settled(room, cursor, &state, &window) {
-            state.settle(room, &cursor, prepass.newest(room));
-            emit_stream(room, Ok((Vec::new(), Vec::new(), cursor)), sink)?;
-            continue;
-        }
-        match read_room(
-            &mut reader,
-            scheme,
-            room,
-            cursor,
-            &window,
-            selection,
-            &mut state.rooms,
-        ) {
-            Ok(read) => {
-                if read.complete {
-                    state.settle(room, &read.cursor, prepass.newest(room));
-                } else {
-                    state.unsettle(room);
-                }
-                if read.stopped {
-                    first_stopped.get_or_insert_with(|| room.clone());
-                }
-                emit_stream(room, Ok((read.warnings, read.records, read.cursor)), sink)?;
-            }
-            Err(error) => {
-                state.unsettle(room);
-                if reader.stopped().is_some() {
-                    first_stopped.get_or_insert_with(|| room.clone());
-                }
-                emit_stream(room, Err(error), sink)?;
-            }
-        }
-    }
-    if let Some(stop) = reader.stopped() {
-        sink(Message::Warning {
-            stream: None,
-            message: format!(
-                "{}: {unread} room(s) were not read this run and keep their cursors; the next fetch reads them first",
-                stop.why()
-            ),
-        })?;
-    }
-    state.first = first_stopped;
-    state.retain(&joined, &planned);
-    state.keep_sync(config.sync, prepass.next_batch);
-    state.save(&request.state_dir)
-}
-
-/// The rooms a run reads: every joined room no exclusion leaves out, by what the run knows of
-/// each room's name and alias, the names a full `/sync` gave replacing any kept from earlier
-/// runs. An allowlisted room the account has not joined is a warning.
-fn plan(
-    joined: &BTreeSet<String>,
-    prepass: &Prepass,
-    state: &mut State,
-    selection: &Selection,
-    prefix: &str,
-    exclusion: &Exclusion,
-    warnings: &mut Vec<String>,
-) -> Vec<String> {
-    for (room, facts) in &prepass.facts {
-        state.rooms.insert(room.clone(), facts.clone());
+    let unnamable = joined.iter().filter(|room| !is_room_id(room)).count();
+    if unnamable > 0 {
+        warnings.push(format!(
+            "{unnamable} joined room(s) have an id that is not a Matrix room id a pointer can name; they are not read"
+        ));
     }
     for id in selection.allowed_ids() {
         if !joined.contains(id) {
@@ -192,24 +106,65 @@ fn plan(
             ));
         }
     }
-    joined
+    // Only what needs no room state leaves a room out of the `/sync`: an id entry, or a
+    // pattern that covers the whole room. A name or an alias decides on the state the `/sync`
+    // gives, or that the room's read reads first, so a renamed room is decided again.
+    let excluded: Vec<&String> = joined
         .iter()
-        .filter(|room| !left_out(room, &state.rooms, selection, exclusion, prefix))
+        .filter(|room| left_out(room, None, selection, &exclusion, &prefix))
+        .collect();
+    let prepass = Prepass::run(&mut reader, config.sync, &state, &excluded, &mut warnings);
+    let planned: Vec<String> = joined
+        .iter()
+        .filter(|room| {
+            is_room_id(room)
+                && !left_out(
+                    room,
+                    prepass.facts.get(room.as_str()),
+                    selection,
+                    &exclusion,
+                    &prefix,
+                )
+        })
         .cloned()
-        .collect()
+        .collect();
+    hello(scheme, &planned, warnings, sink)?;
+
+    let mut pass = Pass {
+        reader,
+        state,
+        window: Window::new(request),
+        prepass,
+        selection,
+        scheme,
+        cursors: &request.cursors,
+        first_stopped: None,
+        unread: 0,
+    };
+    // The run starts at the room the last run's budget or the homeserver's rate limit stopped
+    // at and goes round, so every room is read in turn.
+    let start = pass
+        .state
+        .first
+        .take()
+        .and_then(|first| planned.iter().position(|room| *room == first))
+        .unwrap_or(0);
+    for room in planned.iter().cycle().skip(start).take(planned.len()) {
+        pass.room(room, sink)?;
+    }
+    pass.finish(&planned, config.sync, &request.state_dir, sink)
 }
 
 /// Whether a run leaves `room` out: an exclusion pattern covers the whole room, or `rooms` and
-/// `exclude_rooms` leave it out by what the run knows of its name and alias.
+/// `exclude_rooms` leave it out by its id, or by `facts`, its name and alias, when known.
 fn left_out(
     room: &str,
-    known: &BTreeMap<String, Facts>,
+    facts: Option<&Facts>,
     selection: &Selection,
     exclusion: &Exclusion,
     prefix: &str,
 ) -> bool {
-    exclusion.covers(&format!("{prefix}{room}/"))
-        || selection.decide(room, known.get(room)) == Decision::Skip
+    exclusion.covers(&format!("{prefix}{room}/")) || selection.decide(room, facts) == Decision::Skip
 }
 
 /// The fetch's hello, planning `planned`, and the warnings found before any room was read.
@@ -235,12 +190,144 @@ fn hello(
     Ok(())
 }
 
+/// One run over the planned rooms.
+struct Pass<'p, 'c> {
+    reader: Reader<'c>,
+    state: State,
+    window: Window,
+    prepass: Prepass,
+    selection: &'p Selection,
+    scheme: &'p str,
+    cursors: &'p BTreeMap<String, String>,
+    /// The first room the run stopped at, which the next run reads first.
+    first_stopped: Option<String>,
+    /// How many rooms the run did not read because it stopped.
+    unread: usize,
+}
+
+impl Pass<'_, '_> {
+    /// Ends `room`'s stream: unread when the run has stopped, at its cursor when the `/sync`
+    /// shows nothing new, else after reading it.
+    fn room(&mut self, room: &str, sink: &mut dyn FnMut(Message) -> Result<()>) -> Result<()> {
+        let cursor = self.cursors.get(room).map(String::as_str);
+        if self.reader.stopped().is_some() {
+            self.unread += 1;
+            self.first_stopped.get_or_insert_with(|| room.to_owned());
+            self.state.unsettle(room);
+            let unmoved = self.window.unmoved(cursor);
+            return emit_stream(room, Ok((Vec::new(), Vec::new(), unmoved)), sink);
+        }
+        if let Some(cursor) = self.prepass.settled(room, cursor, &self.state) {
+            self.state.settle(room, &cursor, self.prepass.newest(room));
+            return emit_stream(room, Ok((Vec::new(), Vec::new(), cursor)), sink);
+        }
+        match self.read(room, cursor) {
+            Ok(read) => {
+                if read.complete {
+                    self.state
+                        .settle(room, &read.cursor, self.prepass.newest(room));
+                } else {
+                    self.state.unsettle(room);
+                }
+                if read.stopped {
+                    self.first_stopped.get_or_insert_with(|| room.to_owned());
+                }
+                emit_stream(room, Ok((read.warnings, read.records, read.cursor)), sink)
+            }
+            Err(error) => {
+                self.state.unsettle(room);
+                if self.reader.stopped().is_some() {
+                    self.first_stopped.get_or_insert_with(|| room.to_owned());
+                }
+                emit_stream(room, Err(error), sink)
+            }
+        }
+    }
+
+    /// Reads one room: its name first — from this run's full `/sync`, else from the room's
+    /// state — so a room `exclude_rooms` names by name or alias has no message read, then its
+    /// events from the cursor on.
+    fn read(&mut self, room: &str, cursor: Option<&str>) -> Result<RoomRead> {
+        let unread = |window: &Window, stopped| RoomRead {
+            records: Vec::new(),
+            warnings: Vec::new(),
+            cursor: window.unmoved(cursor),
+            complete: false,
+            stopped,
+        };
+        let facts = if let Some(facts) = self.prepass.facts.get(room) {
+            facts.clone()
+        } else {
+            let Ok(facts) = self.reader.facts(room, self.selection.names_aliases())? else {
+                return Ok(unread(&self.window, true));
+            };
+            facts
+        };
+        if self.selection.decide(room, Some(&facts)) == Decision::Skip {
+            return Ok(unread(&self.window, false));
+        }
+        let label = facts.label(room).to_owned();
+        let mut walk = Walk {
+            reader: &mut self.reader,
+            room: Room {
+                scheme: self.scheme,
+                id: room,
+                label: &label,
+            },
+            window: &self.window,
+            unrecorded: &mut self.state.unrecorded,
+            members: BTreeMap::new(),
+            records: Vec::new(),
+            index: BTreeMap::new(),
+            originals: BTreeMap::new(),
+            removed: BTreeSet::new(),
+            warnings: Vec::new(),
+            encrypted: 0,
+            unserved: 0,
+            unnamable: 0,
+            lookups: 0,
+            position: Position::Cursor(cursor.map(str::to_owned)),
+            met: BTreeSet::new(),
+            halt: None,
+            reached_end: false,
+            believable: latest_believable(self.window.end),
+        };
+        walk.start(cursor)?;
+        Ok(walk.finish())
+    }
+
+    /// Warns of the rooms a stop left unread and keeps what the next run needs.
+    fn finish(
+        mut self,
+        planned: &[String],
+        sync: SyncMode,
+        dir: &Path,
+        sink: &mut dyn FnMut(Message) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(stop) = self.reader.stopped() {
+            sink(Message::Warning {
+                stream: None,
+                message: format!(
+                    "{}: {} room(s) were not read this run and keep their cursors; the next fetch reads them first",
+                    stop.why(),
+                    self.unread
+                ),
+            })?;
+        }
+        self.state.first = self.first_stopped;
+        self.state
+            .retain(planned, self.window.end - Duration::days(UNRECORDED_DAYS));
+        self.state.keep_sync(sync, self.prepass.next_batch);
+        self.state.save(dir)
+    }
+}
+
 /// What the run's `/sync` said before it read any room.
 struct Prepass {
     seen: Seen,
     /// The token the next incremental `/sync` starts from.
     next_batch: Option<String>,
-    /// The name and alias of each room a full `/sync` listed.
+    /// The name and alias of each room a full `/sync` listed, as they stand now.
     facts: BTreeMap<String, Facts>,
 }
 
@@ -249,9 +336,9 @@ enum Seen {
     Nothing,
     /// An incremental `/sync`: the rooms with any event since the stored token.
     Changed(BTreeSet<String>),
-    /// A full `/sync`: the id and time of each room's newest event of any type, or `None` for a
-    /// room whose timeline came back empty.
-    Newest(BTreeMap<String, Option<(String, DateTime<Utc>)>>),
+    /// A full `/sync`: the id of each room's newest event of any type, or `None` for a room
+    /// whose timeline came back empty.
+    Newest(BTreeMap<String, Option<String>>),
 }
 
 impl Prepass {
@@ -303,56 +390,32 @@ impl Prepass {
     /// keeps beside its cursor.
     fn newest(&self, room: &str) -> Option<&str> {
         match &self.seen {
-            Seen::Newest(newest) => newest
-                .get(room)
-                .and_then(Option::as_ref)
-                .map(|(id, _)| id.as_str()),
+            Seen::Newest(newest) => newest.get(room).and_then(Option::as_deref),
             Seen::Nothing | Seen::Changed(_) => None,
         }
     }
 
-    /// The cursor a room ends at without being read, when the `/sync` shows it has nothing a
-    /// read would find.
+    /// The cursor a room ends at without being read: the run that last read it to its end,
+    /// holding nothing back, proposed the cursor it still has, and the `/sync` shows nothing
+    /// since. A room no run has settled is always read.
     ///
     /// Both kinds of `/sync` ask for each room's newest event of any type, not its newest
     /// message: a homeserver may filter a timeline by type after it has cut it to its newest
-    /// events, so a room whose last event is a reaction can come back with no message at all.
-    fn settled(
-        &self,
-        room: &str,
-        cursor: Option<&str>,
-        state: &State,
-        window: &Window,
-    ) -> Option<String> {
-        let settled_here = state.settled.get(room).map(String::as_str) == cursor;
-        match &self.seen {
-            Seen::Nothing => None,
-            // Unchanged since the token, and settled at the cursor it still has: the window that
-            // settled it was stored, and nothing arrived since.
-            Seen::Changed(changed) => cursor
-                .filter(|_| settled_here && !changed.contains(room))
-                .map(str::to_owned),
-            Seen::Newest(newest) => {
-                let (id, sent) = newest.get(room)?.as_ref()?;
-                // The run that settled the room read it to its end after a `/sync` that showed
-                // this same newest event, and the window it wrote was stored: nothing arrived
-                // since.
-                if cursor.is_some()
-                    && settled_here
-                    && state.newest.get(room).map(String::as_str) == Some(id.as_str())
-                {
-                    return cursor.map(str::to_owned);
-                }
-                // A room the stream has no event of, whose newest event is older than where its
-                // read would start: nothing in it is new.
-                let from = match cursor.map(TokenCursor::parse) {
-                    None => window.start,
-                    Some(TokenCursor::Time(time)) => time,
-                    Some(TokenCursor::Token { .. }) => return None,
-                };
-                (*sent < from).then(|| window.unmoved(cursor))
-            }
+    /// events, so a room whose newest event is a reaction can come back with no message at all.
+    fn settled(&self, room: &str, cursor: Option<&str>, state: &State) -> Option<String> {
+        let cursor = cursor?;
+        if state.settled.get(room).map(String::as_str) != Some(cursor) {
+            return None;
         }
+        let unchanged = match &self.seen {
+            Seen::Nothing => false,
+            Seen::Changed(changed) => !changed.contains(room),
+            Seen::Newest(newest) => newest
+                .get(room)
+                .and_then(Option::as_deref)
+                .is_some_and(|id| state.newest.get(room).map(String::as_str) == Some(id)),
+        };
+        unchanged.then(|| cursor.to_owned())
     }
 }
 
@@ -393,6 +456,14 @@ fn joined_entries(body: &Value) -> impl Iterator<Item = (&String, &Value)> {
         .flatten()
 }
 
+/// The events of one array of a `/sync` room entry.
+fn entry_events<'e>(entry: &'e Value, pointer: &str) -> &'e [Value] {
+    entry
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
 /// The rooms with any event since `since`. `None` when the run must stop.
 fn incremental(
     reader: &mut Reader<'_>,
@@ -421,19 +492,18 @@ fn full(reader: &mut Reader<'_>, excluded: &[&String]) -> Result<Option<Prepass>
     let mut newest = BTreeMap::new();
     let mut facts = BTreeMap::new();
     for (room, entry) in joined_entries(&body) {
-        let last = entry
-            .pointer("/timeline/events")
-            .and_then(Value::as_array)
-            .and_then(|events| events.last())
-            .and_then(|event| Some((event_id(event)?.to_owned(), sent_at(event)?)));
-        newest.insert(room.clone(), last);
+        let timeline = entry_events(entry, "/timeline/events");
+        newest.insert(
+            room.clone(),
+            timeline.last().and_then(event_id).map(str::to_owned),
+        );
+        // The state comes as it stood before the timeline's events, so a rename that is the
+        // room's newest event comes in the timeline.
         let mut known = Facts::default();
-        for event in entry
-            .pointer("/state/events")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        for event in entry_events(entry, "/state/events").iter().chain(timeline) {
+            if event.get("state_key").and_then(Value::as_str) != Some("") {
+                continue;
+            }
             let field = |name: &str| {
                 event
                     .pointer(&format!("/content/{name}"))
@@ -468,63 +538,11 @@ struct RoomRead {
     stopped: bool,
 }
 
-/// Reads one room: its name first, so a room `exclude_rooms` names by name is never read, then
-/// its events from the cursor on.
-fn read_room(
-    reader: &mut Reader<'_>,
-    scheme: &str,
-    room: &str,
-    cursor: Option<&str>,
-    window: &Window,
-    selection: &Selection,
-    known: &mut BTreeMap<String, Facts>,
-) -> Result<RoomRead> {
-    let unread = |stopped| RoomRead {
-        records: Vec::new(),
-        warnings: Vec::new(),
-        cursor: window.unmoved(cursor),
-        complete: false,
-        stopped,
-    };
-    let Ok(facts) = reader.facts(room, selection.names_aliases())? else {
-        return Ok(unread(true));
-    };
-    known.insert(room.to_owned(), facts.clone());
-    if selection.decide(room, Some(&facts)) == Decision::Skip {
-        return Ok(unread(false));
-    }
-    let label = facts.label(room).to_owned();
-    let mut walk = Walk {
-        reader,
-        room: Room {
-            scheme,
-            id: room,
-            label: &label,
-        },
-        window,
-        members: BTreeMap::new(),
-        records: Vec::new(),
-        index: BTreeMap::new(),
-        originals: BTreeMap::new(),
-        removed: BTreeSet::new(),
-        warnings: Vec::new(),
-        encrypted: 0,
-        unserved: 0,
-        position: Position::Cursor(cursor.map(str::to_owned)),
-        held: false,
-        stopped: false,
-        reached_end: false,
-        believable: latest_believable(window.end),
-    };
-    walk.start(cursor)?;
-    Ok(walk.finish())
-}
-
 /// Where a room's read stands.
 enum Position {
     /// Where the cursor it started from says.
     Cursor(Option<String>),
-    /// After this event, sent at this time.
+    /// After this event, stored through this time.
     Event { id: String, ts: DateTime<Utc> },
     /// Through this time, with no event to name.
     Time(DateTime<Utc>),
@@ -537,34 +555,67 @@ enum Flow {
     Hold,
     /// The run stopped before the event could be read.
     Stop,
+    /// The room has had its [`ROOM_LOOKUPS`] this run: the event and everything after it wait
+    /// for the next fetch.
+    Pause,
 }
+
+/// Why a room's read ended before the room's end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Halt {
+    /// An event was sent after the window end.
+    Held,
+    /// The run stopped: its budget, the homeserver's rate limit, or no answer.
+    Stopped,
+    /// The room had its [`ROOM_LOOKUPS`] this run.
+    Paused,
+}
+
+/// An event a read looked up, with the time its record carries, or `None` when the homeserver
+/// does not serve it.
+type Looked = Option<(Value, DateTime<Utc>)>;
 
 /// One room's read, event by event.
 struct Walk<'w, 'c> {
     reader: &'w mut Reader<'c>,
     room: Room<'w>,
     window: &'w Window,
+    /// The message events read, in this run or an earlier one, that made no record of their
+    /// own, with the end of the window that read each.
+    unrecorded: &'w mut BTreeMap<String, DateTime<Utc>>,
     /// Each sender's display name, or `None` when the room holds none.
     members: BTreeMap<String, Option<String>>,
     records: Vec<Record>,
     /// Where in `records` the record of each pointer is.
     index: BTreeMap<String, usize>,
-    /// Each message event the read has met, and the time its record carries.
-    originals: BTreeMap<String, (Value, DateTime<Utc>)>,
+    /// Each message event the read has met or looked up.
+    originals: BTreeMap<String, Looked>,
     /// The messages a redaction this read met removed.
     removed: BTreeSet<String>,
     warnings: Vec<String>,
     encrypted: usize,
-    /// Edits and redactions of an event the homeserver no longer serves.
+    /// Edits and redactions of an event the homeserver does not serve.
     unserved: usize,
+    /// Events whose own id is not one a pointer can name.
+    unnamable: usize,
+    lookups: u32,
     position: Position,
-    held: bool,
-    stopped: bool,
+    /// The message events this read met in the room's timeline.
+    met: BTreeSet<String>,
+    /// Why the read ended before the room's end, when it did.
+    halt: Option<Halt>,
     reached_end: bool,
     /// The latest time an event the last page held can carry and still have been sent, taken
     /// just after that page was read: an event dated later is taken for a wrong clock and
     /// stored at the window end.
     believable: DateTime<Utc>,
+}
+
+fn is_message_type(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("m.room.message" | "m.sticker")
+    )
 }
 
 impl Walk<'_, '_> {
@@ -576,7 +627,7 @@ impl Walk<'_, '_> {
                 token,
                 stored_through,
             }) => match self.reader.context(room, token)? {
-                Err(_) => self.stopped = true,
+                Err(_) => self.halt = Some(Halt::Stopped),
                 Ok(Some(context)) => {
                     self.learn(&context.state);
                     let end = context.end.ok_or_else(|| {
@@ -599,25 +650,41 @@ impl Walk<'_, '_> {
         Ok(())
     }
 
-    /// Reads from the first event sent at or after `time`.
+    /// Reads from `time`: from the first event dated at or after it, and from the events placed
+    /// before that one that are dated after it, which a bridge's late delivery puts there.
     fn read_from_time(&mut self, time: DateTime<Utc>) -> Result<()> {
         let room = self.room.id;
         match self.reader.timestamp_to_event(room, time)? {
-            Err(_) => self.stopped = true,
+            Err(_) => self.halt = Some(Halt::Stopped),
             Ok(Found::Nothing) => {
                 self.position = Position::Time(time);
                 self.reached_end = true;
             }
-            Ok(Found::Unsupported) => self.backward(time)?,
+            Ok(Found::Unsupported) => {
+                if let Some(events) = self.back(None, time)? {
+                    if self.replay(&events, time)? {
+                        self.reached_end = true;
+                    }
+                }
+            }
             Ok(Found::Event(first)) => match self.reader.context(room, &first)? {
-                Err(_) => self.stopped = true,
+                Err(_) => self.halt = Some(Halt::Stopped),
                 Ok(None) => bail!(
                     "the homeserver named {first} as the first event in {room} at {} and then served no context for it",
                     rfc3339(time)
                 ),
                 Ok(Some(context)) => {
                     self.learn(&context.state);
-                    if matches!(self.step(&context.event)?, Flow::Go) {
+                    let earlier = match context.start {
+                        Some(start) => match self.back(Some(start), time)? {
+                            Some(events) => events,
+                            None => return Ok(()),
+                        },
+                        None => Vec::new(),
+                    };
+                    if self.replay(&earlier, time)?
+                        && matches!(self.step(&context.event)?, Flow::Go)
+                    {
                         let end = context.end.ok_or_else(|| {
                             anyhow!("the homeserver's context of {first} in {room} has no end token")
                         })?;
@@ -646,7 +713,7 @@ impl Walk<'_, '_> {
                 .reader
                 .messages(self.room.id, Direction::Forward, Some(&token))?
             else {
-                self.stopped = true;
+                self.halt = Some(Halt::Stopped);
                 return Ok(());
             };
             self.learn(&page.state);
@@ -655,69 +722,74 @@ impl Walk<'_, '_> {
                     return Ok(());
                 }
             }
-            if !page.chunk.is_empty() {
-                from = page.end;
-            }
+            // A homeserver leaves out what the user may not see after it has taken a page, so
+            // an empty page can have more after it: only a page with no `end` is the room's end.
+            from = page.end.filter(|end| *end != token);
         }
         self.reached_end = true;
         Ok(())
     }
 
-    /// Reads the room newest first from its end back past `time`, then oldest first, for a
-    /// homeserver that does not serve `/timestamp_to_event`.
-    fn backward(&mut self, time: DateTime<Utc>) -> Result<()> {
+    /// Pages back from `from`, or from the room's end, until a page holds only events dated
+    /// before `time` or the room's start, for at most [`BACKWARD_PAGES`] pages. The events it
+    /// read come back oldest first; `None` when the run stopped.
+    fn back(&mut self, from: Option<String>, time: DateTime<Utc>) -> Result<Option<Vec<Value>>> {
         let mut events = Vec::new();
-        let mut from: Option<String> = None;
-        let mut reached = false;
+        let mut from = from;
         for _ in 0..BACKWARD_PAGES {
             let Ok(page) =
                 self.reader
                     .messages(self.room.id, Direction::Backward, from.as_deref())?
             else {
-                self.stopped = true;
-                return Ok(());
+                self.halt = Some(Halt::Stopped);
+                return Ok(None);
             };
             self.learn(&page.state);
-            let last_page = page.chunk.is_empty() || page.end.is_none();
-            for event in page.chunk {
-                reached |= sent_at(&event).is_some_and(|sent| sent < time);
-                events.push(event);
+            let older = !page.chunk.is_empty()
+                && page
+                    .chunk
+                    .iter()
+                    .all(|event| sent_at(event).is_some_and(|sent| sent < time));
+            events.extend(page.chunk);
+            let next = page.end.filter(|end| Some(end) != from.as_ref());
+            if older || next.is_none() {
+                events.reverse();
+                return Ok(Some(events));
             }
-            if reached || last_page {
-                reached = true;
-                break;
-            }
-            from = page.end;
+            from = next;
         }
-        if !reached {
-            self.warnings.push(format!(
-                "the homeserver does not serve /timestamp_to_event, and the newest {} pages of this room reach back only to {}: its older events since {} are not read",
-                BACKWARD_PAGES,
-                events
-                    .last()
-                    .and_then(sent_at)
-                    .map_or_else(|| "its start".to_owned(), rfc3339),
-                rfc3339(time)
-            ));
-        }
+        self.warnings.push(format!(
+            "{BACKWARD_PAGES} pages back from where this room's read starts reach only to {}: earlier events dated since {} are not read",
+            events
+                .last()
+                .and_then(sent_at)
+                .map_or_else(|| "its start".to_owned(), rfc3339),
+            rfc3339(time)
+        ));
         events.reverse();
-        for event in &events {
+        Ok(Some(events))
+    }
+
+    /// Reads `events`, oldest first, leaving out those dated before `time`, which are older
+    /// than where the read starts though a bridge delivered them after it. `false` when the
+    /// read must stop.
+    fn replay(&mut self, events: &[Value], time: DateTime<Utc>) -> Result<bool> {
+        for event in events {
             match (event_id(event), sent_at(event)) {
-                (Some(id), Some(sent)) if sent < time => {
+                (Some(id), Some(sent)) if sent < time && is_event_id(id) => {
                     self.position = Position::Event {
                         id: id.to_owned(),
-                        ts: sent,
+                        ts: time,
                     };
                 }
                 _ => {
                     if !matches!(self.step(event)?, Flow::Go) {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
             }
         }
-        self.reached_end = true;
-        Ok(())
+        Ok(true)
     }
 
     /// Learns what a page or context just read says: its senders' names, and the latest date
@@ -727,15 +799,20 @@ impl Walk<'_, '_> {
         self.believable = latest_believable(self.window.end);
     }
 
-    /// Reads one event, and moves the position past it unless it must wait or the run stopped.
+    /// Reads one event, and moves the position past it unless it must wait or the read stops.
     fn step(&mut self, event: &Value) -> Result<Flow> {
         let (Some(id), Some(sent)) = (event_id(event), sent_at(event)) else {
             return Ok(Flow::Go);
         };
+        if !is_event_id(id) {
+            // No pointer can name it, and no cursor either: the read goes past it in place.
+            self.unnamable += 1;
+            return Ok(Flow::Go);
+        }
         let ts = if sent <= self.window.end {
             sent
         } else if sent <= self.believable {
-            self.held = true;
+            self.halt = Some(Halt::Held);
             return Ok(Flow::Hold);
         } else {
             self.warnings.push(format!(
@@ -746,37 +823,51 @@ impl Walk<'_, '_> {
             ));
             self.window.end
         };
-        if matches!(
-            event.get("type").and_then(Value::as_str),
-            Some("m.room.message" | "m.sticker")
-        ) {
-            self.originals.insert(id.to_owned(), (event.clone(), ts));
+        let message = is_message_type(event);
+        if message {
+            self.originals
+                .insert(id.to_owned(), Some((event.clone(), ts)));
+            self.met.insert(id.to_owned());
         }
         let flow = match kind(event) {
             Kind::Message => self.message(event, ts)?,
-            Kind::Removed => self.removal(event, event, ts)?,
-            Kind::Edit { target, content } => self.edit(event, target, content)?,
+            // Served already redacted: the stream never read its text, so no record of it
+            // exists to change.
+            Kind::Removed => Flow::Go,
+            Kind::Edit { target, content } => {
+                self.unrecorded.insert(id.to_owned(), self.window.end);
+                self.edit(event, target, content)?
+            }
             Kind::Redaction { target } => self.redaction(event, target)?,
             Kind::Encrypted => {
                 self.encrypted += 1;
                 Flow::Go
             }
-            Kind::Other => Flow::Go,
+            Kind::Other => {
+                if message {
+                    self.unrecorded.insert(id.to_owned(), self.window.end);
+                }
+                Flow::Go
+            }
         };
-        if matches!(flow, Flow::Go) {
-            self.position = Position::Event {
-                id: id.to_owned(),
-                ts,
-            };
-        } else {
-            self.stopped = true;
+        match flow {
+            Flow::Go => {
+                self.position = Position::Event {
+                    id: id.to_owned(),
+                    ts,
+                };
+            }
+            Flow::Stop => self.halt = Some(Halt::Stopped),
+            Flow::Pause => self.halt = Some(Halt::Paused),
+            Flow::Hold => self.halt = Some(Halt::Held),
         }
         Ok(flow)
     }
 
     fn message(&mut self, event: &Value, ts: DateTime<Utc>) -> Result<Flow> {
-        let Ok(author) = self.author(event)? else {
-            return Ok(Flow::Stop);
+        let author = match self.author(event)? {
+            Ok(author) => author,
+            Err(flow) => return Ok(flow),
         };
         let content = event.get("content").unwrap_or(&Value::Null);
         if let Some(record) = self.room.record(event, content, event, &author, ts) {
@@ -785,39 +876,37 @@ impl Walk<'_, '_> {
         Ok(Flow::Go)
     }
 
-    /// Records `message` as removed, by `cause`.
-    fn removal(&mut self, message: &Value, cause: &Value, ts: DateTime<Utc>) -> Result<Flow> {
-        let Ok(author) = self.author(message)? else {
-            return Ok(Flow::Stop);
-        };
-        if let Some(record) = self.room.removed(message, cause, &author, ts) {
-            self.put(record);
+    /// The event `target` names, as this read met or looked it up when `cached`, else as the
+    /// homeserver serves it now, with the time its record carries. `Err` carries the flow when
+    /// the read cannot look it up: the run stopped, or the room has had its lookups.
+    fn lookup(&mut self, target: &str, cached: bool) -> Result<Result<Looked, Flow>> {
+        if cached {
+            if let Some(found) = self.originals.get(target) {
+                return Ok(Ok(found.clone()));
+            }
         }
-        Ok(Flow::Go)
-    }
-
-    /// The message `target` names, met in this read or fetched, and the time its record
-    /// carries; `None` when the homeserver does not serve it.
-    fn original(&mut self, target: &str) -> Step<Option<(Value, DateTime<Utc>)>> {
-        if let Some(original) = self.originals.get(target) {
-            return Ok(Ok(Some(original.clone())));
+        if self.lookups == ROOM_LOOKUPS {
+            return Ok(Err(Flow::Pause));
         }
-        let fetched = match self.reader.event(self.room.id, target)? {
-            Ok(fetched) => fetched,
-            Err(stop) => return Ok(Err(stop)),
+        self.lookups += 1;
+        let Ok(fetched) = self.reader.related_event(self.room.id, target)? else {
+            return Ok(Err(Flow::Stop));
         };
-        Ok(Ok(fetched.and_then(|event| {
+        let found = fetched.and_then(|event| {
             let ts = sent_at(&event)?.min(self.window.end);
             Some((event, ts))
-        })))
+        });
+        self.originals.insert(target.to_owned(), found.clone());
+        Ok(Ok(found))
     }
 
     /// Applies an edit: the message it names, with the new text, as Matrix's rules for a
     /// replacement allow it — the sender of both is the same, and the message is neither
     /// removed nor itself an edit.
     fn edit(&mut self, edit: &Value, target: &str, content: &Value) -> Result<Flow> {
-        let Ok(found) = self.original(target)? else {
-            return Ok(Flow::Stop);
+        let found = match self.lookup(target, true)? {
+            Ok(found) => found,
+            Err(flow) => return Ok(flow),
         };
         let Some((original, ts)) = found else {
             self.unserved += 1;
@@ -829,8 +918,9 @@ impl Walk<'_, '_> {
         {
             return Ok(Flow::Go);
         }
-        let Ok(author) = self.author(&original)? else {
-            return Ok(Flow::Stop);
+        let author = match self.author(&original)? {
+            Ok(author) => author,
+            Err(flow) => return Ok(flow),
         };
         if let Some(record) = self.room.record(&original, content, edit, &author, ts) {
             self.put(record);
@@ -838,42 +928,69 @@ impl Walk<'_, '_> {
         Ok(Flow::Go)
     }
 
-    /// Applies a redaction: the message it names reads as removed. A redaction of anything
-    /// but a message — a reaction, an edit — changes no record.
+    /// Applies a redaction: the message it names reads as removed, when the homeserver serves
+    /// that message redacted now. A redaction the homeserver did not apply — its sender may not
+    /// redact that message — changes nothing, and neither does one of an event that made no
+    /// record of its own (an edit, a reaction) or of a message this read met already redacted.
     fn redaction(&mut self, redaction: &Value, target: &str) -> Result<Flow> {
-        let Ok(found) = self.original(target)? else {
-            return Ok(Flow::Stop);
+        if self.unrecorded.contains_key(target) {
+            return Ok(Flow::Go);
+        }
+        // This read met the message in the timeline: its record is this read's own, or none at
+        // all when the homeserver served it already redacted.
+        let met = if self.met.contains(target) {
+            self.originals.get(target).cloned().flatten()
+        } else {
+            None
         };
-        let Some((original, ts)) = found else {
+        if met
+            .as_ref()
+            .is_some_and(|(event, _)| kind(event) == Kind::Removed)
+        {
+            return Ok(Flow::Go);
+        }
+        let current = match self.lookup(target, false)? {
+            Ok(current) => current,
+            Err(flow) => return Ok(flow),
+        };
+        let Some((current, ts)) = current else {
             self.unserved += 1;
             return Ok(Flow::Go);
         };
-        let is_message = matches!(
-            original.get("type").and_then(Value::as_str),
-            Some("m.room.message" | "m.sticker")
-        );
-        if !is_message || matches!(kind(&original), Kind::Edit { .. }) {
+        if !is_message_type(&current) || kind(&current) != Kind::Removed {
             return Ok(Flow::Go);
         }
+        let (message, ts) = met.unwrap_or((current, ts));
         self.removed.insert(target.to_owned());
-        self.removal(&original, redaction, ts)
+        let author = match self.author(&message)? {
+            Ok(author) => author,
+            Err(flow) => return Ok(flow),
+        };
+        if let Some(record) = self.room.removed(&message, redaction, &author, ts) {
+            self.put(record);
+        }
+        Ok(Flow::Go)
     }
 
-    /// The name of `event`'s sender: the display name the room holds for them, else their
-    /// Matrix id.
-    fn author(&mut self, event: &Value) -> Step<String> {
+    /// How a record names `event`'s sender ([`author_line`]), with the display name the room
+    /// holds for them.
+    fn author(&mut self, event: &Value) -> Result<Result<String, Flow>> {
         let Some(user) = sender(event) else {
             return Ok(Ok(String::new()));
         };
         if let Some(name) = self.members.get(user) {
-            return Ok(Ok(name.clone().unwrap_or_else(|| user.to_owned())));
+            return Ok(Ok(author_line(name.as_deref(), user)));
         }
-        let name = match self.reader.member_name(self.room.id, user)? {
-            Ok(name) => name,
-            Err(stop) => return Ok(Err(stop)),
+        if self.lookups == ROOM_LOOKUPS {
+            return Ok(Err(Flow::Pause));
+        }
+        self.lookups += 1;
+        let Ok(name) = self.reader.member_name(self.room.id, user)? else {
+            return Ok(Err(Flow::Stop));
         };
-        self.members.insert(user.to_owned(), name.clone());
-        Ok(Ok(name.unwrap_or_else(|| user.to_owned())))
+        let line = author_line(name.as_deref(), user);
+        self.members.insert(user.to_owned(), name);
+        Ok(Ok(line))
     }
 
     /// Adds a record, or replaces the one for the same message, which keeps its place.
@@ -900,8 +1017,19 @@ impl Walk<'_, '_> {
         }
         if self.unserved > 0 {
             self.warnings.push(format!(
-                "{} edit(s) or redaction(s) skipped: each names an event the homeserver no longer serves",
+                "{} edit(s) or redaction(s) skipped: each names an event the homeserver does not serve to this account",
                 self.unserved
+            ));
+        }
+        if self.unnamable > 0 {
+            self.warnings.push(format!(
+                "{} event(s) skipped: their id is not a Matrix event id a pointer can name",
+                self.unnamable
+            ));
+        }
+        if self.halt == Some(Halt::Paused) {
+            self.warnings.push(format!(
+                "this room's read stopped after {ROOM_LOOKUPS} lookups of the events its edits and redactions name and of senders no page named, the most one run makes for a room; the next fetch reads on from where this one stopped"
             ));
         }
         let cursor = match self.position {
@@ -910,11 +1038,11 @@ impl Walk<'_, '_> {
             Position::Time(time) => rfc3339(time),
         };
         RoomRead {
-            complete: self.reached_end && !self.held && !self.stopped,
+            complete: self.reached_end && self.halt.is_none(),
             records: self.records,
             warnings: self.warnings,
             cursor,
-            stopped: self.stopped,
+            stopped: self.halt == Some(Halt::Stopped),
         }
     }
 }

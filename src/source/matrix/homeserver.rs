@@ -59,6 +59,8 @@ pub(super) type Step<T> = Result<Result<T, Stop>>;
 pub(super) struct Context {
     /// The event itself.
     pub(super) event: Value,
+    /// The token that reads back from just before the event.
+    pub(super) start: Option<String>,
     /// The token that reads on from just after the event.
     pub(super) end: Option<String>,
     /// The state that comes with it, which names the members whose events it returns.
@@ -135,7 +137,9 @@ impl<'c> Reader<'c> {
             let reply = match self.client.get(path, query) {
                 Ok(reply) => reply,
                 Err(error) => {
-                    if error.downcast_ref::<NoAnswer>().is_some() {
+                    // A request the budget does not cover — the room listing, the `/sync` —
+                    // is a step before any room's read, which its caller gets past without it.
+                    if charged && error.downcast_ref::<NoAnswer>().is_some() {
                         self.stopped = Some(Stop::NoAnswer);
                     }
                     return Err(error);
@@ -286,6 +290,7 @@ impl<'c> Reader<'c> {
         };
         Ok(Ok(Some(Context {
             event: found,
+            start: token(&body, "start"),
             end: token(&body, "end"),
             state: events(&mut body, "state"),
         })))
@@ -367,6 +372,18 @@ impl<'c> Reader<'c> {
 
     /// One event, or `None` when the homeserver does not serve it.
     pub(super) fn event(&mut self, room: &str, event: &str) -> Step<Option<Value>> {
+        self.lookup(room, event, false)
+    }
+
+    /// The event another one names in its own content — the message an edit or a redaction is
+    /// of, a thread's root — or `None` when the homeserver will not serve it. Its sender wrote
+    /// the id, so any refusal (`4xx`) means there is no such event the user may read, never
+    /// that the room's read failed.
+    pub(super) fn related_event(&mut self, room: &str, event: &str) -> Step<Option<Value>> {
+        self.lookup(room, event, true)
+    }
+
+    fn lookup(&mut self, room: &str, event: &str, related: bool) -> Step<Option<Value>> {
         let path = format!(
             "/_matrix/client/v3/rooms/{}/event/{}",
             encode(room),
@@ -376,7 +393,7 @@ impl<'c> Reader<'c> {
             Ok(reply) => reply,
             Err(stop) => return Ok(Err(stop)),
         };
-        if reply.is_not_found() {
+        if reply.is_not_found() || (related && (400..500).contains(&reply.status)) {
             return Ok(Ok(None));
         }
         if !reply.is_success() {
