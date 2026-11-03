@@ -53,14 +53,15 @@ fn ctx_commands(text: &str) -> Vec<(String, Vec<String>)> {
 }
 
 /// Whether a command runs only on a machine with its own tree, filling in required arguments
-/// a skill leaves out when it only names the command (`ctx dossier`).
+/// a skill leaves out when it only names the command (`ctx dossier`), each with `1`, which
+/// parses as a path, an id or a count.
 fn runs_only_locally(argv: &[String]) -> Result<bool> {
     let mut argv = argv.to_vec();
     loop {
         match parse_argv(&argv) {
             Ok(cli) => return Ok(cli.command.remote() == Remote::Local),
             Err(error) if error.kind() == ErrorKind::MissingRequiredArgument && argv.len() < 8 => {
-                argv.push("x".to_owned());
+                argv.push("1".to_owned());
             }
             Err(error) => bail!("{} does not parse: {error}", argv.join(" ")),
         }

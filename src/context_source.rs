@@ -5,7 +5,8 @@
 //! input, `{"window": <id>, "subjects": [<subject>…]}`, and answers on standard output with
 //! `{"items": [{"ref", "title", "status", "updated_at", "links"}…], "unavailable": <reason>}`.
 //! A subject is a key the configured pattern matches or a web address under a configured
-//! prefix, found in the window's messages and in the `tracked_by` of every open record.
+//! prefix, found in the window's messages and in the `tracked_by` of every open record. Of a
+//! window worked in pages, only the messages of the page `ctx pending` lists are read.
 //!
 //! What it answers reaches an agent that reads text outside parties wrote, so every field is
 //! cut and cleaned here, whatever the program did: control characters go, a title is at most
@@ -16,7 +17,7 @@
 //! never an error: context is optional, and the cycle goes on without it. Each run is one line
 //! on standard error.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -251,7 +252,10 @@ pub fn prepare(
     let window = Window::open(dir)
         .map_err(|_| Refused::Missing(format!("window {id} does not exist or is incomplete")))?;
     let exclusion = Exclusion::configured(&context.config)?;
-    let mut subjects = subjects(&config, &window, &context.tree, &exclusion)?;
+    // A window worked in pages has the context of the page an answer lists now, so a cycle on a
+    // later page is not handed what the window's first page named.
+    let page = crate::marker::page_pointers(context, &window)?;
+    let mut subjects = subjects(&config, &window, &context.tree, &exclusion, page.as_ref())?;
     subjects.truncate(limits.max_subjects);
     let schemes = crate::source::configured_schemes(&context.config.sources)?;
     let seconds = config
@@ -269,8 +273,9 @@ pub fn prepare(
 }
 
 /// The subjects of one window: what the key pattern matches and the web addresses under a link
-/// prefix, in the window's messages (less those the deployment excludes) and then in the
-/// `tracked_by` of every open record, each once, at most [`MAX_SUBJECTS`].
+/// prefix, in the window's messages (less those the deployment excludes, and, when `only` names
+/// the messages of the page an answer lists, less every other) and then in the `tracked_by` of
+/// every open record, each once, at most [`MAX_SUBJECTS`].
 ///
 /// # Errors
 ///
@@ -281,6 +286,7 @@ pub fn subjects(
     window: &Window,
     tree: &Tree,
     exclusion: &Exclusion,
+    only: Option<&BTreeSet<String>>,
 ) -> Result<Vec<String>> {
     let pattern = config
         .key_pattern
@@ -291,7 +297,9 @@ pub fn subjects(
     let mut found = Found::default();
     for sourced in window.records()? {
         let record = &sourced.record;
-        if exclusion.matches(&record.pointer) {
+        if exclusion.matches(&record.pointer)
+            || only.is_some_and(|only| !only.contains(&record.pointer))
+        {
             continue;
         }
         for text in [

@@ -4,11 +4,11 @@
 
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
-use ctx_memory::marker::Marker;
+use ctx_memory::marker::{Marker, Page, PageMessage};
 use ctx_memory::protocol::{
     Captured, CommandRequest, Committed, DeleteRequest, Draft, Finding, MarkerRequest,
-    MarkerResponse, PutBatchRequest, PutRequest, RecordFile, Refused, COMMAND_ROUTE, DELETE_ROUTE,
-    MARKER_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE,
+    MarkerResponse, PageRequest, PageResponse, PutBatchRequest, PutRequest, RecordFile, Refused,
+    COMMAND_ROUTE, DELETE_ROUTE, MARKER_ROUTE, PAGE_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -85,6 +85,45 @@ fn a_batch_put_request_keeps_its_route_and_bytes() -> Result<()> {
     )?;
     let bare: PutBatchRequest = serde_json::from_str(r#"{"records":[]}"#)?;
     assert!(bare.records.is_empty() && bare.session.is_none());
+    Ok(())
+}
+
+/// The page route is newer than the shared module: its path, its body and its answer are
+/// pinned so a client and a server of different releases agree on them. An older server has no
+/// such route and answers 404, so an older server never takes a page for a marker move.
+#[test]
+fn a_page_record_keeps_its_route_and_bytes() -> Result<()> {
+    assert_eq!(PAGE_ROUTE, "/v1/marker/page");
+    same_bytes(
+        &PageRequest {
+            ends_at: "slack:C0EXAMPLE01/1700000000.000200".to_owned(),
+            session: Some("session-7".to_owned()),
+            window: "20261028T000000Z-0001".to_owned(),
+        },
+        r#"{"ends_at":"slack:C0EXAMPLE01/1700000000.000200","session":"session-7","window":"20261028T000000Z-0001"}"#,
+    )?;
+    let bare: PageRequest = serde_json::from_str(r#"{"window":"w","ends_at":"echo:a"}"#)?;
+    assert_eq!(bare.session, None);
+    let at = Utc
+        .with_ymd_and_hms(2026, 10, 28, 1, 2, 3)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("no such time"))?;
+    same_bytes(
+        &PageResponse {
+            page: Page {
+                version: 1,
+                window: "20261028T000000Z-0001".to_owned(),
+                worked: 200,
+                last: PageMessage {
+                    ts: at,
+                    pointer: "slack:C0EXAMPLE01/1700000000.000200".to_owned(),
+                },
+                recorded_at: at,
+                by: "ada@example.com (session-7)".to_owned(),
+            },
+        },
+        r#"{"page":{"version":1,"window":"20261028T000000Z-0001","worked":200,"last":{"ts":"2026-10-28T01:02:03Z","pointer":"slack:C0EXAMPLE01/1700000000.000200"},"recorded_at":"2026-10-28T01:02:03Z","by":"ada@example.com (session-7)"}}"#,
+    )?;
     Ok(())
 }
 

@@ -1,5 +1,5 @@
 //! What `ctx pending` leaves out: the messages the deployment excludes, and what would take
-//! one answer past its size.
+//! one answer past its size, which waits for the window's next page.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,21 +8,47 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, TimeZone as _, Utc};
 
-use super::Pending;
+use super::{Pending, Serving};
 use crate::config::DataDir;
 use crate::delta::{Delta, NewMessage, OpenFlag, ReplyRef};
 use crate::exclude::Exclusion;
 use crate::windows::{Manifest, Status};
 
-/// [`super::pending_in`] with no window cap and no Slack source, which these tests do not
-/// exercise.
-fn pending_in(
-    data: &DataDir,
-    exclusion: &Exclusion,
-    budget: usize,
-    offset: usize,
-) -> Result<Pending> {
-    super::pending_in(data, None, exclusion, budget, offset, None)
+/// Answers held to `budget` bytes, with pages of any count and no Slack source, which these
+/// tests do not exercise.
+fn serving(exclusion: &Exclusion, budget: usize) -> Serving<'_> {
+    Serving {
+        exclusion,
+        budget,
+        page_messages: usize::MAX,
+        mentions: None,
+    }
+}
+
+/// [`super::pending_in`] with no window cap, held to `budget` bytes.
+fn pending_in(data: &DataDir, exclusion: &Exclusion, budget: usize) -> Result<Pending> {
+    super::pending_in(data, None, &serving(exclusion, budget))
+}
+
+/// Records the page `pending` lists for its first window, as a cycle does once the page's records
+/// are written, and says whether another page waits after it.
+fn record_page(data: &DataDir, pending: &Pending, budget: usize) -> Result<bool> {
+    let window = pending.windows.first().context("a window waits")?;
+    let page = window
+        .page
+        .as_ref()
+        .context("the window is worked in pages")?;
+    if page.last {
+        return Ok(false);
+    }
+    super::page_in(
+        data,
+        &window.window,
+        page.ends_at.as_deref().context("the page names its end")?,
+        "test",
+        &serving(&Exclusion::default(), budget),
+    )?;
+    Ok(true)
 }
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -126,7 +152,7 @@ fn an_excluded_stream_never_appears_in_a_pending_delta() -> Result<()> {
     let before = std::fs::read(dir.join("delta.json"))?;
 
     let exclusion = Exclusion::new(&["github:example-org/busy@*".to_owned()])?;
-    let pending = pending_in(&data, &exclusion, usize::MAX, 0)?;
+    let pending = pending_in(&data, &exclusion, usize::MAX)?;
     let after = std::fs::read(dir.join("delta.json"))?;
     remove(&root)?;
 
@@ -164,7 +190,7 @@ fn windows_past_the_answer_size_wait_for_the_next_answer() -> Result<()> {
     for (n, id) in ids.iter().enumerate() {
         window(&data, id, messages(&format!("slack:C0EXAMPLE0{n}"), 40)?)?;
     }
-    let whole = pending_in(&data, &Exclusion::default(), usize::MAX, 0)?;
+    let whole = pending_in(&data, &Exclusion::default(), usize::MAX)?;
     let one = whole
         .delta
         .as_ref()
@@ -172,7 +198,7 @@ fn windows_past_the_answer_size_wait_for_the_next_answer() -> Result<()> {
         .answer_len()
         / 3;
     // Room for two windows' deltas and not three.
-    let pending = pending_in(&data, &Exclusion::default(), one * 2 + one / 2, 0)?;
+    let pending = pending_in(&data, &Exclusion::default(), one * 2 + one / 2)?;
     remove(&root)?;
 
     assert_eq!(whole.later_windows, 0);
@@ -192,12 +218,12 @@ fn windows_past_the_answer_size_wait_for_the_next_answer() -> Result<()> {
     assert!(pending
         .windows
         .iter()
-        .all(|window| window.listed_messages == window.new_messages));
+        .all(|window| window.listed_messages == window.new_messages && window.page.is_none()));
     Ok(())
 }
 
-/// One window larger than an answer is still listed, with the oldest messages that fit; the
-/// answer says how many it left out, and stays within its size.
+/// One window larger than an answer is still listed, with the oldest messages that fit, as its
+/// first page; the answer says how many it left out, and stays within its size.
 #[test]
 fn a_window_larger_than_an_answer_lists_what_fits_and_counts_the_rest() -> Result<()> {
     let root = scratch()?;
@@ -213,7 +239,7 @@ fn a_window_larger_than_an_answer_lists_what_fits_and_counts_the_rest() -> Resul
         messages("slack:C0EXAMPLE01", 3)?,
     )?;
     let budget = 64 * 1024;
-    let pending = pending_in(&data, &Exclusion::default(), budget, 0)?;
+    let pending = pending_in(&data, &Exclusion::default(), budget)?;
     remove(&root)?;
 
     let delta = pending.delta.as_ref().context("one delta")?;
@@ -232,7 +258,14 @@ fn a_window_larger_than_an_answer_lists_what_fits_and_counts_the_rest() -> Resul
         Some(2_000 - first.listed_messages),
         "the answer counts what it left out"
     );
-    assert_eq!(pending.next_offset, Some(first.listed_messages));
+    let page = first
+        .page
+        .as_ref()
+        .context("the window is worked in pages")?;
+    assert_eq!(
+        (page.worked, page.through, page.last),
+        (0, first.listed_messages, false)
+    );
     let oldest = delta.new_messages.windows(2).all(|pair| {
         pair.first().map(|m| (m.ts, &m.pointer)) <= pair.get(1).map(|m| (m.ts, &m.pointer))
     });
@@ -240,10 +273,10 @@ fn a_window_larger_than_an_answer_lists_what_fits_and_counts_the_rest() -> Resul
     Ok(())
 }
 
-/// Following `next_offset` lists every message of a window larger than an answer, each once,
-/// and every part stays within the answer's size.
+/// Recording each page lists every message of a window larger than an answer, each once, one
+/// page an answer, and every page stays within the answer's size.
 #[test]
-fn next_offset_lists_every_message_of_a_large_window_once() -> Result<()> {
+fn recording_each_page_lists_every_message_of_a_large_window_once() -> Result<()> {
     let root = scratch()?;
     let data = DataDir::new(root.clone());
     let all = messages("github:example-org/busy@c", 2_000)?;
@@ -253,23 +286,21 @@ fn next_offset_lists_every_message_of_a_large_window_once() -> Result<()> {
         .collect::<std::collections::BTreeSet<_>>();
     window(&data, "20261030T020000Z-0000", all)?;
     let budget = 64 * 1024;
-    let mut offset = 0;
     let mut listed = Vec::new();
     let mut parts = 0;
     loop {
-        let pending = pending_in(&data, &Exclusion::default(), budget, offset)?;
-        let delta = pending.delta.context("a delta")?;
+        let pending = pending_in(&data, &Exclusion::default(), budget)?;
+        let delta = pending.delta.as_ref().context("a delta")?;
         assert!(delta.answer_len() <= budget, "part {parts} fits");
         listed.extend(
             delta
                 .new_messages
-                .into_iter()
-                .map(|message| message.pointer),
+                .iter()
+                .map(|message| message.pointer.clone()),
         );
         parts += 1;
-        match pending.next_offset {
-            Some(next) => offset = next,
-            None => break,
+        if !record_page(&data, &pending, budget)? {
+            break;
         }
         assert!(parts < 1_000, "the parts end");
     }
@@ -298,12 +329,17 @@ fn an_empty_window_does_not_hold_back_a_large_one() -> Result<()> {
         "20261030T021500Z-0000",
         messages("github:example-org/busy@c", 2_000)?,
     )?;
-    let pending = pending_in(&data, &Exclusion::default(), 64 * 1024, 0)?;
+    let pending = pending_in(&data, &Exclusion::default(), 64 * 1024)?;
     remove(&root)?;
 
     assert_eq!(pending.windows.len(), 2);
     assert_eq!(pending.later_windows, 0);
-    assert!(pending.next_offset.is_some());
+    assert!(pending.windows.first().is_some_and(|w| w.page.is_none()));
+    assert!(pending
+        .windows
+        .get(1)
+        .and_then(|w| w.page.as_ref())
+        .is_some());
     Ok(())
 }
 
@@ -322,7 +358,7 @@ fn the_answer_size_is_what_goes_on_the_wire() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     window(&data, "20261030T020000Z-0000", heavy)?;
     let budget = 64 * 1024;
-    let pending = pending_in(&data, &Exclusion::default(), budget, 0)?;
+    let pending = pending_in(&data, &Exclusion::default(), budget)?;
     remove(&root)?;
 
     let mut printed = Vec::new();
@@ -338,7 +374,7 @@ fn the_answer_size_is_what_goes_on_the_wire() -> Result<()> {
 
 /// Messages that each make a different record stale page through like any others: a flag's
 /// own fields count only on the page that lists one of its replies, and every page lists at
-/// least one message, so `next_offset` always moves on.
+/// least one message, so each recorded page moves on.
 #[test]
 fn flagged_messages_page_through_and_every_page_moves_on() -> Result<()> {
     let root = scratch()?;
@@ -365,26 +401,32 @@ fn flagged_messages_page_through_and_every_page_moves_on() -> Result<()> {
         .collect();
     window_with(&data, "20261030T020000Z-0000", all, flags, Vec::new())?;
     let budget = 256 * 1024;
-    let mut offset = 0;
+    let mut worked = 0;
     let mut listed = 0;
     let mut parts = 0;
     loop {
-        let pending = pending_in(&data, &Exclusion::default(), budget, offset)?;
-        let delta = pending.delta.context("a delta")?;
+        let pending = pending_in(&data, &Exclusion::default(), budget)?;
+        let delta = pending.delta.as_ref().context("a delta")?;
         assert!(delta.answer_len() <= budget, "part {parts} fits");
         assert!(
             !delta.new_messages.is_empty(),
             "part {parts} lists a message"
         );
         assert_eq!(delta.unreviewed.len(), delta.new_messages.len());
+        let page = pending
+            .windows
+            .first()
+            .and_then(|window| window.page.as_ref())
+            .context("the window is worked in pages")?;
+        assert!(
+            page.worked == worked && page.through > worked,
+            "the page moves on"
+        );
+        worked = page.through;
         listed += delta.new_messages.len();
         parts += 1;
-        match pending.next_offset {
-            Some(next) => {
-                assert!(next > offset, "next_offset moves on");
-                offset = next;
-            }
-            None => break,
+        if !record_page(&data, &pending, budget)? {
+            break;
         }
         assert!(parts < 1_000, "the parts end");
     }
@@ -417,7 +459,7 @@ fn a_window_of_status_changes_alone_does_not_hold_back_the_next() -> Result<()> 
         messages("slack:C0EXAMPLE01", 3)?,
     )?;
     let budget = 64 * 1024;
-    let pending = pending_in(&data, &Exclusion::default(), budget, 0)?;
+    let pending = pending_in(&data, &Exclusion::default(), budget)?;
     remove(&root)?;
 
     assert_eq!(pending.windows.len(), 2, "both windows are listed");
@@ -464,7 +506,7 @@ fn one_message_with_more_flags_than_an_answer_holds_stays_within_it() -> Result<
         Vec::new(),
     )?;
     let budget = 256 * 1024;
-    let pending = pending_in(&data, &Exclusion::default(), budget, 0)?;
+    let pending = pending_in(&data, &Exclusion::default(), budget)?;
     remove(&root)?;
 
     let delta = pending.delta.context("a delta")?;
@@ -488,7 +530,7 @@ fn one_message_with_a_huge_author_stays_within_an_answer() -> Result<()> {
     only.author = Some("\u{7f}".repeat(1024 * 1024));
     window(&data, "20261030T020000Z-0000", vec![only])?;
     let budget = 256 * 1024;
-    let pending = pending_in(&data, &Exclusion::default(), budget, 0)?;
+    let pending = pending_in(&data, &Exclusion::default(), budget)?;
     remove(&root)?;
 
     let delta = pending.delta.context("a delta")?;
@@ -508,10 +550,10 @@ fn a_persisted_pointer_past_the_bound_is_held_to_it_when_read() -> Result<()> {
     let mut threaded = message("slack:C0EXAMPLE01/2", 1)?;
     threaded.thread = Some(format!("slack:C0EXAMPLE01/{long}"));
     window(&data, "20261030T020000Z-0000", vec![threaded])?;
-    let threads = pending_in(&data, &Exclusion::default(), usize::MAX, 0)?;
+    let threads = pending_in(&data, &Exclusion::default(), usize::MAX)?;
     let named = message(&format!("slack:C0EXAMPLE01/{long}"), 0)?;
     window(&data, "20261030T021500Z-0000", vec![named])?;
-    let refused = pending_in(&data, &Exclusion::default(), usize::MAX, 0);
+    let refused = pending_in(&data, &Exclusion::default(), usize::MAX);
     remove(&root)?;
 
     let delta = threads.delta.context("a delta")?;

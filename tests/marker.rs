@@ -551,3 +551,322 @@ fn a_delta_read_prints_the_stored_delta_and_never_computes() -> Result<()> {
     assert!(!computed, "a read writes no delta");
     Ok(())
 }
+
+/// Runs `ctx` with `args` against the tree.
+fn run(tree: &Path, state: &Path, args: &[&str]) -> Result<Output> {
+    run_env(tree, state, args, &[])
+}
+
+/// The streams of a tree whose one window holds `count` new messages, `echo:<stream>/record`,
+/// which sort as they count.
+fn streams(count: usize) -> Vec<String> {
+    (1..=count).map(|n| format!("C0EXAMPLE{n:03}")).collect()
+}
+
+/// A window's `page` in a `ctx pending` answer: `(worked, through, last)`.
+type PageSpan = (u64, u64, bool);
+
+/// What one `ctx pending` answer lists: the first window's page when it has one, and the
+/// pointers of the delta's messages.
+fn listed_page(output: &Output) -> Result<(Option<PageSpan>, Vec<String>)> {
+    assert_eq!(output.status.code(), Some(0));
+    let data = data(output)?;
+    let page = data.pointer("/windows/0/page").map(|page| {
+        (
+            page.get("worked")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            page.get("through")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            page.get("last")
+                .and_then(Value::as_bool)
+                .unwrap_or_default(),
+        )
+    });
+    let pointers = data
+        .pointer("/delta/new_messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| message.get("pointer").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((page, pointers))
+}
+
+/// The `page.ends_at` of the first window one `ctx pending` answer lists: what a session passes
+/// to `ctx marker page`.
+fn page_end(output: &Output) -> Result<String> {
+    data(output)?
+        .pointer("/windows/0/page/ends_at")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("the window's page names the message it ends with")
+}
+
+/// Runs `ctx` with `args` against the tree, with `env` set.
+fn run_env(tree: &Path, state: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<Output> {
+    let mut command = command(tree, state)?;
+    command.args(args);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command
+        .output()
+        .with_context(|| format!("running ctx {}", args.join(" ")))
+}
+
+/// A window of seven new messages, in a tree whose page is three, is worked over three cycles:
+/// each cycle's `ctx pending` lists the next page, the cycle records it with `ctx marker page`,
+/// and `ctx marker show` names how far the pages reach. The marker refuses to pass the window
+/// until the answer lists its last page, and then passes it and forgets the pages. A cycle that
+/// stops before recording its page leaves the next cycle that same page.
+#[test]
+fn a_window_larger_than_a_page_is_worked_one_page_a_cycle() -> Result<()> {
+    let root = scratch("pages")?;
+    let names = streams(7);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let tree = tree_with(&root, &names, "page_messages = 3")?;
+    let state = root.join("state");
+    let window = fetch(&tree, &state, "2026-10-25T18:00:00Z")?;
+    let mut cycles = Vec::new();
+    let mut early = Vec::new();
+    let mut shown = Vec::new();
+    let mut repeated = None;
+    loop {
+        let answer = run(&tree, &state, &["pending"])?;
+        let (page, pointers) = listed_page(&answer)?;
+        let (worked, through, last) = page.context("the window is listed as a page")?;
+        assert_eq!(
+            page_end(&answer).ok(),
+            pointers.last().cloned(),
+            "the page does not end with the last message it lists"
+        );
+        cycles.push(((worked, through, last), pointers.clone()));
+        if last {
+            let advanced = run(&tree, &state, &["marker", "advance", &window])?;
+            assert_eq!(advanced.status.code(), Some(0), "{advanced:?}");
+            break;
+        }
+        if worked == 3 {
+            // This cycle stops partway through its page: the next one reads the same page.
+            repeated = Some(listed_page(&run(&tree, &state, &["pending"])?)?);
+        }
+        let refused = run(&tree, &state, &["marker", "advance", &window])?;
+        early.push((refused.status.code(), error_message(&refused)?));
+        let end = page_end(&answer)?;
+        let recorded = run(&tree, &state, &["marker", "page", &window, &end])?;
+        assert_eq!(recorded.status.code(), Some(0), "{recorded:?}");
+        let show = data(&run(&tree, &state, &["marker", "show"])?)?;
+        shown.push(show.get("page").cloned().unwrap_or_default());
+        assert!(cycles.len() < 10, "the pages end");
+    }
+    let after = data(&run(&tree, &state, &["marker", "show"])?)?;
+    let pending = data(&run(&tree, &state, &["pending"])?)?;
+    let spent = data_dir(&tree, &state)?.join("marker-page.json").exists();
+    remove_scratch(&root)?;
+
+    let pointer = |n: usize| format!("echo:C0EXAMPLE{n:03}/record");
+    assert_eq!(
+        cycles,
+        vec![
+            ((0, 3, false), (1..=3).map(pointer).collect::<Vec<_>>()),
+            ((3, 6, false), (4..=6).map(pointer).collect::<Vec<_>>()),
+            ((6, 7, true), vec![pointer(7)]),
+        ]
+    );
+    assert_eq!(
+        repeated,
+        Some((Some((3, 6, false)), (4..=6).map(pointer).collect())),
+        "the cycle after one that stopped mid-page was not handed that page again"
+    );
+    for (code, message) in &early {
+        assert_eq!(*code, Some(2), "{message}");
+        assert!(message.contains("ctx marker page"), "{message}");
+    }
+    assert_eq!(early.len(), 2);
+    assert_eq!(shown.len(), 2);
+    for (page, worked) in shown.iter().zip([3, 6]) {
+        assert_eq!(
+            page.get("window").and_then(Value::as_str),
+            Some(window.as_str())
+        );
+        assert_eq!(page.get("worked").and_then(Value::as_u64), Some(worked));
+        assert_eq!(page.get("by").and_then(Value::as_str), Some("test-session"));
+    }
+    assert_eq!(
+        after.pointer("/marker/window").and_then(Value::as_str),
+        Some(window.as_str())
+    );
+    assert!(
+        after.get("page").is_none(),
+        "the spent page is still shown: {after}"
+    );
+    assert_eq!(
+        pending
+            .get("windows")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert!(
+        !spent,
+        "the page record outlived the window the marker passed"
+    );
+    Ok(())
+}
+
+/// A tree that sets no page size gets pages of 500: a fetched window of 501 new messages is
+/// listed as a first page of 500, and once that page is recorded, as a last page of one.
+#[test]
+fn a_tree_that_sets_no_page_size_pages_at_500() -> Result<()> {
+    let root = scratch("default-page")?;
+    let names = streams(501);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let tree = tree_with(&root, &names, "")?;
+    let state = root.join("state");
+    let window = fetch(&tree, &state, "2026-10-25T18:00:00Z")?;
+    let answer = run(&tree, &state, &["pending"])?;
+    let first = listed_page(&answer)?;
+    let first_end = page_end(&answer)?;
+    let recorded = run(&tree, &state, &["marker", "page", &window, &first_end])?;
+    let last = listed_page(&run(&tree, &state, &["pending"])?)?;
+    remove_scratch(&root)?;
+
+    assert_eq!(first.0, Some((0, 500, false)));
+    assert_eq!(first_end, "echo:C0EXAMPLE500/record");
+    assert_eq!(first.1.len(), 500);
+    assert_eq!(recorded.status.code(), Some(0), "{recorded:?}");
+    assert_eq!(last.0, Some((500, 501, true)));
+    assert_eq!(last.1, vec!["echo:C0EXAMPLE501/record".to_owned()]);
+    Ok(())
+}
+
+/// A window no larger than a page is handled as before pages existed: `ctx pending` lists it
+/// whole with no `page`, `ctx marker show` names no page, the marker passes it, and no page
+/// record is ever written.
+#[test]
+fn a_window_within_a_page_is_handled_as_before() -> Result<()> {
+    let root = scratch("within-a-page")?;
+    let tree = tree_with(&root, &["C0EXAMPLE01", "C0EXAMPLE02"], "page_messages = 3")?;
+    let state = root.join("state");
+    let window = fetch(&tree, &state, "2026-10-25T18:00:00Z")?;
+    let pending = run(&tree, &state, &["pending"])?;
+    let shown = data(&run(&tree, &state, &["marker", "show"])?)?;
+    let advanced = run(&tree, &state, &["marker", "advance", &window])?;
+    let recorded = data_dir(&tree, &state)?.join("marker-page.json").exists();
+    remove_scratch(&root)?;
+
+    let (page, pointers) = listed_page(&pending)?;
+    assert_eq!(page, None);
+    assert_eq!(pointers.len(), 2);
+    assert!(
+        data(&pending)?.pointer("/windows/0/page").is_none(),
+        "a window listed whole carries a page field"
+    );
+    assert_eq!(
+        shown.as_object().map(serde_json::Map::len),
+        Some(1),
+        "{shown}"
+    );
+    assert_eq!(advanced.status.code(), Some(0), "{advanced:?}");
+    assert!(
+        !recorded,
+        "a page record was written for a window within a page"
+    );
+    Ok(())
+}
+
+/// A page is recorded only for the oldest window after the marker, only by a message of that
+/// window, and only as far as the page `ctx pending` lists for it reaches: anything else is
+/// refused, and records nothing.
+#[test]
+fn a_page_other_than_the_one_pending_lists_is_refused() -> Result<()> {
+    let root = scratch("wrong-page")?;
+    let names = streams(7);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let tree = tree_with(&root, &names, "page_messages = 3")?;
+    let state = root.join("state");
+    let first = fetch(&tree, &state, "2026-10-25T18:00:00Z")?;
+    let second = fetch(&tree, &state, "2026-10-25T19:00:00Z")?;
+    let not_oldest = run(
+        &tree,
+        &state,
+        &["marker", "page", &second, "echo:C0EXAMPLE001/record"],
+    )?;
+    let past_the_page = run(
+        &tree,
+        &state,
+        &["marker", "page", &first, "echo:C0EXAMPLE004/record"],
+    )?;
+    let not_a_message = run(
+        &tree,
+        &state,
+        &["marker", "page", &first, "echo:C0EXAMPLE999/record"],
+    )?;
+    let recorded = data_dir(&tree, &state)?.join("marker-page.json").exists();
+    remove_scratch(&root)?;
+
+    for (output, words) in [
+        (&not_oldest, "oldest window after the marker"),
+        (&past_the_page, "ends at message 3"),
+        (&not_a_message, "is not a new message"),
+    ] {
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let message = error_message(output)?;
+        assert!(message.contains(words), "{message}");
+    }
+    assert!(!recorded, "a refused page was recorded");
+    Ok(())
+}
+
+/// A session records its page by the message it ends with, as `ctx pending` listed it, so an
+/// exclusion that takes effect while it works the page passes no message: here `CTX_EXCLUDE`
+/// leaves out a message inside the page between the session's `ctx pending` and its
+/// `ctx marker page`, and the next page still starts right after the page the session saw.
+#[test]
+fn an_exclusion_added_mid_page_moves_the_page_end_nowhere() -> Result<()> {
+    let root = scratch("exclusion-mid-page")?;
+    let names = streams(7);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let tree = tree_with(&root, &names, "page_messages = 3")?;
+    let state = root.join("state");
+    let window = fetch(&tree, &state, "2026-10-25T18:00:00Z")?;
+    let read = run(&tree, &state, &["pending"])?;
+    let seen = listed_page(&read)?;
+    let ends_at = page_end(&read)?;
+    let excluded = [("CTX_EXCLUDE", "echo:C0EXAMPLE002/record")];
+    let recorded = run_env(
+        &tree,
+        &state,
+        &["marker", "page", &window, &ends_at],
+        &excluded,
+    )?;
+    let next = listed_page(&run_env(&tree, &state, &["pending"], &excluded)?)?;
+    remove_scratch(&root)?;
+
+    let pointer = |n: usize| format!("echo:C0EXAMPLE{n:03}/record");
+    assert_eq!(seen.1, (1..=3).map(pointer).collect::<Vec<_>>());
+    assert_eq!(ends_at, pointer(3));
+    assert_eq!(recorded.status.code(), Some(0), "{recorded:?}");
+    assert_eq!(
+        data(&recorded)?
+            .pointer("/page/worked")
+            .and_then(Value::as_u64),
+        Some(2),
+        "the page holds the two messages of it the exclusion leaves"
+    );
+    assert_eq!(
+        next,
+        (
+            Some((2, 5, false)),
+            (4..=6).map(pointer).collect::<Vec<_>>()
+        ),
+        "a message after the page the session saw was passed unseen"
+    );
+    Ok(())
+}

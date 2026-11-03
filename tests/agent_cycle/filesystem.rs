@@ -1647,3 +1647,168 @@ fn a_whole_cycle_that_skipped_a_window_unwritten_exits_non_zero() -> Result<()> 
     );
     Ok(())
 }
+
+/// A real tree for the whole runner beside `rig`: its echo source delivers `streams` messages
+/// into one fetched window, `page_messages` to a page, and the runner's `ctx` is the real binary
+/// on that tree, run locally. Returns the window's id.
+fn real_tree(rig: &CycleRig, streams: usize, page_messages: usize) -> Result<String> {
+    let tree = rig.root.join("tree");
+    let state = rig.root.join("state");
+    std::fs::create_dir_all(&tree)?;
+    let names: Vec<String> = (1..=streams)
+        .map(|n| format!("\"C0EXAMPLE{n:02}\""))
+        .collect();
+    std::fs::write(
+        tree.join("ctx.toml"),
+        format!(
+            "version = 1\nid = \"pages\"\n\n[ingest]\npage_messages = {page_messages}\n\n\
+             [[sources]]\nid = \"echo\"\nkind = \"echo\"\nscheme = \"echo\"\nstreams = [{}]\n",
+            names.join(", ")
+        ),
+    )?;
+    std::fs::write(tree.join("rules.md"), "---\ntype: rules\n---\n# Rules\n")?;
+    let ctx = env!("CARGO_BIN_EXE_ctx");
+    let path = std::env::var("PATH").context("PATH is not set")?;
+    let fetched = Command::new(ctx)
+        .arg("--json")
+        .arg("--memory")
+        .arg(&tree)
+        .args(["fetch", "--window-end", "2026-11-02T08:00:00Z"])
+        .env("CTX_STATE_DIR", &state)
+        .env("CTX_DATA_DIR", &rig.data)
+        .env(
+            "PATH",
+            format!("{}:{path}", repo().join("tests/fixtures").display()),
+        )
+        .output()
+        .context("fetching the window")?;
+    let answer: serde_json::Value = serde_json::from_slice(&fetched.stdout)
+        .with_context(|| String::from_utf8_lossy(&fetched.stderr).into_owned())?;
+    let window = answer
+        .pointer("/data/window")
+        .and_then(serde_json::Value::as_str)
+        .context("the fetch completed no window")?
+        .to_owned();
+    // The runner's `ctx`: the real binary on the tree, with no server to send to.
+    write_executable(
+        &rig.root.join("real-ctx"),
+        &format!(
+            "#!/bin/sh\nunset CTX_SERVER\nexec env CTX_STATE_DIR='{}' '{ctx}' --memory '{}' \"$@\"\n",
+            state.display(),
+            tree.display()
+        ),
+    )?;
+    Ok(window)
+}
+
+/// One cycle of the whole runner with the real `ctx` of [`real_tree`], through a stand-in
+/// session that does what the prompt tells it: it reads `ctx pending`, records the page it was
+/// handed with `ctx marker page`, or on the window's last page moves the marker past it, notes
+/// `<window> <through> <last>` in `cycles` beside the rig, and ends with `events`.
+fn page_cycle(rig: &CycleRig, events: &str) -> Result<std::process::Output> {
+    let session = rig.root.join("session-events");
+    std::fs::write(&session, events)?;
+    let cycles = rig.root.join("cycles");
+    let ctx = std::fs::read_to_string(rig.root.join("real-ctx"))?;
+    rig.run_through_the_session(
+        &ctx,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{prompt}'\n\
+             answer=\"$(ctx pending --json)\"\n\
+             window=\"$(printf '%s' \"$answer\" | jq -r '.data.windows[0].window')\"\n\
+             through=\"$(printf '%s' \"$answer\" | jq -r '.data.windows[0].page.through // 0')\"\n\
+             ends_at=\"$(printf '%s' \"$answer\" | jq -r '.data.windows[0].page.ends_at // empty')\"\n\
+             last=\"$(printf '%s' \"$answer\" | jq -r '.data.windows[0] | if .page then .page.last else true end')\"\n\
+             if [ \"$last\" = true ]; then ctx marker advance \"$window\" >/dev/null; \
+             else ctx marker page \"$window\" \"$ends_at\" >/dev/null; fi\n\
+             printf '%s %s %s\\n' \"$window\" \"$through\" \"$last\" >> '{cycles}'\n\
+             cat '{session}'\n",
+            prompt = rig.omp_log.display(),
+            cycles = cycles.display(),
+            session = session.display()
+        ),
+    )
+}
+
+/// The whole runner, cycle after cycle, over a real tree whose one window holds seven new
+/// messages and whose page is three: each cycle's session is handed the next page, records it
+/// (`ctx marker page`) after writing a record, and exits 0; the cycle handed the last page moves
+/// the marker past the window, and the cycle after it finds nothing pending. The prompt tells
+/// the session how to work a page. A cycle that records a page and writes nothing fails, with
+/// the one line that names what it moved past.
+#[test]
+fn the_whole_runner_works_a_large_window_a_page_a_cycle() -> Result<()> {
+    let rig = CycleRig::new("pages-whole-run")?;
+    rig.pretend_root()?;
+    let window = real_tree(&rig, 7, 3)?;
+    let written = wrote(&[("ctx_record_put", true)], answer("Handled one page."));
+    let mut outputs = Vec::new();
+    for _ in 0..4 {
+        outputs.push(page_cycle(&rig, &written)?);
+    }
+    let cycles = std::fs::read_to_string(rig.root.join("cycles")).unwrap_or_default();
+    let prompt = std::fs::read_to_string(&rig.omp_log).unwrap_or_default();
+    let shown = Command::new("sh")
+        .arg(rig.root.join("real-ctx"))
+        .args(["--json", "marker", "show"])
+        .env("CTX_DATA_DIR", &rig.data)
+        .output()?;
+    rig.remove()?;
+
+    for (n, output) in outputs.iter().enumerate() {
+        ensure!(
+            output.status.success(),
+            "cycle {} did not exit 0 ({}): {}",
+            n + 1,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    ensure!(
+        cycles == format!("{window} 3 false\n{window} 6 false\n{window} 7 true\n"),
+        "the cycles were not handed one page each, in order: {cycles:?}"
+    );
+    let after_the_last = outputs.last().context("no cycle ran")?;
+    ensure!(
+        String::from_utf8_lossy(&after_the_last.stdout).contains("no pending windows"),
+        "the cycle after the last page still found a window pending: {}",
+        String::from_utf8_lossy(&after_the_last.stderr)
+    );
+    ensure!(
+        prompt.contains("ctx marker page <window> '<page.ends_at>'"),
+        "the prompt does not tell the session how to record a page: {prompt}"
+    );
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout)?;
+    ensure!(
+        shown
+            .pointer("/data/marker/window")
+            .and_then(serde_json::Value::as_str)
+            == Some(window.as_str())
+            && shown.pointer("/data/page").is_none(),
+        "the marker did not pass the window, or its pages outlived it: {shown}"
+    );
+
+    let rig = CycleRig::new("pages-whole-run-unwritten")?;
+    rig.pretend_root()?;
+    let window = real_tree(&rig, 7, 3)?;
+    let unwritten = page_cycle(
+        &rig,
+        &wrote(&[], answer("Nothing in this page needed a record.")),
+    )?;
+    rig.remove()?;
+    let stderr = String::from_utf8_lossy(&unwritten.stderr);
+    let named: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("run-cycle: ") && line.contains("wrote no record"))
+        .collect();
+    ensure!(
+        !unwritten.status.success()
+            && named.len() == 1
+            && named
+                .concat()
+                .contains(&format!("{window} (messages 1 to 3 of 7 new, recorded as pages)")),
+        "the cycle that recorded a page unwritten did not fail with one line naming it ({}): {stderr}",
+        unwritten.status
+    );
+    Ok(())
+}

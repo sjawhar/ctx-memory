@@ -114,3 +114,5 @@ bash:
       approval: allow
     - match: "ctx marker advance *"
       approval: allow
+    - match: "ctx marker page *"
+      approval: allow

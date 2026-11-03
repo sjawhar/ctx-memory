@@ -1062,6 +1062,7 @@ fn router(shared: Arc<Shared>, identity: Identity) -> Router {
         .route(protocol::PUT_BATCH_ROUTE, post(write::put_batch))
         .route(protocol::DELETE_ROUTE, post(write::delete))
         .route(protocol::MARKER_ROUTE, post(write::marker_advance))
+        .route(protocol::PAGE_ROUTE, post(write::marker_page))
         .route(protocol::CONTEXT_ROUTE, get(context::window_context))
         .with_state(Listener {
             shared: Arc::clone(&shared),

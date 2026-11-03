@@ -204,13 +204,27 @@ impl Delta {
     }
 
     /// Leaves out the `count` oldest new messages, with the open flags' replies that are among
-    /// them: what an earlier answer already listed (`ctx pending --offset`).
+    /// them: those the window's earlier pages hold, which the agent has worked
+    /// (`ctx marker page`).
     pub fn skip(&mut self, count: usize) {
         if count == 0 {
             return;
         }
         self.new_messages
             .drain(..count.min(self.new_messages.len()));
+        self.keep_replies_to_listed();
+    }
+
+    /// Keeps the `count` oldest new messages, with the open flags' replies that are among them,
+    /// and counts the messages it leaves out in `omitted_messages`: one page of a window larger
+    /// than a page (`[ingest] page_messages`).
+    pub fn keep_oldest(&mut self, count: usize) {
+        let left_out = self.new_messages.len().saturating_sub(count);
+        if left_out == 0 {
+            return;
+        }
+        self.new_messages.truncate(count);
+        self.omitted_messages = Some(self.omitted_messages.unwrap_or_default() + left_out);
         self.keep_replies_to_listed();
     }
 
@@ -221,10 +235,11 @@ impl Delta {
     /// status changes keep at most a quarter of the budget, and `omitted_changes` counts any
     /// left out.
     ///
-    /// Messages come oldest first, so what an answer leaves out is the newest: `ctx pending
-    /// --offset` lists it next. An answer always lists at least one message when any remain,
-    /// so following `next_offset` always moves on; a message that alone passes the budget is
-    /// listed with the open flags and record matches that fit (`fit_alone`).
+    /// Messages come oldest first, so what an answer leaves out is the newest: the window's
+    /// next page lists it, once the agent records this one (`ctx marker page`). An answer always
+    /// lists at least one message when any remain, so every page moves on; a message that alone
+    /// passes the budget is listed with the open flags and record matches that fit
+    /// (`fit_alone`).
     pub fn fit(&mut self, budget: usize) {
         if self.answer_len() <= budget {
             return;
@@ -1190,11 +1205,7 @@ pub fn combine(deltas: &[Delta], generated_at: DateTime<Utc>) -> Option<Delta> {
         opened.extend(delta.opened_since_previous.iter().cloned());
     }
     let mut new_messages = new_messages.into_values().collect::<Vec<_>>();
-    new_messages.sort_by(|left, right| {
-        left.ts
-            .cmp(&right.ts)
-            .then_with(|| left.pointer.cmp(&right.pointer))
-    });
+    oldest_first(&mut new_messages);
     Some(Delta {
         version: 1,
         window: newest.window.clone(),
@@ -1208,6 +1219,16 @@ pub fn combine(deltas: &[Delta], generated_at: DateTime<Utc>) -> Option<Delta> {
         omitted_messages: None,
         omitted_changes: None,
     })
+}
+
+/// Puts `messages` in the order every answer lists them: oldest first, and by pointer among
+/// messages of one time. A window's pages are cut from this order.
+pub fn oldest_first(messages: &mut [NewMessage]) {
+    messages.sort_by(|left, right| {
+        left.ts
+            .cmp(&right.ts)
+            .then_with(|| left.pointer.cmp(&right.pointer))
+    });
 }
 
 /// One open record a window's durable delta flagged, with what `ctx open` takes from each of

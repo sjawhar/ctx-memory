@@ -67,19 +67,34 @@ pub struct IngestConfig {
     /// Pointer patterns of the messages this tree never ingests ([`crate::exclude`]).
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// The most new messages one `ctx pending` answer lists: a page, sized to what one ingest
+    /// cycle finishes. A window with more is worked a page at a time, each recorded with
+    /// `ctx marker page` ([`crate::marker`]). [`DEFAULT_PAGE_MESSAGES`] unless the tree sets it.
+    #[serde(default = "default_page_messages")]
+    pub page_messages: usize,
 }
+
+/// The page size of a tree that sets none: what an ingest cycle has been seen to finish well
+/// inside its session's time limit, so a large first backfill is worked across cycles rather
+/// than started over in each.
+pub const DEFAULT_PAGE_MESSAGES: usize = 500;
 
 impl Default for IngestConfig {
     fn default() -> Self {
         Self {
             backfill_hours: default_backfill_hours(),
             exclude: Vec::new(),
+            page_messages: default_page_messages(),
         }
     }
 }
 
 const fn default_backfill_hours() -> u32 {
     24
+}
+
+const fn default_page_messages() -> usize {
+    DEFAULT_PAGE_MESSAGES
 }
 
 /// `[context_source]` in `ctx.toml`: the program the server runs to read a window's context,
@@ -194,6 +209,9 @@ impl TreeConfig {
             }
         }
         crate::exclude::Exclusion::new(&self.ingest.exclude).context("ingest.exclude")?;
+        if self.ingest.page_messages == 0 {
+            bail!("ingest.page_messages must be at least 1");
+        }
         if let Some(source) = &self.context_source {
             crate::context_source::validate(source).context("context_source")?;
         }
@@ -453,6 +471,13 @@ impl DataDir {
         self.root.join("marker.json")
     }
 
+    /// How far the agent has worked the window after the marker, a page at a time
+    /// ([`crate::marker::Page`]).
+    #[must_use]
+    pub fn marker_page(&self) -> PathBuf {
+        self.root.join("marker-page.json")
+    }
+
     /// The directory holding cached embedding vectors, one file per content hash (C1).
     #[must_use]
     pub fn embeddings(&self) -> PathBuf {
@@ -482,6 +507,7 @@ mod tests {
 
     use super::{
         data_dir_from, locate_tree, state_base_from, DataDir, StateDir, TreeConfig, UserConfig,
+        DEFAULT_PAGE_MESSAGES,
     };
 
     static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -556,6 +582,41 @@ mod tests {
         Ok(())
     }
 
+    /// A tree that sets no page size gets [`DEFAULT_PAGE_MESSAGES`], so a large first backfill
+    /// is paged without any configuration; a tree may set its own, and a page holds at least one
+    /// message, since a page of none would never move on.
+    #[test]
+    fn the_page_size_defaults_to_500_and_is_at_least_one() -> Result<()> {
+        let root = scratch()?;
+        std::fs::write(root.join("ctx.toml"), "version = 1\n")?;
+        let unset = TreeConfig::load(&root);
+        std::fs::write(
+            root.join("ctx.toml"),
+            "version = 1\n\n[ingest]\nbackfill_hours = 48\n",
+        )?;
+        let other_ingest_keys = TreeConfig::load(&root);
+        std::fs::write(
+            root.join("ctx.toml"),
+            "version = 1\n\n[ingest]\npage_messages = 0\n",
+        )?;
+        let zero = TreeConfig::load(&root);
+        std::fs::write(
+            root.join("ctx.toml"),
+            "version = 1\n\n[ingest]\npage_messages = 200\n",
+        )?;
+        let set = TreeConfig::load(&root);
+        remove_scratch(&root)?;
+
+        assert_eq!(DEFAULT_PAGE_MESSAGES, 500);
+        assert_eq!(unset?.ingest.page_messages, 500);
+        assert_eq!(other_ingest_keys?.ingest.page_messages, 500);
+        assert_eq!(TreeConfig::default().ingest.page_messages, 500);
+        let error = zero.err().context("a page of no messages loaded")?;
+        assert!(format!("{error:#}").contains("page_messages"));
+        assert_eq!(set?.ingest.page_messages, 200);
+        Ok(())
+    }
+
     #[test]
     fn source_id_must_be_a_safe_state_key() -> Result<()> {
         let root = scratch()?;
@@ -614,6 +675,10 @@ mod tests {
         assert_eq!(
             data.marker(),
             PathBuf::from("/mnt/share/memory/marker.json")
+        );
+        assert_eq!(
+            data.marker_page(),
+            PathBuf::from("/mnt/share/memory/marker-page.json")
         );
         assert_eq!(
             data.source_state("slack"),

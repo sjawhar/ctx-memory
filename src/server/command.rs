@@ -358,9 +358,11 @@ fn allowed(argv: &[String], parsed: Option<&cli::Cli>) -> Result<(), String> {
         Remote::Put { .. }
         | Remote::PutBatch { .. }
         | Remote::Rm { .. }
-        | Remote::MarkerAdvance { .. } => Err(format!(
+        | Remote::MarkerAdvance { .. }
+        | Remote::MarkerPage { .. } => Err(format!(
             "{} writes, and has its own endpoint: records go to /v1/records/put, \
-             /v1/records/put-batch and /v1/records/delete, the marker to /v1/marker/advance",
+             /v1/records/put-batch and /v1/records/delete, the marker to /v1/marker/advance \
+             and a page of the window after it to /v1/marker/page",
             parsed.command.name()
         )),
         Remote::Context { .. } => Err(

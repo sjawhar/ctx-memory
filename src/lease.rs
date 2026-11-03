@@ -1,14 +1,14 @@
 //! One writer per role, across machines.
 //!
 //! Two roles write what every machine shares: the fetch job writes windows, cursors and
-//! per-source state on the share, and the server writes the marker on the share and pushes the
-//! graph repository. Two local commands write the same files, and take the same leases: `ctx
-//! delta --write` replaces a window's delta files, which the fetch writes, so it takes the
-//! fetch lease; `ctx marker advance` run without a server moves the marker, which the server
-//! moves, so it takes the server lease. The share is NFS without file locks, and both roles can
-//! be started twice at once: a Cloud Run rollout starts the new server copy before the old one
-//! stops, and Cloud Scheduler can start a fetch while the last one still runs. A small Cloud
-//! Storage object is the arbiter.
+//! per-source state on the share, and the server writes the marker and its page record on the
+//! share and pushes the graph repository. Three local commands write the same files, and take the
+//! same leases: `ctx delta --write` replaces a window's delta files, which the fetch writes, so it
+//! takes the fetch lease; `ctx marker advance` and `ctx marker page` run without a server move the
+//! marker and record its page, which the server writes, so they take the server lease. The share
+//! is NFS without file locks, and both roles can be started twice at once: a Cloud Run rollout
+//! starts the new server copy before the old one stops, and Cloud Scheduler can start a fetch
+//! while the last one still runs. A small Cloud Storage object is the arbiter.
 //!
 //! `embeddings/` on the share is the one thing several writers share without a lease: the
 //! fetch job, the server and any machine that searches or reads a delta each add the vectors

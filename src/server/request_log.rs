@@ -32,7 +32,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 
 use super::identity::Caller;
-use crate::protocol::{DELETE_ROUTE, MARKER_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE};
+use crate::protocol::{DELETE_ROUTE, MARKER_ROUTE, PAGE_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE};
 use crate::redact::one_line;
 use crate::session_id;
 
@@ -232,6 +232,7 @@ fn route_command(path: &str) -> Option<&'static str> {
         PUT_ROUTE | PUT_BATCH_ROUTE => Some("record put"),
         DELETE_ROUTE => Some("record rm"),
         MARKER_ROUTE => Some("marker advance"),
+        PAGE_ROUTE => Some("marker page"),
         _ => None,
     }
 }
