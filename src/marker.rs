@@ -774,10 +774,12 @@ pub fn print_pending(pending: &Pending, out: &mut dyn Write) -> std::io::Result<
                 window.window
             )?;
         } else if let Some(ends_at) = page.ends_at.as_deref() {
+            // In single quotes, so the command copies into a shell as it is: a Matrix pointer
+            // holds a `$` and a `!`, and no pointer holds a `'`.
             writeln!(
                 out,
-                "  once its records are written, `ctx marker page {} {}` records the page, and the \
-                 next answer lists the next one",
+                "  once its records are written, `ctx marker page {} '{}'` records the page, and \
+                 the next answer lists the next one",
                 window.window,
                 printable(ends_at)
             )?;
@@ -912,7 +914,8 @@ mod tests {
     use chrono::{TimeZone as _, Utc};
 
     use super::{
-        advance_in, load, page_in, pending_in, write_json, Marker, Pending, Refused, Serving,
+        advance_in, load, page_in, pending_in, print_pending, write_json, Marker, Pending, Refused,
+        Serving,
     };
     use crate::config::{DataDir, DEFAULT_PAGE_MESSAGES};
     use crate::delta::Delta;
@@ -1255,6 +1258,26 @@ mod tests {
                 (1_000, 1_200, true, 200)
             ]
         );
+        Ok(())
+    }
+
+    /// The text answer names the command that records the page it lists, with the page's end in
+    /// single quotes, so the line copies into a shell as it is.
+    #[test]
+    fn the_text_answer_names_the_page_command_with_its_end_quoted() -> Result<()> {
+        let root = scratch("text")?;
+        let data = DataDir::new(root.clone());
+        let id = WINDOWS[0];
+        write_window(&data, id, 7)?;
+        let exclusion = Exclusion::default();
+        let pending = pending_in(&data, None, &paged(&exclusion, 3))?;
+        std::fs::remove_dir_all(&root)?;
+        let mut text = Vec::new();
+        print_pending(&pending, &mut text)?;
+        let text = String::from_utf8(text)?;
+
+        let command = format!("`ctx marker page {id} '{}'`", pointer(id, 2));
+        assert!(text.contains(&command), "{text}");
         Ok(())
     }
 
