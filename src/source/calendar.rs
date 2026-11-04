@@ -26,6 +26,7 @@ use serde_json::Value;
 use crate::api::client;
 use crate::api::google::{self, Google};
 use crate::atomic::write_replace;
+use crate::exclude::Exclusion;
 use crate::record::Record;
 
 use super::{
@@ -251,10 +252,12 @@ struct Emitted {
 /// One calendar's entries.
 ///
 /// A fetch saves its entries before its window is stored, and a window may never be stored. So
-/// they are kept beside those of the windows that were, with the cursor the fetch proposed, and
-/// count only for a fetch that starts from that cursor: the cursor moves only once the window is
-/// stored. A fetch that starts from another cursor reads the same changes again, from the
-/// entries of the windows that were stored.
+/// they are kept beside those of the windows known to be stored, with the cursor the fetch
+/// proposed. A fetch that starts from that cursor knows the window was stored and takes them as
+/// they are. A fetch that starts from another cannot tell: the window may never have been stored,
+/// or stored with its cursor left behind, as a fetch given an older window end leaves it. It
+/// keeps every entry, each at the later of its two starts: a spurious `[event cancelled]` record
+/// costs less than a cancelled meeting the tree shows as still on.
 #[derive(Deserialize, Serialize)]
 struct CalendarList {
     #[serde(default)]
@@ -271,12 +274,22 @@ struct Proposed {
 }
 
 impl CalendarList {
-    /// The entries of the windows that were stored, as a fetch from `cursor` finds them.
+    /// The entries of the windows that may have been stored, as a fetch from `cursor` finds them.
     fn stored_as_of(&self, cursor: Option<&str>) -> Recorded {
-        match &self.proposed {
-            Some(proposed) if Some(proposed.cursor.as_str()) == cursor => proposed.recorded.clone(),
-            _ => self.stored.clone(),
+        let Some(proposed) = &self.proposed else {
+            return self.stored.clone();
+        };
+        if Some(proposed.cursor.as_str()) == cursor {
+            return proposed.recorded.clone();
         }
+        let mut stored = self.stored.clone();
+        for (id, start) in &proposed.recorded {
+            stored
+                .entry(id.clone())
+                .and_modify(|held| *held = (*held).max(*start))
+                .or_insert(*start);
+        }
+        stored
     }
 }
 
@@ -334,6 +347,7 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
+    let exclusion = Exclusion::new(&request.exclude)?;
     let (emitted, warning) = Emitted::load(&request.state_dir);
     if let Some(message) = warning {
         sink(Message::Warning {
@@ -359,6 +373,11 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
         let collected = collect_calendar(request, calendar, api, held.as_ref()).and_then(|c| {
             let mut recorded = c.recorded;
             recorded.retain(|_, start| *start >= forget_before(request));
+            // The fetch drops the record of an excluded event, so the tree never holds it.
+            if !exclusion.is_empty() {
+                let scheme = &request.source.scheme;
+                recorded.retain(|id, _| !exclusion.matches(&format!("{scheme}:{calendar}/{id}")));
+            }
             let list = CalendarList {
                 stored: held.unwrap_or_default(),
                 proposed: Some(Proposed {
