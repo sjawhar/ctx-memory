@@ -179,18 +179,34 @@ pub fn show_page(context: &Context) -> Result<Option<Page>> {
 /// stops a move — a marker or a window it cannot read, a marker it cannot write — is the
 /// machine's, not the caller's.
 #[derive(Debug)]
-pub struct Refused(String);
+pub struct Refused {
+    why: String,
+    pages_left: bool,
+}
+
+impl Refused {
+    /// Whether this refused a move of the marker past a window with pages left. A client older
+    /// than paging means by that move to pass the whole window, so the server answers it as the
+    /// client's protocol, not its mistake.
+    #[must_use]
+    pub const fn pages_left(&self) -> bool {
+        self.pages_left
+    }
+}
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.why)
     }
 }
 
 impl std::error::Error for Refused {}
 
 fn refused(why: String) -> anyhow::Error {
-    anyhow::Error::new(Refused(why))
+    anyhow::Error::new(Refused {
+        why,
+        pages_left: false,
+    })
 }
 
 /// What one answer is held to, and the names it serves Slack mentions with.
@@ -280,14 +296,17 @@ fn advance_in(data: &DataDir, window: &str, by: &str, serving: &Serving<'_>) -> 
             continue;
         };
         if let Some(view) = entry.page.as_ref().filter(|view| !view.last) {
-            return Err(refused(format!(
-                "window {id} holds {} new message(s) no recorded page holds, more than one page \
-                 ({} listed): the marker passes it once its last page is worked. Work it a page at \
-                 a time as `ctx pending` lists it, and record each page with \
-                 `ctx marker page {id} <ends_at>`, giving the page's `ends_at`",
-                entry.new_messages - view.worked,
-                entry.listed_messages
-            )));
+            return Err(anyhow::Error::new(Refused {
+                why: format!(
+                    "window {id} holds {} new message(s) no recorded page holds, more than one \
+                     page ({} listed): the marker passes it once its last page is worked. Work it \
+                     a page at a time as `ctx pending` lists it, and record each page with \
+                     `ctx marker page {id} <ends_at>`, giving the page's `ends_at`",
+                    entry.new_messages - view.worked,
+                    entry.listed_messages
+                ),
+                pages_left: true,
+            }));
         }
     }
     let marker = Marker {

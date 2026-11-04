@@ -17,7 +17,7 @@ use crate::cli::{self, Remote};
 use crate::context::Context;
 use crate::git::Repo;
 use crate::output::Sink;
-use crate::protocol::{Captured, CommandRequest, Draft};
+use crate::protocol::{self, Captured, CommandRequest, Draft};
 use crate::redact::one_line;
 use crate::remote::{global_flag, Global};
 use crate::tree::Doc;
@@ -218,6 +218,10 @@ pub struct Health {
 /// the remote at start cannot clone at all, so restarting it would stop it serving the tree it
 /// has. The field is what a monitor reads.
 ///
+/// Every answer says the protocol version the server speaks in `protocol`, as every answer of
+/// the server names it in a header ([`protocol::VERSION`]), whatever its status: a wedged copy
+/// still speaks one.
+///
 /// The probe is open to anyone who reaches the port, so what it says about a failure is fixed
 /// words. Why the loop or the check fails — a URL, a repository, what GitHub or git answered —
 /// goes to the server's log.
@@ -252,6 +256,7 @@ pub async fn healthz(State(listener): State<Listener>) -> Response {
                 "head": health.head,
                 "windows": health.windows,
                 "following": following,
+                "protocol": protocol::VERSION,
             })),
         )
             .into_response(),
@@ -264,6 +269,7 @@ pub async fn healthz(State(listener): State<Listener>) -> Response {
                 "windows": health.windows,
                 "error": health.wedged,
                 "following": following,
+                "protocol": protocol::VERSION,
             })),
         )
             .into_response(),
@@ -291,7 +297,12 @@ const CHECK_FAILED: &str = "the health check failed; the server's log says why";
 fn unchecked(following: &serde_json::Value) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({ "ok": false, "error": CHECK_FAILED, "following": following })),
+        Json(json!({
+            "ok": false,
+            "error": CHECK_FAILED,
+            "following": following,
+            "protocol": protocol::VERSION,
+        })),
     )
         .into_response()
 }
@@ -368,6 +379,10 @@ fn allowed(argv: &[String], parsed: Option<&cli::Cli>) -> Result<(), String> {
         Remote::Context { .. } => Err(
             "context has its own endpoint, GET /v1/windows/{id}/context, which only the callers \
              context_source.callers names may read"
+                .to_owned(),
+        ),
+        Remote::Protocol => Err(
+            "protocol asks the server's own /healthz, which names the server's protocol version"
                 .to_owned(),
         ),
         Remote::Local => Err(format!(

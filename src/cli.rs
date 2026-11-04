@@ -185,6 +185,9 @@ pub enum Command {
     },
     /// Serve read commands and record writes over HTTP.
     Serve(server::ServeArgs),
+    /// Print the protocol version this ctx speaks to a server and, when a server is configured,
+    /// the one that server speaks (0 for a server older than the version header).
+    Protocol,
     #[command(external_subcommand)]
     External(Vec<OsString>),
 }
@@ -324,6 +327,7 @@ impl Command {
                 command: SlackCommand::Login,
             } => "slack login".to_owned(),
             Self::Serve(_) => "serve".to_owned(),
+            Self::Protocol => "protocol".to_owned(),
             Self::External(arguments) => arguments
                 .first()
                 .and_then(|argument| argument.to_str())
@@ -394,6 +398,7 @@ impl Command {
                 window,
                 limits: crate::context_source::Limits::capped(*max_subjects, *seconds),
             },
+            Self::Protocol => Remote::Protocol,
             // `--write` replaces the window's `delta.json`, `delta.md` and
             // `open-snapshot.json`, which the fetch job owns.
             Self::Delta { write: true, .. }
@@ -437,6 +442,8 @@ pub enum Remote<'a> {
         window: &'a str,
         limits: crate::context_source::Limits,
     },
+    /// `protocol`: the client's own protocol version, and `GET /healthz` for the server's.
+    Protocol,
 }
 
 #[derive(Serialize)]
@@ -707,6 +714,7 @@ fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
             "slack login is dispatched before the tree commands"
         )),
         Command::Serve(_) => Err(anyhow!("serve is dispatched before the tree commands")),
+        Command::Protocol => Err(anyhow!("protocol is dispatched before the tree commands")),
         Command::External(_) => Err(anyhow!("external command dispatch failed")),
     }
 }

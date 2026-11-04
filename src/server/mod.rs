@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -1051,12 +1051,13 @@ fn announce(sink: &mut Sink<'_>, label: &str, address: SocketAddr) -> Result<()>
 /// The routes one listener answers. The listener decides how a caller is identified, and each
 /// request it answers is one line of the request log ([`request_log`]). At the local door every
 /// request, to any path, axum's own `404` and `405` answers included, is first checked for a
-/// web page's ([`no_web_page`]).
+/// web page's ([`no_web_page`]). Every answer names the server's protocol version
+/// ([`name_protocol`]).
 fn router(shared: Arc<Shared>, identity: Identity) -> Router {
     let door = identity.door();
     let local = matches!(identity, Identity::Local(_));
     let routes = Router::new()
-        .route("/healthz", get(command::healthz))
+        .route(protocol::HEALTH_ROUTE, get(command::healthz))
         .route(protocol::COMMAND_ROUTE, post(command::command))
         .route(protocol::PUT_ROUTE, post(write::put))
         .route(protocol::PUT_BATCH_ROUTE, post(write::put_batch))
@@ -1073,7 +1074,20 @@ fn router(shared: Arc<Shared>, identity: Identity) -> Router {
     } else {
         routes
     };
-    routes.layer(axum::middleware::from_fn_with_state(door, request_log::log))
+    routes
+        .layer(axum::middleware::from_fn_with_state(door, request_log::log))
+        .layer(axum::middleware::map_response(name_protocol))
+}
+
+/// Names this server's protocol version on an answer, in [`protocol::VERSION_HEADER`]: every
+/// answer, a refusal, a `404` and a probe's among them, so a client and a deployment can read it
+/// whatever they asked. It waits for nothing, so its future is ready at once.
+fn name_protocol(mut response: Response) -> std::future::Ready<Response> {
+    response.headers_mut().insert(
+        protocol::VERSION_HEADER,
+        HeaderValue::from(protocol::VERSION),
+    );
+    std::future::ready(response)
 }
 
 /// Answers `401` to a request at the local door that a web page sent

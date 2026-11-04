@@ -24,13 +24,13 @@ use crate::context::Context;
 use crate::marker;
 use crate::protocol::{
     Committed, DeleteRequest, Finding, MarkerRequest, MarkerResponse, PageRequest, PageResponse,
-    PutBatchRequest, PutRequest, RecordFile, Refused, DELETE_ROUTE, MARKER_ROUTE, PAGE_ROUTE,
-    PUT_BATCH_ROUTE, PUT_ROUTE,
+    PutBatchRequest, PutRequest, RecordFile, Refused, DELETE_ROUTE, MARKER_ROUTE, PAGED_SINCE,
+    PAGE_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE, VERSION_HEADER,
 };
 use crate::redact::credentials_in;
 
 use self::response::{
-    bad_request, deferred, failed, log_failure, not_written, unauthorized, unheld,
+    bad_request, deferred, failed, log_failure, not_written, too_old, unauthorized, unheld,
 };
 use self::transaction::{apply, ApplyError};
 
@@ -195,22 +195,37 @@ pub async fn delete(
 /// long as git takes, and a check made before that wait could be stale by the time the marker
 /// moves. A window the caller names wrongly is answered 400; a marker the server cannot read
 /// or write is its own trouble, answered 500.
+///
+/// A client older than paging ([`PAGED_SINCE`]) means by a move past a window to pass all of
+/// it. Such a move past a window with pages left is answered `409` rather than refused as the
+/// caller's mistake ([`too_old`]); every other move means what it did, and answers it as before.
 pub async fn marker_advance(
     State(listener): State<Listener>,
     Extension(note): Extension<Note>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match admit::<MarkerRequest>(&listener, MARKER_ROUTE, &headers, &body, &note).await {
-        Ok((caller, MarkerRequest { session, window })) => {
+    match admit_speaking::<MarkerRequest>(&listener, MARKER_ROUTE, &headers, &body, &note, 0).await
+    {
+        Ok((caller, client, MarkerRequest { session, window })) => {
+            let shared = Arc::clone(&listener.shared);
             move_marker(
                 &listener.shared,
                 caller,
                 MARKER_ROUTE,
                 session,
-                move |context, by| {
-                    let marker = marker::advance(context, &window, by)?;
-                    Ok((StatusCode::OK, Json(MarkerResponse { marker })).into_response())
+                move |context, by| match marker::advance(context, &window, by) {
+                    Ok(marker) => {
+                        Ok((StatusCode::OK, Json(MarkerResponse { marker })).into_response())
+                    }
+                    Err(error) if client < PAGED_SINCE && passes_pages_left(&error) => Ok(too_old(
+                        &shared,
+                        MARKER_ROUTE,
+                        client,
+                        "a move of the marker past a window with pages left",
+                        PAGED_SINCE,
+                    )),
+                    Err(error) => Err(error),
                 },
             )
             .await
@@ -219,18 +234,29 @@ pub async fn marker_advance(
     }
 }
 
+/// Whether `error` refused a move of the marker past a window with pages left.
+fn passes_pages_left(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<marker::Refused>()
+        .is_some_and(marker::Refused::pages_left)
+}
+
 /// Answers `POST /v1/marker/page`: records a page of the window after the marker, beside the
 /// marker and under the same lease, as [`marker_advance`] moves the marker. A window or a page
-/// the caller names wrongly is answered 400.
+/// the caller names wrongly is answered 400, and a client older than paging ([`PAGED_SINCE`])
+/// `409`.
 pub async fn marker_page(
     State(listener): State<Listener>,
     Extension(note): Extension<Note>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match admit::<PageRequest>(&listener, PAGE_ROUTE, &headers, &body, &note).await {
+    match admit_speaking::<PageRequest>(&listener, PAGE_ROUTE, &headers, &body, &note, PAGED_SINCE)
+        .await
+    {
         Ok((
             caller,
+            _,
             PageRequest {
                 ends_at,
                 session,
@@ -262,21 +288,85 @@ async fn admit<Body: DeserializeOwned>(
     body: &[u8],
     note: &Note,
 ) -> Result<(Caller, Body), Box<Response>> {
+    let caller = identify(listener, route, headers, note).await?;
+    Ok((caller, read_body(&listener.shared, route, body)?))
+}
+
+/// [`admit`] for a marker route, whose meaning depends on the protocol version the client
+/// speaks: once the caller is identified, the version it names is read ([`client_protocol`]),
+/// and a client older than `since` is answered `409` before its body is read, since that body
+/// may mean something else to it. Answers the caller, its version and the body.
+async fn admit_speaking<Body: DeserializeOwned>(
+    listener: &Listener,
+    route: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    note: &Note,
+    since: u32,
+) -> Result<(Caller, u32, Body), Box<Response>> {
+    let caller = identify(listener, route, headers, note).await?;
     let shared = &listener.shared;
-    let caller = match listener.caller(headers).await {
-        Ok(caller) => caller,
-        Err(error) => return Err(Box::new(unauthorized(shared, route, &error))),
-    };
+    let client =
+        client_protocol(headers).map_err(|why| Box::new(bad_request(shared, route, &why)))?;
+    if client < since {
+        return Err(Box::new(too_old(shared, route, client, route, since)));
+    }
+    Ok((caller, client, read_body(shared, route, body)?))
+}
+
+/// The caller of one write, or its `401`. The caller goes in `note` for the request log.
+async fn identify(
+    listener: &Listener,
+    route: &str,
+    headers: &HeaderMap,
+    note: &Note,
+) -> Result<Caller, Box<Response>> {
+    let caller = listener
+        .caller(headers)
+        .await
+        .map_err(|error| Box::new(unauthorized(&listener.shared, route, &error)))?;
     note.caller(&caller);
-    serde_json::from_slice(body)
-        .map(|request| (caller, request))
-        .map_err(|error| {
-            Box::new(bad_request(
-                shared,
-                route,
-                &format!("invalid request: {error}"),
-            ))
-        })
+    Ok(caller)
+}
+
+/// The body of one write, or its `400`.
+fn read_body<Body: DeserializeOwned>(
+    shared: &Shared,
+    route: &str,
+    body: &[u8],
+) -> Result<Body, Box<Response>> {
+    serde_json::from_slice(body).map_err(|error| {
+        Box::new(bad_request(
+            shared,
+            route,
+            &format!("invalid request: {error}"),
+        ))
+    })
+}
+
+/// The protocol version the client of one request speaks, as it names it in
+/// [`VERSION_HEADER`]: 0 when it names none, as every client from before that header does.
+/// Such a client still writes records and moves the marker past a window of one page, which mean
+/// what they did; only what changed since its version is refused it.
+///
+/// # Errors
+///
+/// Returns why the request names no one version, which the client is answered with.
+fn client_protocol(headers: &HeaderMap) -> std::result::Result<u32, String> {
+    let mut named = headers.get_all(VERSION_HEADER).iter();
+    let Some(value) = named.next() else {
+        return Ok(0);
+    };
+    if named.next().is_some() {
+        return Err(format!(
+            "the request names more than one {VERSION_HEADER} header"
+        ));
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .ok_or_else(|| format!("{VERSION_HEADER} is not a protocol version, a whole number"))
 }
 
 /// Moves the marker, or records a page of the window after it, for a caller already

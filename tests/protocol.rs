@@ -8,7 +8,8 @@ use ctx_memory::marker::{Marker, Page, PageMessage};
 use ctx_memory::protocol::{
     Captured, CommandRequest, Committed, DeleteRequest, Draft, Finding, MarkerRequest,
     MarkerResponse, PageRequest, PageResponse, PutBatchRequest, PutRequest, RecordFile, Refused,
-    COMMAND_ROUTE, DELETE_ROUTE, MARKER_ROUTE, PAGE_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE,
+    COMMAND_ROUTE, DELETE_ROUTE, HEALTH_ROUTE, MARKER_ROUTE, PAGED_SINCE, PAGE_ROUTE,
+    PUT_BATCH_ROUTE, PUT_ROUTE, VERSION, VERSION_HEADER,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -60,6 +61,18 @@ fn the_routes_are_the_paths_the_server_has_always_answered() {
     assert_eq!(PUT_ROUTE, "/v1/records/put");
     assert_eq!(DELETE_ROUTE, "/v1/records/delete");
     assert_eq!(MARKER_ROUTE, "/v1/marker/advance");
+}
+
+/// The protocol version, its header and its probe are what a client and a server of another
+/// release read, so they are pinned: the v0.3 protocol, paged windows, is 1, and paging is
+/// refused a client older than it. A release that bumps the version changes these lines and the
+/// wire pins in tests/server.rs and tests/remote.rs.
+#[test]
+fn the_protocol_version_and_where_it_travels_are_pinned() {
+    assert_eq!(VERSION, 1);
+    assert_eq!(PAGED_SINCE, 1);
+    assert_eq!(VERSION_HEADER, "X-Ctx-Protocol");
+    assert_eq!(HEALTH_ROUTE, "/healthz");
 }
 
 /// The batch route is newer than the shared module: its path and body are pinned so a client
