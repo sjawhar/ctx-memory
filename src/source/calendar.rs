@@ -237,12 +237,13 @@ type Recorded = BTreeMap<String, DateTime<Utc>>;
 /// What each calendar's fetches recorded, kept in `<state_dir>/emitted.json`.
 ///
 /// A fetch has no view of the store, and Google names a cancelled event by its id, often with
-/// no start. This list tells the cancellation of an event the tree holds, which is recorded,
-/// from that of an event never stored, which is not; and the move of an event the tree holds,
+/// no start. This list tells the cancellation of an event that may have been stored, which is
+/// recorded, from that of an event never recorded, which is not; and the move of such an event,
 /// which is recorded wherever it now starts, from an instance of a series past the horizon,
-/// which is not. An entry is forgotten once its event started more than [`HORIZON`] before the
-/// window end, so the list holds the events recorded within the horizon either side of the
-/// window and the events moved past it, never a series' decades.
+/// which is not. Each entry keeps the latest start a record of it may have. An entry is
+/// forgotten once that start is more than [`HORIZON`] before the window end, so the list holds
+/// the events recorded within the horizon either side of the window and the events moved past
+/// it, never a series' decades.
 #[derive(Default, Deserialize, Serialize)]
 struct Emitted {
     #[serde(default)]
@@ -373,10 +374,22 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
         let collected = collect_calendar(request, calendar, api, held.as_ref()).and_then(|c| {
             let mut recorded = c.recorded;
             recorded.retain(|_, start| *start >= forget_before(request));
-            // The fetch drops the record of an excluded event, so the tree never holds it.
+            // The fetch drops the record of an excluded event, so this fetch's record of one is
+            // not listed; one listed before, whose record the tree may hold, stays as it was.
             if !exclusion.is_empty() {
                 let scheme = &request.source.scheme;
-                recorded.retain(|id, _| !exclusion.matches(&format!("{scheme}:{calendar}/{id}")));
+                recorded.retain(|id, start| {
+                    if !exclusion.matches(&format!("{scheme}:{calendar}/{id}")) {
+                        return true;
+                    }
+                    match held.as_ref().and_then(|held| held.get(id)) {
+                        Some(listed) => {
+                            *start = *listed;
+                            true
+                        }
+                        None => false,
+                    }
+                });
             }
             let list = CalendarList {
                 stored: held.unwrap_or_default(),
@@ -397,7 +410,7 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
 /// Reads one calendar: incrementally when the cursor names a sync token, else from the time it
 /// names or the backfill window. Either way it records no instance of a recurring series whose
 /// start and slot both lie at or after the horizon, [`HORIZON`] past the window end to the second,
-/// unless the tree holds a record of it (`held`, the events recorded in windows that were stored);
+/// unless the source's list says a stored window may have recorded it (`held`);
 /// a listing by time records no event that starts past it at all.
 fn collect_calendar<C: CalendarApi + ?Sized>(
     request: &FetchRequest,
@@ -488,9 +501,9 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
     for event in &page.items {
         let stored = event_id(event).and_then(|id| collected.recorded.get(id).copied());
         let start = match stored {
-            // The tree holds a record of an event the sync token names, so the change reaches
-            // it wherever the event now starts. A cancelled one is recorded as cancelled, at the
-            // start its record has, since Google may name it by its id alone.
+            // A record of an event the sync token names may be stored, so the change reaches it
+            // wherever the event now starts. A cancelled one is recorded as cancelled, at the
+            // start the list keeps for it, since Google may name it by its id alone.
             Some(stored) if named_by_token => {
                 if is_cancelled(event) {
                     let mut cancelled = record(event, stored)?;
