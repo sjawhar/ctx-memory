@@ -2351,6 +2351,34 @@ mod tests {
     }
 
     #[test]
+    fn an_event_stored_before_it_was_excluded_stays_listed() -> Result<()> {
+        let (state_dir, stored_cursor, first) = first_fetch(vec![meeting()])?;
+        assert_eq!(first.len(), 1);
+
+        // The deployment then excludes the meeting; the record the tree holds stays.
+        let quiet_api = api(vec![listing("sync-3", Vec::new())]);
+        let mut excluded = request_after(&stored_cursor, &state_dir)?;
+        excluded.exclude = vec!["gcal:team@example.com/EVENT-EXAMPLE".to_owned()];
+        let quiet = run_fetch(&quiet_api, &excluded)?;
+        let quiet_cursor = cursor(&quiet).context("the excluding fetch moved on")?;
+
+        // The exclusion is lifted, and the meeting is cancelled.
+        let cancelled = json!({"id": "EVENT-EXAMPLE", "status": "cancelled"});
+        let api = api(vec![listing("sync-4", vec![cancelled])]);
+        let messages = run_fetch(&api, &request_after(&quiet_cursor, &state_dir)?)?;
+
+        let records = records(&messages);
+        assert_eq!(pointers(&records), ["gcal:team@example.com/EVENT-EXAMPLE"]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.text == "[event cancelled]"),
+            "{records:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn an_excluded_event_is_not_listed_as_recorded() -> Result<()> {
         // The fetch drops the record of an event the deployment excludes, so the tree never
         // holds it.
