@@ -12,7 +12,10 @@ use std::fmt::Write as _;
 use std::ops::RangeBounds;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, SubsecRound as _, TimeZone as _, Utc};
+use chrono::{
+    DateTime, Duration, NaiveDate, NaiveDateTime, SecondsFormat, SubsecRound as _, TimeZone as _,
+    Utc,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -385,7 +388,25 @@ fn token_named_start(event: &Value, horizon: DateTime<Utc>) -> Result<Option<Dat
     let Some(slot) = event.get("originalStartTime") else {
         return Ok(None);
     };
-    Ok((event_time(slot, "originalStartTime")? < horizon).then_some(start))
+    Ok((earliest_slot(slot)? < horizon).then_some(start))
+}
+
+/// The earliest instant an instance's slot (`originalStartTime`) can name.
+///
+/// Google may give its time without an offset and name the time zone beside it, and time zones
+/// run from 12 hours behind UTC to 14 ahead. Read in the zone furthest ahead, such a slot lies
+/// before the horizon whenever it does in its own zone: an occurrence the tree holds is never
+/// dropped for it, and a series yields at most a day's more slots.
+fn earliest_slot(slot: &Value) -> Result<DateTime<Utc>> {
+    let Some(value) = slot.get("dateTime").and_then(Value::as_str) else {
+        return event_time(slot, "originalStartTime");
+    };
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+        return Ok(timestamp.with_timezone(&Utc));
+    }
+    let local = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+        .with_context(|| format!("parsing Calendar event originalStartTime {value:?}"))?;
+    Ok(Utc.from_utc_datetime(&local) - Duration::hours(14))
 }
 
 fn event_id(event: &Value) -> Option<&str> {
