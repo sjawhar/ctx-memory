@@ -87,6 +87,40 @@ fn healthz_reports_the_loaded_tree() -> Result<()> {
     Ok(())
 }
 
+/// The protocol version this release's server speaks, pinned as the wire carries it, so a
+/// release that changes it changes these tests too.
+const PROTOCOL: &str = "1";
+
+/// The server names its protocol version in `/healthz` and in `X-Ctx-Protocol` on every answer,
+/// a refusal and an unknown path among them, so a deployment and a client can each read it
+/// whatever they asked.
+#[test]
+fn healthz_and_every_answer_name_the_server_s_protocol_version() -> Result<()> {
+    let tree = fixture_tree("server-protocol")?;
+    let server = Server::start(&tree, &[])?;
+    let address = server.tailnet_address()?;
+    let health = server.get(address, "/healthz", &[])?;
+    let command = server.command(&["rules"])?;
+    let anonymous = server.post(address, "/v1/command", &json!({ "argv": ["rules"] }), &[])?;
+    let unknown = server.protocol_of(address, "/v1/no-such-route")?;
+    drop(server);
+    remove_fixture(&tree)?;
+
+    assert_eq!(health.status, 200, "{}", health.body);
+    assert_eq!(health.field("protocol")?, &json!(1), "{}", health.body);
+    assert_eq!(anonymous.status, 401, "{}", anonymous.body);
+    assert_eq!(unknown.0, 404);
+    for (what, status, protocol) in [
+        ("/healthz", health.status, health.protocol.as_deref()),
+        ("a command", command.status, command.protocol.as_deref()),
+        ("a refusal", anonymous.status, anonymous.protocol.as_deref()),
+        ("an unknown path", unknown.0, unknown.1.as_deref()),
+    ] {
+        assert_eq!(protocol, Some(PROTOCOL), "{what} ({status})");
+    }
+    Ok(())
+}
+
 const AUDIENCE: &str = "https://ctx-memory.example.run.app";
 
 /// Who the test server answers: the people of the company and its agent service accounts.
@@ -2449,6 +2483,96 @@ fn a_large_window_is_worked_a_page_a_cycle_through_the_server() -> Result<()> {
         page_lines, 2,
         "the request log does not name each page record: {log:?}"
     );
+    Ok(())
+}
+
+/// The `page` that `ctx pending` lists for the window after the marker, read through
+/// `/v1/command` with `headers`, which must be answered.
+fn listed_page(server: &Server, headers: &[(&str, &str)]) -> Result<Value> {
+    let reply = server.post(
+        server.tailnet_address()?,
+        "/v1/command",
+        &json!({ "argv": ["--json", "pending"] }),
+        headers,
+    )?;
+    anyhow::ensure!(
+        reply.status == 200,
+        "pending was not answered: {}",
+        reply.body
+    );
+    let pending: Value = serde_json::from_str(reply.text("stdout")?)?;
+    pending
+        .pointer("/data/windows/0/page")
+        .cloned()
+        .with_context(|| format!("the window is not listed as a page: {pending}"))
+}
+
+/// The `ends_at` of a listed `page`.
+fn ends_at(page: &Value) -> Result<String> {
+    page.get("ends_at")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("the page names no end: {page}"))
+}
+
+/// A client older than paging names no protocol version, and a page record or a move of the
+/// marker past a window with pages left is refused it with a `409` that names both versions,
+/// rather than a `400` that reads as the client's own mistake. What did not change for it
+/// answers it as before: its reads, and a move of the marker that passes no page left. A client
+/// that names this server's version is answered as before, and one whose version is not a number
+/// is refused.
+#[test]
+fn a_client_too_old_for_paging_gets_409_and_keeps_its_unchanged_routes() -> Result<()> {
+    let (tree, window) = tree_of_pages("server-protocol-paging")?;
+    let server = Server::start(&tree, &[])?;
+    let address = server.tailnet_address()?;
+    let user = ("Tailscale-User-Login", "ada@example.com");
+    let old: &[(&str, &str)] = &[user];
+    let current: &[(&str, &str)] = &[user, ("X-Ctx-Protocol", PROTOCOL)];
+    let garbled: &[(&str, &str)] = &[user, ("X-Ctx-Protocol", "two")];
+    let page = |headers: &[(&str, &str)], ends_at: &str| {
+        let body = json!({ "window": window.as_str(), "ends_at": ends_at, "session": "s" });
+        server.post(address, "/v1/marker/page", &body, headers)
+    };
+    let advance = |headers: &[(&str, &str)]| {
+        let body = json!({ "window": window.as_str(), "session": "s" });
+        server.post(address, "/v1/marker/advance", &body, headers)
+    };
+    let first = ends_at(&listed_page(&server, old)?)?;
+    let old_page = page(old, &first)?;
+    let old_advance = advance(old)?;
+    let current_advance = advance(current)?;
+    let garbled_page = page(garbled, &first)?;
+    let mut recorded = Vec::new();
+    let mut listed = listed_page(&server, old)?;
+    while listed.get("last") != Some(&Value::Bool(true)) && recorded.len() < 5 {
+        recorded.push(page(current, &ends_at(&listed)?)?.status);
+        listed = listed_page(&server, old)?;
+    }
+    let last_advance = advance(old)?;
+    drop(server);
+    remove_fixture(&tree)?;
+
+    for (what, reply) in [
+        ("a page record", &old_page),
+        ("a move past pages left", &old_advance),
+    ] {
+        assert_eq!(reply.status, 409, "{what}: {}", reply.body);
+        let error = reply.text("error")?;
+        assert!(
+            error.contains("protocol 0") && error.contains(&format!("protocol {PROTOCOL}")),
+            "{what}: the refusal does not name both versions: {error}"
+        );
+    }
+    assert_eq!(current_advance.status, 400, "{}", current_advance.body);
+    assert!(
+        current_advance.text("error")?.contains("ctx marker page"),
+        "{}",
+        current_advance.body
+    );
+    assert_eq!(garbled_page.status, 400, "{}", garbled_page.body);
+    assert_eq!(recorded, [200, 200]);
+    assert_eq!(last_advance.status, 200, "{}", last_advance.body);
     Ok(())
 }
 

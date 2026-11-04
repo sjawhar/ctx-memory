@@ -149,10 +149,13 @@ fn a_window_worked_in_pages_is_sent_the_subjects_of_its_page() -> Result<()> {
     let server = Server::start(&tree, &[])?;
     let first = ask(&server, &window, Some(CYCLE))?;
     let first_sent = std::fs::read_to_string(&request).unwrap_or_default();
-    let recorded = server.post_as(
-        CYCLE,
+    // A page record is refused a client that names no protocol version, as one older than
+    // paging names none; the cycle's ctx names its own.
+    let recorded = server.post(
+        server.tailnet_address()?,
         "/v1/marker/page",
         &serde_json::json!({ "window": window, "ends_at": "echo:C0EXAMPLE02/record", "session": "cycle-1" }),
+        &[("Tailscale-User-Login", CYCLE), ("X-Ctx-Protocol", "1")],
     )?;
     let second = ask(&server, &window, Some(CYCLE))?;
     let second_sent = std::fs::read_to_string(&request).unwrap_or_default();
