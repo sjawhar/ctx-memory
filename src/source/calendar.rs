@@ -3,24 +3,29 @@
 //! Each configured calendar is one stream whose cursor is a Calendar sync token: a fetch asks
 //! for what changed since the last run, and a first fetch lists every event from the backfill
 //! window onwards. Either way it records no instance of a recurring series whose start and slot
-//! in the series both lie [`HORIZON`] or more past the window end, reckoned to the second, and
-//! lists no event that far ahead by time. A record's timestamp is the event's start, so an event
-//! that starts after the window ends is a context record.
+//! in the series both lie [`HORIZON`] or more past the window end, reckoned to the second, unless
+//! it recorded that instance before, and lists no event that far ahead by time. A record's
+//! timestamp is the event's start, so an event that starts after the window ends is a context
+//! record. A cancelled event it recorded before is recorded again as cancelled (`Emitted`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::fs;
+use std::io::ErrorKind;
 use std::ops::RangeBounds;
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::{
     DateTime, Duration, NaiveDate, NaiveDateTime, SecondsFormat, SubsecRound as _, TimeZone as _,
     Utc,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::client;
 use crate::api::google::{self, Google};
+use crate::atomic::write_replace;
 use crate::record::Record;
 
 use super::{
@@ -35,11 +40,12 @@ use super::{
 /// decades. Reading this far keeps a trip booked for next year and the next instance or two of a
 /// yearly series, and stops every other series here. A listing by time asks for nothing later; a
 /// sync token takes no time bounds, so from its listing only a series' instances whose start and
-/// slot both lie past the horizon are dropped. A one-off event it names, which has changed, is
-/// recorded wherever it now starts, and so is an occurrence moved from a slot within reach. A
-/// fetch that follows a sync token also makes the horizon listing: the events that came
-/// within this reach since its cursor's window, which the token does not name unless they
-/// changed. So each series yields its next instance as the horizon reaches it.
+/// slot both lie past the horizon are dropped, unless the source recorded them before. A one-off
+/// event it names, which has changed, is recorded wherever it now starts, and so is an occurrence
+/// moved from a slot within reach or one recorded before. A fetch that follows a sync token also
+/// makes the horizon listing: the events that came within this reach since its cursor's window,
+/// which the token does not name unless they changed. So each series yields its next instance as
+/// the horizon reaches it.
 ///
 /// Where the reach of the fetch that wrote a cursor ended is reckoned from the cursor's time and
 /// this value, so raising it leaves the events between the old reach and the new one unrecorded
@@ -217,12 +223,71 @@ fn emit_resolve_hello(
     })
 }
 
-/// One calendar's records, warnings, and the cursor that follows them.
+/// The file a fetch lists the events it recorded in, under the source's state directory.
+const EMITTED_FILE: &str = "emitted.json";
+
+/// The text of the record that replaces a cancelled event's, as a removed chat message reads
+/// `[message removed]`.
+const CANCELLED: &str = "[event cancelled]";
+
+/// The events each calendar's fetches recorded, each with the start its latest record has.
+type Recorded = BTreeMap<String, DateTime<Utc>>;
+
+/// What each calendar's fetches recorded, kept in `<state_dir>/emitted.json`.
+///
+/// A fetch has no view of the store, and Google names a cancelled event by its id, often with
+/// no start. This list tells the cancellation of an event the tree holds, which is recorded,
+/// from that of an event never recorded, which is not; and the move of an event the tree holds,
+/// which is recorded wherever it now starts, from an instance of a series past the horizon,
+/// which is not. An entry is forgotten once its event started [`HORIZON`] before the window end,
+/// so the list holds the events recorded within the horizon either side of the window and the
+/// events moved past it, never a series' decades.
+#[derive(Default, Deserialize, Serialize)]
+struct Emitted {
+    #[serde(default)]
+    calendars: BTreeMap<String, Recorded>,
+}
+
+impl Emitted {
+    /// Reads the list. One this build cannot read is dropped with a warning rather than failing
+    /// the fetch: each calendar then does without it, as one with a cursor and no list does.
+    fn load(dir: &Path) -> (Self, Option<String>) {
+        let path = dir.join(EMITTED_FILE);
+        let unread = |error: &dyn std::fmt::Display| {
+            format!(
+                "{} cannot be read ({error}); a cancellation of an event stored before this fetch is not recorded, and a move of one past the horizon is followed only from its slot",
+                path.display()
+            )
+        };
+        match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(list) => (list, None),
+                Err(error) => (Self::default(), Some(unread(&error))),
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => (Self::default(), None),
+            Err(error) => (Self::default(), Some(unread(&error))),
+        }
+    }
+
+    /// Saves `calendar`'s entries, and every other calendar's as the file has them now.
+    fn save(dir: &Path, calendar: &str, recorded: Recorded) -> Result<()> {
+        let (mut list, _) = Self::load(dir);
+        list.calendars.insert(calendar.to_owned(), recorded);
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let bytes =
+            serde_json::to_vec_pretty(&list).context("serializing the recorded Calendar events")?;
+        write_replace(&dir.join(EMITTED_FILE), &bytes)
+    }
+}
+
+/// One calendar's records, warnings, and the cursor that follows them, and the events it has
+/// recorded since.
 #[derive(Default)]
 struct Collected {
     records: Vec<Record>,
     warnings: Vec<String>,
     cursor: String,
+    recorded: Recorded,
 }
 
 fn fetch_with_api<C: CalendarApi + ?Sized>(
@@ -231,24 +296,37 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
+    let (emitted, warning) = Emitted::load(&request.state_dir);
+    if let Some(message) = warning {
+        sink(Message::Warning {
+            stream: None,
+            message,
+        })?;
+    }
     for calendar in &config.calendars {
-        super::emit_stream(
-            calendar,
-            collect_calendar(request, calendar, api).map(|c| (c.warnings, c.records, c.cursor)),
-            sink,
-        )?;
+        let held = emitted.calendars.get(calendar.as_str());
+        // The list is saved before any record is sent: a record stored without its entry would
+        // leave its cancellation unrecorded, so a save that fails stores nothing and leaves the
+        // cursor, and the next fetch reads the same changes again.
+        let collected = collect_calendar(request, calendar, api, held).and_then(|collected| {
+            Emitted::save(&request.state_dir, calendar, collected.recorded)?;
+            Ok((collected.warnings, collected.records, collected.cursor))
+        });
+        super::emit_stream(calendar, collected, sink)?;
     }
     Ok(())
 }
 
 /// Reads one calendar: incrementally when the cursor names a sync token, else from the time it
 /// names or the backfill window. Either way it records no instance of a recurring series whose
-/// start and slot both lie at or after the horizon, [`HORIZON`] past the window end to the second;
-/// a listing by time records no event that starts past it at all.
+/// start and slot both lie at or after the horizon, [`HORIZON`] past the window end to the second,
+/// unless the tree holds a record of it (`held`, the events earlier fetches recorded); a listing by
+/// time records no event that starts past it at all.
 fn collect_calendar<C: CalendarApi + ?Sized>(
     request: &FetchRequest,
     calendar: &str,
     api: &C,
+    held: Option<&Recorded>,
 ) -> Result<Collected> {
     let cursor = request
         .cursors
@@ -270,6 +348,18 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
         list_by_time(api, calendar, start.min(horizon), horizon + LISTING_MARGIN)
     };
     let mut collected = Collected::default();
+    if held.is_none() && cursor.is_some() {
+        collected.warnings.push(format!(
+            "Calendar {calendar} has no list of the events it stored ({EMITTED_FILE}), as an earlier build kept none; a cancellation of an event stored before this fetch is not recorded, and a move of one past the horizon is followed only from its slot"
+        ));
+    }
+    // An event that started the horizon or more before the window end is forgotten, so the list
+    // does not grow for decades: its cancellation is no longer recorded.
+    let forget_before = request.window_end.trunc_subsecs(0) - HORIZON;
+    collected.recorded = held.cloned().unwrap_or_default();
+    collected
+        .recorded
+        .retain(|_, start| *start >= forget_before);
     let mut page = match cursor {
         Some(TokenCursor::Token { token, .. }) => api.events(calendar, &sync_query(token))?,
         Some(TokenCursor::Time(start)) => list_from(start)?,
@@ -328,13 +418,26 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
         )
     };
     for event in &page.items {
-        let start = if named_by_token {
-            token_named_start(event, horizon)?
-        } else {
-            recorded_start(event, &(..horizon))?
+        let stored = event_id(event).and_then(|id| collected.recorded.get(id).copied());
+        let start = match stored {
+            // The tree holds a record of an event the sync token names, so the change reaches
+            // it wherever the event now starts. A cancelled one is recorded as cancelled, at the
+            // start its record has, since Google may name it by its id alone.
+            Some(stored) if named_by_token => {
+                if is_cancelled(event) {
+                    let mut cancelled = record(event, stored)?;
+                    cancelled.text = CANCELLED.to_owned();
+                    collected.records.push(cancelled);
+                    continue;
+                }
+                recorded_start(event, &..)?
+            }
+            _ if named_by_token => token_named_start(event, horizon)?,
+            _ => recorded_start(event, &(..horizon))?,
         };
         if let Some(start) = start {
             collected.records.push(record(event, start)?);
+            remember(&mut collected.recorded, event, start);
         }
     }
     if let Some((kept, listing)) = &horizon_listing {
@@ -351,10 +454,22 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
         for event in unnamed {
             if let Some(start) = recorded_start(event, kept)? {
                 collected.records.push(record(event, start)?);
+                remember(&mut collected.recorded, event, start);
             }
         }
     }
     Ok(collected)
+}
+
+/// Lists `event` as recorded at `start`.
+fn remember(recorded: &mut Recorded, event: &Value, start: DateTime<Utc>) {
+    if let Some(id) = event_id(event) {
+        recorded.insert(id.to_owned(), start);
+    }
+}
+
+fn is_cancelled(event: &Value) -> bool {
+    event.get("status").and_then(Value::as_str) == Some("cancelled")
 }
 
 /// The start of `event` when it is recorded: it is not cancelled, and its start lies in `kept`.
@@ -362,7 +477,7 @@ fn recorded_start(
     event: &Value,
     kept: &impl RangeBounds<DateTime<Utc>>,
 ) -> Result<Option<DateTime<Utc>>> {
-    if event.get("status").and_then(Value::as_str) == Some("cancelled") {
+    if is_cancelled(event) {
         return Ok(None);
     }
     let start = event_start(event)?;
