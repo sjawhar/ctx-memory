@@ -2295,25 +2295,57 @@ mod tests {
     }
 
     #[test]
-    fn an_event_recorded_only_in_a_window_that_was_not_stored_is_not_recorded_cancelled(
+    fn a_cancellation_after_a_window_stored_without_moving_its_cursor_reaches_the_record(
     ) -> Result<()> {
         let (state_dir, stored_cursor, _) = first_fetch(vec![meeting()])?;
 
-        // A fetch records a new meeting, and its window is never stored.
+        // A fetch given an older window end records a new meeting. Its window is stored, but the
+        // cursor stays where it was, since a newer window moved it.
         let new = event(
             "EVENT-NEW",
             "2026-11-02T09:00:00Z",
             "2026-11-02T10:00:00Z",
             None,
         );
-        let lost_api = api(vec![listing("sync-3", vec![new])]);
-        let lost = run_fetch(&lost_api, &request_after(&stored_cursor, &state_dir)?)?;
-        assert_eq!(records(&lost).len(), 1);
+        let older_api = api(vec![listing("sync-3", vec![new])]);
+        let mut older = request_after(&stored_cursor, &state_dir)?;
+        older.window_end = at("2026-10-23T18:00:00Z")?;
+        let stored = run_fetch(&older_api, &older)?;
+        assert_eq!(records(&stored).len(), 1);
 
-        // The fetch that reads the same changes again finds it cancelled: the tree never held it.
+        // The next fetch, from the cursor that did not move, finds it cancelled. Whether that
+        // window was stored cannot be told, so the cancellation is recorded.
         let cancelled = json!({"id": "EVENT-NEW", "status": "cancelled"});
         let api = api(vec![listing("sync-4", vec![cancelled])]);
         let messages = run_fetch(&api, &request_after(&stored_cursor, &state_dir)?)?;
+
+        let records = records(&messages);
+        assert_eq!(pointers(&records), ["gcal:team@example.com/EVENT-NEW"]);
+        assert_eq!(starts(&records), ["2026-11-02T09:00:00Z"]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.text == "[event cancelled]"),
+            "{records:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_excluded_event_is_not_listed_as_recorded() -> Result<()> {
+        // The fetch drops the record of an event the deployment excludes, so the tree never
+        // holds it.
+        let api = api(vec![listing("sync-2", vec![meeting()])]);
+        let mut first = request(None)?;
+        first.exclude = vec!["gcal:team@example.com/EVENT-EXAMPLE".to_owned()];
+        let first_messages = run_fetch(&api, &first)?;
+        let first_cursor = cursor(&first_messages).context("the first fetch moved on")?;
+        let list = std::fs::read_to_string(first.state_dir.join("emitted.json"))?;
+        assert!(!list.contains("EVENT-EXAMPLE"), "{list}");
+
+        let cancelled = json!({"id": "EVENT-EXAMPLE", "status": "cancelled"});
+        let api = api(vec![listing("sync-3", vec![cancelled])]);
+        let messages = run_fetch(&api, &request_after(&first_cursor, &first.state_dir)?)?;
 
         assert!(records(&messages).is_empty(), "{messages:?}");
         Ok(())
