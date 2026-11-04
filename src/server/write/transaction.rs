@@ -64,15 +64,16 @@ const PUSH_PAUSE: Duration = Duration::from_secs(2);
 /// timed out. Each push, and the fetch after a failed one, may take up to
 /// `git::NETWORK_TIMEOUT` (25 s), and the lease check before each push reads Cloud Storage, so
 /// a retry is not bounded by its own count. Instead a push is made again only when the request
-/// has been in the server less than this — its waits for the index and the tree included —
-/// checked right before the push, after the pause and the lease check. A retry's push and its
-/// fetch then end within 30 + 25 + 25 = 80 seconds of the request reaching the write handler,
-/// inside the client's 120. A remote that fails fast, as the one that refused with `(failure)`
-/// did, is retried; a write that got there slowly is deferred to the client at once.
+/// has been in the server less than this, the identification of its caller and its waits for
+/// the index and the tree included, checked right before the push, after the pause and the
+/// lease check. A retry's push and its fetch then end within 30 + 25 + 25 = 80 seconds of the
+/// request reaching the server, inside the client's 120. A remote that fails fast, as the one
+/// that refused with `(failure)` did, is retried; a write that got there slowly is deferred to
+/// the client at once.
 const RETRY_DEADLINE: Duration = Duration::from_secs(30);
 
-/// What one write may still spend on pushes made again: when its request reached the write
-/// handler, and how many retries it has made ([`PUSH_RETRIES`], [`RETRY_DEADLINE`]).
+/// What one write may still spend on pushes made again: when its request reached the
+/// server, and how many retries it has made ([`PUSH_RETRIES`], [`RETRY_DEADLINE`]).
 struct Retries {
     started: Instant,
     made: u32,
@@ -91,7 +92,7 @@ impl From<anyhow::Error> for ApplyError {
 /// has moved, every later write and every follow pass fails on a clone that cannot
 /// fast-forward. So the body of the write runs inside [`attempt`], and anything it leaves
 /// behind is thrown away here before the caller is answered. `started` is when the request
-/// reached the write handler, which bounds the write's retries ([`RETRY_DEADLINE`]).
+/// reached the server, which bounds the write's retries ([`RETRY_DEADLINE`]).
 pub(super) fn apply(
     shared: &Shared,
     caller: &Caller,

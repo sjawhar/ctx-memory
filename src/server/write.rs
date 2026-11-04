@@ -473,9 +473,10 @@ async fn write(
     session: Option<String>,
     note: &Note,
 ) -> Response {
-    // When the request reached the handler, before its waits for the index and the tree: the
-    // client's request timeout runs from about then, and the write's retries are bounded by it.
-    let started = std::time::Instant::now();
+    // When the request reached the server, before its caller was identified and before its
+    // waits for the index and the tree: the client's request timeout runs from about then, and
+    // the write's retries are bounded by it.
+    let started = note.arrived().unwrap_or_else(std::time::Instant::now);
     let shared = &listener.shared;
     shared.index_ready().await;
     let writing = Arc::clone(shared);
