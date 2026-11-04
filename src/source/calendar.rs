@@ -230,22 +230,54 @@ const EMITTED_FILE: &str = "emitted.json";
 /// `[message removed]`.
 const CANCELLED: &str = "[event cancelled]";
 
-/// The events each calendar's fetches recorded, each with the start its latest record has.
+/// The events a calendar's fetches recorded, each with the start its latest record has.
 type Recorded = BTreeMap<String, DateTime<Utc>>;
 
 /// What each calendar's fetches recorded, kept in `<state_dir>/emitted.json`.
 ///
 /// A fetch has no view of the store, and Google names a cancelled event by its id, often with
 /// no start. This list tells the cancellation of an event the tree holds, which is recorded,
-/// from that of an event never recorded, which is not; and the move of an event the tree holds,
+/// from that of an event never stored, which is not; and the move of an event the tree holds,
 /// which is recorded wherever it now starts, from an instance of a series past the horizon,
-/// which is not. An entry is forgotten once its event started [`HORIZON`] before the window end,
-/// so the list holds the events recorded within the horizon either side of the window and the
-/// events moved past it, never a series' decades.
+/// which is not. An entry is forgotten once its event started more than [`HORIZON`] before the
+/// window end, so the list holds the events recorded within the horizon either side of the
+/// window and the events moved past it, never a series' decades.
 #[derive(Default, Deserialize, Serialize)]
 struct Emitted {
     #[serde(default)]
-    calendars: BTreeMap<String, Recorded>,
+    calendars: BTreeMap<String, CalendarList>,
+}
+
+/// One calendar's entries.
+///
+/// A fetch saves its entries before its window is stored, and a window may never be stored. So
+/// they are kept beside those of the windows that were, with the cursor the fetch proposed, and
+/// count only for a fetch that starts from that cursor: the cursor moves only once the window is
+/// stored. A fetch that starts from another cursor reads the same changes again, from the
+/// entries of the windows that were stored.
+#[derive(Deserialize, Serialize)]
+struct CalendarList {
+    #[serde(default)]
+    stored: Recorded,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proposed: Option<Proposed>,
+}
+
+/// The entries of the last fetch that saved them, and the cursor it proposed.
+#[derive(Deserialize, Serialize)]
+struct Proposed {
+    cursor: String,
+    recorded: Recorded,
+}
+
+impl CalendarList {
+    /// The entries of the windows that were stored, as a fetch from `cursor` finds them.
+    fn stored_as_of(&self, cursor: Option<&str>) -> Recorded {
+        match &self.proposed {
+            Some(proposed) if Some(proposed.cursor.as_str()) == cursor => proposed.recorded.clone(),
+            _ => self.stored.clone(),
+        }
+    }
 }
 
 impl Emitted {
@@ -270,12 +302,12 @@ impl Emitted {
     }
 
     /// Saves `calendar`'s entries, and every other calendar's as the file has them now.
-    fn save(dir: &Path, calendar: &str, recorded: Recorded) -> Result<()> {
-        let (mut list, _) = Self::load(dir);
-        list.calendars.insert(calendar.to_owned(), recorded);
+    fn save(dir: &Path, calendar: &str, list: CalendarList) -> Result<()> {
+        let (mut emitted, _) = Self::load(dir);
+        emitted.calendars.insert(calendar.to_owned(), list);
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let bytes =
-            serde_json::to_vec_pretty(&list).context("serializing the recorded Calendar events")?;
+        let bytes = serde_json::to_vec_pretty(&emitted)
+            .context("serializing the recorded Calendar events")?;
         write_replace(&dir.join(EMITTED_FILE), &bytes)
     }
 }
@@ -288,6 +320,12 @@ struct Collected {
     warnings: Vec<String>,
     cursor: String,
     recorded: Recorded,
+}
+
+/// The start before which a recorded event is forgotten: [`HORIZON`] before the window end, so
+/// the list does not grow for decades. The cancellation of an event that old is not recorded.
+fn forget_before(request: &FetchRequest) -> DateTime<Utc> {
+    request.window_end.trunc_subsecs(0) - HORIZON
 }
 
 fn fetch_with_api<C: CalendarApi + ?Sized>(
@@ -304,13 +342,33 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
         })?;
     }
     for calendar in &config.calendars {
-        let held = emitted.calendars.get(calendar.as_str());
+        let cursor = request.cursors.get(calendar).map(String::as_str);
+        let held = emitted.calendars.get(calendar.as_str()).map(|list| {
+            let mut stored = list.stored_as_of(cursor);
+            stored.retain(|_, start| *start >= forget_before(request));
+            stored
+        });
+        let missing = (held.is_none() && cursor.is_some()).then(|| {
+            format!(
+                "Calendar {calendar} has no list of the events it stored ({EMITTED_FILE}), as an earlier build kept none; a cancellation of an event stored before this fetch is not recorded, and a move of one past the horizon is followed only from its slot"
+            )
+        });
         // The list is saved before any record is sent: a record stored without its entry would
         // leave its cancellation unrecorded, so a save that fails stores nothing and leaves the
         // cursor, and the next fetch reads the same changes again.
-        let collected = collect_calendar(request, calendar, api, held).and_then(|collected| {
-            Emitted::save(&request.state_dir, calendar, collected.recorded)?;
-            Ok((collected.warnings, collected.records, collected.cursor))
+        let collected = collect_calendar(request, calendar, api, held.as_ref()).and_then(|c| {
+            let mut recorded = c.recorded;
+            recorded.retain(|_, start| *start >= forget_before(request));
+            let list = CalendarList {
+                stored: held.unwrap_or_default(),
+                proposed: Some(Proposed {
+                    cursor: c.cursor.clone(),
+                    recorded,
+                }),
+            };
+            Emitted::save(&request.state_dir, calendar, list)?;
+            let warnings: Vec<String> = missing.into_iter().chain(c.warnings).collect();
+            Ok((warnings, c.records, c.cursor))
         });
         super::emit_stream(calendar, collected, sink)?;
     }
@@ -320,8 +378,8 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
 /// Reads one calendar: incrementally when the cursor names a sync token, else from the time it
 /// names or the backfill window. Either way it records no instance of a recurring series whose
 /// start and slot both lie at or after the horizon, [`HORIZON`] past the window end to the second,
-/// unless the tree holds a record of it (`held`, the events earlier fetches recorded); a listing by
-/// time records no event that starts past it at all.
+/// unless the tree holds a record of it (`held`, the events recorded in windows that were stored);
+/// a listing by time records no event that starts past it at all.
 fn collect_calendar<C: CalendarApi + ?Sized>(
     request: &FetchRequest,
     calendar: &str,
@@ -347,19 +405,10 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
     let list_from = |start: DateTime<Utc>| {
         list_by_time(api, calendar, start.min(horizon), horizon + LISTING_MARGIN)
     };
-    let mut collected = Collected::default();
-    if held.is_none() && cursor.is_some() {
-        collected.warnings.push(format!(
-            "Calendar {calendar} has no list of the events it stored ({EMITTED_FILE}), as an earlier build kept none; a cancellation of an event stored before this fetch is not recorded, and a move of one past the horizon is followed only from its slot"
-        ));
-    }
-    // An event that started the horizon or more before the window end is forgotten, so the list
-    // does not grow for decades: its cancellation is no longer recorded.
-    let forget_before = request.window_end.trunc_subsecs(0) - HORIZON;
-    collected.recorded = held.cloned().unwrap_or_default();
-    collected
-        .recorded
-        .retain(|_, start| *start >= forget_before);
+    let mut collected = Collected {
+        recorded: held.cloned().unwrap_or_default(),
+        ..Collected::default()
+    };
     let mut page = match cursor {
         Some(TokenCursor::Token { token, .. }) => api.events(calendar, &sync_query(token))?,
         Some(TokenCursor::Time(start)) => list_from(start)?,
