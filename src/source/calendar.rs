@@ -1102,6 +1102,50 @@ mod tests {
     }
 
     #[test]
+    fn an_occurrence_whose_slot_names_its_time_zone_apart_follows_its_move() -> Result<()> {
+        // Google may give a time without its offset and name the time zone beside it. The slot
+        // next June is inside the horizon, 2027-11-29T18:00:00Z, in every time zone; the one in
+        // December is past it in every time zone, and is not kept.
+        let named_zone = |id: &str, start: &str, slot: &str| {
+            let mut moved = instance(event(id, start, "2029-01-22T10:00:00Z", None));
+            if let Some(fields) = moved.as_object_mut() {
+                fields.insert(
+                    "originalStartTime".to_owned(),
+                    json!({"dateTime": slot, "timeZone": "Europe/London"}),
+                );
+            }
+            moved
+        };
+        let api = api(vec![listing(
+            "sync-3",
+            vec![
+                named_zone(
+                    "EVENT-SERIES_20270614",
+                    "2029-01-22T09:00:00Z",
+                    "2027-06-14T09:00:00",
+                ),
+                named_zone(
+                    "EVENT-SERIES_20271201",
+                    "2029-01-23T09:00:00Z",
+                    "2027-12-01T09:00:00",
+                ),
+            ],
+        )]);
+        let request = request(Some("sync-2@2026-10-25T18:00:00Z"))?;
+        let messages = run_fetch(&api, &request)?;
+
+        assert_eq!(
+            pointers(&records(&messages)),
+            ["gcal:team@example.com/EVENT-SERIES_20270614"]
+        );
+        assert_eq!(
+            cursor(&messages),
+            Some("sync-3@2026-10-25T18:00:00Z".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn an_occurrence_the_sync_token_names_moved_past_the_horizon_is_recorded_at_its_new_start(
     ) -> Result<()> {
         // The first fetch stores the occurrence in its slot next June, inside the horizon.
