@@ -1,7 +1,7 @@
 //! The serialized write transaction and rollback protocol.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
 
@@ -38,7 +38,7 @@ pub(super) enum ApplyError {
     /// nobody can say yet whether the commit landed; why. 503, not 500: the follow loop
     /// settles it.
     Unknown(String),
-    /// Every push of the write failed on the remote's side ([`PUSH_RETRIES`]), and the remote,
+    /// Every push the write made ([`publish`]) failed on the remote's side, and the remote,
     /// asked after the last, does not hold the commit; why. Nothing was published, so the
     /// same write sent again is applied once at most.
     RemoteFailed(String),
@@ -55,6 +55,19 @@ const PUSH_RETRIES: u32 = 2;
 /// waits in its request, so it is kept short: the two add 4 seconds to a write the remote
 /// fails, against the client's 120 second request timeout.
 const PUSH_PAUSE: Duration = Duration::from_secs(2);
+
+/// How long after its first push a write may still start a retry.
+///
+/// Each push, and the fetch after a failed one, may take up to `git::NETWORK_TIMEOUT` (25 s),
+/// so retries that each failed slowly would hold a write far past the client's 120 second
+/// request timeout, and the commit could land after the caller was told the request timed
+/// out. A retry starts only while the write's pushes have taken less than this: a remote
+/// that fails fast, as the one that refused with `(failure)` did, is retried, and one that
+/// fails slowly is deferred to the client at once. So the pushes of one publish take at most
+/// this, a pause and one more push and fetch, 10 + 2 + 50 s: with the pull before them
+/// (25 s), 87 s, inside the client's 120 s. A write that also loses a race with a merge
+/// pulls and publishes a second time, as it always has, and can take longer.
+const RETRY_WINDOW: Duration = Duration::from_secs(10);
 
 impl From<anyhow::Error> for ApplyError {
     fn from(error: anyhow::Error) -> Self {
@@ -365,12 +378,14 @@ fn commit_message(change: &Change, paths: &[String], session: &str) -> String {
 /// clone's next pull takes it back, so neither answer loses it.
 ///
 /// A push that failed on the remote's side, after which the remote does not hold the commit,
-/// is made again after [`PUSH_PAUSE`], at most [`PUSH_RETRIES`] times, each a line on standard
-/// error. Each is the same push of the same commit: nothing in the clone changes between them.
-/// Each asks the remote again what it holds, as every push does: a remote that took the
-/// commit after all answers the push as one it already holds, or git refuses it and
-/// [`Repo::push`] finds the commit on the remote, and either is [`Push::Pushed`].
+/// is made again after [`PUSH_PAUSE`], at most [`PUSH_RETRIES`] times and only within
+/// [`RETRY_WINDOW`] of the first push, each a line on standard error. Each is the same push of
+/// the same commit: nothing in the clone changes between them. Each asks the remote again what
+/// it holds, as every push does: a remote that took the commit after all answers the push as
+/// one it already holds, or git refuses it and [`Repo::push`] finds the commit on the remote,
+/// and either is [`Push::Pushed`].
 fn publish(shared: &Shared, repo: &Repo) -> Result<Option<String>, ApplyError> {
+    let started = Instant::now();
     let mut retries = 0;
     loop {
         shared.hold_lease().map_err(ApplyError::Unheld)?;
@@ -378,7 +393,9 @@ fn publish(shared: &Shared, repo: &Repo) -> Result<Option<String>, ApplyError> {
             Push::Pushed => return Ok(None),
             Push::Rejected(why) => return Ok(Some(why)),
             Push::Unknown(why) => return Err(ApplyError::Unknown(why)),
-            Push::RemoteFailed(why) if retries < PUSH_RETRIES => {
+            Push::RemoteFailed(why)
+                if retries < PUSH_RETRIES && started.elapsed() < RETRY_WINDOW =>
+            {
                 retries += 1;
                 eprintln!("{}", retry_line(retries, &why));
                 std::thread::sleep(PUSH_PAUSE);

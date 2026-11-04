@@ -14,9 +14,12 @@ const REMOTE_REJECTED: &str = "[remote rejected]";
 
 /// The `[remote rejected]` reasons a remote gives for a failure of its own. Both are GitHub's:
 /// `failure` came with `remote: fatal error in commit_refs` during an outage on 2026-11-04,
-/// and `Internal Server Error` answered a push to this repository the same day. Every other
-/// reason is the remote refusing the push — `pre-receive hook declined`, `protected branch
-/// hook declined`, `hook declined` (git's `builtin/receive-pack.c`) — and is a refusal.
+/// and `Internal Server Error` answered a push to this repository the same day. Any other
+/// reason keeps the answer a failed push always had. Most are the remote refusing the push —
+/// `pre-receive hook declined`, `protected branch hook declined`, `hook declined` (git's
+/// `builtin/receive-pack.c`) — and are read as refusals. A stock receive-pack's own failures,
+/// `failed to update ref` and `unable to migrate objects to permanent storage`, are failures
+/// too, but no remote this server pushes to has been seen giving them, so they are left out.
 const REMOTE_FAILURE_REASONS: &[&str] = &["failure", "Internal Server Error"];
 
 /// The line for a ref the remote took no stand on: it ended the push without reporting what it
@@ -33,11 +36,17 @@ const HTTP_STATUS: &[&str] = &["The requested URL returned error: ", "RPC failed
 
 /// A connection that broke, was refused or timed out, as the C library's `strerror` words it
 /// for a socket and libcurl quotes it (`Recv failure: Connection reset by peer`, `Failed to
-/// connect to <host> port 443 after 2 ms: Connection refused`), or as libcurl words its own
-/// limits (`Connection timed out after 300000 milliseconds`, `Operation timed out after …`).
+/// connect to <host> port 443 after 2 ms: Connection refused`), as libcurl words a connection
+/// it could not make with no reason from the system (`Failed to connect to 127.0.0.1 port 1
+/// after 0 ms: Couldn't connect to server`, from git 2.43 with its curl; newer curl says
+/// `Could not connect to server`, `curl_easy_strerror` in curl's `lib/strerror.c`), or as
+/// libcurl words its own limits (`Connection timed out after 300000 milliseconds`,
+/// `Operation timed out after …`).
 const CONNECTION_FAILURES: &[&str] = &[
     "Connection reset by peer",
     "Connection refused",
+    "Couldn't connect to server",
+    "Could not connect to server",
     "Connection timed out",
     "Operation timed out",
 ];
@@ -156,6 +165,17 @@ mod tests {
             128,
             "fatal: unable to access 'https://github.com/owner/graph.git/': Failed to connect \
              to github.com port 443 after 2 ms: Connection refused",
+        ),
+        // git 2.43 pushing to a port nothing listens on.
+        (
+            128,
+            "fatal: unable to access 'http://127.0.0.1:1/remote.git/': Failed to connect to \
+             127.0.0.1 port 1 after 0 ms: Couldn't connect to server",
+        ),
+        (
+            128,
+            "fatal: unable to access 'http://127.0.0.1:1/remote.git/': Failed to connect to \
+             127.0.0.1 port 1 after 0 ms: Could not connect to server",
         ),
         (
             128,

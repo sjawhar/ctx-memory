@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use serde_json::Value;
 
 use crate::fixtures::{
-    fail_pushes_on_the_remotes_side, good_record, merge_before_the_servers_push, pushes_taken,
+    fail_pushes_on_the_remotes_side, good_record, merge_before_the_servers_push, pushed_commits,
     put_body,
 };
 use crate::logging::Logged;
@@ -48,7 +48,7 @@ fn a_push_the_remote_fails_once_is_tried_again_and_lands_once() -> Result<()> {
         &bare,
         &["log", "--format=%H", "main", "--", "decisions/retried.md"],
     )?;
-    let pushes = pushes_taken(&bare)?;
+    let pushed = pushed_commits(&bare)?;
     let local_head = git(&tree, &["rev-parse", "HEAD"])?;
     remove_fixture(&tree)?;
 
@@ -64,7 +64,11 @@ fn a_push_the_remote_fails_once_is_tried_again_and_lands_once() -> Result<()> {
         1,
         "the record did not land in exactly one commit: {commits}"
     );
-    assert_eq!(pushes, 2, "the remote was not asked twice");
+    assert_eq!(
+        pushed,
+        [remote_head.as_str(); 2],
+        "the remote was not asked twice for the one commit it holds"
+    );
     assert_eq!(
         local_head, remote_head,
         "the clone is not where the remote is"
@@ -108,7 +112,7 @@ fn a_push_the_remote_keeps_failing_is_deferred_and_put_back() -> Result<()> {
     let logged = std::fs::read_to_string(&log)?;
     let remote_head = git(&bare, &["rev-parse", "main"])?;
     let listing = git(&bare, &["ls-tree", "-r", "--name-only", "main"])?;
-    let pushes = pushes_taken(&bare)?;
+    let pushed = pushed_commits(&bare)?;
     let local_head = git(&tree, &["rev-parse", "HEAD"])?;
     let dirt = git(&tree, &["status", "--porcelain", "--untracked-files=all"])?;
     remove_fixture(&tree)?;
@@ -125,7 +129,11 @@ fn a_push_the_remote_keeps_failing_is_deferred_and_put_back() -> Result<()> {
             .is_some_and(|error| error.contains("(failure)")),
         "the answer does not say what the remote said: {body}"
     );
-    assert_eq!(pushes, 3, "the push was not tried exactly twice more");
+    assert_eq!(pushed.len(), 3, "the push was not tried exactly twice more");
+    assert!(
+        pushed.iter().all(|commit| Some(commit) == pushed.first()),
+        "a retry pushed another commit: {pushed:?}"
+    );
     assert_eq!(remote_head, start, "the remote's main moved");
     assert!(
         !listing.lines().any(|name| name == "decisions/deferred.md"),
@@ -149,6 +157,60 @@ fn a_push_the_remote_keeps_failing_is_deferred_and_put_back() -> Result<()> {
     assert!(
         lines_starting(&logged, "write failed: ").is_empty(),
         "a remote's outage paged as a failed write: {logged}"
+    );
+    Ok(())
+}
+
+/// A push and the fetch after it may each take up to 25 seconds, and the client gives up on a
+/// request after 120. A remote that takes longer than the retry window to fail the first push
+/// is not tried again within the write, which could then land after its caller gave up: the
+/// write is deferred at once, put back, and sent again by the client.
+#[test]
+fn a_push_the_remote_fails_slowly_is_deferred_without_a_retry() -> Result<()> {
+    let tree = fixture_clone("write-remote-fails-slowly")?;
+    fetch_window(&tree)?;
+    let root = tree.parent().context("the fixture has a root")?;
+    let log = root.join("serve.log");
+    let bare = remote_of(&tree)?;
+    let start = git(&bare, &["rev-parse", "main"])?;
+    fail_pushes_on_the_remotes_side(&bare, &["slow-fail"])?;
+    let server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
+    let (status, retry_after, body) = server.post_answer(
+        Some("ada@example.com"),
+        "/v1/records/put",
+        &put_body("decisions/slow.md", &good_record(), "session-slow"),
+    )?;
+    drop(server);
+    let logged = std::fs::read_to_string(&log)?;
+    let remote_head = git(&bare, &["rev-parse", "main"])?;
+    let pushed = pushed_commits(&bare)?;
+    let local_head = git(&tree, &["rev-parse", "HEAD"])?;
+    remove_fixture(&tree)?;
+
+    assert_eq!(status, 503, "unexpected body: {body}");
+    assert_eq!(
+        retry_after.as_deref(),
+        Some("30"),
+        "unexpected body: {body}"
+    );
+    assert_eq!(
+        pushed.len(),
+        1,
+        "a slow failure was tried again: {pushed:?}"
+    );
+    assert_eq!(remote_head, start, "the remote's main moved");
+    assert_eq!(
+        local_head, start,
+        "the clone is not back on the start commit"
+    );
+    assert!(
+        lines_starting(&logged, RETRIED).is_empty(),
+        "a slow failure was tried again: {logged}"
+    );
+    assert_eq!(
+        lines_starting(&logged, "write deferred: /v1/records/put 503 ").len(),
+        1,
+        "the deferral is not one write deferred: line: {logged}"
     );
     Ok(())
 }
@@ -177,7 +239,7 @@ fn a_retry_the_remote_took_though_it_said_failure_is_committed_once() -> Result<
         &bare,
         &["log", "--format=%H", "main", "--", "decisions/landed.md"],
     )?;
-    let pushes = pushes_taken(&bare)?;
+    let pushed = pushed_commits(&bare)?;
     let local_head = git(&tree, &["rev-parse", "HEAD"])?;
     remove_fixture(&tree)?;
 
@@ -193,8 +255,9 @@ fn a_retry_the_remote_took_though_it_said_failure_is_committed_once() -> Result<
         "the record did not land in exactly one commit: {commits}"
     );
     assert_eq!(
-        pushes, 2,
-        "the server pushed again after the remote took it"
+        pushed,
+        [remote_head.as_str(); 2],
+        "the server pushed again after the remote took it, or pushed another commit"
     );
     assert_eq!(
         local_head, remote_head,

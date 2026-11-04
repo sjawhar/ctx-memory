@@ -90,9 +90,10 @@ const WRITE_DEFERRED: &str = "write deferred: ";
 /// The seconds a caller is asked to wait, in `Retry-After`, before it sends again a write whose
 /// pushes the remote kept failing on its own side.
 ///
-/// The client sends a deferred write again for up to 180 seconds of pauses in all, so it tries
-/// six more times, each with the server's own retries, across three minutes: during the
-/// outage this answers, the remote took some pushes and failed others, minutes apart.
+/// The client sends a deferred write again until 180 seconds have passed since its first try,
+/// requests included, so at this pause it tries up to five more times, each with the server's
+/// own retries, spread across those three minutes: during the outage this answers, the remote
+/// took some pushes and failed others, minutes apart.
 const REMOTE_PAUSE: u64 = 30;
 
 /// Another copy of the server still holds the write lease while this new copy takes over

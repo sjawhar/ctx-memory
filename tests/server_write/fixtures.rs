@@ -55,12 +55,14 @@ pub(super) fn refuse_every_push(bare: &Path) -> Result<()> {
 ///   own, as a hosting service's backend refused pushes during an outage. git prints
 ///   `remote: fatal error in commit_refs` and ` ! [remote rejected] HEAD -> main (failure)`.
 /// - `land-and-fail`: `main` moves to the pushed commit, and the push is refused all the same.
+/// - `slow-fail`: as `fail`, after 11 seconds.
 /// - a push past the last line lands.
 ///
-/// Each push the hook answers appends its outcome to `pushes` there. The hook speaks git's
-/// proc-receive protocol (githooks(5)): a version line and a flush, then one `ng <ref>
-/// <reason>` or `ok <ref>` packet per command and a flush, each packet four hex digits of
-/// length and the text. Objects are already out of quarantine when it runs.
+/// Each push the hook answers appends the commit it was asked to put on `main` to `pushes`
+/// there. The hook speaks git's proc-receive protocol (githooks(5)): a version line and a
+/// flush, then one `ng <ref> <reason>` or `ok <ref>` packet per command and a flush, each
+/// packet four hex digits of length and the text. Objects are already out of quarantine when
+/// it runs.
 const PROC_RECEIVE: &str = r#"#!/bin/sh
 read_pkt() {
   len=$(dd bs=1 count=4 2>/dev/null)
@@ -79,9 +81,10 @@ printf '%s' "$commands" | while read -r old new ref; do
   outcome=$(head -n 1 "$GIT_DIR/outcomes")
   tail -n +2 "$GIT_DIR/outcomes" > "$GIT_DIR/outcomes.next"
   mv "$GIT_DIR/outcomes.next" "$GIT_DIR/outcomes"
-  echo "${outcome:-land}" >> "$GIT_DIR/pushes"
+  echo "$new" >> "$GIT_DIR/pushes"
   case "$outcome" in
-    fail)
+    fail|slow-fail)
+      if [ "$outcome" = slow-fail ]; then sleep 11; fi
       echo 'fatal error in commit_refs' >&2
       write_pkt "ng $ref failure" ;;
     land-and-fail)
@@ -109,11 +112,12 @@ pub(super) fn fail_pushes_on_the_remotes_side(bare: &Path, outcomes: &[&str]) ->
     install_hook(bare, "proc-receive", PROC_RECEIVE)
 }
 
-/// How many pushes the remote [`fail_pushes_on_the_remotes_side`] set up was asked to take.
-pub(super) fn pushes_taken(bare: &Path) -> Result<usize> {
+/// The commits the remote [`fail_pushes_on_the_remotes_side`] set up was asked to put on
+/// `main`, one per push, in order.
+pub(super) fn pushed_commits(bare: &Path) -> Result<Vec<String>> {
     match std::fs::read_to_string(bare.join("pushes")) {
-        Ok(pushes) => Ok(pushes.lines().count()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Ok(pushes) => Ok(pushes.lines().map(str::to_owned).collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error.into()),
     }
 }
