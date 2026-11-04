@@ -134,6 +134,109 @@ fn a_calendar_fetch_records_a_yearly_series_only_up_to_its_horizon() -> Result<(
     Ok(())
 }
 
+/// Through the `ctx` binary: a fetch stores an occurrence of a series in its slot next June; the
+/// next fetch's sync token names that occurrence moved to 500 days past the window end, past the
+/// horizon. `ctx resolve` then serves it at its new start.
+#[test]
+fn a_stored_occurrence_moved_past_the_horizon_resolves_at_its_new_start() -> Result<()> {
+    let root = scratch("calendar-moved-occurrence")?;
+    let tree = root.join("tree");
+    std::fs::create_dir(&tree).with_context(|| format!("creating {}", tree.display()))?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"calendar\"\nkind = \"calendar\"\ncalendars = [\"primary\"]\n",
+    )?;
+    let occurrence = |start: &str, end: &str| {
+        json!({
+            "id": "EVENT-SERIES_20270614",
+            "summary": "Quarterly review",
+            "recurringEventId": "EVENT-SERIES",
+            "originalStartTime": {"dateTime": "2027-06-14T08:00:00Z"},
+            "start": {"dateTime": start},
+            "end": {"dateTime": end}
+        })
+    };
+    // The sync token the first fetch keeps names the move; any other listing, by time, still has
+    // the occurrence in its slot.
+    let server = FakeGoogle::start(vec![
+        (
+            "syncToken=sync-2",
+            json!({
+                "items": [occurrence("2028-03-08T18:00:00Z", "2028-03-08T19:00:00Z")],
+                "nextSyncToken": "sync-3"
+            }),
+        ),
+        (
+            "/calendar/v3/calendars/primary/events",
+            json!({
+                "items": [occurrence("2027-06-14T08:00:00Z", "2027-06-14T09:00:00Z")],
+                "nextSyncToken": "sync-2"
+            }),
+        ),
+    ])?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let ctx = |arguments: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ctx"))
+            .args(["--json", "--memory", tree_text])
+            .args(arguments)
+            .env("CTX_STATE_DIR", root.join("state"))
+            .env("CTX_DATA_DIR", root.join("data"))
+            .env("CTX_GOOGLE_API_BASE", server.base())
+            .env("CTX_CREDENTIAL_GOOGLE", "ya29.calendar-test")
+            .env_remove("CTX_SERVER")
+            .output()
+            .with_context(|| format!("running ctx {}", arguments.join(" ")))
+    };
+
+    let first = ctx(&["fetch", "--window-end", "2026-10-25T18:00:00Z"])?;
+    let before = ctx(&["resolve", "gcal:primary/EVENT-SERIES_20270614"])?;
+    let second = ctx(&["fetch", "--window-end", "2026-10-25T19:00:00Z"])?;
+    let after = ctx(&["resolve", "gcal:primary/EVENT-SERIES_20270614"])?;
+    let cursors = std::fs::read(root.join("data/cursors.json"));
+    let requests = server.requests()?;
+    remove_scratch(&root)?;
+
+    for (name, output) in [
+        ("first fetch", &first),
+        ("resolve before", &before),
+        ("second fetch", &second),
+        ("resolve after", &after),
+    ] {
+        assert!(
+            output.status.success(),
+            "{name}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let text = |output: &std::process::Output| -> Result<String> {
+        let response: Value = serde_json::from_slice(&output.stdout)?;
+        response
+            .pointer("/data/results/0/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("resolve returned text: {response}"))
+    };
+    let before = text(&before)?;
+    assert!(before.contains("2027-06-14T08:00:00Z"), "{before}");
+    let after = text(&after)?;
+    assert!(after.contains("2028-03-08T18:00:00Z"), "{after}");
+    assert!(!after.contains("2027-06-14T08:00:00Z"), "{after}");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("syncToken=sync-2")),
+        "{requests:?}"
+    );
+    let cursors: Value = serde_json::from_slice(&cursors?)?;
+    let cursor = cursors
+        .pointer("/sources/calendar/primary/cursor")
+        .and_then(Value::as_str)
+        .with_context(|| format!("the calendar cursor is saved: {cursors}"))?;
+    assert_eq!(cursor, "sync-3@2026-10-25T19:00:00Z");
+    Ok(())
+}
+
 #[test]
 fn a_google_fetch_saves_the_cursor_each_api_gave_it() -> Result<()> {
     let _environment = environment_lock();
