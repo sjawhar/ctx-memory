@@ -1065,6 +1065,173 @@ mod tests {
         Ok(())
     }
 
+    /// `event` as the instance of a series whose slot, by the series' recurrence, starts at
+    /// `slot`, as Google gives it in `originalStartTime`; a moved instance keeps its slot.
+    fn occurrence(mut event: Value, slot: &str) -> Value {
+        if let Some(fields) = event.as_object_mut() {
+            fields.insert("recurringEventId".to_owned(), json!("SERIES-EXAMPLE"));
+            fields.insert("originalStartTime".to_owned(), json!({"dateTime": slot}));
+        }
+        event
+    }
+
+    #[test]
+    fn an_occurrence_the_sync_token_names_moved_past_the_horizon_is_recorded_at_its_new_start(
+    ) -> Result<()> {
+        // The first fetch stores the occurrence in its slot next June, inside the horizon.
+        let slot = "2027-06-14T08:00:00Z";
+        let stored = occurrence(
+            event("EVENT-SERIES_20270614", slot, "2027-06-14T09:00:00Z", None),
+            slot,
+        );
+        let first_api = api(vec![listing("sync-3", vec![stored])]);
+        let first_messages = run_fetch(&first_api, &request(None)?)?;
+        assert_eq!(starts(&records(&first_messages)), [slot]);
+        let first_cursor = cursor(&first_messages).context("the first fetch moved on")?;
+
+        // That one occurrence then moves to 500 days past the window end, well past the
+        // horizon, 2027-11-29T18:00:00Z, and the sync token names it.
+        let moved = occurrence(
+            event(
+                "EVENT-SERIES_20270614",
+                "2028-03-08T18:00:00Z",
+                "2028-03-08T19:00:00Z",
+                None,
+            ),
+            slot,
+        );
+        let second_api = api(vec![listing("sync-4", vec![moved])]);
+        let messages = run_fetch(&second_api, &request(Some(&first_cursor))?)?;
+
+        let records = records(&messages);
+        assert_eq!(
+            pointers(&records),
+            ["gcal:team@example.com/EVENT-SERIES_20270614"]
+        );
+        assert_eq!(starts(&records), ["2028-03-08T18:00:00Z"]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.context && record.text.contains("2028-03-08T18:00:00Z")),
+            "{records:?}"
+        );
+        // The cursor moves past the change only after the record that carries it.
+        let recorded_at = messages
+            .iter()
+            .position(|message| matches!(message, Message::Record(_)))
+            .context("the fetch sent the record")?;
+        let ended_at = messages
+            .iter()
+            .position(|message| matches!(message, Message::StreamEnd { .. }))
+            .context("the fetch ended the stream")?;
+        assert!(recorded_at < ended_at, "{messages:?}");
+        assert_eq!(
+            cursor(&messages),
+            Some("sync-4@2026-10-25T18:00:00Z".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_sync_listing_keeps_a_series_instance_whose_start_or_slot_is_inside_the_horizon(
+    ) -> Result<()> {
+        // The series changed, so the token names every instance, each with its slot. Only the
+        // slots inside the horizon, 2027-11-29T18:00:00Z, are kept, wherever they now start, so a
+        // series with no end still stops at the horizon.
+        let mut items = (2026..=2056)
+            .map(|year| {
+                let start = format!("{year}-11-03T09:00:00Z");
+                occurrence(
+                    event(
+                        &format!("EVENT-SERIES_{year}1103"),
+                        &start,
+                        &format!("{year}-11-03T10:00:00Z"),
+                        None,
+                    ),
+                    &start,
+                )
+            })
+            .collect::<Vec<_>>();
+        items.extend([
+            // Its slot is inside the horizon, and it moved past it.
+            occurrence(
+                event(
+                    "EVENT-SERIES_20270614",
+                    "2029-01-22T09:00:00Z",
+                    "2029-01-22T10:00:00Z",
+                    None,
+                ),
+                "2027-06-14T08:00:00Z",
+            ),
+            // Its slot is past the horizon, and it moved inside it.
+            occurrence(
+                event(
+                    "EVENT-SERIES_20300614",
+                    "2027-07-01T08:00:00Z",
+                    "2027-07-01T09:00:00Z",
+                    None,
+                ),
+                "2030-06-14T08:00:00Z",
+            ),
+            // Its slot is past the horizon, and so is its new start.
+            occurrence(
+                event(
+                    "EVENT-SERIES_20310614",
+                    "2031-07-01T08:00:00Z",
+                    "2031-07-01T09:00:00Z",
+                    None,
+                ),
+                "2031-06-14T08:00:00Z",
+            ),
+        ]);
+        let api = api(vec![listing("sync-3", items)]);
+        let request = request(Some("sync-2@2026-10-25T18:00:00Z"))?;
+        let messages = run_fetch(&api, &request)?;
+
+        assert_eq!(
+            starts(&records(&messages)),
+            [
+                "2026-11-03T09:00:00Z",
+                "2027-11-03T09:00:00Z",
+                "2029-01-22T09:00:00Z",
+                "2027-07-01T08:00:00Z"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancelled_occurrence_the_sync_token_names_past_the_horizon_is_not_recorded() -> Result<()>
+    {
+        // Google sends a cancelled instance with its id, status, series and slot, and no start.
+        let cancelled = json!({
+            "id": "EVENT-SERIES_20270614",
+            "status": "cancelled",
+            "recurringEventId": "SERIES-EXAMPLE",
+            "originalStartTime": {"dateTime": "2027-06-14T08:00:00Z"}
+        });
+        let api = api(vec![listing("sync-4", vec![cancelled])]);
+        let request = request(Some("sync-3@2026-10-25T18:00:00Z"))?;
+        let messages = run_fetch(&api, &request)?;
+
+        assert!(records(&messages).is_empty());
+        assert!(
+            !messages.iter().any(|message| matches!(
+                message,
+                Message::StreamEnd {
+                    status: StreamStatus::Error,
+                    ..
+                }
+            )),
+            "{messages:?}"
+        );
+        assert_eq!(
+            cursor(&messages),
+            Some("sync-4@2026-10-25T18:00:00Z".to_owned())
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_listing_by_time_keeps_only_what_starts_before_the_horizon() -> Result<()> {
         // Google answers to a day past the horizon, so a one-off event there comes back too; the
