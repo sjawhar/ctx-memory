@@ -2392,6 +2392,35 @@ mod tests {
     }
 
     #[test]
+    fn an_event_stored_before_it_was_excluded_stays_listed_when_it_moves_while_excluded(
+    ) -> Result<()> {
+        let (state_dir, stored_cursor, _) = first_fetch(vec![meeting()])?;
+
+        // While excluded, the meeting moves to more than 400 days ago; the fetch drops that
+        // record, so the tree still holds the meeting as first stored.
+        let moved = event(
+            "EVENT-EXAMPLE",
+            "2025-01-01T09:00:00Z",
+            "2025-01-01T10:00:00Z",
+            None,
+        );
+        let moved_api = api(vec![listing("sync-3", vec![moved])]);
+        let mut excluded = request_after(&stored_cursor, &state_dir)?;
+        excluded.exclude = vec!["gcal:team@example.com/*".to_owned()];
+        let moved_messages = run_fetch(&moved_api, &excluded)?;
+        let moved_cursor = cursor(&moved_messages).context("the excluding fetch moved on")?;
+
+        let cancelled = json!({"id": "EVENT-EXAMPLE", "status": "cancelled"});
+        let api = api(vec![listing("sync-4", vec![cancelled])]);
+        let messages = run_fetch(&api, &request_after(&moved_cursor, &state_dir)?)?;
+
+        let records = records(&messages);
+        assert_eq!(pointers(&records), ["gcal:team@example.com/EVENT-EXAMPLE"]);
+        assert_eq!(starts(&records), ["2026-10-25T09:00:00Z"]);
+        Ok(())
+    }
+
+    #[test]
     fn an_excluded_event_is_not_listed_as_recorded() -> Result<()> {
         // The fetch drops the record of an event the deployment excludes, so the tree never
         // holds it.
