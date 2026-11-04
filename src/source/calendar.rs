@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
-use std::ops::RangeBounds;
+use std::ops::{Range, RangeBounds};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -426,7 +426,7 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
             Some(stored) if named_by_token => {
                 if is_cancelled(event) {
                     let mut cancelled = record(event, stored)?;
-                    cancelled.text = CANCELLED.to_owned();
+                    CANCELLED.clone_into(&mut cancelled.text);
                     collected.records.push(cancelled);
                     continue;
                 }
@@ -436,36 +436,45 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
             _ => recorded_start(event, &(..horizon))?,
         };
         if let Some(start) = start {
-            collected.records.push(record(event, start)?);
-            remember(&mut collected.recorded, event, start);
+            collected.keep(record(event, start)?, event, start);
         }
     }
     if let Some((kept, listing)) = &horizon_listing {
-        // An event the sync token named as well is recorded once, as that listing has it.
-        let named = page
-            .items
-            .iter()
-            .filter_map(event_id)
-            .collect::<BTreeSet<_>>();
-        let unnamed = listing
-            .items
-            .iter()
-            .filter(|event| event_id(event).is_none_or(|id| !named.contains(id)));
-        for event in unnamed {
-            if let Some(start) = recorded_start(event, kept)? {
-                collected.records.push(record(event, start)?);
-                remember(&mut collected.recorded, event, start);
-            }
-        }
+        collect_horizon_listing(&mut collected, &page.items, kept, listing, &record)?;
     }
     Ok(collected)
 }
 
-/// Lists `event` as recorded at `start`.
-fn remember(recorded: &mut Recorded, event: &Value, start: DateTime<Utc>) {
-    if let Some(id) = event_id(event) {
-        recorded.insert(id.to_owned(), start);
+impl Collected {
+    /// Adds `record`, of `event` at `start`, and lists the event as recorded there.
+    fn keep(&mut self, record: Record, event: &Value, start: DateTime<Utc>) {
+        self.records.push(record);
+        if let Some(id) = event_id(event) {
+            self.recorded.insert(id.to_owned(), start);
+        }
     }
+}
+
+/// Records the events of the horizon listing that start in `kept`. An event the sync token named
+/// as well is recorded once, as that listing has it.
+fn collect_horizon_listing(
+    collected: &mut Collected,
+    named: &[Value],
+    kept: &Range<DateTime<Utc>>,
+    listing: &EventPage,
+    record: &impl Fn(&Value, DateTime<Utc>) -> Result<Record>,
+) -> Result<()> {
+    let named = named.iter().filter_map(event_id).collect::<BTreeSet<_>>();
+    let unnamed = listing
+        .items
+        .iter()
+        .filter(|event| event_id(event).is_none_or(|id| !named.contains(id)));
+    for event in unnamed {
+        if let Some(start) = recorded_start(event, kept)? {
+            collected.keep(record(event, start)?, event, start);
+        }
+    }
+    Ok(())
 }
 
 fn is_cancelled(event: &Value) -> bool {
@@ -2183,6 +2192,81 @@ mod tests {
             &request_after(&first_cursor, &first.state_dir)?,
         )?;
         assert!(warnings(&messages).is_empty(), "{messages:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancellation_after_a_window_that_was_not_stored_reaches_the_record_the_tree_holds(
+    ) -> Result<()> {
+        let slot = "2027-06-14T08:00:00Z";
+        let (state_dir, stored_cursor, first) = first_fetch(vec![occurrence(
+            event("EVENT-SERIES_20270614", slot, "2027-06-14T09:00:00Z", None),
+            slot,
+        )])?;
+        assert_eq!(starts(&first), [slot]);
+
+        // A fetch reads the occurrence moved to more than 400 days ago, and its window is never
+        // stored: the store keeps June 2027, and the cursor stays where it was.
+        let moved = occurrence(
+            event(
+                "EVENT-SERIES_20270614",
+                "2025-01-01T08:00:00Z",
+                "2025-01-01T09:00:00Z",
+                None,
+            ),
+            slot,
+        );
+        let lost_api = api(vec![listing("sync-3", vec![moved])]);
+        let lost = run_fetch(&lost_api, &request_after(&stored_cursor, &state_dir)?)?;
+        assert_eq!(starts(&records(&lost)), ["2025-01-01T08:00:00Z"]);
+
+        // Before the fetch that reads the same changes again, the occurrence is cancelled.
+        let cancelled = json!({
+            "id": "EVENT-SERIES_20270614",
+            "status": "cancelled",
+            "recurringEventId": "SERIES-EXAMPLE",
+            "originalStartTime": {"dateTime": slot}
+        });
+        let api = api(vec![listing("sync-4", vec![cancelled])]);
+        let messages = run_fetch(&api, &request_after(&stored_cursor, &state_dir)?)?;
+
+        let records = records(&messages);
+        assert_eq!(
+            pointers(&records),
+            ["gcal:team@example.com/EVENT-SERIES_20270614"]
+        );
+        assert_eq!(starts(&records), [slot]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.text == "[event cancelled]"),
+            "{records:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_event_recorded_only_in_a_window_that_was_not_stored_is_not_recorded_cancelled(
+    ) -> Result<()> {
+        let (state_dir, stored_cursor, _) = first_fetch(vec![meeting()])?;
+
+        // A fetch records a new meeting, and its window is never stored.
+        let new = event(
+            "EVENT-NEW",
+            "2026-11-02T09:00:00Z",
+            "2026-11-02T10:00:00Z",
+            None,
+        );
+        let lost_api = api(vec![listing("sync-3", vec![new])]);
+        let lost = run_fetch(&lost_api, &request_after(&stored_cursor, &state_dir)?)?;
+        assert_eq!(records(&lost).len(), 1);
+
+        // The fetch that reads the same changes again finds it cancelled: the tree never held it.
+        let cancelled = json!({"id": "EVENT-NEW", "status": "cancelled"});
+        let api = api(vec![listing("sync-4", vec![cancelled])]);
+        let messages = run_fetch(&api, &request_after(&stored_cursor, &state_dir)?)?;
+
+        assert!(records(&messages).is_empty(), "{messages:?}");
         Ok(())
     }
 
