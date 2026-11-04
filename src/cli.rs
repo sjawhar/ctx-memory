@@ -272,11 +272,26 @@ pub enum MarkerCommand {
     /// Print the window the agent has handled up to, and the page of the window after it.
     Show,
     /// Move the marker to a completed window after the commit that handled it.
-    Advance { window: String },
+    Advance {
+        window: String,
+        /// Declare that the window's new messages needed no record, and why, when the cycle
+        /// wrote none for them. The flag changes nothing the move does, reaches no server and
+        /// is stored nowhere: it is this session's own word about its own cycle, printed with
+        /// the answer and kept in the session's transcript, which the ingest runner reads
+        /// before it fails a cycle for skipping a window.
+        #[arg(long = "no-records", value_name = "REASON")]
+        no_records: Option<marker::NoRecords>,
+    },
     /// Record that the agent has worked the window after the marker through the page `ctx
     /// pending` lists, after the commit that wrote its records: `ends_at` is the page's
     /// `page.ends_at`, the pointer of the message the page ends with.
-    Page { window: String, ends_at: String },
+    Page {
+        window: String,
+        ends_at: String,
+        /// Declare that the page's new messages needed no record, and why, as on `advance`.
+        #[arg(long = "no-records", value_name = "REASON")]
+        no_records: Option<marker::NoRecords>,
+    },
 }
 
 impl Command {
@@ -385,11 +400,23 @@ impl Command {
                 command: RecordCommand::Rm { path },
             } => Remote::Rm { path },
             Self::Marker {
-                command: MarkerCommand::Advance { window },
-            } => Remote::MarkerAdvance { window },
+                command: MarkerCommand::Advance { window, no_records },
+            } => Remote::MarkerAdvance {
+                window,
+                no_records: *no_records,
+            },
             Self::Marker {
-                command: MarkerCommand::Page { window, ends_at },
-            } => Remote::MarkerPage { window, ends_at },
+                command:
+                    MarkerCommand::Page {
+                        window,
+                        ends_at,
+                        no_records,
+                    },
+            } => Remote::MarkerPage {
+                window,
+                ends_at,
+                no_records: *no_records,
+            },
             Self::Context {
                 window,
                 max_subjects,
@@ -432,10 +459,20 @@ pub enum Remote<'a> {
     PutBatch { source: &'a str },
     /// `record rm`: `/v1/records/delete`.
     Rm { path: &'a str },
-    /// `marker advance`: `/v1/marker/advance`, under the server's write lease.
-    MarkerAdvance { window: &'a str },
-    /// `marker page`: `/v1/marker/page`, under the server's write lease.
-    MarkerPage { window: &'a str, ends_at: &'a str },
+    /// `marker advance`: `/v1/marker/advance`, under the server's write lease. The declaration
+    /// `--no-records` carries is the session's own, printed with the answer and never sent: the
+    /// route moves the marker the same way with or without it.
+    MarkerAdvance {
+        window: &'a str,
+        no_records: Option<marker::NoRecords>,
+    },
+    /// `marker page`: `/v1/marker/page`, under the server's write lease, with the same
+    /// declaration `marker advance` takes.
+    MarkerPage {
+        window: &'a str,
+        ends_at: &'a str,
+        no_records: Option<marker::NoRecords>,
+    },
     /// `context`: `GET /v1/windows/{id}/context`, which only the callers the tree's
     /// `[context_source]` names may read.
     Context {
@@ -513,9 +550,22 @@ struct MarkerShowPayload {
     page: Option<marker::Page>,
 }
 
+/// What `marker advance` answers: the marker it left, in the shape `marker show` carries it,
+/// and the declaration the caller made about the window it passed, which is the caller's own
+/// word and is stored nowhere ([`marker::NoRecords`]).
+#[derive(Serialize)]
+struct MarkerAdvancePayload {
+    marker: Option<Marker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_records: Option<marker::NoRecords>,
+}
+
 #[derive(Serialize)]
 struct MarkerPagePayload {
     page: marker::Page,
+    /// The declaration `marker page --no-records` carried, as on `advance`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_records: Option<marker::NoRecords>,
 }
 
 #[derive(Serialize)]
@@ -1042,7 +1092,7 @@ fn run_marker(run: &mut Run<'_, '_>, command: &MarkerCommand) -> Result<Outcome>
                     .map_or(Ok(()), |page| marker::print_page(page, out))
             })?;
         }
-        MarkerCommand::Advance { window } => {
+        MarkerCommand::Advance { window, no_records } => {
             // The marker is on the share, and the server moves it under its write lease. A
             // move made here takes that lease while it writes, and moves nothing while another
             // copy, such as a running server, holds it.
@@ -1051,15 +1101,20 @@ fn run_marker(run: &mut Run<'_, '_>, command: &MarkerCommand) -> Result<Outcome>
             )?;
             let moved = marker::advance(run.context, window, &session_id::caller());
             give_back(lease, run.sink.err);
-            let payload = MarkerShowPayload {
+            let payload = MarkerAdvancePayload {
                 marker: Some(moved?),
-                page: None,
+                no_records: *no_records,
             };
             run.emit("marker advance", &payload, |payload, out| {
-                marker::print(payload.marker.as_ref(), out)
+                marker::print(payload.marker.as_ref(), out)?;
+                marker::print_no_records(payload.no_records, out)
             })?;
         }
-        MarkerCommand::Page { window, ends_at } => {
+        MarkerCommand::Page {
+            window,
+            ends_at,
+            no_records,
+        } => {
             // The page record is on the share beside the marker, and the server writes it under
             // its write lease, as it moves the marker.
             let lease = lease::for_role("server").context(
@@ -1067,9 +1122,13 @@ fn run_marker(run: &mut Run<'_, '_>, command: &MarkerCommand) -> Result<Outcome>
             )?;
             let recorded = marker::page(run.context, window, ends_at, &session_id::caller());
             give_back(lease, run.sink.err);
-            let payload = MarkerPagePayload { page: recorded? };
+            let payload = MarkerPagePayload {
+                page: recorded?,
+                no_records: *no_records,
+            };
             run.emit("marker page", &payload, |payload, out| {
-                marker::print_page(&payload.page, out)
+                marker::print_page(&payload.page, out)?;
+                marker::print_no_records(payload.no_records, out)
             })?;
         }
     }

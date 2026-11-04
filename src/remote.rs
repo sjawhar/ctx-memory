@@ -548,23 +548,17 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             let written = client()?.delete(path, &session)?;
             report_write(&written, cli.json, "record rm", path, sink).map(Some)
         }
-        Remote::MarkerAdvance { window } => {
-            // The shape a local advance answers with: `marker show`'s, and its text.
+        Remote::MarkerAdvance { window, no_records } => {
             let marker = client()?.marker_advance(window, &session)?;
-            let payload = json!({ "marker": marker });
-            output::emit(sink, cli.json, "marker advance", &payload, |_, out| {
-                marker::print(Some(&marker), out)
-            })?;
-            Ok(Some(Outcome::Pass))
+            report_marker_advance(&marker, no_records, cli.json, sink).map(Some)
         }
-        Remote::MarkerPage { window, ends_at } => {
-            // The shape a local page record answers with, and its text.
+        Remote::MarkerPage {
+            window,
+            ends_at,
+            no_records,
+        } => {
             let page = client()?.marker_page(window, ends_at, &session)?;
-            let payload = json!({ "page": page });
-            output::emit(sink, cli.json, "marker page", &payload, |_, out| {
-                marker::print_page(&page, out)
-            })?;
-            Ok(Some(Outcome::Pass))
+            report_marker_page(&page, no_records, cli.json, sink).map(Some)
         }
         Remote::Context { window, limits } => {
             let answer = client()?.context(window, limits)?;
@@ -593,6 +587,47 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             Ok(Some(Outcome::Code(captured.exit_code)))
         }
     }
+}
+
+/// Prints what a marker move the server made answers: the shape a local advance answers with,
+/// `marker show`'s, and its text, with the declaration the caller made about the window it
+/// passed. That declaration is the caller's own word about its own cycle (`marker::NoRecords`):
+/// it reaches no server and changes nothing the move did, and it is printed so the caller, and
+/// whoever reads the session afterwards, sees that ctx took it.
+fn report_marker_advance(
+    marker: &marker::Marker,
+    no_records: Option<marker::NoRecords>,
+    json: bool,
+    sink: &mut Sink<'_>,
+) -> Result<Outcome> {
+    let payload = match no_records {
+        Some(reason) => json!({ "marker": marker, "no_records": reason }),
+        None => json!({ "marker": marker }),
+    };
+    output::emit(sink, json, "marker advance", &payload, |_, out| {
+        marker::print(Some(marker), out)?;
+        marker::print_no_records(no_records, out)
+    })?;
+    Ok(Outcome::Pass)
+}
+
+/// [`report_marker_advance`] for a page the server recorded: the shape a local page record
+/// answers with, and its text.
+fn report_marker_page(
+    page: &marker::Page,
+    no_records: Option<marker::NoRecords>,
+    json: bool,
+    sink: &mut Sink<'_>,
+) -> Result<Outcome> {
+    let payload = match no_records {
+        Some(reason) => json!({ "page": page, "no_records": reason }),
+        None => json!({ "page": page }),
+    };
+    output::emit(sink, json, "marker page", &payload, |_, out| {
+        marker::print_page(page, out)?;
+        marker::print_no_records(no_records, out)
+    })?;
+    Ok(Outcome::Pass)
 }
 
 /// Prints the protocol version this client speaks and the one its server speaks, `None` when no

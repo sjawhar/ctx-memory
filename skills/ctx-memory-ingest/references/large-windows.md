@@ -27,3 +27,7 @@ leaves the page unrecorded, and the next cycle reads that page again and no page
 records already written for it are updated, not minted twice. The marker refuses to move past a
 window whose last page no answer has listed yet, and `ctx marker page` refuses any page but the
 one the answer lists for the oldest window after the marker.
+
+A page whose messages need no record is declared as a window is (the ingest skill's step 11):
+`ctx marker page <window id> '<ends_at>' --no-records nothing-new`, with the word that says
+why, so the cycle is not failed for passing those messages in silence.

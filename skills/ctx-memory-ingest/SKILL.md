@@ -66,11 +66,9 @@ edits a file, and that policy keeps text in a window from becoming a command. Re
 with `read`, `grep` and `glob`, a record of the tree with `ctx record show <path>`, and write
 each record through the record tool.
 
-The fetched material sits in the shared data directory, which the prompt that starts the
-cycle names. `ctx pending --json` gives each pending window's `dir`: its directory under the
-data directory. The files beside the windows — what each source stream has delivered, which
-sources quote verbatim, and what a source keeps between fetches — belong to the fetch job.
-Read them if a question needs them; never write them.
+The fetched material sits in the shared data directory, which the prompt names, and
+`ctx pending --json` gives each pending window's `dir` under it. The files beside the
+windows belong to the fetch job: read them if a question needs them, never write them.
 
 `ctx pending --json` leaves out the messages the deployment excludes, and one answer holds at
 most one page. When its `later_windows` is above zero or a window it lists has a `page`, read
@@ -106,7 +104,7 @@ unchanged is not new and is in no delta.
 ## One writer
 
 The server is the only writer of records, and this cycle the only agent writing while it
-runs. A helper may read and draft records or evidence; it never writes.
+runs. A helper may read and draft records; it never writes.
 
 ## Sources
 
@@ -126,11 +124,11 @@ automated notification noise unless a person acts on it.
    wait for the next cycle. When it lists none, say so and stop. If a stream reports an
    error, report it to whoever runs the cycle (and in the cycle log of step 7, if there is
    one); that stream's cursor stays where it is, so the next fetch re-reads it. A window
-   whose `new_messages` count is zero is still handled: there is nothing to record
-   for it, but advance the marker past it (step 11) so it does not sit in front of the windows
-   after it. When every window this cycle holds is empty, advance the marker to the newest of
-   them and report that the cycle found nothing new — never stop with an empty window
-   unmarked, or under a cap it would hide every newer window behind it, cycle after cycle.
+   whose `new_messages` count is zero is still handled: there is nothing to record for it,
+   but advance the marker past it (step 11) so it does not sit in front of the windows after
+   it. When every window this cycle holds is empty, advance the marker to the newest of them
+   and report that the cycle found nothing new — never leave an empty window unmarked, which
+   under a cap hides every newer window behind it, cycle after cycle.
 3. Read each window's directory, its `dir` under the data directory: `manifest.json`
    (per-stream status, record counts and proposed cursors), `records.jsonl` (one
    normalized record per message, with its `pointer`, `thread`, `ts`, `author` and
@@ -186,7 +184,8 @@ automated notification noise unless a person acts on it.
     start the next window, run `ctx marker advance <that window id>`, and for an empty window
     as soon as you have seen it is empty (step 2). The marker covers every window up to the
     one named and refuses an older one. Work a window with a `page` as large-windows.md
-    says.
+    says. A window or page whose new messages got no record is passed as
+    `skill://ctx-memory-ingest/references/no-records.md` says; a silent pass fails the cycle.
 
 ## Record rules
 
@@ -276,7 +275,7 @@ mint it; each rule says where a fact worth keeping goes instead.
 ## When a cycle fails
 
 - An interrupted cycle has moved the marker past each window it finished (step 11), so the
-  next cycle reads only the windows it did not reach, plus new ones. A window it was partway
-  through is read again, and the records already written for it are updated, not minted twice.
+  next cycle reads only the windows it did not reach, plus new ones; a window it was partway
+  through is read again, and its records already written are updated, not minted twice.
   Never move the marker to get past a failure, nor past a window whose records you have not
-  written.
+  written, unless no-records.md says you may.

@@ -133,6 +133,63 @@ fn marker_advance_rejects_older_window() -> Result<()> {
     Ok(())
 }
 
+/// `--no-records` says why a window's new messages needed no record. It moves the marker as a
+/// plain advance does and writes nothing else, and the answer carries the word it was given, in
+/// JSON and in text, so the session that ran it, and whoever reads the cycle afterwards, sees
+/// the declaration was taken. A word that is not one of the three is refused, so no declaration
+/// is made by a move that ctx never ran.
+#[test]
+fn marker_advance_takes_a_declaration_that_the_window_needed_no_record() -> Result<()> {
+    let root = scratch("no-records")?;
+    let tree = tree(&root)?;
+    let state = root.join("state");
+    let window = fetch(&tree, &state, "2026-10-25T18:00:00Z")?;
+
+    let unknown = command(&tree, &state)?
+        .args(["marker", "advance", &window, "--no-records", "it-was-noise"])
+        .output()
+        .context("advancing with a word that is no reason")?;
+    let unmarked = state.join("example/marker.json").exists();
+    let declared = command(&tree, &state)?
+        .args(["marker", "advance", &window, "--no-records", "nothing-new"])
+        .output()
+        .context("advancing with a declaration")?;
+    let text = Command::new(env!("CARGO_BIN_EXE_ctx"))
+        .args(["--memory", tree.to_str().context("tree path is UTF-8")?])
+        .args(["marker", "show"])
+        .env("CTX_STATE_DIR", &state)
+        .env("CTX_SESSION", "test-session")
+        .env("PATH", fixture_path()?)
+        .output()
+        .context("showing the marker")?;
+    remove_scratch(&root)?;
+
+    assert_ne!(unknown.status.code(), Some(0), "{unknown:?}");
+    assert!(
+        !unmarked,
+        "a refused declaration moved the marker all the same"
+    );
+    assert_eq!(declared.status.code(), Some(0), "{declared:?}");
+    let answer = data(&declared)?;
+    assert_eq!(
+        answer
+            .get("marker")
+            .and_then(|marker| marker.get("window"))
+            .and_then(Value::as_str),
+        Some(window.as_str())
+    );
+    assert_eq!(
+        answer.get("no_records").and_then(Value::as_str),
+        Some("nothing-new")
+    );
+    let shown = String::from_utf8(text.stdout).context("marker show prints text")?;
+    assert!(
+        !shown.contains("no records"),
+        "the declaration is about the cycle, not the marker, and is kept nowhere: {shown}"
+    );
+    Ok(())
+}
+
 #[test]
 fn marker_advance_rejects_an_incomplete_window() -> Result<()> {
     let root = scratch("incomplete-window")?;
