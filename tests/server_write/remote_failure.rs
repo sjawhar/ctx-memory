@@ -190,10 +190,21 @@ fn a_write_past_the_retry_deadline_is_deferred_without_a_retry() -> Result<()> {
     remove_fixture(&tree)?;
 
     assert_eq!(status, 503, "unexpected body: {body}");
-    assert_eq!(retry_after.as_deref(), Some("30"), "unexpected body: {body}");
-    assert_eq!(pushed.len(), 1, "a push past the deadline was made again: {pushed:?}");
+    assert_eq!(
+        retry_after.as_deref(),
+        Some("30"),
+        "unexpected body: {body}"
+    );
+    assert_eq!(
+        pushed.len(),
+        1,
+        "a push past the deadline was made again: {pushed:?}"
+    );
     assert_eq!(remote_head, start, "the remote's main moved");
-    assert_eq!(local_head, start, "the clone is not back on the start commit");
+    assert_eq!(
+        local_head, start,
+        "the clone is not back on the start commit"
+    );
     assert!(
         lines_starting(&logged, RETRIED).is_empty(),
         "a push past the deadline was made again: {logged}"

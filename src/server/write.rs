@@ -473,13 +473,16 @@ async fn write(
     session: Option<String>,
     note: &Note,
 ) -> Response {
+    // When the request reached the handler, before its waits for the index and the tree: the
+    // client's request timeout runs from about then, and the write's retries are bounded by it.
+    let started = std::time::Instant::now();
     let shared = &listener.shared;
     shared.index_ready().await;
     let writing = Arc::clone(shared);
     let session = session_label(session.as_deref()).unwrap_or_else(|| "unknown".to_owned());
     let note = note.clone();
     let answered = tokio::task::spawn_blocking(move || {
-        let applied = apply(&writing, &caller, &change, &session);
+        let applied = apply(&writing, &caller, &change, &session, started);
         answer_write(&writing, route, applied, &note)
     })
     .await;
