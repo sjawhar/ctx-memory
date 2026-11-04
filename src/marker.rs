@@ -39,6 +39,55 @@ pub struct Marker {
     pub by: String,
 }
 
+/// Why a cycle moved past a window's new messages and wrote no record for them: the declaration
+/// `ctx marker advance --no-records` and `ctx marker page --no-records` carry.
+///
+/// A move that passes new messages and writes nothing is how a cycle skips material for good, so
+/// the ingest runner fails a cycle that made one (`check_skipped_windows` in `runner/run-cycle.sh`).
+/// Some windows really hold nothing a record would keep, and this is how a session says so: one
+/// word of a fixed list, never the session's prose. The command the session ran, declaration and
+/// all, is in the cycle's transcript for a person to audit, the runner names each declared
+/// window and its word once in the cycle's log, and the runner can tell a declared move from a
+/// silent one. Nothing of it is written into the tree or the marker, and nothing is sent to a
+/// server: the declaration is about the cycle, not the graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum NoRecords {
+    /// The new messages carry no decision, commitment, question, metric or fact about a person
+    /// or project: chatter, an acknowledgement, a message with nothing in it to keep.
+    NothingNew,
+    /// Every new message is of a kind the ingest skill's "Not a record" names, such as a
+    /// payment receipt, a spend alert or pipeline bookkeeping.
+    NotARecord,
+    /// The records the tree already holds carry what the new messages say, unchanged.
+    AlreadyRecorded,
+}
+
+impl NoRecords {
+    /// The word the declaration is written and printed as.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NothingNew => "nothing-new",
+            Self::NotARecord => "not-a-record",
+            Self::AlreadyRecorded => "already-recorded",
+        }
+    }
+}
+
+/// Prints the declaration `no_records` carries, or nothing when there is none.
+///
+/// # Errors
+///
+/// Returns an error when the output cannot be written.
+pub fn print_no_records(no_records: Option<NoRecords>, out: &mut dyn Write) -> std::io::Result<()> {
+    match no_records {
+        Some(reason) => writeln!(out, "no records declared: {}", reason.as_str()),
+        None => Ok(()),
+    }
+}
+
 /// How far the agent has worked the oldest window after the marker, a page at a time: every new
 /// message of `window` up to `last`, in the order an answer lists them, has its records written.
 ///

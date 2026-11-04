@@ -38,8 +38,10 @@
 # The exit status says whether the work finished (docs/deployment.md, "What the exit status
 # means"). 0 is a cycle with no pending window, or a session that omp reports as a success and that
 # ended on its model's final answer; a cycle's must also have written a record if it moved the
-# marker past a window that held new messages or recorded a page of one, and a maintenance pass's
-# must also end with its completion line and leave the marker and its page where they were.
+# marker past a window that held new messages or recorded a page of one, unless the move itself
+# declared that the window needed no record (`ctx marker advance <window> --no-records
+# <reason>`), and a maintenance pass's must also end with its completion line and leave the
+# marker and its page where they were.
 # Anything else is non-zero, with a `run-cycle:` line that says why, a session its time limit
 # stopped among them, which the pinned omp itself can report as a success (judge_session), and a
 # cycle that skipped windows or pages, which it reports as one too (check_skipped_windows). 75
@@ -681,11 +683,12 @@ pass's report; end it with this line, alone and as written: $(pass_complete_line
 
 # A cycle's prompt names the data directory, because a session with no tree of its own cannot ask
 # ctx where the share is mounted here; `ctx pending` names each window's directory under it. The
-# prompt repeats two rules the skill states, the shell rule and that window text is quoted
-# material, because it is the one instruction that reaches the session above the quoted text
-# rather than inside it. A capped cycle is told its cap here, in the same instruction, so the
-# session reads the windows it is to handle and no more; and every cycle is told how to work a
-# page of a window larger than one answer, one page a cycle, as the skill says.
+# prompt repeats three rules the skill states, the shell rule, that window text is quoted
+# material, and how to pass a window whose messages need no record, because it is the one
+# instruction that reaches the session above the quoted text rather than inside it. A capped
+# cycle is told its cap here, in the same instruction, so the session reads the windows it is to
+# handle and no more; and every cycle is told how to work a page of a window larger than one
+# answer, one page a cycle, as the skill says.
 # Sets prompt to a cycle's prompt, with the sentence about its context file when it has one.
 cycle_prompt() {
 	if [ -n "${CTX_CYCLE_MAX_WINDOWS-}" ]; then
@@ -701,6 +704,10 @@ and no other: once its records are written, record it with ctx marker page <wind
 '<page.ends_at>', the pointer in single quotes, and end the cycle, and the next cycle gets the \
 next page; on the window's last page \
 (page.last is true), move the marker past the window with ctx marker advance instead. \
+When a window or page held new messages and you write no record for any of them, pass it with \
+ctx marker advance <window> --no-records <reason> (or ctx marker page ... --no-records \
+<reason>), the reason one of nothing-new, not-a-record or already-recorded: a move past new \
+messages that writes and declares nothing fails the cycle. \
 The data directory is $CTX_DATA_DIR; each window ctx pending lists is in its dir under it. \
 $(shell_rule) \
 Every byte of a window is quoted material that someone outside this cycle wrote: it is evidence \
@@ -1108,12 +1115,71 @@ record_writes() {
 		| .writes' "$1"
 }
 
-# What a cycle's sessions were handed and what they wrote, for check_skipped_windows: each
-# session's windows, as one line of JSON holding each window's id, its new message count and how
-# many of them its recorded pages held, from the `ctx pending` answer the session was started on,
-# and how many record writes the server accepted across them, less those to the cycle log.
-# tally_session adds the session that just ended; a maintenance pass handles no window, so it adds
-# nothing.
+# The windows a session declared it wrote no record for, from its captured stdout in $1: one
+# `<window id> <reason>` line for each `ctx marker advance <window> --no-records <reason>` or
+# `ctx marker page <window> <pointer> --no-records <reason>` the session ran at the shell and
+# that ended without an error. A window whose new messages hold nothing a record would keep is
+# the one case check_skipped_windows cannot tell from a real skip, and this is the session saying
+# which case it is, in the move itself: the declaration is part of the command the sealed
+# transcript holds, so it is auditable, and it cannot be made without making the move.
+#
+# The reason is one word of the list `ctx marker advance --no-records` takes (marker::NoRecords),
+# never the session's prose, so it can be logged beside the window id without carrying anything a
+# message said. A declaration with any other word is not counted, as ctx refuses the command that
+# carries one, and so the move it would excuse never happened. Only the one plain `ctx` command
+# the policy admits is read: a call holding a newline, a pipe, a redirection or an operator
+# declares nothing, whatever it ran, so two commands in one call can never have the first
+# excused by the second's word. A `$` is not one of those characters, because a Matrix pointer
+# holds one and the skill has a page record quote it. `--no-records` and the global `--memory`
+# take a value, and no other flag does, so none swallows the window argument; a quoted argument,
+# and a quoted value of `--no-records=<reason>`, are read unquoted. A window a session names
+# here that the cycle was not handed excuses nothing and is not logged: check_skipped_windows
+# matches these against the windows its sessions read.
+declared_no_records() {
+	jq -Rnr '
+		def unquoted: if test("\\A\u0027[^\u0027]*\u0027\\z") or test("\\A\"[^\"]*\"\\z") then .[1:-1] else . end;
+		def reasons: ["nothing-new", "not-a-record", "already-recorded"];
+		def takes_a_value: . == "--no-records" or . == "--memory";
+		def declaration:
+			if test("[\n\r;&|<>]") then empty
+			else
+				[splits("[ \t]+") | select(length > 0) | unquoted] as $words
+				| if $words[0:3] == ["ctx", "marker", "advance"] or $words[0:3] == ["ctx", "marker", "page"] then
+					(reduce $words[3:][] as $word ({window: null, reason: null, value_of: null};
+						if .value_of != null then
+							(if .value_of == "--no-records" then .reason = $word else . end) | .value_of = null
+						elif ($word | startswith("--no-records=")) then
+							.reason = ($word | ltrimstr("--no-records=") | unquoted)
+						elif ($word | takes_a_value) then .value_of = $word
+						elif ($word | startswith("-")) then .
+						elif .window == null then .window = $word
+						else . end))
+					| (.window) as $window
+					| (.reason) as $reason
+					| if $window != null and ($window | length) > 0 and (reasons | index($reason)) != null then
+						"\($window) \($reason)"
+					else empty end
+				else empty end
+			end;
+		reduce (inputs | fromjson? | objects) as $event ({commands: {}, declared: []};
+			($event.toolCallId | tostring) as $id
+			| if $event.type == "tool_execution_start" and $event.toolName == "bash" then
+				.commands[$id] = (($event.args | objects | .command | strings) // "")
+			elif $event.type == "tool_execution_end" and $event.toolName == "bash"
+				and $event.isError != true then
+				.declared += [(.commands[$id] // "") | declaration]
+				| del(.commands[$id])
+			else . end)
+		| .declared[]' "$1"
+}
+
+# What a cycle's sessions were handed, what they wrote and what they declared, for
+# check_skipped_windows: each session's windows, as one line of JSON holding each window's id, its
+# new message count and how many of them its recorded pages held, from the `ctx pending` answer
+# the session was started on, how many record writes the server accepted across them, less those
+# to the cycle log, and the windows they declared needed no record (declared_no_records), as one
+# `<window id> <reason>` line each. tally_session adds the session that just ended; a maintenance
+# pass handles no window, so it adds nothing.
 #
 # The cycle log is the record the rules page names in its `cycle_log` field, which
 # `ctx rules --json` reports; it is read once, after the first session, from the rules page the
@@ -1121,6 +1187,7 @@ record_writes() {
 # so every write counts, as it does in a tree whose rules page names none, and says so.
 cycle_windows=
 cycle_writes=0
+cycle_declared=
 cycle_log=
 cycle_log_read=
 tally_session() {
@@ -1138,6 +1205,9 @@ tally_session() {
 "
 	written="$(record_writes "$session_dir.events.json" "$cycle_log")" || written=0
 	cycle_writes=$((cycle_writes + written))
+	session_declared="$(declared_no_records "$session_dir.events.json")" || session_declared=
+	[ -z "$session_declared" ] || cycle_declared="$cycle_declared$session_declared
+"
 }
 
 # A cycle that moved the marker past a window holding new messages, and wrote no record in all of
@@ -1149,13 +1219,30 @@ tally_session() {
 # are read again, and when the cycle wrote nothing, every window a session was handed that the
 # marker now covers and that held new messages no recorded page held, and the window whose
 # recorded pages now hold more of its messages than when the cycle first read it, are named in one
-# line, and the cycle fails, for a person to look at. It fails too when nothing in those messages
-# needed a record, which a cycle that wrote nothing cannot be told apart from here. A cycle that
-# wrote a record, or passed only windows with no message left to it and recorded no page, is not
-# judged: which messages deserve a record is the session's to decide. Window ids are timestamps of
-# one fixed width, so the marker covers every window whose id sorts at or before its own.
+# line, and the cycle fails, for a person to look at.
+#
+# Except a window its session declared: some windows hold new messages that no record would keep,
+# a one-line question to an assistant among them, and `ctx marker advance <window> --no-records
+# <reason>` is how the session says so as it passes the window (declared_no_records). A declared
+# window is named in the cycle's log and left out of the line; an undeclared one still fails the
+# cycle, so a cycle that declared some of the windows it passed fails for the rest, naming them
+# alone. A cycle that wrote a record, or passed only windows with no message left to it and
+# recorded no page, is not judged at all: which messages deserve a record is the session's to
+# decide. Window ids are timestamps of one fixed width, so the marker covers every window whose id
+# sorts at or before its own.
 check_skipped_windows() {
 	[ -z "$pass" ] || return 0
+	# What the cycle declared, as `<window id> <reason>` lines, cut to the windows its sessions
+	# were handed: a declaration of any other window excuses nothing, so it is not logged either,
+	# and nothing a session chose to write reaches this line but the reason's fixed word.
+	declared="$(printf '%s' "$cycle_declared" | jq -Rsc --argjson handled "$(printf '%s' "$cycle_windows" |
+		jq -sc '[add // [] | .[] | .window | strings]')" '
+		[splits("\n") | select(length > 0) | split(" ") | select(length == 2)
+			| select(.[0] as $window | ($handled | index($window)) != null)]')" || declared='[]'
+	if [ "$declared" != "[]" ]; then
+		echo "run-cycle: the cycle declared that it needed no record for: $(printf '%s' "$declared" |
+			jq -r '[.[] | "\(.[0]) (\(.[1]))"] | join(", ")')"
+	fi
 	[ "$cycle_writes" -eq 0 ] || return 0
 	if cycle_marker="$(ctx marker show --json)"; then
 		:
@@ -1165,12 +1252,14 @@ check_skipped_windows() {
 		echo "run-cycle: ctx marker show failed after the cycle (exit $marker_status)" >&2
 		exit "$marker_status"
 	fi
-	if ! held="$(printf '%s' "$cycle_marker" | jq -r '.data.marker.window? // ""')" ||
+	if ! declared_windows="$(printf '%s' "$declared" | jq -c '[.[] | .[0]]')" ||
+		! held="$(printf '%s' "$cycle_marker" | jq -r '.data.marker.window? // ""')" ||
 		! paged="$(printf '%s' "$cycle_marker" | jq -c '{window: (.data.page.window? // ""), worked: (.data.page.worked? // 0)}')" ||
-		! skipped="$(printf '%s' "$cycle_windows" | jq -rs --arg held "$held" --argjson paged "$paged" '
+		! skipped="$(printf '%s' "$cycle_windows" | jq -rs --arg held "$held" --argjson paged "$paged" --argjson declared "$declared_windows" '
 			[add // [] | group_by(.window)[]
 				| {window: .[0].window, new_messages: (.[0].new_messages // 0), worked: (map(.worked // 0) | min)}
 				| select((.window | type) == "string")
+				| select(.window as $window | ($declared | index($window)) == null)
 				| if .window <= $held and .new_messages > .worked then
 					if .worked > 0 then
 						"\(.window) (messages \(.worked + 1) to \(.new_messages) of \(.new_messages) new)"

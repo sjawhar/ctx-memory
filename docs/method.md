@@ -73,7 +73,7 @@ Run the cycle in this order:
 4. Verify every selected quote against its source.
 5. Write each record. The server checks and commits it; a refused write changes nothing and prints what to fix.
 6. Run `ctx sweep` over the whole tree once the cycle's records are written, and fix its structural findings with further writes. It reports what a single write cannot see, such as a record no page links to yet, so it runs after the writes it checks.
-7. Run `ctx marker advance <newest window>`, or, for a window `ctx pending` listed a page of, `ctx marker page <window> <ends_at>` (below).
+7. Run `ctx marker advance <newest window>`, or, for a window `ctx pending` listed a page of, `ctx marker page <window> <ends_at>` (below). A window or page that held new messages and got no record is passed with `--no-records <reason>` on that same command, one word of a fixed list, so what the cycle found not worth recording is said plainly rather than left as a silent move past material no later cycle reads ([deployment.md](deployment.md#what-the-exit-status-means)).
 
 Two positions move separately. A cursor says what a source has delivered, and the fetch owns it: an interrupted fetch stores nothing for its failed streams and re-reads them. The marker says what the agent has turned into records, and it moves only after those records are written, so an interrupted cycle leaves its windows pending and the next cycle reads them again. The ingest loop records knowledge and follow-up work; it does not send outbound messages. The step-by-step procedure an agent follows is [skills/ctx-memory-ingest/SKILL.md](../skills/ctx-memory-ingest/SKILL.md).
 

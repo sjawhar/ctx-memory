@@ -561,6 +561,37 @@ pub(crate) fn wrote_to(calls: &[(&str, &[&str], bool)], last: Value) -> String {
     events(&messages)
 }
 
+/// A session that ran `commands` at the shell, each as the model's turn asking for it, omp's
+/// `tool_execution_start` and `tool_execution_end` events and the call's result, and then ended
+/// on `last`. A command whose run failed is paired with `false`, as a `ctx` call the server
+/// refused or clap rejected is.
+fn ran(commands: &[(&str, bool)], last: Value) -> String {
+    let mut messages = vec![prompt()];
+    for (index, &(command, ok)) in commands.iter().enumerate() {
+        let id = format!("toolu_{index}");
+        let arguments = json!({"command": command});
+        let content = json!([{"type": "text", "text": if ok { "marker 1" } else { "error" }}]);
+        messages.extend([
+            json!({
+                "role": "assistant", "stopReason": "toolUse",
+                "content": [{"type": "toolCall", "id": id, "name": "bash", "arguments": arguments}]
+            }),
+            json!({"type": "tool_execution_start", "toolCallId": id, "toolName": "bash", "args": arguments}),
+            json!({
+                "type": "tool_execution_end", "toolCallId": id, "toolName": "bash",
+                "result": {"content": content, "details": {"exitCode": i32::from(!ok)}},
+                "isError": !ok
+            }),
+            json!({
+                "role": "toolResult", "toolCallId": id, "toolName": "bash",
+                "content": content, "isError": !ok
+            }),
+        ]);
+    }
+    messages.push(last);
+    events(&messages)
+}
+
 /// A maintenance pass's final report, ending with the line `ending` (none when `None`).
 fn report(ending: Option<&str>) -> String {
     let body = "Checked 3 open records; changed 1.\n\n- decisions/a.md: [] -> [Ada], settled by slack:C0/1.1\n";
@@ -1446,6 +1477,135 @@ pub(crate) fn record_writes(events: &str, cycle_log: &str) -> Result<usize> {
         .context("record_writes printed no number")
 }
 
+/// What the session whose omp stdout is `events` declared it wrote no record for, as
+/// `run-cycle.sh` reads it: its `declared_no_records` function, run by `sh` over the capture, one
+/// `<window id> <reason>` line each.
+fn declared_no_records(events: &str) -> Result<Vec<String>> {
+    let dir = scratch("declared-no-records")?;
+    let capture = dir.join("events.json");
+    std::fs::write(&capture, events)?;
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "set -eu\n{}\ndeclared_no_records \"$1\"",
+            script_function("declared_no_records")?
+        ))
+        .arg("sh")
+        .arg(&capture)
+        .output();
+    remove_scratch(&dir)?;
+    let output = output.context("running run-cycle.sh's declared_no_records")?;
+    ensure!(
+        output.status.success(),
+        "declared_no_records failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// What the runner reads as a declaration, command by command. The parser decides which windows
+/// the guard excuses, so each shape it must take, and each it must refuse, is pinned here: a
+/// window that is not declared is one the cycle is failed for, and a declaration read off a call
+/// that did more than the one `ctx` command the policy admits would let one command's word
+/// excuse another command's silent move.
+#[test]
+fn the_runner_reads_a_declaration_only_from_one_plain_ctx_command_that_ran() -> Result<()> {
+    for (command, ok, declared, what) in [
+        (
+            format!("ctx marker advance {FIRST} --no-records nothing-new"),
+            true,
+            Some(format!("{FIRST} nothing-new")),
+            "an advance with the reason after the window",
+        ),
+        (
+            format!("ctx marker advance --no-records already-recorded '{FIRST}'"),
+            true,
+            Some(format!("{FIRST} already-recorded")),
+            "the reason before a quoted window",
+        ),
+        (
+            format!("ctx marker advance {FIRST} --no-records=not-a-record"),
+            true,
+            Some(format!("{FIRST} not-a-record")),
+            "the reason given as one word",
+        ),
+        (
+            format!("ctx marker advance {FIRST} --no-records='nothing-new'"),
+            true,
+            Some(format!("{FIRST} nothing-new")),
+            "a quoted reason given as one word",
+        ),
+        (
+            format!("ctx marker page {FIRST} 'slack:C0/1700000000.000006' --no-records nothing-new"),
+            true,
+            Some(format!("{FIRST} nothing-new")),
+            "a page record with a quoted pointer",
+        ),
+        (
+            format!("ctx marker page {FIRST} 'matrix:!room:example.org/$event' --no-records nothing-new"),
+            true,
+            Some(format!("{FIRST} nothing-new")),
+            "a page record whose Matrix pointer holds a dollar sign",
+        ),
+        (
+            format!("ctx marker advance --memory /tmp/tree {FIRST} --no-records nothing-new"),
+            true,
+            Some(format!("{FIRST} nothing-new")),
+            "a global flag that takes a value before the window",
+        ),
+        (
+            format!("ctx marker advance {FIRST}"),
+            true,
+            None,
+            "a plain advance declares nothing",
+        ),
+        (
+            format!("ctx marker advance {FIRST} --no-records it-was-only-noise"),
+            true,
+            None,
+            "a word ctx does not take is no reason",
+        ),
+        (
+            format!("ctx marker advance {FIRST} --no-records nothing-new"),
+            false,
+            None,
+            "a call that failed declares nothing",
+        ),
+        (
+            format!("ctx marker advance {FIRST}\nctx marker advance {SECOND} --no-records nothing-new"),
+            true,
+            None,
+            "two commands in one call declare nothing, so neither excuses the other",
+        ),
+        (
+            format!("ctx marker advance {FIRST} && ctx marker advance {SECOND} --no-records nothing-new"),
+            true,
+            None,
+            "commands joined by an operator declare nothing",
+        ),
+        (
+            format!("ctx pending --json --limit 1 # {FIRST} --no-records nothing-new"),
+            true,
+            None,
+            "another ctx command declares nothing, whatever it holds",
+        ),
+    ] {
+        let events = ran(&[(&command, ok)], answer("Handled the windows."));
+        let read = declared_no_records(&events)?;
+        match declared {
+            Some(line) => ensure!(
+                read == vec![line.clone()],
+                "{what}: the runner read {read:?}, not [{line:?}]"
+            ),
+            None => ensure!(read.is_empty(), "{what}: the runner read {read:?}"),
+        }
+    }
+    Ok(())
+}
+
 /// A session that moves the marker past a window with new messages, and writes no record in the
 /// whole cycle, has skipped that window for good: no later cycle reads it again. A session did
 /// exactly that on a real sample, moving the marker past five windows that held new messages
@@ -1556,6 +1716,191 @@ fn only_a_cycle_that_wrote_nothing_past_new_messages_fails_for_skipping() -> Res
             &Around {
                 marker_moves: moves,
                 pending: &[pending],
+                ..Around::default()
+            },
+        )?;
+        if skipped {
+            ensure_failed_saying(&verdict, SKIPPED, what)?;
+        } else {
+            ensure_succeeded(&verdict, what)?;
+        }
+    }
+    Ok(())
+}
+
+/// What the line naming the windows a cycle declared it needed no record for says.
+const DECLARED: &str = "declared that it needed no record";
+
+/// Some windows hold new messages no record would keep: a greeting, a one-line question to an
+/// assistant. A session says so as it passes such a window, with `ctx marker advance <window>
+/// --no-records <reason>`, and the cycle passes: the declaration, which the runner reads from
+/// the session's own event capture, tells what the guard alone cannot, a window nothing in which
+/// needed a record from one the session never read. The cycle's log names each declared window
+/// and the word it was declared with, and nothing of the session's prose.
+#[test]
+fn a_cycle_that_declared_its_windows_needed_no_record_passes() -> Result<()> {
+    let pending = pending_answer(&[(FIRST, 1), (SECOND, 3)]);
+    let declared = ran(
+        &[
+            (
+                &format!("ctx marker advance {FIRST} --no-records nothing-new"),
+                true,
+            ),
+            (
+                &format!("ctx marker advance '{SECOND}' --no-records already-recorded"),
+                true,
+            ),
+        ],
+        answer("Handled 2 windows; neither needed a record."),
+    );
+    let verdict = verdict(
+        None,
+        &[Attempt {
+            status: 0,
+            events: &declared,
+        }],
+        &Around {
+            marker_moves: &[(1, SECOND)],
+            pending: &[&pending],
+            ..Around::default()
+        },
+    )?;
+    ensure_succeeded(
+        &verdict,
+        "the session declared that both windows it passed needed no record",
+    )?;
+    let line = verdict.lines_saying(DECLARED).concat();
+    ensure!(
+        line.contains(&format!("{FIRST} (nothing-new)"))
+            && line.contains(&format!("{SECOND} (already-recorded)")),
+        "the cycle does not log what it declared and why: {line}"
+    );
+    Ok(())
+}
+
+/// A declaration is the session's word about the window it passed, so it excuses that window and
+/// no other: a cycle that declared one of the two windows it passed, that declared a window it
+/// was never handed, or whose declaring call failed, still fails, and the line names the windows
+/// left undeclared alone.
+#[test]
+fn a_cycle_that_declared_only_some_of_what_it_passed_fails_for_the_rest() -> Result<()> {
+    let pending = pending_answer(&[(FIRST, 1), (SECOND, 3)]);
+    let one_of_two = ran(
+        &[(
+            &format!("ctx marker advance {FIRST} --no-records nothing-new"),
+            true,
+        )],
+        answer("Handled 2 windows."),
+    );
+    let another_window = ran(
+        &[(
+            &format!("ctx marker advance {THIRD} --no-records nothing-new"),
+            true,
+        )],
+        answer("Handled 2 windows."),
+    );
+    let call_failed = ran(
+        &[(
+            &format!("ctx marker advance {FIRST} --no-records nothing-new"),
+            false,
+        )],
+        answer("Handled 2 windows."),
+    );
+    let unknown_word = ran(
+        &[(
+            &format!("ctx marker advance {FIRST} --no-records it-was-only-noise"),
+            true,
+        )],
+        answer("Handled 2 windows."),
+    );
+    for (events, named, not_named, what) in [
+        (
+            &one_of_two,
+            SECOND,
+            Some(FIRST),
+            "the session declared one of the two windows it passed",
+        ),
+        (
+            &another_window,
+            FIRST,
+            None,
+            "the session declared a window this cycle was not handed",
+        ),
+        (
+            &call_failed,
+            FIRST,
+            None,
+            "the declaring call failed, so it declared nothing",
+        ),
+        (
+            &unknown_word,
+            FIRST,
+            None,
+            "the declaration named no reason ctx takes",
+        ),
+    ] {
+        let verdict = verdict(
+            None,
+            &[Attempt { status: 0, events }],
+            &Around {
+                marker_moves: &[(1, SECOND)],
+                pending: &[&pending],
+                ..Around::default()
+            },
+        )?;
+        ensure_failed_saying(&verdict, SKIPPED, what)?;
+        let line = verdict.lines_saying(SKIPPED).concat();
+        ensure!(
+            line.contains(named) && not_named.is_none_or(|window| !line.contains(window)),
+            "{what}, yet the line does not name the undeclared windows alone: {line}"
+        );
+        ensure!(
+            !verdict.lines_saying(DECLARED).concat().contains(THIRD),
+            "{what}, yet the cycle logs a declaration of a window it was never handed: {}",
+            verdict.lines_saying(DECLARED).concat()
+        );
+    }
+    Ok(())
+}
+
+/// A page a cycle recorded moves past its messages as a marker move does, and a declaration on
+/// `ctx marker page` covers the page the same way `ctx marker advance`'s covers a window.
+#[test]
+fn a_declared_page_is_no_skip() -> Result<()> {
+    // The runner's read lists the second page of a window of ten: messages 4 to 6.
+    let second_page = paged_answer(&[(FIRST, 10, Some((3, 6)))]);
+    let declared = ran(
+        &[(
+            &format!("ctx marker page {FIRST} 'slack:C0EXAMPLE01/1700000000.000006' --no-records not-a-record"),
+            true,
+        )],
+        answer("Handled one page; it needed no record."),
+    );
+    let silent = ran(
+        &[(
+            &format!("ctx marker page {FIRST} 'slack:C0EXAMPLE01/1700000000.000006'"),
+            true,
+        )],
+        answer("Handled one page."),
+    );
+    for (events, skipped, what) in [
+        (
+            &declared,
+            false,
+            "the session declared that the page it recorded needed no record",
+        ),
+        (
+            &silent,
+            true,
+            "the session recorded the page and declared nothing",
+        ),
+    ] {
+        let verdict = verdict(
+            None,
+            &[Attempt { status: 0, events }],
+            &Around {
+                page_moves: &[(0, FIRST, 3), (1, FIRST, 6)],
+                pending: &[&second_page],
                 ..Around::default()
             },
         )?;
