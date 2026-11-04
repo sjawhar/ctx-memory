@@ -231,7 +231,7 @@ const EMITTED_FILE: &str = "emitted.json";
 /// `[message removed]`.
 const CANCELLED: &str = "[event cancelled]";
 
-/// The events a calendar's fetches recorded, each with the start its latest record has.
+/// The events a calendar's fetches recorded, each with the latest start a record of it may have.
 type Recorded = BTreeMap<String, DateTime<Utc>>;
 
 /// What each calendar's fetches recorded, kept in `<state_dir>/emitted.json`.
@@ -373,24 +373,21 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
         // cursor, and the next fetch reads the same changes again.
         let collected = collect_calendar(request, calendar, api, held.as_ref()).and_then(|c| {
             let mut recorded = c.recorded;
-            recorded.retain(|_, start| *start >= forget_before(request));
             // The fetch drops the record of an excluded event, so this fetch's record of one is
             // not listed; one listed before, whose record the tree may hold, stays as it was.
+            // This comes before the old entries are forgotten, so a move the fetch dropped does
+            // not make the tree's record forgotten either.
             if !exclusion.is_empty() {
                 let scheme = &request.source.scheme;
-                recorded.retain(|id, start| {
-                    if !exclusion.matches(&format!("{scheme}:{calendar}/{id}")) {
-                        return true;
+                let excluded = |id: &str| exclusion.matches(&format!("{scheme}:{calendar}/{id}"));
+                recorded.retain(|id, _| !excluded(id.as_str()));
+                if let Some(held) = &held {
+                    for (id, start) in held.iter().filter(|(id, _)| excluded(id.as_str())) {
+                        recorded.insert(id.clone(), *start);
                     }
-                    match held.as_ref().and_then(|held| held.get(id)) {
-                        Some(listed) => {
-                            *start = *listed;
-                            true
-                        }
-                        None => false,
-                    }
-                });
+                }
             }
+            recorded.retain(|_, start| *start >= forget_before(request));
             let list = CalendarList {
                 stored: held.unwrap_or_default(),
                 proposed: Some(Proposed {
