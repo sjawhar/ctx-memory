@@ -30,7 +30,8 @@ use crate::protocol::{
 use crate::redact::credentials_in;
 
 use self::response::{
-    bad_request, deferred, failed, log_failure, not_written, too_old, unauthorized, unheld,
+    bad_request, deferred, failed, log_failure, not_written, remote_failed, too_old, unauthorized,
+    unheld,
 };
 use self::transaction::{apply, ApplyError};
 
@@ -472,13 +473,17 @@ async fn write(
     session: Option<String>,
     note: &Note,
 ) -> Response {
+    // When the request reached the server, before its caller was identified and before its
+    // waits for the index and the tree: the client's request timeout runs from about then, and
+    // the write's retries are bounded by it.
+    let started = note.arrived().unwrap_or_else(std::time::Instant::now);
     let shared = &listener.shared;
     shared.index_ready().await;
     let writing = Arc::clone(shared);
     let session = session_label(session.as_deref()).unwrap_or_else(|| "unknown".to_owned());
     let note = note.clone();
     let answered = tokio::task::spawn_blocking(move || {
-        let applied = apply(&writing, &caller, &change, &session);
+        let applied = apply(&writing, &caller, &change, &session, started);
         answer_write(&writing, route, applied, &note)
     })
     .await;
@@ -531,6 +536,7 @@ fn answer_write(
                  follow loop takes it within one pull interval; ask again before writing it twice"
             ),
         ),
+        Err(ApplyError::RemoteFailed(why)) => remote_failed(shared, route, &why),
     }
 }
 

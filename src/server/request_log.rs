@@ -68,12 +68,16 @@ struct Facts {
     query_chars: Option<usize>,
     exit_code: Option<u8>,
     refusals: Vec<String>,
-    /// The write was deferred by a rollout's handover: `503` with `Retry-After`, nothing wrong.
+    /// The write was deferred, by a rollout's handover or a remote that kept failing its push:
+    /// `503` with `Retry-After`, nothing wrong with this server.
     deferred: bool,
+    /// When the request reached the server, before anything identified its caller: `None`
+    /// only for a note no request carries.
+    arrived: Option<Instant>,
 }
 
-/// Put on an answer by a write deferred during a rollout's handover, so its line says
-/// `deferred` and files it as a warning: `503` with `Retry-After`, nothing wrong.
+/// Put on an answer by a deferred write, so its line says `deferred` and files it as a
+/// warning: `503` with `Retry-After`, nothing wrong with this server.
 #[derive(Clone, Copy, Debug)]
 pub struct Deferred;
 
@@ -130,9 +134,16 @@ impl Note {
         self.facts().refusals = kinds.into_iter().map(str::to_owned).collect();
     }
 
-    /// The write was deferred by a rollout's handover rather than failed.
+    /// The write was deferred rather than failed.
     fn deferred(&self) {
         self.facts().deferred = true;
+    }
+
+    /// When the request reached the server, before its caller was identified: a write's
+    /// retries are bounded by how long its caller has been waiting.
+    #[must_use]
+    pub fn arrived(&self) -> Option<Instant> {
+        self.facts().arrived
     }
 
     /// The facts, whatever a holder that panicked left: each field is written whole.
@@ -172,12 +183,14 @@ type Answer = (StatusCode, Option<u64>);
 pub async fn log(State(door): State<Door>, mut request: Request, next: Next) -> Response {
     let note = Note::default();
     note.session(request.headers());
+    let started = Instant::now();
+    note.facts().arrived = Some(started);
     request.extensions_mut().insert(note.clone());
     let mut pending = Pending {
         door,
         route: route_command(request.uri().path()),
         head: request.method() == Method::HEAD,
-        started: Instant::now(),
+        started,
         note,
         logged: false,
     };
