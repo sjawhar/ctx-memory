@@ -396,7 +396,7 @@ fn token_named_start(event: &Value, horizon: DateTime<Utc>) -> Result<Option<Dat
 /// Google may give its time without an offset and name the time zone beside it, and time zones
 /// run from 12 hours behind UTC to 14 ahead. Read in the zone furthest ahead, such a slot lies
 /// before the horizon whenever it does in its own zone: an occurrence the tree holds is never
-/// dropped for it, and a series yields at most a day's more slots.
+/// dropped for it, and a series yields at most 26 hours' more slots.
 fn earliest_slot(slot: &Value) -> Result<DateTime<Utc>> {
     let Some(value) = slot.get("dateTime").and_then(Value::as_str) else {
         return event_time(slot, "originalStartTime");
@@ -1226,8 +1226,8 @@ mod tests {
     #[test]
     fn a_sync_listing_keeps_a_series_instance_whose_start_or_slot_is_inside_the_horizon(
     ) -> Result<()> {
-        // The series changed, so the token names every instance, each with its slot. Only the
-        // slots inside the horizon, 2027-11-29T18:00:00Z, are kept, wherever they now start, so a
+        // The series changed, so the token names every instance, each with its slot. An instance
+        // is kept when its start or its slot is inside the horizon, 2027-11-29T18:00:00Z, so a
         // series with no end still stops at the horizon.
         let mut items = (2026..=2056)
             .map(|year| {
