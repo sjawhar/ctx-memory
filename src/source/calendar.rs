@@ -2335,10 +2335,10 @@ mod tests {
     fn an_excluded_event_is_not_listed_as_recorded() -> Result<()> {
         // The fetch drops the record of an event the deployment excludes, so the tree never
         // holds it.
-        let api = api(vec![listing("sync-2", vec![meeting()])]);
+        let first_api = api(vec![listing("sync-2", vec![meeting()])]);
         let mut first = request(None)?;
         first.exclude = vec!["gcal:team@example.com/EVENT-EXAMPLE".to_owned()];
-        let first_messages = run_fetch(&api, &first)?;
+        let first_messages = run_fetch(&first_api, &first)?;
         let first_cursor = cursor(&first_messages).context("the first fetch moved on")?;
         let list = std::fs::read_to_string(first.state_dir.join("emitted.json"))?;
         assert!(!list.contains("EVENT-EXAMPLE"), "{list}");
