@@ -1001,7 +1001,8 @@ const PROTOCOL_MISMATCH: i32 = 75;
 /// runs no other command and starts no session, says so in one line naming both versions, and
 /// exits [`PROTOCOL_MISMATCH`], so the deployment can tell a stop mid-roll from a failure. A
 /// server older than the version header is protocol 0. Equal versions run the cycle as before,
-/// and a `ctx protocol` that fails stops the cycle with its own status, as a failed read does.
+/// a `ctx protocol` that fails stops the cycle with its own status, as a failed read does, and an
+/// answer that names no number for one of the versions is refused.
 #[test]
 fn the_runner_starts_no_session_while_the_server_speaks_another_protocol() -> Result<()> {
     let rig = CycleRig::new("protocol-mismatch")?;
@@ -1034,6 +1035,10 @@ fn the_runner_starts_no_session_while_the_server_speaks_another_protocol() -> Re
     let older = run(&protocol_answer(1, 0), 0)?;
     let same = run(&protocol_answer(1, 1), 0)?;
     let failed = run("{\"ok\":false}", 2)?;
+    let unnamed = run(
+        "{\"version\":1,\"command\":\"protocol\",\"data\":{\"client\":1}}",
+        0,
+    )?;
     let omp = rig.omp_started();
     rig.remove()?;
 
@@ -1075,6 +1080,15 @@ fn the_runner_starts_no_session_while_the_server_speaks_another_protocol() -> Re
         "a failed ctx protocol did not stop the cycle with its status: {:?} {}",
         failed.0.status.code(),
         String::from_utf8_lossy(&failed.0.stderr)
+    );
+    ensure!(
+        unnamed.0.status.code() == Some(1)
+            && String::from_utf8_lossy(&unnamed.0.stderr)
+                .contains("did not name both protocol versions")
+            && !unnamed.1.lines().any(|line| line.starts_with("pending")),
+        "an answer naming no server version did not stop the cycle: {:?} {}",
+        unnamed.0.status.code(),
+        String::from_utf8_lossy(&unnamed.0.stderr)
     );
     ensure!(!omp, "a session started");
     Ok(())

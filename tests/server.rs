@@ -2530,6 +2530,11 @@ fn a_client_too_old_for_paging_gets_409_and_keeps_its_unchanged_routes() -> Resu
     let old: &[(&str, &str)] = &[user];
     let current: &[(&str, &str)] = &[user, ("X-Ctx-Protocol", PROTOCOL)];
     let garbled: &[(&str, &str)] = &[user, ("X-Ctx-Protocol", "two")];
+    let doubled: &[(&str, &str)] = &[
+        user,
+        ("X-Ctx-Protocol", PROTOCOL),
+        ("X-Ctx-Protocol", PROTOCOL),
+    ];
     let page = |headers: &[(&str, &str)], ends_at: &str| {
         let body = json!({ "window": window.as_str(), "ends_at": ends_at, "session": "s" });
         server.post(address, "/v1/marker/page", &body, headers)
@@ -2543,6 +2548,7 @@ fn a_client_too_old_for_paging_gets_409_and_keeps_its_unchanged_routes() -> Resu
     let old_advance = advance(old)?;
     let current_advance = advance(current)?;
     let garbled_page = page(garbled, &first)?;
+    let doubled_page = page(doubled, &first)?;
     let mut recorded = Vec::new();
     let mut listed = listed_page(&server, old)?;
     while listed.get("last") != Some(&Value::Bool(true)) && recorded.len() < 5 {
@@ -2571,6 +2577,7 @@ fn a_client_too_old_for_paging_gets_409_and_keeps_its_unchanged_routes() -> Resu
         current_advance.body
     );
     assert_eq!(garbled_page.status, 400, "{}", garbled_page.body);
+    assert_eq!(doubled_page.status, 400, "{}", doubled_page.body);
     assert_eq!(recorded, [200, 200]);
     assert_eq!(last_advance.status, 200, "{}", last_advance.body);
     Ok(())
