@@ -57,8 +57,8 @@ impl CycleRig {
         std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o444))?;
         std::fs::set_permissions(root.join("opt"), std::fs::Permissions::from_mode(0o555))?;
         let omp_log = root.join("omp-started");
-        write_executable(
-            &bin.join("ctx"),
+        write_ctx(
+            &bin,
             "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"data\":{\"windows\":[{\"id\":\"w1\"}]}}'\n",
         )?;
         write_executable(
@@ -224,7 +224,7 @@ impl CycleRig {
              find) exit 0 ;;\n\
              esac\nexec \"$@\"\n",
         )?;
-        write_executable(&self.bin.join("ctx"), ctx)?;
+        write_ctx(&self.bin, ctx)?;
         write_executable(&self.bin.join("omp"), omp)?;
         let key_file = self.root.join("run/model-key");
         let script = runner("run-cycle.sh")?.replace(
@@ -247,8 +247,8 @@ impl CycleRig {
     /// in the file this returns.
     fn nothing_pending(&self) -> Result<PathBuf> {
         let calls = self.root.join("ctx-calls");
-        write_executable(
-            &self.bin.join("ctx"),
+        write_ctx(
+            &self.bin,
             &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[]}}}}'\n",
                 calls.display()
@@ -261,8 +261,8 @@ impl CycleRig {
     /// `CTX_SESSION`, one line per call, in the file this returns.
     fn record_sessions(&self) -> Result<PathBuf> {
         let calls = self.root.join("ctx-sessions");
-        write_executable(
-            &self.bin.join("ctx"),
+        write_ctx(
+            &self.bin,
             &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"${{CTX_SESSION-}}\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[{{\"id\":\"w1\"}}]}}}}'\n",
                 calls.display()
@@ -278,6 +278,31 @@ impl CycleRig {
     fn remove(self) -> Result<()> {
         remove_scratch(&self.root)
     }
+}
+
+/// What a `ctx` stand-in answers `ctx protocol --json` with: the protocol versions this client
+/// and its server speak, in the envelope the CLI prints.
+fn protocol_answer(client: u32, server: u32) -> String {
+    format!(
+        "{{\"version\":1,\"command\":\"protocol\",\"data\":{{\"client\":{client},\"server\":{server}}}}}"
+    )
+}
+
+/// Writes `script` to `bin` as the `ctx` stand-in, answering `ctx protocol` before anything in
+/// it as a server and a client of one release do, so a stand-in written for what the runner
+/// does after its check of the protocol versions gets there. That call is not one `script`
+/// records.
+fn write_ctx(bin: &std::path::Path, script: &str) -> Result<()> {
+    let (shebang, rest) = script
+        .split_once('\n')
+        .context("a ctx stand-in starts with its #! line")?;
+    write_executable(
+        &bin.join("ctx"),
+        &format!(
+            "{shebang}\nif [ \"$1\" = protocol ]; then printf '%s\\n' '{}'; exit 0; fi\n{rest}",
+            protocol_answer(1, 1)
+        ),
+    )
 }
 
 fn assert_refused(rig: &CycleRig, output: &std::process::Output, reason: &str) -> Result<()> {
@@ -962,6 +987,110 @@ fn the_runner_waits_for_the_server_before_it_starts_a_session() -> Result<()> {
         "the runner did not say the server never answered: {}",
         String::from_utf8_lossy(&hung.stderr)
     );
+    Ok(())
+}
+
+/// The status the runner exits with when the server and its own ctx speak different protocol
+/// versions, which no other end of a cycle exits with.
+const PROTOCOL_MISMATCH: i32 = 75;
+
+/// Once the server answers, and before anything else of the cycle, the runner asks `ctx
+/// protocol` which protocol version the server speaks and which its own ctx does. A deployment
+/// that rolls the server and the runner one after the other has the two disagree in between,
+/// and a session started then fails partway through its writes. So on a mismatch the runner
+/// runs no other command and starts no session, says so in one line naming both versions, and
+/// exits [`PROTOCOL_MISMATCH`], so the deployment can tell a stop mid-roll from a failure. A
+/// server older than the version header is protocol 0. Equal versions run the cycle as before,
+/// a `ctx protocol` that fails stops the cycle with its own status, as a failed read does, and an
+/// answer that names no number for one of the versions is refused.
+#[test]
+fn the_runner_starts_no_session_while_the_server_speaks_another_protocol() -> Result<()> {
+    let rig = CycleRig::new("protocol-mismatch")?;
+    rig.pretend_root()?;
+    let calls = rig.root.join("ctx-calls");
+    let answer = rig.root.join("protocol-answer");
+    let status = rig.root.join("protocol-status");
+    write_executable(
+        &rig.bin.join("ctx"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\n\
+             if [ \"$1\" = protocol ]; then cat '{answer}'; exit \"$(cat '{status}')\"; fi\n\
+             printf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[]}}}}'\n",
+            calls = calls.display(),
+            answer = answer.display(),
+            status = status.display()
+        ),
+    )?;
+    let run = |said: &str, code: u8| -> Result<(std::process::Output, String)> {
+        std::fs::write(&answer, format!("{said}\n"))?;
+        std::fs::write(&status, format!("{code}\n"))?;
+        let output = rig.run()?;
+        let called = std::fs::read_to_string(&calls).unwrap_or_default();
+        if calls.exists() {
+            std::fs::remove_file(&calls)?;
+        }
+        Ok((output, called))
+    };
+    let newer = run(&protocol_answer(1, 2), 0)?;
+    let older = run(&protocol_answer(1, 0), 0)?;
+    let same = run(&protocol_answer(1, 1), 0)?;
+    let failed = run("{\"ok\":false}", 2)?;
+    let unnamed = run(
+        "{\"version\":1,\"command\":\"protocol\",\"data\":{\"client\":1}}",
+        0,
+    )?;
+    let omp = rig.omp_started();
+    rig.remove()?;
+
+    for (what, (output, called), server) in [("newer", &newer, 2), ("older", &older, 0)] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            output.status.code() == Some(PROTOCOL_MISMATCH),
+            "a {what} server: the runner exited {:?}, not {PROTOCOL_MISMATCH}: {stderr}",
+            output.status.code()
+        );
+        let said: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.starts_with("run-cycle:"))
+            .collect();
+        ensure!(
+            said.len() == 1
+                && said.iter().all(|line| {
+                    line.contains(&format!("protocol {server}")) && line.contains("protocol 1")
+                }),
+            "a {what} server: the runner did not say once which versions differ: {said:?}"
+        );
+        ensure!(
+            called.lines().any(|line| line == "protocol --json")
+                && called
+                    .lines()
+                    .all(|line| line == "protocol --json" || line.starts_with("marker show")),
+            "a {what} server: the runner ran more than the wait and the check: {called:?}"
+        );
+    }
+    ensure!(
+        same.0.status.success() && same.1.lines().any(|line| line.starts_with("pending")),
+        "equal versions did not run the cycle: {}{:?}",
+        String::from_utf8_lossy(&same.0.stderr),
+        same.1
+    );
+    ensure!(
+        failed.0.status.code() == Some(2)
+            && !failed.1.lines().any(|line| line.starts_with("pending")),
+        "a failed ctx protocol did not stop the cycle with its status: {:?} {}",
+        failed.0.status.code(),
+        String::from_utf8_lossy(&failed.0.stderr)
+    );
+    ensure!(
+        unnamed.0.status.code() == Some(1)
+            && String::from_utf8_lossy(&unnamed.0.stderr)
+                .contains("did not name both protocol versions")
+            && !unnamed.1.lines().any(|line| line.starts_with("pending")),
+        "an answer naming no server version did not stop the cycle: {:?} {}",
+        unnamed.0.status.code(),
+        String::from_utf8_lossy(&unnamed.0.stderr)
+    );
+    ensure!(!omp, "a session started");
     Ok(())
 }
 

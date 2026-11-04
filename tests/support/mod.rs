@@ -387,6 +387,8 @@ pub struct Reply {
     pub body: Value,
     /// How many bytes the body held, as the request log counts them.
     pub bytes: usize,
+    /// The protocol version the answer names in `X-Ctx-Protocol`, as it came.
+    pub protocol: Option<String>,
 }
 
 impl Reply {
@@ -548,6 +550,17 @@ impl Server {
         Ok((status, response.bytes()?.len()))
     }
 
+    /// Sends a `GET` whatever its answer, which may not be JSON or may have no body, and returns
+    /// its status and the protocol version it names in `X-Ctx-Protocol`.
+    pub fn protocol_of(&self, address: SocketAddr, path: &str) -> Result<(u16, Option<String>)> {
+        let response = self
+            .client
+            .get(format!("http://{address}{path}"))
+            .send()
+            .context("getting from ctx serve")?;
+        Ok((response.status().as_u16(), protocol_header(&response)))
+    }
+
     /// Runs one allowlisted command over `/v1/command` as a tailnet user.
     pub fn command(&self, argv: &[&str]) -> Result<Reply> {
         self.post_as("ada@example.com", "/v1/command", &json!({ "argv": argv }))
@@ -603,6 +616,15 @@ impl Drop for Server {
     }
 }
 
+/// The `X-Ctx-Protocol` header of `response`, as text.
+fn protocol_header(response: &reqwest::blocking::Response) -> Option<String> {
+    response
+        .headers()
+        .get("x-ctx-protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
 fn reply(response: reqwest::blocking::Response) -> Result<Reply> {
     let status = response.status().as_u16();
     let content_type = response
@@ -611,6 +633,7 @@ fn reply(response: reqwest::blocking::Response) -> Result<Reply> {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
+    let protocol = protocol_header(&response);
     let text = response.text()?;
     if !content_type.starts_with("application/json") {
         bail!("response {status} is not JSON ({content_type}): {text}");
@@ -619,6 +642,7 @@ fn reply(response: reqwest::blocking::Response) -> Result<Reply> {
         status,
         body: serde_json::from_str(&text).with_context(|| format!("decoding {text}"))?,
         bytes: text.len(),
+        protocol,
     })
 }
 

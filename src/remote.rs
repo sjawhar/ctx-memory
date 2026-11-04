@@ -72,7 +72,9 @@ impl Client {
     ///
     /// Every request carries `session`, the caller's session id, in
     /// [`session_id::HEADER`]; one that does not [fit](session_id::fits) the header is not
-    /// sent.
+    /// sent. Every request also names the protocol version this client speaks
+    /// ([`protocol::VERSION`]) in [`protocol::VERSION_HEADER`], so a server can refuse what
+    /// changed since that version rather than misread it.
     ///
     /// # Errors
     ///
@@ -83,8 +85,14 @@ impl Client {
         let base = base.trim_end_matches('/');
         let origin = origin(base)?;
         let token = identity_token(&origin)?;
+        let mut speaks = reqwest::header::HeaderMap::new();
+        speaks.insert(
+            protocol::VERSION_HEADER,
+            reqwest::header::HeaderValue::from(protocol::VERSION),
+        );
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(120))
+            .default_headers(speaks)
             .redirect(same_origin_redirects(origin.clone()));
         if origin.starts_with("http://") {
             // Plain HTTP is taken only to loopback or over the tailnet, whose tunnel carries
@@ -100,6 +108,54 @@ impl Client {
                 .filter(|session| session_id::fits(session))
                 .map(str::to_owned),
         })
+    }
+
+    /// The protocol version the server speaks, as its `/healthz` names it in
+    /// [`protocol::VERSION_HEADER`], whatever the probe's status: a wedged copy still speaks
+    /// one. A server older than that header names none, which is protocol 0. An answer that
+    /// names none and is not a success is not taken for such a server: a proxy or a load
+    /// balancer answers like that in the server's place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server cannot be reached, names a version that is not a whole
+    /// number, or answers with neither a version nor a success.
+    pub fn protocol(&self) -> Result<u32> {
+        let path = protocol::HEALTH_ROUTE;
+        let response = self
+            .get(path)
+            .send()
+            .with_context(|| format!("asking {}{path}", self.base))?;
+        let status = response.status();
+        match response.headers().get(protocol::VERSION_HEADER) {
+            Some(value) => value
+                .to_str()
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .with_context(|| {
+                    format!(
+                        "the server's {} header ({status}) is not a protocol version",
+                        protocol::VERSION_HEADER
+                    )
+                }),
+            None if status.is_success() => Ok(0),
+            None => bail!(
+                "the server answered {status} to {path}, naming no protocol version; the \
+                 answer may be a proxy's"
+            ),
+        }
+    }
+
+    /// A `GET` of `path` on the server, carrying the caller's identity token and session.
+    fn get(&self, path: &str) -> reqwest::blocking::RequestBuilder {
+        let mut request = self.http.get(format!("{}{path}", self.base));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(session) = &self.session {
+            request = request.header(session_id::HEADER, session);
+        }
+        request
     }
 
     /// Runs one command on the server and returns what it printed. `drafts` are the files on
@@ -236,14 +292,8 @@ impl Client {
             limits.max_subjects,
             limits.seconds
         );
-        let mut request = self.http.get(format!("{}{path}", self.base));
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        if let Some(session) = &self.session {
-            request = request.header(session_id::HEADER, session);
-        }
-        let response = request
+        let response = self
+            .get(&path)
             .send()
             .with_context(|| format!("asking {}{path}", self.base))?;
         let status = response.status();
@@ -444,6 +494,9 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
         ) {
             bail!("no ctx server is configured; set CTX_SERVER or server in the user config");
         }
+        if route == Remote::Protocol {
+            return report_protocol(sink, cli.json, None).map(Some);
+        }
         return Ok(None);
     };
     if route == Remote::Local {
@@ -521,6 +574,7 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             )?;
             Ok(Some(Outcome::Pass))
         }
+        Remote::Protocol => report_protocol(sink, cli.json, Some(client()?.protocol()?)).map(Some),
         Remote::Forward => {
             let argv = forwarded_argv()?;
             let drafts = local_drafts(&cli.command)?;
@@ -536,6 +590,20 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Option<Outcome>> {
             Ok(Some(Outcome::Code(captured.exit_code)))
         }
     }
+}
+
+/// Prints the protocol version this client speaks and the one its server speaks, `None` when no
+/// server is configured: `{"client": 1, "server": 1}` in JSON, one line each in text.
+fn report_protocol(sink: &mut Sink<'_>, json: bool, server: Option<u32>) -> Result<Outcome> {
+    let payload = json!({ "client": protocol::VERSION, "server": server });
+    output::emit(sink, json, "protocol", &payload, |_, out| {
+        writeln!(out, "client protocol {}", protocol::VERSION)?;
+        match server {
+            Some(server) => writeln!(out, "server protocol {server}"),
+            None => writeln!(out, "no server is configured"),
+        }
+    })?;
+    Ok(Outcome::Pass)
 }
 
 /// This process's own arguments, ready for the server.

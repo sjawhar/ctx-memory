@@ -20,6 +20,24 @@ pub(super) fn bad_request(shared: &Shared, route: &str, message: &str) -> Respon
     not_written(shared, route, StatusCode::BAD_REQUEST, message)
 }
 
+/// The answer to a client whose protocol version is older than what it asked needs: `409`,
+/// naming the version the client speaks, the one this server speaks and the one `what` needs,
+/// so the caller is told the two releases differ rather than that it named something wrongly.
+pub(super) fn too_old(
+    shared: &Shared,
+    route: &str,
+    client: u32,
+    what: &str,
+    since: u32,
+) -> Response {
+    let message = format!(
+        "this client speaks ctx protocol {client} and the server protocol {}: {what} needs \
+         protocol {since} or later. Roll the client to the server's release",
+        crate::protocol::VERSION
+    );
+    not_written(shared, route, StatusCode::CONFLICT, &message)
+}
+
 /// Another copy of the server holds the write lease, so this copy wrote nothing. A caller
 /// that tries again reaches the copy that holds it, or this one once it has taken it over.
 pub(super) fn unheld(shared: &Shared, route: &str, message: &str) -> Response {

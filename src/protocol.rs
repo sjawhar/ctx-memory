@@ -8,6 +8,36 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::marker;
 
+/// The version of the protocol below: these routes, their bodies and answers, and what each
+/// means. The server names it on every answer and the client on every request, both in
+/// [`VERSION_HEADER`], and `/healthz` says it as `protocol`. `ctx protocol` prints the client's
+/// and its server's, which the ingest runner compares before it starts a session.
+///
+/// Bump it by one, by hand, in the release that adds or removes a route or changes what a
+/// route takes, answers or means in a way a client of the version before would misread; never
+/// for a release that changes none of that. It is not the crate's version: most releases change
+/// no route, and the two would only drift. A bump also sets the `*_SINCE` constant of each
+/// route whose meaning it changed, so the server refuses that route to an older client, and
+/// says so in `docs/deployment.md`.
+///
+/// - 0: a client or a server from before this number existed, which names none.
+/// - 1: the v0.3 protocol. A window larger than one page is worked a page at a time:
+///   [`PAGE_ROUTE`] records a page, and [`MARKER_ROUTE`] refuses to pass a window whose last
+///   page no answer has listed.
+pub const VERSION: u32 = 1;
+
+/// The header that carries the protocol version, in a request the client's and in an answer
+/// the server's. A request without it is from a client of protocol 0.
+pub const VERSION_HEADER: &str = "X-Ctx-Protocol";
+
+/// The oldest client protocol that works a window a page at a time. An older client is answered
+/// `409` on [`PAGE_ROUTE`], and on a move of the marker ([`MARKER_ROUTE`]) that would pass a
+/// window with pages left: by that move it means to pass the whole window.
+pub const PAGED_SINCE: u32 = 1;
+
+/// The route that answers how the server is and which protocol version it speaks.
+pub const HEALTH_ROUTE: &str = "/healthz";
+
 /// The route that runs one allowlisted read command.
 pub const COMMAND_ROUTE: &str = "/v1/command";
 /// The route that writes one record.

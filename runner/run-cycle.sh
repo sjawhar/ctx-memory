@@ -19,7 +19,8 @@
 # `ctx record put -- <path> -` with the record, or `ctx record put --batch -` with several, on
 # standard input), --no-lsp starts no language server, and omp keeps no shell snapshot, because
 # the directory it would write one to is root's. Before it starts, this script waits for the
-# server to answer a read quickly, and checks that ctx-agent can read the windows and write its
+# server to answer a read quickly, checks that the server and its own ctx speak one protocol
+# version (check_protocol), and checks that ctx-agent can read the windows and write its
 # own transcript directory but nothing else on the share, nor anything in its home or working
 # directory (where omp reads its configuration, the shell its startup files, and omp and ctx
 # discover the tools and servers they start), omp's plugin directory and native module, or that
@@ -41,7 +42,10 @@
 # must also end with its completion line and leave the marker and its page where they were.
 # Anything else is non-zero, with a `run-cycle:` line that says why, a session its time limit
 # stopped among them, which the pinned omp itself can report as a success (judge_session), and a
-# cycle that skipped windows or pages, which it reports as one too (check_skipped_windows).
+# cycle that skipped windows or pages, which it reports as one too (check_skipped_windows). 75
+# is a cycle or a pass that started no session because the server and this runner's ctx speak
+# different protocol versions, as between the server's roll and the runner's; nothing else this
+# script decides exits with it.
 #
 # While a session runs, the job log gets one short line of JSON for each tool call and one for each
 # model turn, written as each ends (summarize_events; docs/deployment.md, "What the job log
@@ -300,6 +304,44 @@ wait_for_server() {
 
 wait_for_server ||
 	refuse "the server at $CTX_SERVER did not answer a read within ${SERVER_PROBE_SECONDS}s in ${SERVER_READY_SECONDS}s of trying"
+
+# The server and this image's ctx each speak one protocol version (src/protocol.rs), which a
+# release bumps only when it changes a route or what one means. A deployment that rolls the server
+# and this runner one after the other has, between the two, a server and a ctx that speak
+# different ones, and a session started then fails partway through its writes. So once the server
+# answers, the cycle asks `ctx protocol` for both versions, and on a mismatch starts no session: it
+# logs one `run-cycle:` line naming both and exits PROTOCOL_MISMATCH, 75 (EX_TEMPFAIL, "try
+# again later"), which nothing else this script decides exits with, so the deployment can tell a
+# stop mid-roll from a failure. The next cycle asks again. A server older than the version header
+# names none, which `ctx protocol` reports as protocol 0. A maintenance pass asks too: its session
+# writes through the same routes.
+PROTOCOL_MISMATCH=75
+
+# Stops the cycle, before any session, unless the server and this runner's ctx speak one protocol
+# version. A `ctx protocol` that fails stops it with its own status, as a failed read does.
+check_protocol() {
+	if versions="$(ctx protocol --json)"; then
+		:
+	else
+		versions_status=$?
+		printf '%s\n' "$versions" >&2
+		echo "run-cycle: ctx protocol failed (exit $versions_status)" >&2
+		exit "$versions_status"
+	fi
+	client="$(printf '%s' "$versions" | jq -r '.data.client | numbers')" || client=
+	server="$(printf '%s' "$versions" | jq -r '.data.server | numbers')" || server=
+	if [ -z "$client" ] || [ -z "$server" ]; then
+		printf '%s\n' "$versions" >&2
+		refuse "ctx protocol did not name both protocol versions"
+	fi
+	if [ "$client" != "$server" ]; then
+		echo "run-cycle: the server at $CTX_SERVER speaks protocol $server and this runner's ctx speaks protocol $client; starting no session until both run one release (exit $PROTOCOL_MISMATCH)" >&2
+		exit "$PROTOCOL_MISMATCH"
+	fi
+	echo "run-cycle: the server and this runner's ctx both speak protocol $client"
+}
+
+check_protocol
 
 # A cycle handles the pending windows, and exits 0 when there are none. A maintenance pass handles
 # no window, so it does not ask. The cap is passed here too, so this read is the size the session's

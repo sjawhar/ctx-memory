@@ -214,6 +214,114 @@ fn a_session_the_header_cannot_carry_is_not_sent_and_the_caller_is_told() -> Res
     Ok(())
 }
 
+/// The protocol version this release's client speaks, pinned as the wire carries it, so a
+/// release that changes it changes these tests too.
+const PROTOCOL: &str = "1";
+
+/// Every request names the protocol version the client speaks in `X-Ctx-Protocol`, so a server
+/// can refuse a route whose meaning changed since that version rather than misread it: a read, a
+/// write, and the client's own ask for the server's version.
+#[test]
+fn every_request_names_the_client_s_protocol_version() -> Result<()> {
+    let marker = json!({
+        "marker": {
+            "version": 1,
+            "window": "20260102T000000Z-0000",
+            "advanced_at": "2026-01-02T01:00:00Z",
+            "by": "ada@example.com (s)"
+        }
+    });
+    let server = FakeHttp::start()?;
+    server.json("/v1/command", 200, &answered())?;
+    server.json("/v1/marker/advance", 200, &marker.to_string())?;
+    server.json_with_headers(
+        "/healthz",
+        200,
+        &[("X-Ctx-Protocol", PROTOCOL)],
+        &json!({ "ok": true }).to_string(),
+    )?;
+    let origin = server.url("");
+    let environment = [("CTX_SERVER", origin.as_str())];
+    let ran = [
+        search(&environment)?,
+        run_client(
+            &["marker", "advance", "20260102T000000Z-0000"],
+            None,
+            &environment,
+        )?,
+        run_client(&["protocol"], None, &environment)?,
+    ];
+
+    for client in &ran {
+        assert_eq!(client.exit_code, 0, "{}{}", client.stdout, client.stderr);
+    }
+    let sent: Vec<(String, Option<String>)> = server
+        .requests()?
+        .into_iter()
+        .map(|request| (request.path, request.headers.get("x-ctx-protocol").cloned()))
+        .collect();
+    let expected: Vec<(String, Option<String>)> = ["/v1/command", "/v1/marker/advance", "/healthz"]
+        .iter()
+        .map(|path| ((*path).to_owned(), Some(PROTOCOL.to_owned())))
+        .collect();
+    assert_eq!(sent, expected);
+    Ok(())
+}
+
+/// `ctx protocol` says which protocol version this client speaks and which one its server names
+/// in `X-Ctx-Protocol` on `/healthz`, whatever the probe's status: a wedged copy still speaks
+/// one. A server older than that header names none, which is protocol 0. An answer that names
+/// none and is not a success is not taken for such a server, since a proxy or a load balancer
+/// answers like that in the server's place: the command fails and names the status. With no
+/// server configured, only the client's version is known.
+#[test]
+fn ctx_protocol_reports_the_client_s_and_the_server_s_versions() -> Result<()> {
+    let reported = |headers: &[(&str, &str)], status: u16| -> Result<Local> {
+        let server = FakeHttp::start()?;
+        let body = json!({ "ok": status == 200 }).to_string();
+        server.json_with_headers("/healthz", status, headers, &body)?;
+        run_client(
+            &["--json", "protocol"],
+            None,
+            &[("CTX_SERVER", &server.url(""))],
+        )
+    };
+    let newer = reported(&[("X-Ctx-Protocol", "7")], 200)?;
+    let wedged = reported(&[("X-Ctx-Protocol", "7")], 503)?;
+    let older = reported(&[], 200)?;
+    let proxy = reported(&[], 403)?;
+    let alone = run_client(&["--json", "protocol"], None, &[])?;
+
+    for (what, client, server) in [
+        ("a newer server", &newer, json!(7)),
+        ("a wedged server", &wedged, json!(7)),
+        ("a server older than the header", &older, json!(0)),
+        ("no server", &alone, serde_json::Value::Null),
+    ] {
+        assert_eq!(
+            client.exit_code, 0,
+            "{what}: {}{}",
+            client.stdout, client.stderr
+        );
+        let envelope: serde_json::Value = serde_json::from_str(client.stdout.trim())
+            .with_context(|| format!("{what}: decoding {}", client.stdout))?;
+        assert_eq!(
+            envelope.get("data"),
+            Some(&json!({ "client": 1, "server": server })),
+            "{what}: {}",
+            client.stdout
+        );
+    }
+    assert_ne!(proxy.exit_code, 0, "{}", proxy.stdout);
+    assert!(
+        format!("{}{}", proxy.stdout, proxy.stderr).contains("403"),
+        "the failure does not name the status: {}{}",
+        proxy.stdout,
+        proxy.stderr
+    );
+    Ok(())
+}
+
 /// A token says which server it is for, and the server that receives one minted for another
 /// could call that one as the caller. So a `CTX_SERVER_AUDIENCE` that names another server is
 /// refused before a token is minted or a request is sent.
