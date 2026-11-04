@@ -16,7 +16,7 @@ use crate::support;
 use crate::support::{fetch_window, fixture_clone, remote_of, remove_fixture};
 
 /// A `ctx serve` whose standard error goes to a file, as Cloud Logging collects it.
-struct Logged {
+pub(super) struct Logged {
     child: std::process::Child,
     tailnet: SocketAddr,
     client: reqwest::blocking::Client,
@@ -25,7 +25,7 @@ struct Logged {
 }
 
 impl Logged {
-    fn start(tree: &Path, extra: &[&str], log: &Path) -> Result<Self> {
+    pub(super) fn start(tree: &Path, extra: &[&str], log: &Path) -> Result<Self> {
         let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
         let mut command = support::binary();
         command
@@ -116,6 +116,24 @@ impl Logged {
     fn post_reply(&self, user: Option<&str>, path: &str, body: &Value) -> Result<(u16, Value)> {
         let response = self.send(user, path, body)?;
         Ok((response.status().as_u16(), response.json()?))
+    }
+
+    /// Posts as [`Logged::post`] does, and returns the status, the `Retry-After` header when
+    /// the answer has one, and the answer.
+    pub(super) fn post_answer(
+        &self,
+        user: Option<&str>,
+        path: &str,
+        body: &Value,
+    ) -> Result<(u16, Option<String>, Value)> {
+        let response = self.send(user, path, body)?;
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()?;
+        Ok((status, retry_after, response.json()?))
     }
 
     fn send(

@@ -9,5 +9,6 @@ mod clone_and_follow;
 mod fixtures;
 mod lease_and_shutdown;
 mod logging;
+mod remote_failure;
 mod requests;
 mod validation;
