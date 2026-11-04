@@ -652,6 +652,9 @@ impl Repo {
     /// - a remote that carries a commit this branch does not moved on: [`Push::Rejected`], and
     ///   the caller rebases and pushes again;
     /// - a remote that could not be asked: [`Push::Unknown`];
+    /// - a remote that does not hold `HEAD`, after a push that failed on its side
+    ///   (`git::push_failure` reads that from what git printed): [`Push::RemoteFailed`], and the
+    ///   same push may land when it is made again;
     /// - anything else did not take the push, and is an error.
     ///
     /// A caller is never told a published write failed.
@@ -668,16 +671,23 @@ impl Repo {
         }
         let branch = self.branch()?;
         let refspec = format!("HEAD:{branch}");
-        let failed = match self.call_remote(&["push", "origin", &refspec], &[]) {
-            Ok(output) if output.success() => return Ok(Push::Pushed),
-            Ok(output) => anyhow!("git push failed: {}", self.said(output.stderr.as_bytes())),
-            Err(stopped) => stopped,
-        };
-        self.settle(&branch, failed)
+        // git words its failures, and the C library its connection errors, in English only
+        // under the C locale, and `push_failure` reads those words.
+        let (failed, remote_side) =
+            match self.call_remote(&["push", "origin", &refspec], &[("LC_ALL", "C")]) {
+                Ok(output) if output.success() => return Ok(Push::Pushed),
+                Ok(output) => (
+                    anyhow!("git push failed: {}", self.said(output.stderr.as_bytes())),
+                    push_failure::on_the_remotes_side(output.code, &output.stderr),
+                ),
+                Err(stopped) => (stopped, false),
+            };
+        self.settle(&branch, failed, remote_side)
     }
 
-    /// What a push that did not end cleanly did, as the remote now says.
-    fn settle(&self, branch: &str, failed: anyhow::Error) -> Result<Push> {
+    /// What a push that did not end cleanly did, as the remote now says. `remote_side` is
+    /// whether git said the push failed on the remote's side.
+    fn settle(&self, branch: &str, failed: anyhow::Error, remote_side: bool) -> Result<Push> {
         if let Err(unread) = self.fetch() {
             return Ok(Push::Unknown(format!(
                 "{failed:#}, and the fetch that would show whether it landed failed too: \
@@ -701,7 +711,11 @@ impl Repo {
         if carried && !self.is_ancestor(&remote, "HEAD") {
             return Ok(Push::Rejected(format!("{failed:#}")));
         }
-        Err(failed.context("the remote does not hold the commit"))
+        let failed = failed.context("the remote does not hold the commit");
+        if remote_side {
+            return Ok(Push::RemoteFailed(format!("{failed:#}")));
+        }
+        Err(failed)
     }
 
     /// What git printed, trimmed, with any credential taken out of it.
@@ -841,6 +855,9 @@ pub enum Push {
     /// The push did not end cleanly and the remote could not be asked whether it landed;
     /// why.
     Unknown(String),
+    /// The push failed on the remote's side, and the remote, asked afterwards, does not hold
+    /// the commit and has not moved on; why. The same push may land when it is made again.
+    RemoteFailed(String),
 }
 
 /// Clones `CTX_MEMORY_REMOTE` into `root` when that path holds no tree yet, and brings it up
@@ -922,6 +939,8 @@ fn clone_into(
     std::fs::write(&mark, remote).with_context(|| format!("writing {}", mark.display()))?;
     Ok(())
 }
+
+mod push_failure;
 
 #[cfg(test)]
 mod tests;

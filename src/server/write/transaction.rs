@@ -1,6 +1,7 @@
 //! The serialized write transaction and rollback protocol.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context as _, Result};
 
@@ -24,7 +25,8 @@ use super::{Applied, Change, Edit, Shared, Unheld};
 /// so once, with 400, and gains nothing by trying again; a server that could not finish a
 /// write it accepted answers 500, which a caller and a probe both read as "come back", and
 /// which no retry of the same request makes worse. A copy that lost the write lease part-way
-/// through answers 503, as one that never held it does.
+/// through answers 503, as one that never held it does. A remote that kept failing the push
+/// on its own side is waited out: 503 with `Retry-After`, which the client sends again.
 pub(super) enum ApplyError {
     /// The request cannot be applied, whatever the server's state is.
     Caller(anyhow::Error),
@@ -36,7 +38,23 @@ pub(super) enum ApplyError {
     /// nobody can say yet whether the commit landed; why. 503, not 500: the follow loop
     /// settles it.
     Unknown(String),
+    /// Every push of the write failed on the remote's side ([`PUSH_RETRIES`]), and the remote,
+    /// asked after the last, does not hold the commit; why. Nothing was published, so the
+    /// same write sent again is applied once at most.
+    RemoteFailed(String),
 }
+
+/// How many times a push that failed on the remote's side is made again within one write.
+///
+/// A remote whose backend failed for a moment takes the next push; one that is down for
+/// minutes is waited out by the client, which sends the write again after the `Retry-After`
+/// the server answers with, while the writer lock is free for other writes.
+const PUSH_RETRIES: u32 = 2;
+
+/// The pause before each push made again. The writer lock is held through it and the caller
+/// waits in its request, so it is kept short: the two add 4 seconds to a write the remote
+/// fails, against the client's 120 second request timeout.
+const PUSH_PAUSE: Duration = Duration::from_secs(2);
 
 impl From<anyhow::Error> for ApplyError {
     fn from(error: anyhow::Error) -> Self {
@@ -278,12 +296,11 @@ fn attempt(
     let message = commit_message(change, &paths, session);
     let mut commit = repo.commit(&paths, &message, &author)?;
 
-    // The lease is checked once more right before each push: another copy may take it over
-    // 30 seconds after the last check this copy passed, and a push is bounded to less than
-    // that (`git::NETWORK_TIMEOUT`), so a push that lands, lands while this copy still holds
-    // it. A failed check is undone like any other failure, before the caller is answered.
-    shared.hold_lease().map_err(ApplyError::Unheld)?;
-    if let Some(why) = publish(repo)? {
+    // The lease is checked once more right before each push (`publish`): another copy may take
+    // it over 30 seconds after the last check this copy passed, and a push is bounded to less
+    // than that (`git::NETWORK_TIMEOUT`), so a push that lands, lands while this copy still
+    // holds it. A failed check is undone like any other failure, before the caller is answered.
+    if let Some(why) = publish(shared, repo)? {
         if let Err(error) = repo.pull_rebase(&author) {
             if !repo.rebase_in_progress() {
                 // No rebase started: the pull never reached the remote, or failed before it
@@ -314,8 +331,7 @@ fn attempt(
             return Ok(Applied::Refused(findings));
         }
         commit = repo.head()?;
-        shared.hold_lease().map_err(ApplyError::Unheld)?;
-        if let Some(why) = publish(repo)? {
+        if let Some(why) = publish(shared, repo)? {
             repo.reset_to(before)?;
             *tree = Context::open(root)?;
             return Ok(Applied::Conflict(why));
@@ -347,12 +363,41 @@ fn commit_message(change: &Change, paths: &[String], session: &str) -> String {
 /// A push whose outcome nobody can tell is an error, and goes back the way every failed
 /// write does: the clone returns to where the write found it. If the commit did land, the
 /// clone's next pull takes it back, so neither answer loses it.
-fn publish(repo: &Repo) -> Result<Option<String>, ApplyError> {
-    match repo.push()? {
-        Push::Pushed => Ok(None),
-        Push::Rejected(why) => Ok(Some(why)),
-        Push::Unknown(why) => Err(ApplyError::Unknown(why)),
+///
+/// A push that failed on the remote's side, after which the remote does not hold the commit,
+/// is made again after [`PUSH_PAUSE`], at most [`PUSH_RETRIES`] times, each a line on standard
+/// error. Each is the same push of the same commit: nothing in the clone changes between them.
+/// Each asks the remote again what it holds, as every push does: a remote that took the
+/// commit after all answers the push as one it already holds, or git refuses it and
+/// [`Repo::push`] finds the commit on the remote, and either is [`Push::Pushed`].
+fn publish(shared: &Shared, repo: &Repo) -> Result<Option<String>, ApplyError> {
+    let mut retries = 0;
+    loop {
+        shared.hold_lease().map_err(ApplyError::Unheld)?;
+        match repo.push()? {
+            Push::Pushed => return Ok(None),
+            Push::Rejected(why) => return Ok(Some(why)),
+            Push::Unknown(why) => return Err(ApplyError::Unknown(why)),
+            Push::RemoteFailed(why) if retries < PUSH_RETRIES => {
+                retries += 1;
+                eprintln!("{}", retry_line(retries, &why));
+                std::thread::sleep(PUSH_PAUSE);
+            }
+            Push::RemoteFailed(why) => return Err(ApplyError::RemoteFailed(why)),
+        }
     }
+}
+
+/// The line [`publish`] prints before it makes a push again, the `retry`th time, one line as
+/// [`one_line`] makes it: `push retried (<retry> of 2, in 2 s): <why>`, where `why` says the
+/// remote does not hold the commit and what git printed. It is short ahead of `why`, so the
+/// line's 300 characters reach git's own line for the ref. It does not start `write failed:`,
+/// which an alert matches: the write may still land.
+fn retry_line(retry: u32, why: &str) -> String {
+    one_line(&format!(
+        "push retried ({retry} of {PUSH_RETRIES}, in {} s): {why}",
+        PUSH_PAUSE.as_secs()
+    ))
 }
 
 /// Writes or removes one record file, at `absolute`, which [`inside_the_tree`] returned for

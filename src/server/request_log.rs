@@ -68,12 +68,13 @@ struct Facts {
     query_chars: Option<usize>,
     exit_code: Option<u8>,
     refusals: Vec<String>,
-    /// The write was deferred by a rollout's handover: `503` with `Retry-After`, nothing wrong.
+    /// The write was deferred, by a rollout's handover or a remote that kept failing its push:
+    /// `503` with `Retry-After`, nothing wrong with this server.
     deferred: bool,
 }
 
-/// Put on an answer by a write deferred during a rollout's handover, so its line says
-/// `deferred` and files it as a warning: `503` with `Retry-After`, nothing wrong.
+/// Put on an answer by a deferred write, so its line says `deferred` and files it as a
+/// warning: `503` with `Retry-After`, nothing wrong with this server.
 #[derive(Clone, Copy, Debug)]
 pub struct Deferred;
 
@@ -130,7 +131,7 @@ impl Note {
         self.facts().refusals = kinds.into_iter().map(str::to_owned).collect();
     }
 
-    /// The write was deferred by a rollout's handover rather than failed.
+    /// The write was deferred rather than failed.
     fn deferred(&self) {
         self.facts().deferred = true;
     }

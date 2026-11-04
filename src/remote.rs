@@ -351,11 +351,14 @@ impl Client {
     /// Sends one write and reads the answer, sending it again while the server defers it.
     ///
     /// A server copy that a rollout just started answers a write `503` with `Retry-After` until
-    /// it takes the write lease over from the copy it replaces. It sends that header only from
-    /// the lease check it makes before the write has changed anything, so the write is sent
-    /// again after that pause and is applied once at most. The pauses a write waits add up to
-    /// at most [`DEFERRAL_BOUND`]: a pause that would take it past that is not waited, and the
-    /// write fails, saying why. Each try still has the client's own request timeout.
+    /// it takes the write lease over from the copy it replaces, and any copy answers so when the
+    /// remote kept failing the write's push on its own side. It sends that header only for a
+    /// write that published nothing: from the lease check it makes before the write has changed
+    /// anything, or once it has put its clone back and seen that the remote does not hold the
+    /// commit. So the write is sent again after that pause and is applied once at most. The
+    /// pauses a write waits add up to at most [`DEFERRAL_BOUND`]: a pause that would take it past
+    /// that is not waited, and the write fails, saying why. Each try still has the client's own
+    /// request timeout.
     fn answer_write(
         &self,
         path: &str,

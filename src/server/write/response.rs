@@ -81,18 +81,44 @@ pub(super) fn failure_line(route: &str, status: StatusCode, reason: &str) -> Str
     )
 }
 
-/// What every line about a write deferred by a rollout's handover starts with. It is not
-/// [`WRITE_FAILED`]: the write did not happen, but the caller is told when to ask again and
-/// nothing is wrong, so an alert on failed writes does not match it.
+/// What every line about a deferred write starts with: one deferred by a rollout's handover,
+/// or by a remote that kept failing its push. It is not [`WRITE_FAILED`]: the write did not
+/// happen, but the caller is told when to ask again and this server is not at fault, so an
+/// alert on failed writes does not match it.
 const WRITE_DEFERRED: &str = "write deferred: ";
+
+/// The seconds a caller is asked to wait, in `Retry-After`, before it sends again a write whose
+/// pushes the remote kept failing on its own side.
+///
+/// The client sends a deferred write again for up to 180 seconds of pauses in all, so it tries
+/// six more times, each with the server's own retries, across three minutes: during the
+/// outage this answers, the remote took some pushes and failed others, minutes apart.
+const REMOTE_PAUSE: u64 = 30;
 
 /// Another copy of the server still holds the write lease while this new copy takes over
 /// from it, so this copy wrote nothing. The answer is `503` with `Retry-After`, the seconds
 /// until this copy may take the lease over, and the line on standard error is
-/// `write deferred: <route> 503 <reason>`.
+/// `write deferred: <route> 503 a handover: … <reason>`.
 pub(super) fn deferred(shared: &Shared, route: &str, message: &str, pause: u64) -> Response {
+    let why = format!("a handover: this copy may take the write lease over in {pause} s");
+    defer(shared, route, &why, message, pause)
+}
+
+/// Every push of the write failed on the remote's side and the remote does not hold the
+/// commit, so nothing was published and the clone is back where the write found it. The
+/// answer is `503` with `Retry-After` of [`REMOTE_PAUSE`] seconds, and the line on standard
+/// error is `write deferred: <route> 503 the remote failed … <reason>`.
+pub(super) fn remote_failed(shared: &Shared, route: &str, message: &str) -> Response {
+    let why =
+        format!("the remote failed every push on its own side; ask again in {REMOTE_PAUSE} s");
+    defer(shared, route, &why, message, REMOTE_PAUSE)
+}
+
+/// The answer to a deferred write: `503` with `Retry-After: <pause>` and `message`, and one
+/// `write deferred:` line on standard error that says `why` and then `message`.
+fn defer(shared: &Shared, route: &str, why: &str, message: &str, pause: u64) -> Response {
     let status = StatusCode::SERVICE_UNAVAILABLE;
-    eprintln!("{}", deferred_line(route, status, message, pause));
+    eprintln!("{}", deferred_line(route, status, why, message));
     let mut response = super::command::error_response(shared, status, message);
     response
         .headers_mut()
@@ -104,13 +130,11 @@ pub(super) fn deferred(shared: &Shared, route: &str, message: &str, pause: u64) 
     response
 }
 
-/// The line [`deferred`] prints, one line as [`one_line`] makes it.
-pub(super) fn deferred_line(route: &str, status: StatusCode, reason: &str, pause: u64) -> String {
+/// The line [`defer`] prints, one line as [`one_line`] makes it.
+fn deferred_line(route: &str, status: StatusCode, why: &str, reason: &str) -> String {
     format!(
         "{WRITE_DEFERRED}{route} {} {}",
         status.as_u16(),
-        one_line(&format!(
-            "a handover: this copy may take the write lease over in {pause} s: {reason}"
-        ))
+        one_line(&format!("{why}: {reason}"))
     )
 }
