@@ -2,14 +2,14 @@
 //!
 //! Each configured calendar is one stream whose cursor is a Calendar sync token: a fetch asks
 //! for what changed since the last run, and a first fetch lists every event from the backfill
-//! window onwards. Either way it records no instance of a recurring series that starts
-//! [`HORIZON`] or more past the window end, reckoned to the second, and lists no event that far
-//! ahead by time. A record's timestamp is the event's start, so an event that starts after the
-//! window ends is a context record.
+//! window onwards. Either way it records no instance of a recurring series whose start and slot
+//! in the series both lie [`HORIZON`] or more past the window end, reckoned to the second, and
+//! lists no event that far ahead by time. A record's timestamp is the event's start, so an event
+//! that starts after the window ends is a context record.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::ops::{Bound, RangeBounds};
+use std::ops::RangeBounds;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, SubsecRound as _, TimeZone as _, Utc};
@@ -31,9 +31,10 @@ use super::{
 /// A listing expands each recurring series into its instances, and a series with no end runs for
 /// decades. Reading this far keeps a trip booked for next year and the next instance or two of a
 /// yearly series, and stops every other series here. A listing by time asks for nothing later; a
-/// sync token takes no time bounds, so from its listing only a series' instances past the horizon
-/// are dropped, and a one-off event it names, which has changed, is recorded wherever it now
-/// starts. A fetch that follows a sync token also makes the horizon listing: the events that came
+/// sync token takes no time bounds, so from its listing only a series' instances whose start and
+/// slot both lie past the horizon are dropped. A one-off event it names, which has changed, is
+/// recorded wherever it now starts, and so is an occurrence moved from a slot within reach. A
+/// fetch that follows a sync token also makes the horizon listing: the events that came
 /// within this reach since its cursor's window, which the token does not name unless they
 /// changed. So each series yields its next instance as the horizon reaches it.
 ///
@@ -238,9 +239,9 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
 }
 
 /// Reads one calendar: incrementally when the cursor names a sync token, else from the time it
-/// names or the backfill window. Either way it records no instance of a recurring series that
-/// starts at or after the horizon, [`HORIZON`] past the window end to the second; a listing by
-/// time records no event past it at all.
+/// names or the backfill window. Either way it records no instance of a recurring series whose
+/// start and slot both lie at or after the horizon, [`HORIZON`] past the window end to the second;
+/// a listing by time records no event that starts past it at all.
 fn collect_calendar<C: CalendarApi + ?Sized>(
     request: &FetchRequest,
     calendar: &str,
@@ -324,14 +325,12 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
         )
     };
     for event in &page.items {
-        // Only a recurring series runs for decades. A one-off event a sync token names has
-        // changed, so it is recorded wherever it now starts, as one moved past the horizon.
-        let kept = if named_by_token && event.get("recurringEventId").is_none() {
-            (Bound::Unbounded, Bound::Unbounded)
+        let start = if named_by_token {
+            token_named_start(event, horizon)?
         } else {
-            (Bound::Unbounded, Bound::Excluded(horizon))
+            recorded_start(event, &(..horizon))?
         };
-        if let Some(start) = recorded_start(event, &kept)? {
+        if let Some(start) = start {
             collected.records.push(record(event, start)?);
         }
     }
@@ -365,6 +364,28 @@ fn recorded_start(
     }
     let start = event_start(event)?;
     Ok(kept.contains(&start).then_some(start))
+}
+
+/// The start of `event`, which a sync token names, when it is recorded: it is not cancelled, and
+/// it starts before `horizon`, or it is a one-off event, or it is an instance of a series whose
+/// slot lies before `horizon`.
+///
+/// Only a recurring series runs for decades, and a change to a series names every instance it
+/// expands. An instance's slot, its start by the series' recurrence (`originalStartTime`), does
+/// not move when the instance does, so keeping the slots before the horizon still stops a series
+/// there, while an occurrence moved from one of them is recorded wherever it now starts, as a
+/// changed one-off event is: the record the tree holds for it follows the move.
+fn token_named_start(event: &Value, horizon: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+    let Some(start) = recorded_start(event, &..)? else {
+        return Ok(None);
+    };
+    if start < horizon || event.get("recurringEventId").is_none() {
+        return Ok(Some(start));
+    }
+    let Some(slot) = event.get("originalStartTime") else {
+        return Ok(None);
+    };
+    Ok((event_time(slot, "originalStartTime")? < horizon).then_some(start))
 }
 
 fn event_id(event: &Value) -> Option<&str> {
@@ -536,20 +557,25 @@ fn event_start(event: &Value) -> Result<DateTime<Utc>> {
     let start = event
         .get("start")
         .ok_or_else(|| anyhow!("Calendar event is missing start"))?;
-    if let Some(value) = start.get("dateTime").and_then(Value::as_str) {
+    event_time(start, "start")
+}
+
+/// The time `field` of an event gives, such as its `start`: its time, or midnight UTC for a date.
+fn event_time(time: &Value, field: &str) -> Result<DateTime<Utc>> {
+    if let Some(value) = time.get("dateTime").and_then(Value::as_str) {
         return DateTime::parse_from_rfc3339(value)
             .map(|timestamp| timestamp.with_timezone(&Utc))
-            .with_context(|| format!("parsing Calendar event start {value:?}"));
+            .with_context(|| format!("parsing Calendar event {field} {value:?}"));
     }
-    let value = start
+    let value = time
         .get("date")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Calendar event start has neither dateTime nor date"))?;
+        .ok_or_else(|| anyhow!("Calendar event {field} has neither dateTime nor date"))?;
     let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .with_context(|| format!("parsing Calendar event date {value:?}"))?;
+        .with_context(|| format!("parsing Calendar event {field} date {value:?}"))?;
     let midnight = date
         .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| anyhow!("Calendar event date {value:?} has no midnight"))?;
+        .ok_or_else(|| anyhow!("Calendar event {field} date {value:?} has no midnight"))?;
     Ok(Utc.from_utc_datetime(&midnight))
 }
 
