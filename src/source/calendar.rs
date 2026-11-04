@@ -620,6 +620,8 @@ fn event_end(event: &Value) -> Option<String> {
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::json;
 
@@ -687,6 +689,17 @@ mod tests {
         event
     }
 
+    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    /// A state directory of its own, as each tree's source has.
+    fn scratch() -> Result<PathBuf> {
+        let suffix = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ctx-calendar-{}-{suffix}", std::process::id()));
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        Ok(dir)
+    }
+
     fn request(cursor: Option<&str>) -> Result<FetchRequest> {
         let mut cursors = BTreeMap::new();
         if let Some(cursor) = cursor {
@@ -704,8 +717,38 @@ mod tests {
             backfill_hours: 24,
             cursors,
             discovered: Vec::new(),
-            state_dir: std::env::temp_dir(),
+            state_dir: scratch()?,
             exclude: Vec::new(),
+        })
+    }
+
+    /// A request for the fetch after the one whose state is in `state_dir`, as the fetches of one
+    /// tree share it.
+    fn request_after(cursor: &str, state_dir: &Path) -> Result<FetchRequest> {
+        let mut request = request(Some(cursor))?;
+        request.state_dir = state_dir.to_owned();
+        Ok(request)
+    }
+
+    fn warnings(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Warning { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ended_with_error(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::StreamEnd {
+                    status: StreamStatus::Error,
+                    ..
+                }
+            )
         })
     }
 
@@ -1762,6 +1805,287 @@ mod tests {
             )),
             "{messages:?}"
         );
+        Ok(())
+    }
+
+    /// Runs a first fetch over `items`, with no cursor, and returns its state directory and the
+    /// cursor it proposed.
+    fn first_fetch(items: Vec<Value>) -> Result<(PathBuf, String, Vec<Record>)> {
+        let api = api(vec![listing("sync-2", items)]);
+        let request = request(None)?;
+        let messages = run_fetch(&api, &request)?;
+        let cursor = cursor(&messages).context("the first fetch moved on")?;
+        Ok((request.state_dir, cursor, records(&messages)))
+    }
+
+    #[test]
+    fn an_event_recorded_and_then_named_cancelled_is_recorded_cancelled() -> Result<()> {
+        let (state_dir, first_cursor, first) = first_fetch(vec![meeting()])?;
+        assert_eq!(starts(&first), ["2026-10-25T09:00:00Z"]);
+
+        // Google names a deleted event by its id and status alone.
+        let cancelled = json!({"id": "EVENT-EXAMPLE", "status": "cancelled"});
+        let api = api(vec![listing("sync-3", vec![cancelled])]);
+        let messages = run_fetch(&api, &request_after(&first_cursor, &state_dir)?)?;
+
+        let records = records(&messages);
+        assert_eq!(pointers(&records), ["gcal:team@example.com/EVENT-EXAMPLE"]);
+        // The record replaces the one the store holds, at the start that one has.
+        assert_eq!(starts(&records), ["2026-10-25T09:00:00Z"]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.text == "[event cancelled]" && !record.context),
+            "{records:?}"
+        );
+        assert_eq!(
+            cursor(&messages),
+            Some("sync-3@2026-10-25T18:00:00Z".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_occurrence_recorded_and_then_named_cancelled_is_recorded_cancelled() -> Result<()> {
+        let slot = "2027-06-14T08:00:00Z";
+        let (state_dir, first_cursor, first) = first_fetch(vec![occurrence(
+            event("EVENT-SERIES_20270614", slot, "2027-06-14T09:00:00Z", None),
+            slot,
+        )])?;
+        assert_eq!(starts(&first), [slot]);
+
+        // Google sends a cancelled instance with its id, status, series and slot, and no start.
+        let cancelled = json!({
+            "id": "EVENT-SERIES_20270614",
+            "status": "cancelled",
+            "recurringEventId": "SERIES-EXAMPLE",
+            "originalStartTime": {"dateTime": slot}
+        });
+        let api = api(vec![listing("sync-3", vec![cancelled])]);
+        let messages = run_fetch(&api, &request_after(&first_cursor, &state_dir)?)?;
+
+        let records = records(&messages);
+        assert_eq!(
+            pointers(&records),
+            ["gcal:team@example.com/EVENT-SERIES_20270614"]
+        );
+        assert_eq!(starts(&records), [slot]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.text == "[event cancelled]" && record.context),
+            "{records:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_event_never_recorded_and_cancelled_produces_nothing() -> Result<()> {
+        let (state_dir, first_cursor, _) = first_fetch(vec![meeting()])?;
+
+        let cancelled = json!({"id": "EVENT-NEVER-STORED", "status": "cancelled"});
+        let api = api(vec![listing("sync-3", vec![cancelled])]);
+        let messages = run_fetch(&api, &request_after(&first_cursor, &state_dir)?)?;
+
+        assert!(records(&messages).is_empty(), "{messages:?}");
+        assert!(warnings(&messages).is_empty(), "{messages:?}");
+        assert_eq!(
+            cursor(&messages),
+            Some("sync-3@2026-10-25T18:00:00Z".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_occurrence_moved_within_the_horizon_from_a_slot_past_it_follows_its_next_move(
+    ) -> Result<()> {
+        // Its slot, in 2030, is past the horizon, 2027-11-29T18:00:00Z; it moved to next July.
+        let slot = "2030-06-14T08:00:00Z";
+        let (state_dir, first_cursor, first) = first_fetch(vec![occurrence(
+            event(
+                "EVENT-SERIES_20300614",
+                "2027-07-01T08:00:00Z",
+                "2027-07-01T09:00:00Z",
+                None,
+            ),
+            slot,
+        )])?;
+        assert_eq!(starts(&first), ["2027-07-01T08:00:00Z"]);
+
+        // Then it moves past the horizon: neither its start nor its slot is within it.
+        let moved = occurrence(
+            event(
+                "EVENT-SERIES_20300614",
+                "2029-01-22T09:00:00Z",
+                "2029-01-22T10:00:00Z",
+                None,
+            ),
+            slot,
+        );
+        let api = api(vec![listing("sync-3", vec![moved])]);
+        let messages = run_fetch(&api, &request_after(&first_cursor, &state_dir)?)?;
+
+        assert_eq!(starts(&records(&messages)), ["2029-01-22T09:00:00Z"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_occurrence_moved_past_the_nearer_horizon_of_an_older_window_end_follows_it(
+    ) -> Result<()> {
+        // Inside this fetch's horizon, 2027-11-29T18:00:00Z.
+        let slot = "2027-11-28T12:00:00Z";
+        let (state_dir, first_cursor, first) = first_fetch(vec![occurrence(
+            event("EVENT-SERIES_20271128", slot, "2027-11-28T13:00:00Z", None),
+            slot,
+        )])?;
+        assert_eq!(starts(&first), [slot]);
+
+        // A fetch given an older window end has a nearer horizon, 2027-11-27T18:00:00Z, past
+        // which the slot lies.
+        let moved = occurrence(
+            event(
+                "EVENT-SERIES_20271128",
+                "2029-01-22T09:00:00Z",
+                "2029-01-22T10:00:00Z",
+                None,
+            ),
+            slot,
+        );
+        let api = api(vec![listing("sync-3", vec![moved])]);
+        let mut older = request_after(&first_cursor, &state_dir)?;
+        older.window_end = at("2026-10-23T18:00:00Z")?;
+        let messages = run_fetch(&api, &older)?;
+
+        assert_eq!(api.calls.borrow().len(), 1);
+        assert_eq!(starts(&records(&messages)), ["2029-01-22T09:00:00Z"]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_event_that_started_more_than_the_horizon_ago_is_forgotten() -> Result<()> {
+        let old = event(
+            "EVENT-OLD",
+            "2025-10-01T09:00:00Z",
+            "2025-10-01T10:00:00Z",
+            None,
+        );
+        let (state_dir, first_cursor, first) = first_fetch(vec![old, meeting()])?;
+        assert_eq!(first.len(), 2);
+        let list = std::fs::read_to_string(state_dir.join("emitted.json"))?;
+        assert!(list.contains("EVENT-OLD"), "{list}");
+
+        // 400 days before this window's end is 2025-10-26T18:00:00Z, after the old event started.
+        let cancelled = json!({"id": "EVENT-OLD", "status": "cancelled"});
+        let api = api(vec![
+            listing("sync-3", vec![cancelled]),
+            listing("listing-token", Vec::new()),
+        ]);
+        let mut later = request_after(&first_cursor, &state_dir)?;
+        later.window_end = at("2026-11-30T18:00:00Z")?;
+        let messages = run_fetch(&api, &later)?;
+
+        assert!(records(&messages).is_empty(), "{messages:?}");
+        let list = std::fs::read_to_string(state_dir.join("emitted.json"))?;
+        assert!(!list.contains("EVENT-OLD"), "{list}");
+        assert!(list.contains("EVENT-EXAMPLE"), "{list}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_list_of_emitted_events_holds_only_the_series_instances_recorded() -> Result<()> {
+        let api = api(vec![listing(
+            "sync-2",
+            (2026..=2056).map(birthday).collect(),
+        )]);
+        let request = request(None)?;
+        run_fetch(&api, &request)?;
+
+        let list = std::fs::read_to_string(request.state_dir.join("emitted.json"))?;
+        assert!(list.contains("BIRTHDAY-EXAMPLE_20271103"), "{list}");
+        assert!(!list.contains("BIRTHDAY-EXAMPLE_20281103"), "{list}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_corrupt_list_of_emitted_events_falls_back_to_the_slot_with_a_warning() -> Result<()> {
+        let (state_dir, first_cursor, _) = first_fetch(vec![meeting()])?;
+        std::fs::write(state_dir.join("emitted.json"), b"{not json")?;
+
+        let slot = "2027-06-14T08:00:00Z";
+        let moved = occurrence(
+            event(
+                "EVENT-SERIES_20270614",
+                "2029-01-22T09:00:00Z",
+                "2029-01-22T10:00:00Z",
+                None,
+            ),
+            slot,
+        );
+        let cancelled = json!({"id": "EVENT-EXAMPLE", "status": "cancelled"});
+        let api = api(vec![listing("sync-3", vec![cancelled, moved])]);
+        let messages = run_fetch(&api, &request_after(&first_cursor, &state_dir)?)?;
+
+        // The list is lost, so the cancellation of the stored meeting is not recorded, and the
+        // move is followed by its slot.
+        assert_eq!(
+            pointers(&records(&messages)),
+            ["gcal:team@example.com/EVENT-SERIES_20270614"]
+        );
+        assert!(
+            warnings(&messages)
+                .iter()
+                .any(|warning| warning.contains("emitted.json")),
+            "{messages:?}"
+        );
+        assert!(!ended_with_error(&messages), "{messages:?}");
+        assert_eq!(
+            cursor(&messages),
+            Some("sync-3@2026-10-25T18:00:00Z".to_owned())
+        );
+        let list = std::fs::read_to_string(state_dir.join("emitted.json"))?;
+        assert!(list.contains("EVENT-SERIES_20270614"), "{list}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_calendar_with_a_cursor_and_no_list_of_emitted_events_warns_once() -> Result<()> {
+        // An earlier build kept no list, so a calendar with a cursor has records it does not know.
+        let first_api = api(vec![listing("sync-3", Vec::new())]);
+        let first = request(Some("sync-2@2026-10-25T18:00:00Z"))?;
+        let first_messages = run_fetch(&first_api, &first)?;
+        assert!(
+            warnings(&first_messages)
+                .iter()
+                .any(|warning| warning.contains("emitted.json")),
+            "{first_messages:?}"
+        );
+        assert!(!ended_with_error(&first_messages), "{first_messages:?}");
+        let first_cursor = cursor(&first_messages).context("the first fetch moved on")?;
+
+        let second_api = api(vec![listing("sync-4", Vec::new())]);
+        let messages = run_fetch(
+            &second_api,
+            &request_after(&first_cursor, &first.state_dir)?,
+        )?;
+        assert!(warnings(&messages).is_empty(), "{messages:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_list_of_emitted_events_that_cannot_be_saved_leaves_the_cursor_alone() -> Result<()> {
+        let mut request = request(Some("sync-2@2026-10-25T18:00:00Z"))?;
+        // The state directory is a file, so nothing can be saved under it.
+        let blocked = request.state_dir.join("blocked");
+        std::fs::write(&blocked, b"")?;
+        request.state_dir = blocked;
+        let api = api(vec![listing("sync-3", vec![meeting()])]);
+        let messages = run_fetch(&api, &request)?;
+
+        // Stored without its entry in the list, the meeting's cancellation would later be lost,
+        // so the stream stores nothing and the next fetch reads the same changes again.
+        assert!(records(&messages).is_empty(), "{messages:?}");
+        assert_eq!(cursor(&messages), None);
+        assert!(ended_with_error(&messages), "{messages:?}");
         Ok(())
     }
 }

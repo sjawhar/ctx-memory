@@ -237,6 +237,90 @@ fn a_stored_occurrence_moved_past_the_horizon_resolves_at_its_new_start() -> Res
     Ok(())
 }
 
+/// Through the `ctx` binary: a fetch stores a meeting; the next fetch's sync token names it
+/// cancelled, as Google names a deleted event, by its id and status alone. `ctx resolve` then
+/// serves the meeting as cancelled.
+#[test]
+fn a_stored_event_named_cancelled_resolves_as_cancelled() -> Result<()> {
+    let root = scratch("calendar-cancelled")?;
+    let tree = root.join("tree");
+    std::fs::create_dir(&tree).with_context(|| format!("creating {}", tree.display()))?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"calendar\"\nkind = \"calendar\"\ncalendars = [\"primary\"]\n",
+    )?;
+    let server = FakeGoogle::start(vec![
+        (
+            "syncToken=sync-2",
+            json!({
+                "items": [{"id": "EVENT-MEETING", "status": "cancelled"}],
+                "nextSyncToken": "sync-3"
+            }),
+        ),
+        (
+            "/calendar/v3/calendars/primary/events",
+            json!({
+                "items": [{
+                    "id": "EVENT-MEETING",
+                    "summary": "Planning",
+                    "start": {"dateTime": "2026-10-25T09:00:00Z"},
+                    "end": {"dateTime": "2026-10-25T10:00:00Z"}
+                }],
+                "nextSyncToken": "sync-2"
+            }),
+        ),
+    ])?;
+    let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
+    let ctx = |arguments: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ctx"))
+            .args(["--json", "--memory", tree_text])
+            .args(arguments)
+            .env("CTX_STATE_DIR", root.join("state"))
+            .env("CTX_DATA_DIR", root.join("data"))
+            .env("CTX_GOOGLE_API_BASE", server.base())
+            .env("CTX_CREDENTIAL_GOOGLE", "ya29.calendar-test")
+            .env_remove("CTX_SERVER")
+            .output()
+            .with_context(|| format!("running ctx {}", arguments.join(" ")))
+    };
+
+    let first = ctx(&["fetch", "--window-end", "2026-10-25T18:00:00Z"])?;
+    let before = ctx(&["resolve", "gcal:primary/EVENT-MEETING"])?;
+    let second = ctx(&["fetch", "--window-end", "2026-10-25T19:00:00Z"])?;
+    let after = ctx(&["resolve", "gcal:primary/EVENT-MEETING"])?;
+    let list = std::fs::read_to_string(root.join("data/sources/calendar/emitted.json"));
+    remove_scratch(&root)?;
+
+    for (name, output) in [
+        ("first fetch", &first),
+        ("resolve before", &before),
+        ("second fetch", &second),
+        ("resolve after", &after),
+    ] {
+        assert!(
+            output.status.success(),
+            "{name}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let text = |output: &std::process::Output| -> Result<String> {
+        let response: Value = serde_json::from_slice(&output.stdout)?;
+        response
+            .pointer("/data/results/0/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("resolve returned text: {response}"))
+    };
+    let before = text(&before)?;
+    assert!(!before.contains("[event cancelled]"), "{before}");
+    let after = text(&after)?;
+    assert!(after.contains("[event cancelled]"), "{after}");
+    let list = list?;
+    assert!(list.contains("EVENT-MEETING"), "{list}");
+    Ok(())
+}
+
 #[test]
 fn a_google_fetch_saves_the_cursor_each_api_gave_it() -> Result<()> {
     let _environment = environment_lock();
