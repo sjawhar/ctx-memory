@@ -11,8 +11,8 @@ use crate::fixtures::{
 use crate::logging::Logged;
 use crate::support::{fetch_window, fixture_clone, git, remote_of, remove_fixture};
 
-/// What the line the server prints for each push it tries again starts with.
-const RETRIED: &str = "push retried: ";
+/// What the line the server prints for each push it makes again starts with.
+const RETRIED: &str = "push retried (";
 
 /// The lines of `logged` that start with `prefix`.
 fn lines_starting<'log>(logged: &'log str, prefix: &str) -> Vec<&'log str> {
@@ -72,7 +72,9 @@ fn a_push_the_remote_fails_once_is_tried_again_and_lands_once() -> Result<()> {
     let retries = lines_starting(&logged, RETRIED);
     assert_eq!(retries.len(), 1, "one retry, one line: {logged}");
     assert!(
-        retries[0].contains("(failure)"),
+        retries
+            .first()
+            .is_some_and(|line| line.contains("(failure)")),
         "the retry line does not say what the remote said: {logged}"
     );
     assert!(
