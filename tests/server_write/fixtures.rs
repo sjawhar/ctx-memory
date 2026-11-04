@@ -55,7 +55,6 @@ pub(super) fn refuse_every_push(bare: &Path) -> Result<()> {
 ///   own, as a hosting service's backend refused pushes during an outage. git prints
 ///   `remote: fatal error in commit_refs` and ` ! [remote rejected] HEAD -> main (failure)`.
 /// - `land-and-fail`: `main` moves to the pushed commit, and the push is refused all the same.
-/// - `slow-fail`: as `fail`, after 11 seconds.
 /// - a push past the last line lands.
 ///
 /// Each push the hook answers appends the commit it was asked to put on `main` to `pushes`
@@ -83,8 +82,7 @@ printf '%s' "$commands" | while read -r old new ref; do
   mv "$GIT_DIR/outcomes.next" "$GIT_DIR/outcomes"
   echo "$new" >> "$GIT_DIR/pushes"
   case "$outcome" in
-    fail|slow-fail)
-      if [ "$outcome" = slow-fail ]; then sleep 11; fi
+    fail)
       echo 'fatal error in commit_refs' >&2
       write_pkt "ng $ref failure" ;;
     land-and-fail)
@@ -120,6 +118,16 @@ pub(super) fn pushed_commits(bare: &Path) -> Result<Vec<String>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Makes every commit the server makes in `tree` take `seconds` longer, as a slow disk or a
+/// large tree would: a `post-commit` hook that sleeps.
+pub(super) fn slow_commits(tree: &Path, seconds: u32) -> Result<()> {
+    install_hook(
+        &tree.join(".git"),
+        "post-commit",
+        &format!("#!/bin/sh\nsleep {seconds}\n"),
+    )
 }
 
 /// Stages a person's merge that lands on `main` right after the server commits a write and

@@ -56,18 +56,19 @@ const PUSH_RETRIES: u32 = 2;
 /// fails, against the client's 120 second request timeout.
 const PUSH_PAUSE: Duration = Duration::from_secs(2);
 
-/// How long after its first push a write may still start a retry.
+/// How long after it began a write may still start a push made again.
 ///
-/// Each push, and the fetch after a failed one, may take up to `git::NETWORK_TIMEOUT` (25 s),
-/// so retries that each failed slowly would hold a write far past the client's 120 second
-/// request timeout, and the commit could land after the caller was told the request timed
-/// out. A retry starts only while the write's pushes have taken less than this: a remote
-/// that fails fast, as the one that refused with `(failure)` did, is retried, and one that
-/// fails slowly is deferred to the client at once. So the pushes of one publish take at most
-/// this, a pause and one more push and fetch, 10 + 2 + 50 s: with the pull before them
-/// (25 s), 87 s, inside the client's 120 s. A write that also loses a race with a merge
-/// pulls and publishes a second time, as it always has, and can take longer.
-const RETRY_WINDOW: Duration = Duration::from_secs(10);
+/// The client gives up on a request after 120 seconds, and a write its caller gave up on runs
+/// on: a retry that landed after that would publish a record whose caller was told the request
+/// timed out. Each push, and the fetch after a failed one, may take up to
+/// `git::NETWORK_TIMEOUT` (25 s), and the lease check before each push reads Cloud Storage, so
+/// a retry is not bounded by its own count. Instead a push is made again only when the write,
+/// counted from when [`apply`] took it (the wait for the tree included), has run less than
+/// this, checked right before the push, after the pause and the lease check. The last retry's
+/// push and fetch then end within 30 + 25 + 25 = 80 seconds of the write's start, inside the
+/// client's 120. A remote that fails fast, as the one that refused with `(failure)` did, is
+/// retried; a write that got there slowly is deferred to the client at once.
+const RETRY_DEADLINE: Duration = Duration::from_secs(30);
 
 impl From<anyhow::Error> for ApplyError {
     fn from(error: anyhow::Error) -> Self {
@@ -88,6 +89,7 @@ pub(super) fn apply(
     change: &Change,
     session: &str,
 ) -> Result<Applied, ApplyError> {
+    let started = Instant::now();
     // A write that carries a credential is refused before anything is written, so the
     // credential never reaches the clone's disk, let alone the graph repository. It is refused
     // before the path is read for anything else, because every other refusal quotes the path.
@@ -149,7 +151,7 @@ pub(super) fn apply(
     let before = repo.head()?;
 
     let outcome = attempt(
-        shared, &repo, &mut tree, &root, &edits, caller, change, &before, session,
+        shared, &repo, &mut tree, &root, &edits, caller, change, &before, session, started,
     );
     if outcome.is_err() {
         // A clone that cannot be put back is wedged: `/healthz` says so, and the next write or
@@ -243,6 +245,7 @@ fn attempt(
     change: &Change,
     before: &str,
     session: &str,
+    started: Instant,
 ) -> Result<Applied, ApplyError> {
     // A path through a symbolic link is refused before git is asked anything about it: git
     // will not answer for a path beyond a link.
@@ -313,7 +316,7 @@ fn attempt(
     // it over 30 seconds after the last check this copy passed, and a push is bounded to less
     // than that (`git::NETWORK_TIMEOUT`), so a push that lands, lands while this copy still
     // holds it. A failed check is undone like any other failure, before the caller is answered.
-    if let Some(why) = publish(shared, repo)? {
+    if let Some(why) = publish(shared, repo, started)? {
         if let Err(error) = repo.pull_rebase(&author) {
             if !repo.rebase_in_progress() {
                 // No rebase started: the pull never reached the remote, or failed before it
@@ -344,7 +347,7 @@ fn attempt(
             return Ok(Applied::Refused(findings));
         }
         commit = repo.head()?;
-        if let Some(why) = publish(shared, repo)? {
+        if let Some(why) = publish(shared, repo, started)? {
             repo.reset_to(before)?;
             *tree = Context::open(root)?;
             return Ok(Applied::Conflict(why));
@@ -378,26 +381,34 @@ fn commit_message(change: &Change, paths: &[String], session: &str) -> String {
 /// clone's next pull takes it back, so neither answer loses it.
 ///
 /// A push that failed on the remote's side, after which the remote does not hold the commit,
-/// is made again after [`PUSH_PAUSE`], at most [`PUSH_RETRIES`] times and only within
-/// [`RETRY_WINDOW`] of the first push, each a line on standard error. Each is the same push of
-/// the same commit: nothing in the clone changes between them. Each asks the remote again what
-/// it holds, as every push does: a remote that took the commit after all answers the push as
-/// one it already holds, or git refuses it and [`Repo::push`] finds the commit on the remote,
-/// and either is [`Push::Pushed`].
-fn publish(shared: &Shared, repo: &Repo) -> Result<Option<String>, ApplyError> {
-    let started = Instant::now();
+/// is made again after [`PUSH_PAUSE`], at most [`PUSH_RETRIES`] times and only while the write
+/// that `started` then has run less than [`RETRY_DEADLINE`], each a line on standard error.
+/// Each is the same push of the same commit: nothing in the clone changes between them. Each
+/// asks the remote again what it holds, as every push does: a remote that took the commit
+/// after all answers the push as one it already holds, or git refuses it and [`Repo::push`]
+/// finds the commit on the remote, and either is [`Push::Pushed`].
+fn publish(shared: &Shared, repo: &Repo, started: Instant) -> Result<Option<String>, ApplyError> {
     let mut retries = 0;
+    // Why the push before this one failed on the remote's side, when this one is a retry.
+    let mut failed: Option<String> = None;
     loop {
         shared.hold_lease().map_err(ApplyError::Unheld)?;
+        if let Some(why) = failed.take() {
+            // The lease check may have taken a while: the deadline is checked after it.
+            if started.elapsed() >= RETRY_DEADLINE {
+                return Err(ApplyError::RemoteFailed(why));
+            }
+            eprintln!("{}", retry_line(retries, &why));
+        }
         match repo.push()? {
             Push::Pushed => return Ok(None),
             Push::Rejected(why) => return Ok(Some(why)),
             Push::Unknown(why) => return Err(ApplyError::Unknown(why)),
             Push::RemoteFailed(why)
-                if retries < PUSH_RETRIES && started.elapsed() < RETRY_WINDOW =>
+                if retries < PUSH_RETRIES && started.elapsed() + PUSH_PAUSE < RETRY_DEADLINE =>
             {
                 retries += 1;
-                eprintln!("{}", retry_line(retries, &why));
+                failed = Some(why);
                 std::thread::sleep(PUSH_PAUSE);
             }
             Push::RemoteFailed(why) => return Err(ApplyError::RemoteFailed(why)),
@@ -405,14 +416,14 @@ fn publish(shared: &Shared, repo: &Repo) -> Result<Option<String>, ApplyError> {
     }
 }
 
-/// The line [`publish`] prints before it makes a push again, the `retry`th time, one line as
-/// [`one_line`] makes it: `push retried (<retry> of 2, in 2 s): <why>`, where `why` says the
-/// remote does not hold the commit and what git printed. It is short ahead of `why`, so the
-/// line's 300 characters reach git's own line for the ref. It does not start `write failed:`,
-/// which an alert matches: the write may still land.
+/// The line [`publish`] prints right before it makes a push again, the `retry`th time, one
+/// line as [`one_line`] makes it: `push retried (<retry> of 2, after 2 s): <why>`, where `why`
+/// says the remote does not hold the commit and what git printed for the push before. It is
+/// short ahead of `why`, so the line's 300 characters reach git's own line for the ref. It
+/// does not start `write failed:`, which an alert matches: the write may still land.
 fn retry_line(retry: u32, why: &str) -> String {
     one_line(&format!(
-        "push retried ({retry} of {PUSH_RETRIES}, in {} s): {why}",
+        "push retried ({retry} of {PUSH_RETRIES}, after {} s): {why}",
         PUSH_PAUSE.as_secs()
     ))
 }

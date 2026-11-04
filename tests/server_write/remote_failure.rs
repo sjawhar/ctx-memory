@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::fixtures::{
     fail_pushes_on_the_remotes_side, good_record, merge_before_the_servers_push, pushed_commits,
-    put_body,
+    put_body, slow_commits,
 };
 use crate::logging::Logged;
 use crate::support::{fetch_window, fixture_clone, git, remote_of, remove_fixture};
@@ -161,24 +161,26 @@ fn a_push_the_remote_keeps_failing_is_deferred_and_put_back() -> Result<()> {
     Ok(())
 }
 
-/// A push and the fetch after it may each take up to 25 seconds, and the client gives up on a
-/// request after 120. A remote that takes longer than the retry window to fail the first push
-/// is not tried again within the write, which could then land after its caller gave up: the
-/// write is deferred at once, put back, and sent again by the client.
+/// The client gives up on a request after 120 seconds, and a write it gave up on runs on. A
+/// push is made again only while the write has run less than 30 seconds, so a retry cannot
+/// land after the caller was told the request timed out: a write that reached its first push
+/// late, here behind a slow commit, is deferred at once when the remote fails it, put back,
+/// and sent again by the client.
 #[test]
-fn a_push_the_remote_fails_slowly_is_deferred_without_a_retry() -> Result<()> {
-    let tree = fixture_clone("write-remote-fails-slowly")?;
+fn a_write_past_the_retry_deadline_is_deferred_without_a_retry() -> Result<()> {
+    let tree = fixture_clone("write-remote-fails-late")?;
     fetch_window(&tree)?;
     let root = tree.parent().context("the fixture has a root")?;
     let log = root.join("serve.log");
     let bare = remote_of(&tree)?;
     let start = git(&bare, &["rev-parse", "main"])?;
-    fail_pushes_on_the_remotes_side(&bare, &["slow-fail"])?;
+    fail_pushes_on_the_remotes_side(&bare, &["fail"])?;
+    slow_commits(&tree, 31)?;
     let server = Logged::start(&tree, &["--pull-interval", "3600"], &log)?;
     let (status, retry_after, body) = server.post_answer(
         Some("ada@example.com"),
         "/v1/records/put",
-        &put_body("decisions/slow.md", &good_record(), "session-slow"),
+        &put_body("decisions/late.md", &good_record(), "session-late"),
     )?;
     drop(server);
     let logged = std::fs::read_to_string(&log)?;
@@ -188,24 +190,13 @@ fn a_push_the_remote_fails_slowly_is_deferred_without_a_retry() -> Result<()> {
     remove_fixture(&tree)?;
 
     assert_eq!(status, 503, "unexpected body: {body}");
-    assert_eq!(
-        retry_after.as_deref(),
-        Some("30"),
-        "unexpected body: {body}"
-    );
-    assert_eq!(
-        pushed.len(),
-        1,
-        "a slow failure was tried again: {pushed:?}"
-    );
+    assert_eq!(retry_after.as_deref(), Some("30"), "unexpected body: {body}");
+    assert_eq!(pushed.len(), 1, "a push past the deadline was made again: {pushed:?}");
     assert_eq!(remote_head, start, "the remote's main moved");
-    assert_eq!(
-        local_head, start,
-        "the clone is not back on the start commit"
-    );
+    assert_eq!(local_head, start, "the clone is not back on the start commit");
     assert!(
         lines_starting(&logged, RETRIED).is_empty(),
-        "a slow failure was tried again: {logged}"
+        "a push past the deadline was made again: {logged}"
     );
     assert_eq!(
         lines_starting(&logged, "write deferred: /v1/records/put 503 ").len(),
