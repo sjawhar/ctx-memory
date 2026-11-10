@@ -207,6 +207,11 @@ impl Store {
     /// same file. Opening the replay takes the share's verbatim declarations, so what a live
     /// resolve learned here survives only for a source the share does not declare.
     ///
+    /// The replay holds the records of one window at a time. What it holds therefore does not
+    /// grow with the number of windows on the share, and `tests/rebuild_bounded.rs` pins that
+    /// bound. The records live resolution kept are the one exception, and the comment beside
+    /// them gives the reason.
+    ///
     /// # Errors
     ///
     /// Returns an error when a window or resolved file cannot be read, or the replay cannot be
@@ -224,27 +229,56 @@ impl Store {
         remove_database(staging.path())?;
         {
             let store = Self::open(staging.path(), &data.sources(), &state.resolved())?;
-            let mut batches: Vec<(DateTime<Utc>, String, Vec<Record>)> = Vec::new();
+            // The replay reads the windows twice, in two orders, because the two tables it
+            // writes read back in two orders. `deliver` writes the delivered table, where the
+            // last write of a pointer wins, so the first pass keeps window order. `put_all`
+            // writes the record table, where `INSERT OR IGNORE` fixes a version's fetch time
+            // at its first write. `versions` and `get` read by that time and then by rowid,
+            // so the second pass keeps fetch order. A backfill separates the two orders. A
+            // window identifier comes from the window end, and a fetch time comes from the
+            // manifest, so `ctx fetch --window-end <past>` writes a window with an older
+            // identifier and a newer fetch time.
+            let mut order = Vec::new();
             let mut through = None;
             for window in windows::after(&data.windows(), None)? {
                 let (fetched_at, by_source) = window.records_by_source()?;
                 store.deliver(by_source.values().flatten(), &window.id)?;
                 through = Some(window.id.clone());
-                batches.extend(
-                    by_source
-                        .into_iter()
-                        .map(|(source, records)| (fetched_at, source, records)),
-                );
+                // The records of this window end here. One fetch time and one identifier stay
+                // for each window, and no number of records makes that pair larger.
+                order.push((fetched_at, window));
             }
-            for resolved in read_resolved(&state.resolved())? {
-                if let Some(verbatim) = resolved.verbatim {
-                    store.cache_source_verbatim(&resolved.source, verbatim)?;
+            order.sort_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.id.cmp(&right.1.id))
+            });
+            // `read_resolved` holds every resolved record at one time, and this replay keeps
+            // that. The resolved directory is part of the state directory. A Cloud Run
+            // execution of the fetch job starts with an empty state directory, so the
+            // workload that rebuilds reads no resolved record. The bound of this function is
+            // against the number of windows.
+            let mut resolved = read_resolved(&state.resolved())?;
+            for entry in &resolved {
+                if let Some(verbatim) = entry.verbatim {
+                    store.cache_source_verbatim(&entry.source, verbatim)?;
                 }
-                batches.push((resolved.fetched_at, resolved.source, vec![resolved.record]));
             }
-            batches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-            for (fetched_at, source, records) in batches {
-                store.put_all(&source, &records, fetched_at)?;
+            resolved.sort_by_key(|entry| entry.fetched_at);
+            let mut resolved = resolved.into_iter().peekable();
+            for (fetched_at, window) in order {
+                // A resolved record of an earlier fetch goes in first, as it would have in a
+                // store that read the fetches one at a time.
+                while let Some(entry) = resolved.next_if(|entry| entry.fetched_at < fetched_at) {
+                    store.put_all(&entry.source, &[entry.record], entry.fetched_at)?;
+                }
+                let (_, by_source) = window.records_by_source()?;
+                for (source, records) in by_source {
+                    store.put_all(&source, &records, fetched_at)?;
+                }
+            }
+            for entry in resolved {
+                store.put_all(&entry.source, &[entry.record], entry.fetched_at)?;
             }
             if let Some(through) = through {
                 // The replay read every window there is, as a fetch and as a server each
@@ -1288,6 +1322,108 @@ mod tests {
             verbatim,
             Some(true),
             "a rebuilt store restores each source's verbatim flag"
+        );
+        Ok(())
+    }
+
+    /// A backfill gives a window an older identifier and a newer fetch time. `WindowId`
+    /// reads the window end, which `ctx fetch --window-end <past>` puts in the past, and the
+    /// fetch time is the manifest's `generated_at`. The replay delivers in identifier order
+    /// and stores in fetch order, so a share with a backfill separates the two orders.
+    #[test]
+    fn rebuild_matches_incremental_across_a_backfilled_window() -> Result<()> {
+        let root = scratch("rebuild-backfill")?;
+        let data = DataDir::new(root.join("data"));
+        let state = StateDir::new(root.join("state"));
+        // The fetch of 12:00 read the window that ends at 12:00.
+        window(
+            &data,
+            "20261025T120000Z-0000",
+            at(12),
+            &[
+                record("slack:C0EXAMPLE01/1", "the first text"),
+                record("slack:C0EXAMPLE01/2", "the first text"),
+            ],
+        )?;
+        // The fetch of 13:00 backfilled the window that ends at 11:00. That window holds the
+        // older identifier and the newer fetch time.
+        window(
+            &data,
+            "20261025T110000Z-0000",
+            at(13),
+            &[
+                record("slack:C0EXAMPLE01/1", "the first text"),
+                record("slack:C0EXAMPLE01/2", "the edited text"),
+            ],
+        )?;
+        let repeated = pointer("slack:C0EXAMPLE01/1")?;
+        let edited = pointer("slack:C0EXAMPLE01/2")?;
+        // What a store answers for the two pointers: each version with the fetch that first
+        // saw it, and the text a lookup returns.
+        let answers = |store: &Store| -> Result<Vec<String>> {
+            let mut lines = Vec::new();
+            for pointer in [&repeated, &edited] {
+                for (fetched_at, record) in store.versions(pointer)? {
+                    lines.push(format!(
+                        "{pointer} {} {}",
+                        fetched_at.to_rfc3339(),
+                        record.text
+                    ));
+                }
+                let newest = store.get(pointer)?.map(|record| record.text);
+                lines.push(format!("{pointer} newest {}", newest.unwrap_or_default()));
+            }
+            Ok(lines)
+        };
+
+        // A store that read the two fetches one at a time, in the order they ran.
+        let incremental = Store::open(
+            &root.join("incremental.sqlite3"),
+            &data.sources(),
+            &state.resolved(),
+        )?;
+        incremental.put_all(
+            "slack",
+            &[
+                record("slack:C0EXAMPLE01/1", "the first text"),
+                record("slack:C0EXAMPLE01/2", "the first text"),
+            ],
+            at(12),
+        )?;
+        incremental.put_all(
+            "slack",
+            &[
+                record("slack:C0EXAMPLE01/1", "the first text"),
+                record("slack:C0EXAMPLE01/2", "the edited text"),
+            ],
+            at(13),
+        )?;
+        let expected = answers(&incremental)?;
+        drop(incremental);
+
+        let rebuilt = Store::load(&data, &state)?;
+        let found = answers(&rebuilt)?;
+        drop(rebuilt);
+        remove_scratch(&root)?;
+
+        assert_eq!(
+            expected,
+            vec![
+                format!("slack:C0EXAMPLE01/1 {} the first text", at(12).to_rfc3339()),
+                "slack:C0EXAMPLE01/1 newest the first text".to_owned(),
+                format!("slack:C0EXAMPLE01/2 {} the first text", at(12).to_rfc3339()),
+                format!(
+                    "slack:C0EXAMPLE01/2 {} the edited text",
+                    at(13).to_rfc3339()
+                ),
+                "slack:C0EXAMPLE01/2 newest the edited text".to_owned(),
+            ],
+            "the fetch of 12:00 first saw the text both windows hold, and the backfill of \
+             13:00 added the edited version"
+        );
+        assert_eq!(
+            found, expected,
+            "a rebuild of a backfilled share answers as the fetches did, one at a time"
         );
         Ok(())
     }
