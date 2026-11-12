@@ -479,7 +479,8 @@ pub enum Remote<'a> {
         window: &'a str,
         limits: crate::context_source::Limits,
     },
-    /// `protocol`: the client's own protocol version, and `GET /healthz` for the server's.
+    /// `protocol`: the client's own protocol version, and `GET /v1/protocol` for the server's,
+    /// or `GET /healthz` for a server older than that route and the version header.
     Protocol,
 }
 

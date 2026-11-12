@@ -9,7 +9,7 @@ use ctx_memory::protocol::{
     Captured, CommandRequest, Committed, DeleteRequest, Draft, Finding, MarkerRequest,
     MarkerResponse, PageRequest, PageResponse, PutBatchRequest, PutRequest, RecordFile, Refused,
     COMMAND_ROUTE, DELETE_ROUTE, HEALTH_ROUTE, MARKER_ROUTE, PAGED_SINCE, PAGE_ROUTE,
-    PUT_BATCH_ROUTE, PUT_ROUTE, VERSION, VERSION_HEADER,
+    PROTOCOL_ROUTE, PUT_BATCH_ROUTE, PUT_ROUTE, VERSION, VERSION_HEADER,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -73,6 +73,17 @@ fn the_protocol_version_and_where_it_travels_are_pinned() {
     assert_eq!(PAGED_SINCE, 1);
     assert_eq!(VERSION_HEADER, "X-Ctx-Protocol");
     assert_eq!(HEALTH_ROUTE, "/healthz");
+}
+
+/// The protocol route is newer than the version: a client of another release asks it first and
+/// reads the server's version there, so its path is pinned. It must not end in `z`: on a
+/// `run.app` URL Cloud Run's front end answers such a path itself, as it answers `/healthz`,
+/// and the server never sees the request.
+#[test]
+fn the_protocol_route_is_pinned_and_is_a_path_cloud_run_passes_on() {
+    assert_eq!(PROTOCOL_ROUTE, "/v1/protocol");
+    assert!(!PROTOCOL_ROUTE.ends_with('z'));
+    assert!(!PROTOCOL_ROUTE.starts_with("/_ah/"));
 }
 
 /// The batch route is newer than the shared module: its path and body are pinned so a client

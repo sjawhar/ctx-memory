@@ -110,40 +110,71 @@ impl Client {
         })
     }
 
-    /// The protocol version the server speaks, as its `/healthz` names it in
-    /// [`protocol::VERSION_HEADER`], whatever the probe's status: a wedged copy still speaks
-    /// one. A server older than that header names none, which is protocol 0. An answer that
-    /// names none and is not a success is not taken for such a server: a proxy or a load
-    /// balancer answers like that in the server's place.
+    /// The protocol version the server speaks, as it names it in [`protocol::VERSION_HEADER`]:
+    /// first at [`protocol::PROTOCOL_ROUTE`], whatever the status, and after a `404` there that
+    /// names none, at `/healthz`, whatever the probe's status: a wedged copy still speaks one.
+    ///
+    /// `/healthz` alone reached no server on Cloud Run, whose front end answers it on a
+    /// `run.app` URL. A server older than [`protocol::PROTOCOL_ROUTE`] answers it `404`, and
+    /// from the release that brought the header that `404` names its version, so `/healthz` is
+    /// asked only for a server older than the header. That server names none at `/healthz`
+    /// either, which is protocol 0. An answer that names none and is not a success, at the
+    /// route other than a `404` or at `/healthz`, is not taken for such a server: a proxy or a
+    /// load balancer answers like that in the server's place.
     ///
     /// # Errors
     ///
     /// Returns an error when the server cannot be reached, names a version that is not a whole
     /// number, or answers with neither a version nor a success.
     pub fn protocol(&self) -> Result<u32> {
-        let path = protocol::HEALTH_ROUTE;
+        let route = protocol::PROTOCOL_ROUTE;
+        let (status, named) = self.named_protocol(route)?;
+        if let Some(version) = named {
+            return Ok(version);
+        }
+        if status != reqwest::StatusCode::NOT_FOUND {
+            bail!(
+                "the server answered {status} to {route}, naming no protocol version; the \
+                 answer may be a proxy's"
+            );
+        }
+        let health = protocol::HEALTH_ROUTE;
+        match self.named_protocol(health)? {
+            (_, Some(version)) => Ok(version),
+            (probed, None) if probed.is_success() => Ok(0),
+            (probed, None) => bail!(
+                "the server answered {status} to {route} and {probed} to {health}, naming no \
+                 protocol version; the answers may be a proxy's"
+            ),
+        }
+    }
+
+    /// A `GET` of `path`: its status, and the protocol version its answer names in
+    /// [`protocol::VERSION_HEADER`], if any.
+    fn named_protocol(&self, path: &str) -> Result<(reqwest::StatusCode, Option<u32>)> {
         let response = self
             .get(path)
             .send()
             .with_context(|| format!("asking {}{path}", self.base))?;
         let status = response.status();
-        match response.headers().get(protocol::VERSION_HEADER) {
-            Some(value) => value
-                .to_str()
-                .ok()
-                .and_then(|text| text.trim().parse().ok())
-                .with_context(|| {
-                    format!(
-                        "the server's {} header ({status}) is not a protocol version",
-                        protocol::VERSION_HEADER
-                    )
-                }),
-            None if status.is_success() => Ok(0),
-            None => bail!(
-                "the server answered {status} to {path}, naming no protocol version; the \
-                 answer may be a proxy's"
-            ),
-        }
+        let named = response
+            .headers()
+            .get(protocol::VERSION_HEADER)
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                    .with_context(|| {
+                        format!(
+                            "the server's {} header ({status}) at {path} is not a protocol \
+                             version",
+                            protocol::VERSION_HEADER
+                        )
+                    })
+            })
+            .transpose()?;
+        Ok((status, named))
     }
 
     /// A `GET` of `path` on the server, carrying the caller's identity token and session.

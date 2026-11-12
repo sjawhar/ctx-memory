@@ -1058,6 +1058,7 @@ fn router(shared: Arc<Shared>, identity: Identity) -> Router {
     let local = matches!(identity, Identity::Local(_));
     let routes = Router::new()
         .route(protocol::HEALTH_ROUTE, get(command::healthz))
+        .route(protocol::PROTOCOL_ROUTE, get(command::protocol_version))
         .route(protocol::COMMAND_ROUTE, post(command::command))
         .route(protocol::PUT_ROUTE, post(write::put))
         .route(protocol::PUT_BATCH_ROUTE, post(write::put_batch))

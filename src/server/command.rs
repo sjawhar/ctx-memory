@@ -287,6 +287,14 @@ pub async fn healthz(State(listener): State<Listener>) -> Response {
     }
 }
 
+/// Answers `GET /v1/protocol` ([`protocol::PROTOCOL_ROUTE`]): the protocol version the server
+/// speaks, in `protocol`, and nothing else. Like `/healthz` it takes no identity and touches no
+/// tree, so a caller reads the version whatever state the copy is in. It is the one a caller on
+/// Cloud Run reads: on a `run.app` URL Cloud Run's front end answers `/healthz` itself.
+pub async fn protocol_version() -> Json<serde_json::Value> {
+    Json(json!({ "protocol": protocol::VERSION }))
+}
+
 /// What `following.error` says while the follow loop fails.
 const FOLLOW_FAILING: &str = "the follow loop is failing; the server's log says why";
 
@@ -382,7 +390,8 @@ fn allowed(argv: &[String], parsed: Option<&cli::Cli>) -> Result<(), String> {
                 .to_owned(),
         ),
         Remote::Protocol => Err(
-            "protocol asks the server's own /healthz, which names the server's protocol version"
+            "protocol asks the server's own /v1/protocol, which names the server's protocol \
+             version"
                 .to_owned(),
         ),
         Remote::Local => Err(format!(

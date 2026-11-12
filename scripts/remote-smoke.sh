@@ -1,6 +1,7 @@
 #!/bin/sh
-# Drives a running ctx server through the surface an agent uses: the health endpoint, a read
-# command in remote mode, and - with --write - one record written, read back and removed again.
+# Drives a running ctx server through the surface an agent uses: the protocol check, the health
+# endpoint, a read command in remote mode, and - with --write - one record written, read back
+# and removed again.
 #
 # Usage:
 #   CTX_SERVER='http://ctx-memory.<tailnet>.ts.net' scripts/remote-smoke.sh [--write] [query]
@@ -24,9 +25,21 @@ ctx=${CTX_BIN:-ctx}
 
 echo "server: $CTX_SERVER"
 
-echo "--- healthz"
-curl -fsS "$CTX_SERVER/healthz"
-echo
+echo "--- ctx protocol"
+"$ctx" protocol
+
+# On a run.app URL Cloud Run's front end answers /healthz itself, as it does every path it
+# reserves (some that end in z), so the server never sees it there.
+case "$CTX_SERVER" in
+*.run.app | *.run.app/* | *.run.app:*)
+    echo "--- healthz: skipped, Cloud Run answers it on a run.app URL"
+    ;;
+*)
+    echo "--- healthz"
+    curl -fsS "$CTX_SERVER/healthz"
+    echo
+    ;;
+esac
 
 echo "--- ctx rules (first line)"
 "$ctx" rules | head -n 1
