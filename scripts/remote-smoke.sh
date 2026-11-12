@@ -31,7 +31,7 @@ echo "--- ctx protocol"
 # On a run.app URL Cloud Run's front end answers /healthz itself, as it does every path it
 # reserves (some that end in z), so the server never sees it there.
 case "$CTX_SERVER" in
-*.run.app | *.run.app/*)
+*.run.app | *.run.app/* | *.run.app:*)
     echo "--- healthz: skipped, Cloud Run answers it on a run.app URL"
     ;;
 *)
