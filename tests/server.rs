@@ -121,6 +121,45 @@ fn healthz_and_every_answer_name_the_server_s_protocol_version() -> Result<()> {
     Ok(())
 }
 
+/// `/v1/protocol` answers the server's protocol version, and nothing else, at either door and to
+/// a caller that names no identity, as `/healthz` does. It is what `ctx protocol` asks first: on
+/// a `run.app` URL Cloud Run's front end answers `/healthz` itself, since it reserves paths that
+/// end in `z`, and the server never sees the request. The request log names it `protocol`.
+#[test]
+fn the_protocol_route_names_the_version_at_either_door_without_an_identity() -> Result<()> {
+    let tree = fixture_tree("server-protocol-route")?;
+    let keys = support::fake_http::FakeHttp::start()?;
+    let mut server = ingress_server(&tree, &keys)?;
+    let start = chrono::Utc::now();
+    let tailnet = server.get(server.tailnet_address()?, "/v1/protocol", &[])?;
+    let ingress = server.get(server.ingress_address()?, "/v1/protocol", &[])?;
+    let printed = server.stop_and_read_stdout()?;
+    let window = (start, chrono::Utc::now());
+    drop(server);
+    remove_fixture(&tree)?;
+
+    for (door, reply) in [("tailnet", &tailnet), ("identity-token", &ingress)] {
+        assert_eq!(reply.status, 200, "{door}: {}", reply.body);
+        assert_eq!(reply.body, json!({ "protocol": 1 }), "{door}");
+        assert_eq!(reply.protocol.as_deref(), Some(PROTOCOL), "{door}");
+    }
+    let lines = request_lines(&printed)?;
+    let [at_tailnet, at_ingress] = lines.as_slice() else {
+        anyhow::bail!("not one line per request: {}", printed.join("\n"));
+    };
+    for (line, door, reply) in [
+        (at_tailnet, "tailnet", &tailnet),
+        (at_ingress, "identity-token", &ingress),
+    ] {
+        let expected = json!({
+            "severity": "INFO", "door": door, "caller": null, "command": "protocol",
+            "result": "ok", "status": 200, "response_bytes": reply.bytes,
+        });
+        assert_logged(line, &expected, window)?;
+    }
+    Ok(())
+}
+
 const AUDIENCE: &str = "https://ctx-memory.example.run.app";
 
 /// Who the test server answers: the people of the company and its agent service accounts.

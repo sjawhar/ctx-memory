@@ -10,8 +10,9 @@ use crate::marker;
 
 /// The version of the protocol below: these routes, their bodies and answers, and what each
 /// means. The server names it on every answer and the client on every request, both in
-/// [`VERSION_HEADER`], and `/healthz` says it as `protocol`. `ctx protocol` prints the client's
-/// and its server's, which the ingest runner compares before it starts a session.
+/// [`VERSION_HEADER`], and [`PROTOCOL_ROUTE`] and `/healthz` say it as `protocol`.
+/// `ctx protocol` prints the client's and its server's, which the ingest runner compares before
+/// it starts a session.
 ///
 /// Bump it by one, by hand, in the release that adds or removes a route or changes what a
 /// route takes, answers or means in a way a client of the version before would misread; never
@@ -37,6 +38,15 @@ pub const PAGED_SINCE: u32 = 1;
 
 /// The route that answers how the server is and which protocol version it speaks.
 pub const HEALTH_ROUTE: &str = "/healthz";
+
+/// The route that answers which protocol version the server speaks, and nothing else, to any
+/// caller. `ctx protocol` asks it before [`HEALTH_ROUTE`]: on a `run.app` URL Cloud Run's own
+/// front end answers `/healthz` with a `404` of its own, since it reserves paths that end in
+/// `z`, so no answer from the server reaches the caller there. A server older than this route
+/// answers it `404`, and from v0.3.2 on that `404` names the server's version in
+/// [`VERSION_HEADER`], as every answer does; the client asks `/healthz` only after a `404` that
+/// names none.
+pub const PROTOCOL_ROUTE: &str = "/v1/protocol";
 
 /// The route that runs one allowlisted read command.
 pub const COMMAND_ROUTE: &str = "/v1/command";

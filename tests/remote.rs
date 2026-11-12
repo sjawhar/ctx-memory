@@ -220,7 +220,8 @@ const PROTOCOL: &str = "1";
 
 /// Every request names the protocol version the client speaks in `X-Ctx-Protocol`, so a server
 /// can refuse a route whose meaning changed since that version rather than misread it: a read, a
-/// write, and the client's own ask for the server's version.
+/// write, and the client's own asks for the server's version, at `/v1/protocol` and, for this
+/// server that does not answer it, at `/healthz`.
 #[test]
 fn every_request_names_the_client_s_protocol_version() -> Result<()> {
     let marker = json!({
@@ -260,20 +261,27 @@ fn every_request_names_the_client_s_protocol_version() -> Result<()> {
         .into_iter()
         .map(|request| (request.path, request.headers.get("x-ctx-protocol").cloned()))
         .collect();
-    let expected: Vec<(String, Option<String>)> = ["/v1/command", "/v1/marker/advance", "/healthz"]
-        .iter()
-        .map(|path| ((*path).to_owned(), Some(PROTOCOL.to_owned())))
-        .collect();
+    let expected: Vec<(String, Option<String>)> = [
+        "/v1/command",
+        "/v1/marker/advance",
+        "/v1/protocol",
+        "/healthz",
+    ]
+    .iter()
+    .map(|path| ((*path).to_owned(), Some(PROTOCOL.to_owned())))
+    .collect();
     assert_eq!(sent, expected);
     Ok(())
 }
 
 /// `ctx protocol` says which protocol version this client speaks and which one its server names
 /// in `X-Ctx-Protocol` on `/healthz`, whatever the probe's status: a wedged copy still speaks
-/// one. A server older than that header names none, which is protocol 0. An answer that names
-/// none and is not a success is not taken for such a server, since a proxy or a load balancer
-/// answers like that in the server's place: the command fails and names the status. With no
-/// server configured, only the client's version is known.
+/// one. These servers answer `/v1/protocol` with a `404` that names no version, as a server
+/// older than the version header does, so the client asks `/healthz` after it. A server older
+/// than that header names none, which is protocol 0. An answer that names none and is not a
+/// success is not taken for such a server, since a proxy or a load balancer answers like that in
+/// the server's place: the command fails and names the status. With no server configured, only
+/// the client's version is known.
 #[test]
 fn ctx_protocol_reports_the_client_s_and_the_server_s_versions() -> Result<()> {
     let reported = |headers: &[(&str, &str)], status: u16| -> Result<Local> {
@@ -319,6 +327,127 @@ fn ctx_protocol_reports_the_client_s_and_the_server_s_versions() -> Result<()> {
         proxy.stdout,
         proxy.stderr
     );
+    Ok(())
+}
+
+/// One path a stand-in server answers: the path, its status and its headers.
+type Answer<'a> = (&'a str, u16, &'a [(&'a str, &'a str)]);
+
+/// Runs `ctx --json protocol` against a server that answers each of `answers`, and every other
+/// path `404` naming no version. Returns the client and the paths it asked, in order.
+fn protocol_against(answers: &[Answer<'_>]) -> Result<(Local, Vec<String>)> {
+    let server = FakeHttp::start()?;
+    for (path, status, headers) in answers {
+        let body = json!({ "ok": *status == 200 }).to_string();
+        server.json_with_headers(path, *status, headers, &body)?;
+    }
+    let client = run_client(
+        &["--json", "protocol"],
+        None,
+        &[("CTX_SERVER", &server.url(""))],
+    )?;
+    let asked = server
+        .requests()?
+        .into_iter()
+        .map(|request| request.path)
+        .collect();
+    Ok((client, asked))
+}
+
+/// `ctx protocol` asks `/v1/protocol` first, because on a `run.app` URL Cloud Run's front end
+/// answers `/healthz` itself with a `404` that names no version. A server with the route names
+/// its version there. A v0.3.2 to v0.3.5 server has no such route, but its `404` names its
+/// version as every answer of it does, which is enough: the client does not ask `/healthz`,
+/// which Cloud Run would answer in its place. Only a `404` that names no version, a server's
+/// older than the version header, sends the client on to `/healthz`.
+#[test]
+fn ctx_protocol_asks_the_protocol_route_first_and_healthz_only_after_a_bare_404() -> Result<()> {
+    let newer = protocol_against(&[
+        ("/v1/protocol", 200, &[("X-Ctx-Protocol", "7")]),
+        ("/healthz", 200, &[("X-Ctx-Protocol", "6")]),
+    ])?;
+    // Cloud Run's own 404 at /healthz names no version.
+    let without_the_route = protocol_against(&[
+        ("/v1/protocol", 404, &[("X-Ctx-Protocol", "1")]),
+        ("/healthz", 404, &[]),
+    ])?;
+    let older_than_the_header = protocol_against(&[("/healthz", 200, &[])])?;
+
+    for (what, (client, asked), server, paths) in [
+        ("a server with the route", &newer, 7, &["/v1/protocol"][..]),
+        (
+            "a v0.3.5 server behind Cloud Run",
+            &without_the_route,
+            1,
+            &["/v1/protocol"][..],
+        ),
+        (
+            "a server older than the header",
+            &older_than_the_header,
+            0,
+            &["/v1/protocol", "/healthz"][..],
+        ),
+    ] {
+        assert_eq!(
+            client.exit_code, 0,
+            "{what}: {}{}",
+            client.stdout, client.stderr
+        );
+        let envelope: serde_json::Value = serde_json::from_str(client.stdout.trim())
+            .with_context(|| format!("{what}: decoding {}", client.stdout))?;
+        assert_eq!(
+            envelope.get("data"),
+            Some(&json!({ "client": 1, "server": server })),
+            "{what}: {}",
+            client.stdout
+        );
+        assert_eq!(asked, paths, "{what}");
+    }
+    Ok(())
+}
+
+/// An answer at `/v1/protocol` that names no version and is not a server's `404` — Cloud Run
+/// refusing the caller's token, say — fails `ctx protocol` at once, naming the status, as
+/// `/healthz`'s did before. A `404` that names no version at both paths is what a proxy answers,
+/// or Cloud Run for a server older than the version header: it fails with exit 2 and names both
+/// paths, so it is not taken for protocol 0.
+#[test]
+fn ctx_protocol_fails_when_no_answer_names_a_version() -> Result<()> {
+    let refused = protocol_against(&[("/v1/protocol", 403, &[])])?;
+    let nowhere = protocol_against(&[])?;
+
+    for (what, (client, asked), words, paths) in [
+        (
+            "a refusal at the route",
+            &refused,
+            &[
+                "403",
+                "/v1/protocol",
+                "naming no protocol version",
+                "proxy's",
+            ][..],
+            &["/v1/protocol"][..],
+        ),
+        (
+            "a 404 at both paths",
+            &nowhere,
+            &[
+                "404",
+                "/v1/protocol",
+                "/healthz",
+                "naming no protocol version",
+                "proxy's",
+            ][..],
+            &["/v1/protocol", "/healthz"][..],
+        ),
+    ] {
+        let printed = format!("{}{}", client.stdout, client.stderr);
+        assert_eq!(client.exit_code, 2, "{what}: {printed}");
+        for word in words {
+            assert!(printed.contains(*word), "{what}: no {word:?} in {printed}");
+        }
+        assert_eq!(asked, paths, "{what}");
+    }
     Ok(())
 }
 
