@@ -20,6 +20,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -32,6 +34,59 @@ pub const SIGNING_KEY: &str = include_str!("../fixtures/jwt-signing-key.pem");
 pub const KEY_ID: &str = "ctx-test-key";
 /// The issuer Google puts in an identity token.
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
+
+/// The label of the PEM frame a PKCS#1 RSA private key is written in.
+const PKCS1_LABEL: &str = "RSA PRIVATE KEY";
+
+/// The bytes a PKCS#8 RSA key holds between its two length bytes and the two length bytes of
+/// the PKCS#1 key it wraps: version 0, the `rsaEncryption` algorithm with its NULL parameters,
+/// and the tag of the OCTET STRING that holds the PKCS#1 key, with its two-byte length form.
+const PKCS8_RSA_HEADER: [u8; 20] = [
+    0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    0x05, 0x00, 0x04, 0x82,
+];
+
+/// [`SIGNING_KEY`] as a PKCS#1 PEM, the form GitHub hands out an App's private key in.
+///
+/// It is made from the PKCS#8 fixture rather than kept as a file: a PKCS#8 RSA key is its
+/// PKCS#1 key behind a fixed header, so the repository holds one test key, not two.
+///
+/// # Errors
+///
+/// Returns an error when the fixture is not base64, or not a PKCS#8 RSA key behind that header.
+pub fn signing_key_pkcs1() -> Result<String> {
+    let body: String = SIGNING_KEY
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    let pkcs8 = STANDARD
+        .decode(body)
+        .context("decoding the fixture signing key")?;
+    let (sequence, rest) = pkcs8
+        .split_first_chunk::<4>()
+        .context("the fixture signing key is too short")?;
+    let (algorithm, rest) = rest
+        .split_first_chunk::<20>()
+        .context("the fixture signing key is too short")?;
+    let (length, pkcs1) = rest
+        .split_first_chunk::<2>()
+        .context("the fixture signing key is too short")?;
+    if !sequence.starts_with(&[0x30, 0x82])
+        || *algorithm != PKCS8_RSA_HEADER
+        || usize::from(u16::from_be_bytes(*length)) != pkcs1.len()
+    {
+        bail!("the fixture signing key is not a PKCS#8 RSA key behind the expected header");
+    }
+    let encoded = STANDARD.encode(pkcs1);
+    let mut lines = vec![format!("-----BEGIN {PKCS1_LABEL}-----")];
+    for chunk in encoded.as_bytes().chunks(64) {
+        lines.push(std::str::from_utf8(chunk)?.to_owned());
+    }
+    lines.push(format!("-----END {PKCS1_LABEL}-----"));
+    let mut pem = lines.join("\n");
+    pem.push('\n');
+    Ok(pem)
+}
 
 /// Mints an identity token shaped like Google's, signed with the fixture key.
 pub fn google_token(audience: &str, email: &str) -> Result<String> {

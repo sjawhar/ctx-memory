@@ -199,7 +199,7 @@ fn the_server_clones_a_private_remote_with_a_numeric_app_id() -> Result<()> {
     let (root, github) = private_remote("private-remote-numeric")?;
     let tree = root.join("tree");
     std::fs::create_dir_all(&tree)?;
-    let environment = container_env(&github, Some(FakeGithub::numeric_app_credential()));
+    let environment = container_env(&github, Some(FakeGithub::numeric_app_credential()?));
     let head = git(&github.bare(OWNER, NAME), &["rev-parse", "main"])?;
 
     let server = Server::start_with_env(&tree, &[], &borrowed(&environment))?;

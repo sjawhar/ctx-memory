@@ -214,9 +214,6 @@ fn the_app_mints_a_token_for_one_repository_only() -> Result<()> {
     Ok(())
 }
 
-/// `support::SIGNING_KEY` as PKCS#1, the form a GitHub App key is downloaded in.
-const PKCS1_KEY: &str = include_str!("fixtures/jwt-signing-key-pkcs1.pem");
-
 /// Every `app_id` the loader refuses, as the JSON text a credential carries.
 const REFUSED_APP_IDS: [&str; 13] = [
     "-5706923",
@@ -255,10 +252,15 @@ fn signed_issuer(app: &App) -> Result<Value> {
 /// `client_id` beside it, and a PKCS#1 key.
 #[test]
 fn a_main_push_shaped_credential_signs_with_its_numeric_app_id() -> Result<()> {
+    let key = support::signing_key_pkcs1()?;
+    assert!(
+        key.starts_with("-----BEGIN RSA "),
+        "the key is not the PKCS#1 PEM GitHub hands out"
+    );
     let credential = json!({
         "app_id": 5_706_923,
         "client_id": "Iv23liFixture",
-        "private_key": PKCS1_KEY,
+        "private_key": key,
     });
     let app = app_from(&credential)?;
     assert_eq!(signed_issuer(&app)?, json!("5706923"));
@@ -324,7 +326,8 @@ fn an_app_id_that_is_not_a_whole_number_or_digits_is_refused_without_its_value()
 
 #[test]
 fn swapped_app_credential_fields_never_print_the_key() -> Result<()> {
-    let swapped = json!({ "app_id": PKCS1_KEY, "private_key": "5706923" });
+    let key = support::signing_key_pkcs1()?;
+    let swapped = json!({ "app_id": key, "private_key": "5706923" });
     let error = app_from(&swapped)
         .err()
         .context("a credential with its fields swapped was accepted")?;
@@ -338,7 +341,7 @@ fn swapped_app_credential_fields_never_print_the_key() -> Result<()> {
         !text.contains("PRIVATE KEY"),
         "the refusal names the key: {text}"
     );
-    for line in PKCS1_KEY.lines().filter(|line| !line.is_empty()) {
+    for line in key.lines().filter(|line| !line.is_empty()) {
         assert!(
             !text.contains(line),
             "the refusal carries a line of the key: {line}"

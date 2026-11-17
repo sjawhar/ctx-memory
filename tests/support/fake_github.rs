@@ -101,14 +101,17 @@ impl FakeGithub {
     /// The same app credential in the shape of a key copied from GitHub's `GET /app` answer:
     /// `app_id` is a number, the `client_id` GitHub shows beside it comes along, and the key
     /// is the PKCS#1 PEM GitHub hands out.
-    #[must_use]
-    pub fn numeric_app_credential() -> String {
-        serde_json::json!({
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PKCS#1 key cannot be made.
+    pub fn numeric_app_credential() -> Result<String> {
+        Ok(serde_json::json!({
             "app_id": 1_234_567,
             "client_id": "Iv23liFixture",
-            "private_key": include_str!("../fixtures/jwt-signing-key-pkcs1.pem"),
+            "private_key": super::signing_key_pkcs1()?,
         })
-        .to_string()
+        .to_string())
     }
 
     /// Every git request this GitHub received, oldest first.
