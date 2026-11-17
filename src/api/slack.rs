@@ -348,7 +348,9 @@ impl SlackCredential {
             serde_json::from_value(value).map(Self::ClaudeCode)
         };
         credential.map_err(|error| {
-            anyhow!("parsing the Slack credential: it is not the expected JSON ({error})")
+            secret
+                .not_the_expected_json(&error)
+                .context("parsing the Slack credential")
         })
     }
 
@@ -989,6 +991,34 @@ mod tests {
                 "{json}: the error carries a token: {error}"
             );
         }
+    }
+
+    /// A stored credential whose `kind` holds a token, as one written with its fields swapped
+    /// would, is refused, and serde's `unknown variant` does not carry the token into it.
+    #[test]
+    fn a_stored_credential_whose_kind_is_a_token_is_refused_without_it() {
+        const TOKEN: &str = "fixture-secret-not-a-real-token";
+        let stored = json!({
+            "kind": TOKEN,
+            "access": "xoxe.xoxp-1-a",
+            "refresh": "xoxe-1-r",
+            "expires": "2026-10-29T16:00:00Z",
+            "client_id": "123.456",
+            "token_url": "https://slack.com/api/oauth.v2.access",
+            "team_id": "T0EXAMPLE1",
+            "user_id": "U0EXAMPLE9"
+        });
+        let error = SlackCredential::from_secret(&Secret::new(stored.to_string()))
+            .err()
+            .map_or_default(|error| format!("{error:#}"));
+        assert!(
+            error.contains("parsing the Slack credential") && error.contains("unknown variant"),
+            "unexpected error {error:?}"
+        );
+        assert!(
+            !error.contains(TOKEN),
+            "the error carries the token: {error}"
+        );
     }
 
     #[test]

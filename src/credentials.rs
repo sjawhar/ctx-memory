@@ -5,6 +5,7 @@
 //! environment variable the tree's configuration names. Nothing writes a credential into the
 //! tree, and no copy of a secret is kept anywhere else.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// The default host of Google's metadata server.
 const METADATA_HOST: &str = "http://metadata.google.internal";
@@ -47,14 +48,61 @@ impl Secret {
     /// Returns an error when the secret is not JSON of the expected shape. The error never
     /// carries the secret.
     pub fn parse<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.0)
-            .map_err(|error| anyhow!("the credential is not the expected JSON ({error})"))
+        serde_json::from_str(&self.0).map_err(|error| self.not_the_expected_json(&error))
+    }
+
+    /// The refusal of this secret as the JSON a caller expected, which never carries the secret.
+    ///
+    /// serde names a value it was handed: a string as `string "<the string>"`, an unknown enum
+    /// tag as `` `<the tag>` ``. A credential that is only its key, or whose fields are swapped,
+    /// hands it the key or a token, so each string the credential holds is taken out of the
+    /// message.
+    #[must_use]
+    pub fn not_the_expected_json(&self, error: &serde_json::Error) -> anyhow::Error {
+        let message = without_strings(&self.0, error.to_string());
+        anyhow!("the credential is not the expected JSON ({message})")
     }
 }
 
 impl fmt::Debug for Secret {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Secret(redacted)")
+    }
+}
+
+/// `message` with each string the JSON `secret` holds taken out: in the form serde gives a
+/// string it was handed (its `Debug` form, quotes included), in the backticks it puts around an
+/// unknown tag, and bare when it is long enough not to be a common word. A secret that is not
+/// JSON makes a syntax error, which names a position and never the text, so that message stays.
+fn without_strings(secret: &str, mut message: String) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(secret) else {
+        return message;
+    };
+    let mut strings = Vec::new();
+    strings_in(&value, &mut strings);
+    strings.retain(|string| !string.is_empty());
+    // Longest first, so a string inside a longer one cannot break the longer one's form.
+    strings.sort_unstable_by_key(|string| (Reverse(string.len()), *string));
+    strings.dedup();
+    for string in strings {
+        message = message
+            .replace(&format!("{string:?}"), "\"…\"")
+            .replace(&format!("`{string}`"), "`…`");
+        if string.chars().count() >= 8 {
+            message = message.replace(string, "…");
+        }
+    }
+    message
+}
+
+/// Every string value in `value`, through arrays and the values of objects. An object's keys
+/// are field names, not values, so they are not collected.
+fn strings_in<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
+    match value {
+        Value::String(string) => strings.push(string),
+        Value::Array(items) => items.iter().for_each(|item| strings_in(item, strings)),
+        Value::Object(map) => map.values().for_each(|item| strings_in(item, strings)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
@@ -357,7 +405,7 @@ fn with_scheme(host: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, load_with, Config, Secret, Source};
+    use super::{load, load_with, Config, Deserialize, Secret, Source};
 
     #[test]
     fn a_secret_never_prints_its_value() {
@@ -433,6 +481,62 @@ mod tests {
         assert!(
             refused.contains(r#"a table { file = "<path>" } or { env = "<VARIABLE>" }"#),
             "a table naming both keys was not refused with the two forms: {refused}"
+        );
+        Ok(())
+    }
+
+    /// serde names a value it was handed, so a token where the credential's JSON wants a
+    /// number, a struct or an enum tag would reach the refusal. It never does, and the refusal
+    /// still says where the JSON went wrong and what was expected there.
+    #[test]
+    fn a_refusal_never_carries_a_string_the_credential_holds() -> anyhow::Result<()> {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(rename_all = "snake_case")]
+        enum Kind {
+            App,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Fixture {
+            count: u64,
+            kind: Kind,
+        }
+        const TOKEN: &str = "fixture-secret-not-a-real-token";
+        let refusal = |json: &str| {
+            Secret::new(json.to_owned())
+                .parse::<Fixture>()
+                .err()
+                .map_or_default(|error| format!("{error:#}"))
+        };
+        let well_formed = Secret::new(r#"{"count": 1, "kind": "app"}"#.to_owned());
+        let fixture: Fixture = well_formed.parse()?;
+        assert_eq!((fixture.count, fixture.kind), (1, Kind::App));
+        for json in [
+            format!("{TOKEN:?}"),
+            format!(r#"{{"count": "{TOKEN}", "kind": "app"}}"#),
+            format!(r#"{{"count": 1, "kind": "{TOKEN}"}}"#),
+        ] {
+            let error = refusal(&json);
+            assert!(
+                error.starts_with("the credential is not the expected JSON ("),
+                "{json}: unexpected error {error:?}"
+            );
+            assert!(
+                !error.contains(TOKEN),
+                "{json}: the error carries the token: {error}"
+            );
+            assert!(
+                error.contains("line 1 column") && error.contains("expected"),
+                "{json}: the error no longer says where or what was expected: {error}"
+            );
+        }
+        let syntax = refusal(r#"{"count": "#);
+        assert!(
+            syntax.starts_with("the credential is not the expected JSON ("),
+            "unexpected error {syntax:?}"
+        );
+        assert!(
+            syntax.contains("EOF while parsing") || syntax.contains("line 1 column"),
+            "the syntax error is not serde_json's own: {syntax:?}"
         );
         Ok(())
     }
