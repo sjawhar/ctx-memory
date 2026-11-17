@@ -130,7 +130,7 @@ fn from_environment(name: &str) -> Result<Option<Secret>> {
             .to_owned();
         return access(&resource).map(Some);
     }
-    if let Some(path) = std::env::var_os(format!("{}_FILE", credential_env(name))) {
+    if let Some(path) = std::env::var_os(credential_file_env(name)) {
         return read_file(&PathBuf::from(path)).map(Some);
     }
     if let Some(value) = std::env::var_os(credential_env(name)) {
@@ -152,10 +152,9 @@ fn from_environment(name: &str) -> Result<Option<Secret>> {
 /// treat as "no credential", from a credential that is named but cannot be read.
 #[must_use]
 pub fn configured(config: &Config, name: &str) -> bool {
-    // Mirrors `from_environment`: the same three variables, and one that is set counts even
-    // when it is empty, as it does there.
+    // A variable that is set counts even when it is empty, as in `from_environment`.
     std::env::var_os(secret_env(name)).is_some()
-        || std::env::var_os(format!("{}_FILE", credential_env(name))).is_some()
+        || std::env::var_os(credential_file_env(name)).is_some()
         || std::env::var_os(credential_env(name)).is_some()
         || config.contains_key(name)
 }
@@ -322,6 +321,10 @@ fn secret_env(name: &str) -> String {
 
 fn credential_env(name: &str) -> String {
     format!("CTX_CREDENTIAL_{}", name.to_uppercase())
+}
+
+fn credential_file_env(name: &str) -> String {
+    format!("{}_FILE", credential_env(name))
 }
 
 /// Where the metadata server is, which a test points at its own.

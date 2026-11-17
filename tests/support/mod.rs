@@ -26,7 +26,8 @@ static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
 /// Google's signing keys as a test key set, and the private key that matches them.
 pub const JWKS: &str = include_str!("../fixtures/jwks.json");
-const SIGNING_KEY: &str = include_str!("../fixtures/jwt-signing-key.pem");
+/// The private key that matches [`JWKS`], as PKCS#8.
+pub const SIGNING_KEY: &str = include_str!("../fixtures/jwt-signing-key.pem");
 /// The key id the fixture key set publishes.
 pub const KEY_ID: &str = "ctx-test-key";
 /// The issuer Google puts in an identity token.

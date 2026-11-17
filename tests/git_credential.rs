@@ -7,6 +7,8 @@
 
 mod support;
 
+use std::path::Path;
+
 use anyhow::{Context as _, Result};
 use serde_json::json;
 
@@ -51,6 +53,23 @@ fn borrowed(environment: &[(String, String)]) -> Vec<(&str, &str)> {
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect()
+}
+
+/// Runs `ctx rules` against `tree` as a container does: with `environment`, then the tree's
+/// own state and data directories.
+fn ctx_rules(tree: &Path, environment: &[(String, String)]) -> Result<support::Local> {
+    let tree_text = tree.to_str().context("the tree path is not valid UTF-8")?;
+    let output = support::binary()
+        .args(["--memory", tree_text, "rules"])
+        .envs(borrowed(environment))
+        .envs(support::tree_env(tree)?)
+        .output()
+        .context("running ctx rules")?;
+    Ok(support::Local {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code().unwrap_or(-1),
+    })
 }
 
 /// The whole life of a container against a private remote: it clones on start, follows the
@@ -154,29 +173,21 @@ fn the_fetch_job_clones_a_private_remote() -> Result<()> {
     let (root, github) = private_remote("private-remote-fetch")?;
     let tree = root.join("tree");
     std::fs::create_dir_all(&tree)?;
-    let tree_text = tree.to_str().context("the tree path is not valid UTF-8")?;
     let environment = container_env(&github, Some(FakeGithub::app_credential()));
 
-    let mut command = support::binary();
-    command.args(["--memory", tree_text, "rules"]);
-    for (name, value) in &environment {
-        command.env(name, value);
-    }
-    for (name, value) in support::tree_env(&tree)? {
-        command.env(name, value);
-    }
-    let output = command.output().context("running ctx rules")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let local = ctx_rules(&tree, &environment)?;
     remove_scratch(&root)?;
 
     assert!(
-        output.status.success(),
-        "ctx rules failed: {stdout}{stderr}"
+        local.exit_code == 0,
+        "ctx rules failed: {}{}",
+        local.stdout,
+        local.stderr
     );
     assert!(
-        stdout.contains("# Rules"),
-        "the private tree was not cloned: {stdout}"
+        local.stdout.contains("# Rules"),
+        "the private tree was not cloned: {}",
+        local.stdout
     );
     Ok(())
 }
@@ -215,47 +226,42 @@ fn the_server_clones_a_private_remote_with_a_numeric_app_id() -> Result<()> {
 }
 
 /// A credential that is named but does not parse stops `ctx` with its own error, and git
-/// never runs. Before this change, ctx ran git with no credential and said only that git's
-/// authentication failed.
+/// never runs. v0.3.6 ran git with no credential and said only that git's authentication
+/// failed.
 #[test]
 fn a_credential_that_does_not_parse_stops_ctx_and_names_the_cause() -> Result<()> {
     let (root, github) = private_remote("private-remote-unparsed")?;
     let tree = root.join("tree");
     std::fs::create_dir_all(&tree)?;
-    let tree_text = tree.to_str().context("the tree path is not valid UTF-8")?;
     // The client id where the app id belongs: GitHub shows the two side by side.
     let credential = json!({
         "app_id": "Iv23liFixture",
-        "private_key": include_str!("fixtures/jwt-signing-key.pem"),
+        "private_key": support::SIGNING_KEY,
     })
     .to_string();
     let environment = container_env(&github, Some(credential));
 
-    let mut command = support::binary();
-    command.args(["--memory", tree_text, "rules"]);
-    for (name, value) in &environment {
-        command.env(name, value);
-    }
-    for (name, value) in support::tree_env(&tree)? {
-        command.env(name, value);
-    }
-    let output = command.output().context("running ctx rules")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let local = ctx_rules(&tree, &environment)?;
     let requests = github.git_requests()?;
     remove_scratch(&root)?;
 
     assert!(
-        !output.status.success(),
-        "ctx rules ran with a credential it cannot parse: {stdout}{stderr}"
+        local.exit_code != 0,
+        "ctx rules ran with a credential it cannot parse: {}{}",
+        local.stdout,
+        local.stderr
     );
     assert!(
-        stderr.contains("the credential is not the expected JSON"),
-        "the error does not name the cause: {stderr}"
+        local
+            .stderr
+            .contains("the credential is not the expected JSON"),
+        "the error does not name the cause: {}",
+        local.stderr
     );
     assert!(
-        !stderr.contains("PRIVATE KEY"),
-        "the error carries the key: {stderr}"
+        !local.stderr.contains("PRIVATE KEY"),
+        "the error carries the key: {}",
+        local.stderr
     );
     assert!(
         requests.is_empty(),

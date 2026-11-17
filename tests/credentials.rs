@@ -127,11 +127,7 @@ fn a_rotated_credential_is_saved_as_a_new_version() -> Result<()> {
 #[test]
 fn a_credentials_file_under_home_is_read() -> Result<()> {
     let _guard = guard();
-    let home = std::env::temp_dir().join(format!("ctx-credentials-home-{}", std::process::id()));
-    if home.exists() {
-        std::fs::remove_dir_all(&home)?;
-    }
-    std::fs::create_dir_all(&home)?;
+    let home = support::scratch("credentials-home")?;
     let contents = r#"{"app_id":"1"}"#;
     std::fs::write(home.join("github-app.json"), contents)?;
     let mut config = credentials::Config::new();
@@ -150,7 +146,7 @@ fn a_credentials_file_under_home_is_read() -> Result<()> {
     } else {
         std::env::remove_var("HOME");
     }
-    std::fs::remove_dir_all(&home)?;
+    support::remove_scratch(&home)?;
 
     assert_eq!(secret?.expose(), contents);
     Ok(())
@@ -172,7 +168,7 @@ fn the_app_mints_a_token_for_one_repository_only() -> Result<()> {
     )?;
     let credential = json!({
         "app_id": "1234567",
-        "private_key": include_str!("fixtures/jwt-signing-key.pem"),
+        "private_key": support::SIGNING_KEY,
     })
     .to_string();
     std::env::set_var("CTX_GITHUB_API", api.url(""));
@@ -218,9 +214,7 @@ fn the_app_mints_a_token_for_one_repository_only() -> Result<()> {
     Ok(())
 }
 
-/// The fixture signing key, as PKCS#8.
-const PKCS8_KEY: &str = include_str!("fixtures/jwt-signing-key.pem");
-/// The same key as PKCS#1, the form a GitHub App key is downloaded in.
+/// `support::SIGNING_KEY` as PKCS#1, the form a GitHub App key is downloaded in.
 const PKCS1_KEY: &str = include_str!("fixtures/jwt-signing-key-pkcs1.pem");
 
 /// Every `app_id` the loader refuses, as the JSON text a credential carries.
@@ -257,6 +251,8 @@ fn signed_issuer(app: &App) -> Result<Value> {
     token.claims.get("iss").cloned().context("no iss")
 }
 
+/// A credential as GitHub gives it, as the main-push key holds one: a numeric `app_id`, the
+/// `client_id` beside it, and a PKCS#1 key.
 #[test]
 fn a_main_push_shaped_credential_signs_with_its_numeric_app_id() -> Result<()> {
     let credential = json!({
@@ -271,7 +267,7 @@ fn a_main_push_shaped_credential_signs_with_its_numeric_app_id() -> Result<()> {
 
 #[test]
 fn a_numeric_app_id_signs_as_its_decimal_text() -> Result<()> {
-    let credential = json!({ "app_id": 5_706_923, "private_key": PKCS8_KEY });
+    let credential = json!({ "app_id": 5_706_923, "private_key": support::SIGNING_KEY });
     let app = app_from(&credential)?;
     assert_eq!(signed_issuer(&app)?, json!("5706923"));
     Ok(())
@@ -280,7 +276,7 @@ fn a_numeric_app_id_signs_as_its_decimal_text() -> Result<()> {
 #[test]
 fn a_digit_string_app_id_signs_as_written() -> Result<()> {
     for written in ["5706923", "0123"] {
-        let credential = json!({ "app_id": written, "private_key": PKCS8_KEY });
+        let credential = json!({ "app_id": written, "private_key": support::SIGNING_KEY });
         let app = app_from(&credential)?;
         assert_eq!(
             signed_issuer(&app)?,
@@ -293,7 +289,7 @@ fn a_digit_string_app_id_signs_as_written() -> Result<()> {
 
 #[test]
 fn an_app_id_that_is_not_a_whole_number_or_digits_is_refused_without_its_value() -> Result<()> {
-    let key = serde_json::to_string(PKCS8_KEY)?;
+    let key = serde_json::to_string(support::SIGNING_KEY)?;
     let mut rows = Vec::new();
     for raw in REFUSED_APP_IDS {
         let written: Value = serde_json::from_str(raw)?;

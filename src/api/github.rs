@@ -23,6 +23,11 @@ use crate::redact::one_line;
 /// The default GitHub API endpoint.
 const API: &str = "https://api.github.com";
 
+/// The name the app's credential is loaded by: `CTX_SECRET_GITHUB_APP`,
+/// `CTX_CREDENTIAL_GITHUB_APP_FILE` or `CTX_CREDENTIAL_GITHUB_APP` names its source, or a
+/// `[credentials]` entry does.
+pub const CREDENTIAL: &str = "github_app";
+
 /// How long the app JWT is valid. GitHub refuses more than ten minutes.
 const JWT_LIFETIME: u64 = 540;
 
@@ -194,7 +199,7 @@ impl App {
     /// `app_id` is a number or a string of digits and other fields are ignored, or carries a
     /// key that is not a PEM private key.
     pub fn load(config: &credentials::Config) -> Result<Self> {
-        Self::from_secret(&credentials::load_with(config, "github_app")?)
+        Self::from_secret(&credentials::load_with(config, CREDENTIAL)?)
     }
 
     /// Builds the app from a credential value.

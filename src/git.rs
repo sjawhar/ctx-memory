@@ -134,7 +134,7 @@ pub fn credential_for(
             return Ok(Some(credential.clone()));
         }
     }
-    if !credentials::configured(config, "github_app") {
+    if !credentials::configured(config, github::CREDENTIAL) {
         return Ok(None);
     }
     let app = github::App::load(config).context("loading the github_app credential")?;
@@ -879,13 +879,13 @@ pub enum Push {
 ///
 /// The graph repository is private, so the clone and the pull carry a read credential, minted
 /// from the app key the environment names. There is no tree yet, so no `[credentials]` table
-/// is read here: a container names its app key with `CTX_SECRET_GITHUB_APP` or
-/// `CTX_CREDENTIAL_GITHUB_APP`.
+/// is read here: a container names its app key with `CTX_SECRET_GITHUB_APP`,
+/// `CTX_CREDENTIAL_GITHUB_APP_FILE` or `CTX_CREDENTIAL_GITHUB_APP`.
 ///
 /// # Errors
 ///
-/// Returns an error when the clone fails, or when `root` holds files that are not a clone of
-/// the remote.
+/// Returns an error when the clone fails, when `root` holds files that are not a clone of the
+/// remote, or when the `github_app` credential is named but cannot be read or parsed.
 pub fn clone_when_empty(root: &Path) -> Result<()> {
     let Some(remote) = std::env::var_os(REMOTE_ENV) else {
         return Ok(());
