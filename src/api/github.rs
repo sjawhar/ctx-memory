@@ -13,7 +13,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::api::client::{self, CutShort, NoAnswer};
@@ -35,11 +35,59 @@ const READ_ATTEMPTS: u32 = 3;
 /// minutes nothing.
 const READ_RETRY_PAUSE: Duration = Duration::from_secs(2);
 
-/// The shape of the `github_app` credential.
+/// The shape of the `github_app` credential. `app_id` is a number or a string of digits, and
+/// other fields, such as the `client_id` GitHub shows beside the id, are ignored.
 #[derive(Debug, Deserialize)]
 struct AppCredential {
+    #[serde(deserialize_with = "app_id_text")]
     app_id: String,
     private_key: String,
+}
+
+/// Why an `app_id` was refused. The text is fixed, and names no part of the value: a
+/// credential whose fields were swapped carries the private key in `app_id`, and this error
+/// reaches the logs.
+const APP_ID_REFUSED: &str =
+    "app_id must be a GitHub App id: a non-negative whole number, or a string of the digits 0 to 9";
+
+/// Reads an `app_id` as the text the JWT names the app by.
+///
+/// GitHub shows the id as a number, and a credential written by hand may quote it. A whole
+/// number that is not negative becomes its decimal text, and a string of the ASCII digits 0 to
+/// 9 is kept as written, leading zeros included. Every other value is refused.
+fn app_id_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    struct AppId;
+
+    impl de::Visitor<'_> for AppId {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a GitHub App id")
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<String, E> {
+            let value = u64::try_from(value).map_err(|_| E::custom(APP_ID_REFUSED))?;
+            Ok(value.to_string())
+        }
+
+        fn visit_f64<E: de::Error>(self, _value: f64) -> Result<String, E> {
+            Err(E::custom(APP_ID_REFUSED))
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+            if !value.is_empty() && value.as_bytes().iter().all(u8::is_ascii_digit) {
+                Ok(value.to_owned())
+            } else {
+                Err(E::custom(APP_ID_REFUSED))
+            }
+        }
+    }
+
+    deserializer.deserialize_any(AppId)
 }
 
 /// How long before its stated end an installation token is treated as spent. A call that
@@ -142,8 +190,9 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error when the credential is missing, is not `{app_id, private_key}`, or
-    /// carries a key that is not a PEM private key.
+    /// Returns an error when the credential is missing, is not `{app_id, private_key}`, where
+    /// `app_id` is a number or a string of digits and other fields are ignored, or carries a
+    /// key that is not a PEM private key.
     pub fn load(config: &credentials::Config) -> Result<Self> {
         Self::from_secret(&credentials::load_with(config, "github_app")?)
     }
@@ -152,7 +201,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error when the value is not `{app_id, private_key}` with a PEM key.
+    /// Returns an error when the value is not `{app_id, private_key}` with a PEM key, where
+    /// `app_id` is a number or a string of digits and other fields are ignored.
     pub fn from_secret(secret: &Secret) -> Result<Self> {
         let credential: AppCredential = secret.parse()?;
         let key = EncodingKey::from_rsa_pem(credential.private_key.as_bytes())

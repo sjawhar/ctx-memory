@@ -10,6 +10,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use ctx_memory::api::github::{App, TokenRequest};
 use ctx_memory::credentials::{self, Secret};
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::{json, Value};
 
 use support::fake_http::FakeHttp;
@@ -179,5 +181,138 @@ fn the_app_mints_a_token_for_one_repository_only() -> Result<()> {
         .context("the app presents a bearer token")?;
     let header = jsonwebtoken::decode_header(jwt)?;
     assert_eq!(header.alg, jsonwebtoken::Algorithm::RS256);
+    Ok(())
+}
+
+/// The fixture signing key, as PKCS#8.
+const PKCS8_KEY: &str = include_str!("fixtures/jwt-signing-key.pem");
+/// The same key as PKCS#1, the form a GitHub App key is downloaded in.
+const PKCS1_KEY: &str = include_str!("fixtures/jwt-signing-key-pkcs1.pem");
+
+/// Every `app_id` the loader refuses, as the JSON text a credential carries.
+const REFUSED_APP_IDS: [&str; 13] = [
+    "-5706923",
+    "5706923.0",
+    "1e6",
+    // One more than the largest u64, which serde_json reads as a float.
+    "18446744073709551616",
+    r#""""#,
+    r#""+5706923""#,
+    r#"" 5706923""#,
+    r#""5706923\n""#,
+    r#""٥٧٠٦٩٢٣""#,
+    r#""Iv23liFixture""#,
+    "true",
+    "null",
+    "[5706923]",
+];
+
+/// Builds the app from `credential`, as the `github_app` credential is read.
+fn app_from(credential: &Value) -> Result<App> {
+    App::from_secret(&Secret::new(credential.to_string()))
+}
+
+/// The `iss` claim of the JWT `app` signs, read by checking the JWT with the fixture key set.
+fn signed_issuer(app: &App) -> Result<Value> {
+    let keys: JwkSet = serde_json::from_str(support::JWKS)?;
+    let key = keys.keys.first().context("no fixture key")?;
+    let key = DecodingKey::from_jwk(key)?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.validate_aud = false;
+    let token = jsonwebtoken::decode::<Value>(&app.jwt()?, &key, &validation)?;
+    token.claims.get("iss").cloned().context("no iss")
+}
+
+#[test]
+fn a_main_push_shaped_credential_signs_with_its_numeric_app_id() -> Result<()> {
+    let credential = json!({
+        "app_id": 5_706_923,
+        "client_id": "Iv23liFixture",
+        "private_key": PKCS1_KEY,
+    });
+    let app = app_from(&credential)?;
+    assert_eq!(signed_issuer(&app)?, json!("5706923"));
+    Ok(())
+}
+
+#[test]
+fn a_numeric_app_id_signs_as_its_decimal_text() -> Result<()> {
+    let credential = json!({ "app_id": 5_706_923, "private_key": PKCS8_KEY });
+    let app = app_from(&credential)?;
+    assert_eq!(signed_issuer(&app)?, json!("5706923"));
+    Ok(())
+}
+
+#[test]
+fn a_digit_string_app_id_signs_as_written() -> Result<()> {
+    for written in ["5706923", "0123"] {
+        let credential = json!({ "app_id": written, "private_key": PKCS8_KEY });
+        let app = app_from(&credential)?;
+        assert_eq!(
+            signed_issuer(&app)?,
+            json!(written),
+            "the app_id {written:?} signs as another issuer"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_app_id_that_is_not_a_whole_number_or_digits_is_refused_without_its_value() -> Result<()> {
+    let key = serde_json::to_string(PKCS8_KEY)?;
+    let mut rows = Vec::new();
+    for raw in REFUSED_APP_IDS {
+        let written: Value = serde_json::from_str(raw)?;
+        // A refused string must not appear in the error. Every text holds the empty one.
+        let content = written
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
+        let credential = format!(r#"{{"app_id": {raw}, "private_key": {key}}}"#);
+        rows.push((raw.to_owned(), credential, content));
+    }
+    let missing = format!(r#"{{"private_key": {key}}}"#);
+    rows.push(("(missing)".to_owned(), missing, None));
+    for (row, credential, content) in rows {
+        let error = App::from_secret(&Secret::new(credential))
+            .err()
+            .with_context(|| format!("the app_id {row} was accepted"))?;
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("the credential is not the expected JSON ("),
+            "the app_id {row} was refused with: {text}"
+        );
+        if let Some(content) = content {
+            assert!(
+                !text.contains(&content),
+                "the refusal of the app_id {row} repeats it: {text}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn swapped_app_credential_fields_never_print_the_key() -> Result<()> {
+    let swapped = json!({ "app_id": PKCS1_KEY, "private_key": "5706923" });
+    let error = app_from(&swapped)
+        .err()
+        .context("a credential with its fields swapped was accepted")?;
+    let text = format!("{error:#}");
+    // The id check refuses it, not the key reader: the PEM in `app_id` is what must stay out.
+    assert!(
+        text.starts_with("the credential is not the expected JSON ("),
+        "the swapped credential was refused with: {text}"
+    );
+    assert!(
+        !text.contains("PRIVATE KEY"),
+        "the refusal names the key: {text}"
+    );
+    for line in PKCS1_KEY.lines().filter(|line| !line.is_empty()) {
+        assert!(
+            !text.contains(line),
+            "the refusal carries a line of the key: {line}"
+        );
+    }
     Ok(())
 }
