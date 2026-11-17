@@ -335,8 +335,7 @@ mod tests {
     fn a_missing_credential_names_both_variables() {
         let error = load_with(&Config::new(), "slack")
             .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            .map_or_default(|error| error.to_string());
         assert!(
             error.contains("CTX_SECRET_SLACK") && error.contains("CTX_CREDENTIAL_SLACK"),
             "unexpected error: {error}"
@@ -349,8 +348,7 @@ mod tests {
     fn a_caller_without_tree_configuration_is_not_sent_to_it() {
         let error = load("google")
             .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            .map_or_default(|error| error.to_string());
         assert!(
             error.contains("CTX_SECRET_GOOGLE") && error.contains("CTX_CREDENTIAL_GOOGLE"),
             "unexpected error: {error}"
@@ -362,8 +360,7 @@ mod tests {
     fn a_caller_that_reads_the_tree_is_sent_to_it() {
         let error = load_with(&Config::new(), "slack")
             .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            .map_or_default(|error| error.to_string());
         assert!(
             error.contains("[credentials] in ctx.toml"),
             "unexpected error: {error}"

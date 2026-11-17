@@ -272,14 +272,13 @@ fn put_citing_a_source_that_declared_nothing_is_422() -> Result<()> {
         .field("findings")
         .ok()
         .and_then(Value::as_array)
-        .map(|findings| {
+        .map_or_default(|findings| {
             findings
                 .iter()
                 .filter_map(|finding| finding.get("kind").and_then(Value::as_str))
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     remove_fixture(&tree)?;
 
     assert_eq!(

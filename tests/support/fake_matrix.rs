@@ -363,8 +363,7 @@ impl FakeMatrix {
 pub fn query(target: &str) -> BTreeMap<String, String> {
     target
         .split_once('?')
-        .map(|(_, query)| query)
-        .unwrap_or_default()
+        .map_or_default(|(_, query)| query)
         .split('&')
         .filter(|pair| !pair.is_empty())
         .map(|pair| {
@@ -717,8 +716,7 @@ fn room_route(
             let found = room
                 .timeline
                 .get(at)
-                .map(|(_, event)| event.clone())
-                .unwrap_or_default();
+                .map_or_default(|(_, event)| event.clone());
             ok(&json!({
                 "event": found,
                 "events_before": [],

@@ -134,9 +134,8 @@ pub(super) fn served_text(
                 ..
             } if shows_id(*mention, shown) => {
                 let id: &str = id;
-                let names = name(id)?
-                    .map(|known| BTreeMap::from([(id.to_owned(), known)]))
-                    .unwrap_or_default();
+                let names =
+                    name(id)?.map_or_default(|known| BTreeMap::from([(id.to_owned(), known)]));
                 let start = served.len();
                 mention.render(&names, &mut served);
                 renamed |= served.get(start..) != Some(shown);

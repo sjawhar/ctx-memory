@@ -982,8 +982,7 @@ mod tests {
         ] {
             let error = SlackCredential::from_secret(&Secret::new(json.clone()))
                 .err()
-                .map(|error| format!("{error:#}"))
-                .unwrap_or_default();
+                .map_or_default(|error| format!("{error:#}"));
             assert!(error.contains(why), "{json}: unexpected error {error:?}");
             assert!(
                 !error.contains("secret-value") && !error.contains("xoxe-1-secret"),
@@ -1013,8 +1012,7 @@ mod tests {
         ] {
             let error = SlackApp::from_secret(&Secret::new(json.clone()))
                 .err()
-                .map(|error| format!("{error:#}"))
-                .unwrap_or_default();
+                .map_or_default(|error| format!("{error:#}"));
             assert!(!error.is_empty(), "{json} was accepted");
             assert!(
                 !error.contains(APP_CLIENT_SECRET),
@@ -1034,8 +1032,7 @@ mod tests {
         }
         let error = SlackApp::load()
             .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
+            .map_or_default(|error| format!("{error:#}"));
         assert!(
             error.contains("CTX_SECRET_SLACK_APP") && error.contains("ctx-memory Slack app"),
             "unexpected error: {error}"
@@ -1109,8 +1106,7 @@ mod tests {
         credential.client_id = "999.999".to_owned();
         let error = refresh_app_credential(&credential, &app()?, now)
             .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
+            .map_or_default(|error| format!("{error:#}"));
         assert!(
             error.contains("is for client 1234567890.0987654321"),
             "{error}"
@@ -1156,10 +1152,7 @@ mod tests {
         server
             .join()
             .map_err(|_| anyhow::anyhow!("fake API server failed"))??;
-        let error = result
-            .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
+        let error = result.err().map_or_default(|error| format!("{error:#}"));
         assert_eq!(error, r#"slack conversations.info: "channel_not_found""#);
         Ok(())
     }

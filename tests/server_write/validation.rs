@@ -15,12 +15,11 @@ pub(super) fn finding_kinds(reply: &support::Reply) -> Vec<String> {
         .field("findings")
         .ok()
         .and_then(Value::as_array)
-        .map(|findings| {
+        .map_or_default(|findings| {
             findings
                 .iter()
                 .filter_map(|finding| finding.get("kind").and_then(Value::as_str))
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
 }

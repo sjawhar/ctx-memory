@@ -336,8 +336,7 @@ fn a_statement_of_absence_without_a_source_is_a_negative() -> Result<()> {
     let snippet = findings
         .negatives
         .first()
-        .map(|negative| negative.snippet.as_str())
-        .unwrap_or_default();
+        .map_or_default(|negative| negative.snippet.as_str());
     assert!(snippet.contains("never told"), "{snippet}");
     Ok(())
 }

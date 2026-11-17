@@ -330,8 +330,7 @@ mod tests {
         ] {
             let error = access_token(&Secret::new(value.to_owned()))
                 .err()
-                .map(|error| error.to_string())
-                .unwrap_or_default();
+                .map_or_default(|error| error.to_string());
             assert!(!error.is_empty(), "{value:?} must be refused");
             assert!(!error.contains("syt_"), "{error}");
         }

@@ -131,10 +131,7 @@ fn a_pointer_into_a_room_the_source_does_not_read_is_refused() -> Result<()> {
     );
 
     for refused in [by_id, by_name, by_alias] {
-        let error = refused
-            .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
+        let error = refused.err().map_or_default(|error| format!("{error:#}"));
         assert!(error.contains("not a room this source reads"), "{error}");
     }
     let read = paths(&server)?;

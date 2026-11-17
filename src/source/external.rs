@@ -101,6 +101,5 @@ fn stderr_tail(stderr: &str) -> String {
     stderr
         .as_bytes()
         .get(start..)
-        .map(|bytes| String::from_utf8_lossy(bytes).trim().to_owned())
-        .unwrap_or_default()
+        .map_or_default(|bytes| String::from_utf8_lossy(bytes).trim().to_owned())
 }

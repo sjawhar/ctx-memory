@@ -1146,10 +1146,7 @@ fn model_error_line(verdict: &Verdict) -> Result<String> {
         verdict.stdout,
         verdict.stderr
     );
-    let line = lines
-        .first()
-        .map(|line| (*line).to_owned())
-        .unwrap_or_default();
+    let line = lines.first().map_or_default(|line| (*line).to_owned());
     ensure!(
         line.contains(FRESH_SESSION)
             && !verdict.stdout.contains("SECRET")

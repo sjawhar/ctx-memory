@@ -201,8 +201,7 @@ fn serve_git(root: &Path, request: &Recorded, body: &[u8]) -> Result<Response> {
     let query = request
         .target
         .split_once('?')
-        .map(|(_, query)| query)
-        .unwrap_or_default();
+        .map_or_default(|(_, query)| query);
     let mut backend = Command::new("git");
     backend
         .arg("http-backend")

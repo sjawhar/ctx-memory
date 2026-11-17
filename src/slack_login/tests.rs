@@ -92,8 +92,7 @@ fn granted() -> String {
 
 fn url_pairs(body: &str) -> Vec<(String, String)> {
     reqwest::Url::parse(&format!("http://localhost/?{body}"))
-        .map(|url| url.query_pairs().into_owned().collect())
-        .unwrap_or_default()
+        .map_or_default(|url| url.query_pairs().into_owned().collect())
 }
 
 #[test]
@@ -138,8 +137,7 @@ fn parse_callback_accepts_a_full_url() -> Result<()> {
 fn parse_callback_rejects_a_mismatched_state() {
     let error = parse_callback("/callback?code=abc&state=other", "expected")
         .err()
-        .map(|error| format!("{error:#}"))
-        .unwrap_or_default();
+        .map_or_default(|error| format!("{error:#}"));
     assert!(
         error.contains("state did not match"),
         "unexpected error: {error}"
@@ -150,8 +148,7 @@ fn parse_callback_rejects_a_mismatched_state() {
 fn parse_callback_reports_a_slack_error() {
     let error = parse_callback("/callback?error=access_denied&state=s", "s")
         .err()
-        .map(|error| format!("{error:#}"))
-        .unwrap_or_default();
+        .map_or_default(|error| format!("{error:#}"));
     assert!(error.contains("access_denied"), "unexpected error: {error}");
 }
 

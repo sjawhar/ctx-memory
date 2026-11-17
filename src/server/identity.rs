@@ -771,8 +771,7 @@ mod tests {
                     }
                     let address = target
                         .split_once("addr=")
-                        .map(|(_, address)| address.replace("%3A", ":"))
-                        .unwrap_or_default();
+                        .map_or_default(|(_, address)| address.replace("%3A", ":"));
                     let (status, body) = match nodes.iter().find(|(known, _)| *known == address) {
                         Some((_, tags)) => (
                             "200 OK",
@@ -796,10 +795,7 @@ mod tests {
         }
 
         fn asked(&self) -> Vec<String> {
-            self.asked
-                .lock()
-                .map(|asked| asked.clone())
-                .unwrap_or_default()
+            self.asked.lock().map_or_default(|asked| asked.clone())
         }
     }
 
