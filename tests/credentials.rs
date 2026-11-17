@@ -381,3 +381,30 @@ fn swapped_app_credential_fields_never_print_the_key() -> Result<()> {
     }
     Ok(())
 }
+
+/// A credential that holds only its key, as a JSON string, is refused without the key. A named
+/// credential that does not load stops `ctx` with this error, so it reaches the standard error
+/// of every clone, pull and push, and the server's logs.
+#[test]
+fn a_credential_that_is_only_its_key_is_refused_without_the_key() -> Result<()> {
+    let key = support::signing_key_pkcs1()?;
+    let error = App::from_secret(&Secret::new(serde_json::to_string(&key)?))
+        .err()
+        .context("a credential that is only its key was accepted")?;
+    let text = format!("{error:#}");
+    assert!(
+        text.starts_with("the credential is not the expected JSON ("),
+        "the credential that is only its key was refused with: {text}"
+    );
+    assert!(
+        !text.contains("PRIVATE KEY"),
+        "the refusal names the key: {text}"
+    );
+    for line in key.lines().filter(|line| !line.is_empty()) {
+        assert!(
+            !text.contains(line),
+            "the refusal carries a line of the key: {line}"
+        );
+    }
+    Ok(())
+}
