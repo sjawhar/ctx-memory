@@ -9,6 +9,7 @@ use anyhow::{Context as _, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use ctx_memory::api::github::{App, TokenRequest};
+use ctx_memory::config::TreeConfig;
 use ctx_memory::credentials::{self, Secret};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -147,6 +148,37 @@ fn a_credentials_file_under_home_is_read() -> Result<()> {
         std::env::remove_var("HOME");
     }
     support::remove_scratch(&home)?;
+
+    assert_eq!(secret?.expose(), contents);
+    Ok(())
+}
+
+/// The README's own `[credentials]` entry, as a person writes it in `ctx.toml`:
+/// `github_app = { file = "~/…" }`. The tree's configuration parses, and the credential is read
+/// from the file under `HOME`.
+#[test]
+fn the_readme_credentials_entry_in_ctx_toml_reads_a_file_under_home() -> Result<()> {
+    let _guard = guard();
+    let root = support::scratch("credentials-readme-entry")?;
+    let tree = root.join("tree");
+    std::fs::create_dir_all(&tree)?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        "version = 1\n\n[credentials]\ngithub_app = { file = \"~/github-app.json\" }\n",
+    )?;
+    let contents = r#"{"app_id":"1"}"#;
+    std::fs::write(root.join("github-app.json"), contents)?;
+
+    let previous = std::env::var_os("HOME");
+    std::env::set_var("HOME", &root);
+    let secret = TreeConfig::load(&tree)
+        .and_then(|config| credentials::load_with(&config.credentials, "github_app"));
+    if let Some(previous) = previous {
+        std::env::set_var("HOME", previous);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    support::remove_scratch(&root)?;
 
     assert_eq!(secret?.expose(), contents);
     Ok(())
