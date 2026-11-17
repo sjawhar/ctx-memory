@@ -59,8 +59,16 @@ impl fmt::Debug for Secret {
 }
 
 /// Where one credential lives when it is not in Secret Manager.
+///
+/// An entry of `[credentials]` in `ctx.toml` is written `name = { file = "<path>" }`, where a
+/// path that starts with `~/` is read under `HOME`, or `name = { env = "<VARIABLE>" }`. A table
+/// that names both keys, or any other key, is refused.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
+#[serde(
+    untagged,
+    deny_unknown_fields,
+    expecting = "a table { file = \"<path>\" } or { env = \"<VARIABLE>\" }"
+)]
 pub enum Source {
     /// A file holding the credential.
     File { file: PathBuf },
@@ -402,6 +410,30 @@ mod tests {
         let secret = load_with(&config, "github_app")?;
         std::fs::remove_file(&path)?;
         assert_eq!(secret.expose(), "{\"app_id\":\"1\"}");
+        Ok(())
+    }
+
+    /// The two forms the README writes, as `ctx.toml` parses them, and a table naming both.
+    #[test]
+    fn a_credentials_entry_is_a_file_or_an_env_table() -> anyhow::Result<()> {
+        let parse = |entry: &str| toml::from_str::<Config>(&format!("github_app = {entry}\n"));
+        let file = std::path::PathBuf::from("~/github-app.json");
+        let env = "CTX_FIXTURE_APP".to_owned();
+        assert_eq!(
+            parse(r#"{ file = "~/github-app.json" }"#)?.get("github_app"),
+            Some(&Source::File { file })
+        );
+        assert_eq!(
+            parse(r#"{ env = "CTX_FIXTURE_APP" }"#)?.get("github_app"),
+            Some(&Source::Env { env })
+        );
+        let refused = parse(r#"{ file = "a", env = "B" }"#)
+            .err()
+            .map_or_default(|error| error.to_string());
+        assert!(
+            refused.contains(r#"a table { file = "<path>" } or { env = "<VARIABLE>" }"#),
+            "a table naming both keys was not refused with the two forms: {refused}"
+        );
         Ok(())
     }
 }
