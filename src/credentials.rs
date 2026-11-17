@@ -94,6 +94,10 @@ pub fn load(name: &str) -> Result<Secret> {
 
 /// Loads a credential by name, including the sources the tree's configuration names.
 ///
+/// A `[credentials]` file entry that starts with `~/` is read under `HOME`, so
+/// `github_app = { file = "~/.config/ctx/github-app.json" }` names a file in the home
+/// directory.
+///
 /// # Errors
 ///
 /// Returns an error when no source is configured for the name or the source cannot be read.
@@ -102,7 +106,10 @@ pub fn load_with(config: &Config, name: &str) -> Result<Secret> {
         return Ok(secret);
     }
     match config.get(name) {
-        Some(Source::File { file }) => read_file(file),
+        Some(Source::File { file }) => match file.to_str() {
+            Some(text) => read_file(&crate::config::expand_home(text)),
+            None => read_file(file),
+        },
         Some(Source::Env { env }) => std::env::var(env)
             .map(Secret)
             .with_context(|| format!("reading {env}")),
@@ -135,6 +142,22 @@ fn from_environment(name: &str) -> Result<Option<Secret>> {
         )));
     }
     Ok(None)
+}
+
+/// Whether any source names the credential: `CTX_SECRET_<NAME>`, `CTX_CREDENTIAL_<NAME>_FILE`
+/// or `CTX_CREDENTIAL_<NAME>` is set, or the tree's `[credentials]` table has an entry for it.
+///
+/// Nothing is read, so a credential named here may still fail to load. A caller that can go
+/// on without the credential uses this to tell "no source names it", the one case it may
+/// treat as "no credential", from a credential that is named but cannot be read.
+#[must_use]
+pub fn configured(config: &Config, name: &str) -> bool {
+    // Mirrors `from_environment`: the same three variables, and one that is set counts even
+    // when it is empty, as it does there.
+    std::env::var_os(secret_env(name)).is_some()
+        || std::env::var_os(format!("{}_FILE", credential_env(name))).is_some()
+        || std::env::var_os(credential_env(name)).is_some()
+        || config.contains_key(name)
 }
 
 /// Stores a new version of a credential, which only a rotated credential needs.

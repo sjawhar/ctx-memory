@@ -33,17 +33,15 @@ fn private_remote(label: &str) -> Result<(std::path::PathBuf, FakeGithub)> {
     Ok((root, github))
 }
 
-/// The environment a container carries: the remote, the app key, and the GitHub to mint from.
-fn container_env(github: &FakeGithub, with_key: bool) -> Vec<(String, String)> {
+/// The environment a container carries: the remote, the GitHub to mint from, and the app key
+/// `credential` holds, when it holds one.
+fn container_env(github: &FakeGithub, credential: Option<String>) -> Vec<(String, String)> {
     let mut environment = vec![
         ("CTX_MEMORY_REMOTE".to_owned(), github.remote(OWNER, NAME)),
         ("CTX_GITHUB_API".to_owned(), github.api()),
     ];
-    if with_key {
-        environment.push((
-            "CTX_CREDENTIAL_GITHUB_APP".to_owned(),
-            FakeGithub::app_credential(),
-        ));
+    if let Some(credential) = credential {
+        environment.push(("CTX_CREDENTIAL_GITHUB_APP".to_owned(), credential));
     }
     environment
 }
@@ -62,7 +60,7 @@ fn the_server_clones_pulls_and_pushes_a_private_remote() -> Result<()> {
     let (root, github) = private_remote("private-remote")?;
     let tree = root.join("tree");
     std::fs::create_dir_all(&tree)?;
-    let environment = container_env(&github, true);
+    let environment = container_env(&github, Some(FakeGithub::app_credential()));
     let bare = github.bare(OWNER, NAME);
     let head = git(&bare, &["rev-parse", "main"])?;
 
@@ -131,7 +129,7 @@ fn without_a_credential_the_private_remote_refuses_the_clone() -> Result<()> {
     let (root, github) = private_remote("private-remote-anon")?;
     let tree = root.join("tree");
     std::fs::create_dir_all(&tree)?;
-    let environment = container_env(&github, false);
+    let environment = container_env(&github, None);
 
     let started = Server::start_with_env(&tree, &[], &borrowed(&environment));
     let requests = github.git_requests()?;
@@ -157,7 +155,7 @@ fn the_fetch_job_clones_a_private_remote() -> Result<()> {
     let tree = root.join("tree");
     std::fs::create_dir_all(&tree)?;
     let tree_text = tree.to_str().context("the tree path is not valid UTF-8")?;
-    let environment = container_env(&github, true);
+    let environment = container_env(&github, Some(FakeGithub::app_credential()));
 
     let mut command = support::binary();
     command.args(["--memory", tree_text, "rules"]);
@@ -179,6 +177,89 @@ fn the_fetch_job_clones_a_private_remote() -> Result<()> {
     assert!(
         stdout.contains("# Rules"),
         "the private tree was not cloned: {stdout}"
+    );
+    Ok(())
+}
+
+/// The start-up clone that v0.3.6 could not make with a key whose `app_id` is a number, the
+/// shape GitHub itself shows: that version refused the key and ran git with no credential.
+#[test]
+fn the_server_clones_a_private_remote_with_a_numeric_app_id() -> Result<()> {
+    let (root, github) = private_remote("private-remote-numeric")?;
+    let tree = root.join("tree");
+    std::fs::create_dir_all(&tree)?;
+    let environment = container_env(&github, Some(FakeGithub::numeric_app_credential()));
+    let head = git(&github.bare(OWNER, NAME), &["rev-parse", "main"])?;
+
+    let server = Server::start_with_env(&tree, &[], &borrowed(&environment))?;
+    let health = server.get(server.tailnet_address()?, "/healthz", &[])?;
+    drop(server);
+
+    let requests = github.git_requests()?;
+    let minted = github.minted()?;
+    remove_scratch(&root)?;
+
+    assert_eq!(health.status, 200, "unexpected body: {}", health.body);
+    assert_eq!(
+        health.text("head")?,
+        head,
+        "the server did not clone the private remote"
+    );
+    assert!(!requests.is_empty(), "the clone never reached the remote");
+    assert!(
+        requests.iter().all(|request| request.authorized),
+        "a git request went out without the credential: {requests:?}"
+    );
+    assert!(minted >= 1, "no installation token was minted");
+    Ok(())
+}
+
+/// A credential that is named but does not parse stops `ctx` with its own error, and git
+/// never runs. Before this change, ctx ran git with no credential and said only that git's
+/// authentication failed.
+#[test]
+fn a_credential_that_does_not_parse_stops_ctx_and_names_the_cause() -> Result<()> {
+    let (root, github) = private_remote("private-remote-unparsed")?;
+    let tree = root.join("tree");
+    std::fs::create_dir_all(&tree)?;
+    let tree_text = tree.to_str().context("the tree path is not valid UTF-8")?;
+    // The client id where the app id belongs: GitHub shows the two side by side.
+    let credential = json!({
+        "app_id": "Iv23liFixture",
+        "private_key": include_str!("fixtures/jwt-signing-key.pem"),
+    })
+    .to_string();
+    let environment = container_env(&github, Some(credential));
+
+    let mut command = support::binary();
+    command.args(["--memory", tree_text, "rules"]);
+    for (name, value) in &environment {
+        command.env(name, value);
+    }
+    for (name, value) in support::tree_env(&tree)? {
+        command.env(name, value);
+    }
+    let output = command.output().context("running ctx rules")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let requests = github.git_requests()?;
+    remove_scratch(&root)?;
+
+    assert!(
+        !output.status.success(),
+        "ctx rules ran with a credential it cannot parse: {stdout}{stderr}"
+    );
+    assert!(
+        stderr.contains("the credential is not the expected JSON"),
+        "the error does not name the cause: {stderr}"
+    );
+    assert!(
+        !stderr.contains("PRIVATE KEY"),
+        "the error carries the key: {stderr}"
+    );
+    assert!(
+        requests.is_empty(),
+        "git asked the remote without the credential: {requests:?}"
     );
     Ok(())
 }

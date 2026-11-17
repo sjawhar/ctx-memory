@@ -122,6 +122,40 @@ fn a_rotated_credential_is_saved_as_a_new_version() -> Result<()> {
     Ok(())
 }
 
+/// A `[credentials]` file entry that starts with `~/` is read under `HOME`, as the README's own
+/// `github_app = { file = "~/.config/ctx/github-app.json" }` is written.
+#[test]
+fn a_credentials_file_under_home_is_read() -> Result<()> {
+    let _guard = guard();
+    let home = std::env::temp_dir().join(format!("ctx-credentials-home-{}", std::process::id()));
+    if home.exists() {
+        std::fs::remove_dir_all(&home)?;
+    }
+    std::fs::create_dir_all(&home)?;
+    let contents = r#"{"app_id":"1"}"#;
+    std::fs::write(home.join("github-app.json"), contents)?;
+    let mut config = credentials::Config::new();
+    config.insert(
+        "github_app".to_owned(),
+        credentials::Source::File {
+            file: "~/github-app.json".into(),
+        },
+    );
+
+    let previous = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    let secret = credentials::load_with(&config, "github_app");
+    if let Some(previous) = previous {
+        std::env::set_var("HOME", previous);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    std::fs::remove_dir_all(&home)?;
+
+    assert_eq!(secret?.expose(), contents);
+    Ok(())
+}
+
 #[test]
 fn the_app_mints_a_token_for_one_repository_only() -> Result<()> {
     let _guard = guard();
