@@ -184,6 +184,56 @@ fn the_readme_credentials_entry_in_ctx_toml_reads_a_file_under_home() -> Result<
     Ok(())
 }
 
+/// A `[credentials]` `{ env = "<VARIABLE>" }` entry whose variable is not UTF-8, or is not set,
+/// is refused by the variable's name and never with its value. A named credential that does
+/// not load stops `ctx` with this error, so it reaches the standard error of every clone, pull
+/// and push, and the server's logs.
+#[test]
+fn a_credentials_env_entry_that_is_not_utf8_is_refused_without_its_value() -> Result<()> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let _guard = guard();
+    let name = "CTX_FIXTURE_NOT_UNICODE_APP";
+    let mut config = credentials::Config::new();
+    config.insert(
+        "github_app".to_owned(),
+        credentials::Source::Env {
+            env: name.to_owned(),
+        },
+    );
+
+    // The 0xff byte keeps the value from being UTF-8.
+    let bytes = b"fixture-secret-\xffnot-a-real-token".to_vec();
+    std::env::set_var(name, std::ffi::OsString::from_vec(bytes));
+    let not_unicode = credentials::load_with(&config, "github_app");
+    std::env::remove_var(name);
+    let unset = credentials::load_with(&config, "github_app");
+
+    let error = not_unicode
+        .err()
+        .context("a variable that is not UTF-8 was accepted")?;
+    let text = format!("{error:#}");
+    assert!(
+        text.contains(name) && text.contains("is not valid UTF-8"),
+        "the variable that is not UTF-8 was refused with: {text}"
+    );
+    for part in ["fixture-secret", "not-a-real-token"] {
+        assert!(
+            !text.contains(part),
+            "the refusal carries the value's {part:?}: {text}"
+        );
+    }
+    let error = unset
+        .err()
+        .context("a variable that is not set was accepted")?;
+    let text = format!("{error:#}");
+    assert!(
+        text.contains(name),
+        "the variable that is not set was refused with: {text}"
+    );
+    Ok(())
+}
+
 #[test]
 fn the_app_mints_a_token_for_one_repository_only() -> Result<()> {
     let _guard = guard();

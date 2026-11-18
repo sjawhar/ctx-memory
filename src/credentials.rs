@@ -137,7 +137,8 @@ pub fn load(name: &str) -> Result<Secret> {
 ///
 /// A `[credentials]` file entry that starts with `~/` is read under `HOME`, so
 /// `github_app = { file = "~/.config/ctx/github-app.json" }` names a file in the home
-/// directory.
+/// directory. An `{ env = "<VARIABLE>" }` entry is read from that variable; one that is not set
+/// or not UTF-8 is refused by its name, never with its value.
 ///
 /// # Errors
 ///
@@ -151,9 +152,15 @@ pub fn load_with(config: &Config, name: &str) -> Result<Secret> {
             Some(text) => read_file(&crate::config::expand_home(text)),
             None => read_file(file),
         },
-        Some(Source::Env { env }) => std::env::var(env)
-            .map(Secret)
-            .with_context(|| format!("reading {env}")),
+        // Not `std::env::var`: its error for a value that is not UTF-8 prints the value.
+        Some(Source::Env { env }) => match std::env::var_os(env) {
+            Some(value) => Ok(Secret(
+                value
+                    .into_string()
+                    .map_err(|_| anyhow!("{env} is not valid UTF-8"))?,
+            )),
+            None => bail!("reading {env}: the variable is not set"),
+        },
         None => bail!(
             "no credential named {name}: set {} or {}, or name one under [credentials] in ctx.toml",
             secret_env(name),
