@@ -408,3 +408,35 @@ fn a_credential_that_is_only_its_key_is_refused_without_the_key() -> Result<()> 
     }
     Ok(())
 }
+
+/// A credential that is only its key, as a JSON string, with more text after it, is refused
+/// without the key: a line copied with its trailing comma, a stray brace on the next line, or
+/// the key written twice. serde reports the string before it reaches the text that keeps the
+/// whole secret from being JSON.
+#[test]
+fn a_key_only_credential_with_text_after_it_is_refused_without_the_key() -> Result<()> {
+    let key = support::signing_key_pkcs1()?;
+    let quoted = serde_json::to_string(&key)?;
+    let twice = format!(" {quoted}");
+    for after in [",", "\n}", twice.as_str()] {
+        let error = App::from_secret(&Secret::new(format!("{quoted}{after}")))
+            .err()
+            .with_context(|| format!("the key followed by {after:?} was accepted"))?;
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("the credential is not the expected JSON ("),
+            "the key followed by {after:?} was refused with: {text}"
+        );
+        assert!(
+            !text.contains("PRIVATE KEY"),
+            "the refusal of the key followed by {after:?} names the key: {text}"
+        );
+        for line in key.lines().filter(|line| !line.is_empty()) {
+            assert!(
+                !text.contains(line),
+                "the refusal of the key followed by {after:?} carries a line of the key: {line}"
+            );
+        }
+    }
+    Ok(())
+}
