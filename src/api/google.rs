@@ -360,8 +360,15 @@ fn refresh_form(credential: &Secret) -> Result<Option<Vec<(&'static str, String)
         }
         return Ok(None);
     }
-    let value: Value =
-        serde_json::from_str(trimmed).context("parsing the Google credential as JSON")?;
+    let value: Value = serde_json::from_str(trimmed).map_err(|error| {
+        anyhow!(
+            "parsing the Google credential: it is not the expected JSON ({})",
+            credentials::json_refusal(
+                &error,
+                "a JSON object with client_id, client_secret and refresh_token"
+            )
+        )
+    })?;
     let field = |name: &str| -> Result<String> {
         value
             .get(name)

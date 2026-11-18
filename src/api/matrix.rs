@@ -229,8 +229,12 @@ pub fn access_token(credential: &Secret) -> Result<Secret> {
         }
         return Ok(Secret::new(trimmed.to_owned()));
     }
-    let value: Value = serde_json::from_str(trimmed)
-        .map_err(|error| anyhow!("the matrix credential is not valid JSON ({error})"))?;
+    let value: Value = serde_json::from_str(trimmed).map_err(|error| {
+        anyhow!(
+            "the matrix credential is not the expected JSON ({})",
+            credentials::json_refusal(&error, "a JSON object with access_token")
+        )
+    })?;
     value
         .get("access_token")
         .and_then(Value::as_str)

@@ -5,7 +5,6 @@
 //! environment variable the tree's configuration names. Nothing writes a credential into the
 //! tree, and no copy of a secret is kept anywhere else.
 
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -17,7 +16,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::error::Category;
+use serde_json::json;
 
 /// The default host of Google's metadata server.
 const METADATA_HOST: &str = "http://metadata.google.internal";
@@ -45,22 +45,10 @@ impl Secret {
     ///
     /// # Errors
     ///
-    /// Returns an error when the secret is not JSON of the expected shape. The error never
-    /// carries the secret.
-    pub fn parse<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.0).map_err(|error| self.not_the_expected_json(&error))
-    }
-
-    /// The refusal of this secret as the JSON a caller expected, which never carries the secret.
-    ///
-    /// serde names a value it was handed: a string as `string "<the string>"`, an unknown enum
-    /// tag as `` `<the tag>` ``. A credential that is only its key, or whose fields are swapped,
-    /// hands it the key or a token, so each string the credential holds is taken out of the
-    /// message.
-    #[must_use]
-    pub fn not_the_expected_json(&self, error: &serde_json::Error) -> anyhow::Error {
-        let message = without_strings(&self.0, error.to_string());
-        anyhow!("the credential is not the expected JSON ({message})")
+    /// Returns an error when the secret is not JSON of the `expected` shape. The error names
+    /// where the JSON went wrong and the shape expected, and never carries the secret.
+    pub fn parse<T: DeserializeOwned>(&self, expected: &str) -> Result<T> {
+        serde_json::from_str(&self.0).map_err(|error| not_the_expected_json(&error, expected))
     }
 }
 
@@ -70,40 +58,37 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// `message` with each string the JSON `secret` holds taken out: in the form serde gives a
-/// string it was handed (its `Debug` form, quotes included), in the backticks it puts around an
-/// unknown tag, and bare when it is long enough not to be a common word. A secret that is not
-/// JSON makes a syntax error, which names a position and never the text, so that message stays.
-fn without_strings(secret: &str, mut message: String) -> String {
-    let Ok(value) = serde_json::from_str::<Value>(secret) else {
-        return message;
+/// Why JSON that holds a secret was refused, from the error's category and position and the
+/// shape the caller `expected`, and never from serde's message, which can quote any value it
+/// was handed: a credential that is only its key, or whose fields are swapped, hands it the key.
+#[must_use]
+pub fn json_refusal(error: &serde_json::Error, expected: &str) -> String {
+    let why = match error.classify() {
+        Category::Syntax => "it is not valid JSON",
+        Category::Eof => "it ends before its JSON does",
+        Category::Data => "its fields or values are not the expected ones",
+        Category::Io => "it could not be read",
     };
-    let mut strings = Vec::new();
-    strings_in(&value, &mut strings);
-    strings.retain(|string| !string.is_empty());
-    // Longest first, so a string inside a longer one cannot break the longer one's form.
-    strings.sort_unstable_by_key(|string| (Reverse(string.len()), *string));
-    strings.dedup();
-    for string in strings {
-        message = message
-            .replace(&format!("{string:?}"), "\"…\"")
-            .replace(&format!("`{string}`"), "`…`");
-        if string.chars().count() >= 8 {
-            message = message.replace(string, "…");
-        }
+    // An error from a value already parsed, as `serde_json::from_value` makes, has no position.
+    if error.line() > 0 {
+        format!(
+            "{why} at line {} column {}; expected {expected}",
+            error.line(),
+            error.column()
+        )
+    } else {
+        format!("{why}; expected {expected}")
     }
-    message
 }
 
-/// Every string value in `value`, through arrays and the values of objects. An object's keys
-/// are field names, not values, so they are not collected.
-fn strings_in<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
-    match value {
-        Value::String(string) => strings.push(string),
-        Value::Array(items) => items.iter().for_each(|item| strings_in(item, strings)),
-        Value::Object(map) => map.values().for_each(|item| strings_in(item, strings)),
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
-    }
+/// The refusal of a credential as the JSON a caller `expected`, which never carries the
+/// credential: see [`json_refusal`].
+#[must_use]
+pub fn not_the_expected_json(error: &serde_json::Error, expected: &str) -> anyhow::Error {
+    anyhow!(
+        "the credential is not the expected JSON ({})",
+        json_refusal(error, expected)
+    )
 }
 
 /// Where one credential lives when it is not in Secret Manager.
@@ -270,9 +255,16 @@ fn access(resource: &str) -> Result<Secret> {
         let detail = response.text().unwrap_or_default();
         bail!("reading {resource} failed: {status} {detail}");
     }
-    let access: Access = response
-        .json()
-        .with_context(|| format!("decoding {resource}"))?;
+    // The answer holds the credential, so its refusal is built without serde's message.
+    let text = response
+        .text()
+        .with_context(|| format!("reading {resource}"))?;
+    let access: Access = serde_json::from_str(&text).map_err(|error| {
+        anyhow!(
+            "decoding {resource}: the answer is not the expected JSON ({})",
+            json_refusal(&error, "{payload: {data}}")
+        )
+    })?;
     let decoded = STANDARD
         .decode(access.payload.data.as_bytes())
         .with_context(|| format!("decoding the payload of {resource}"))?;
@@ -304,7 +296,13 @@ pub fn metadata_token() -> Result<Secret> {
     if !status.is_success() {
         bail!("the metadata server answered {status}");
     }
-    let token: Token = response.json().context("decoding the metadata token")?;
+    let text = response.text().context("reading the metadata token")?;
+    let token: Token = serde_json::from_str(&text).map_err(|error| {
+        anyhow!(
+            "decoding the metadata token: the answer is not the expected JSON ({})",
+            json_refusal(&error, "{access_token}")
+        )
+    })?;
     Ok(Secret(token.access_token))
 }
 
@@ -486,8 +484,9 @@ mod tests {
     }
 
     /// serde names a value it was handed, so a token where the credential's JSON wants a
-    /// number, a struct or an enum tag would reach the refusal. It never does, and the refusal
-    /// still says where the JSON went wrong and what was expected there.
+    /// number, a struct or an enum tag, or a token that is the whole credential with text after
+    /// it, would reach serde's message. The refusal is built without that message: it says
+    /// where the JSON went wrong and what was expected, and never carries the token.
     #[test]
     fn a_refusal_never_carries_a_string_the_credential_holds() -> anyhow::Result<()> {
         #[derive(Debug, Deserialize, PartialEq)]
@@ -501,23 +500,29 @@ mod tests {
             kind: Kind,
         }
         const TOKEN: &str = "fixture-secret-not-a-real-token";
+        const EXPECTED: &str = "{count, kind}";
         let refusal = |json: &str| {
             Secret::new(json.to_owned())
-                .parse::<Fixture>()
+                .parse::<Fixture>(EXPECTED)
                 .err()
                 .map_or_default(|error| format!("{error:#}"))
         };
         let well_formed = Secret::new(r#"{"count": 1, "kind": "app"}"#.to_owned());
-        let fixture: Fixture = well_formed.parse()?;
+        let fixture: Fixture = well_formed.parse(EXPECTED)?;
         assert_eq!((fixture.count, fixture.kind), (1, Kind::App));
         for json in [
             format!("{TOKEN:?}"),
             format!(r#"{{"count": "{TOKEN}", "kind": "app"}}"#),
             format!(r#"{{"count": 1, "kind": "{TOKEN}"}}"#),
+            format!("{TOKEN:?},"),
+            format!("{TOKEN:?}\n}}"),
         ] {
             let error = refusal(&json);
             assert!(
-                error.starts_with("the credential is not the expected JSON ("),
+                error.starts_with(
+                    "the credential is not the expected JSON (its fields or values are not the \
+                     expected ones at line 1 column "
+                ),
                 "{json}: unexpected error {error:?}"
             );
             assert!(
@@ -525,19 +530,26 @@ mod tests {
                 "{json}: the error carries the token: {error}"
             );
             assert!(
-                error.contains("line 1 column") && error.contains("expected"),
-                "{json}: the error no longer says where or what was expected: {error}"
+                error.ends_with("; expected {count, kind})"),
+                "{json}: the error no longer says what was expected: {error}"
             );
         }
-        let syntax = refusal(r#"{"count": "#);
-        assert!(
-            syntax.starts_with("the credential is not the expected JSON ("),
-            "unexpected error {syntax:?}"
-        );
-        assert!(
-            syntax.contains("EOF while parsing") || syntax.contains("line 1 column"),
-            "the syntax error is not serde_json's own: {syntax:?}"
-        );
+        for (json, why) in [
+            (r#"{"count": "#, "it ends before its JSON does"),
+            ("{count: 1}", "it is not valid JSON"),
+        ] {
+            let error = refusal(json);
+            assert!(
+                error.starts_with(&format!(
+                    "the credential is not the expected JSON ({why} at line 1 column "
+                )),
+                "{json}: unexpected error {error:?}"
+            );
+            assert!(
+                error.ends_with("; expected {count, kind})") && !error.contains("EOF"),
+                "{json}: unexpected error {error:?}"
+            );
+        }
         Ok(())
     }
 }

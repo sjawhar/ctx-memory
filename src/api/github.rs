@@ -49,9 +49,13 @@ struct AppCredential {
     private_key: String,
 }
 
-/// Why an `app_id` was refused. The text is fixed, and names no part of the value: a
-/// credential whose fields were swapped carries the private key in `app_id`, and this error
-/// reaches the logs.
+/// The shape of the `github_app` credential, as its refusal names it.
+const APP_CREDENTIAL_SHAPE: &str =
+    "{app_id, private_key}, where app_id is a number or a string of digits";
+
+/// Why an `app_id` was refused. The loader's refusal never shows serde's message
+/// ([`credentials::json_refusal`]), and this text names no part of the value either: a
+/// credential whose fields were swapped carries the private key in `app_id`.
 const APP_ID_REFUSED: &str =
     "app_id must be a GitHub App id: a non-negative whole number, or a string of the digits 0 to 9";
 
@@ -209,7 +213,7 @@ impl App {
     /// Returns an error when the value is not `{app_id, private_key}` with a PEM key, where
     /// `app_id` is a number or a string of digits and other fields are ignored.
     pub fn from_secret(secret: &Secret) -> Result<Self> {
-        let credential: AppCredential = secret.parse()?;
+        let credential: AppCredential = secret.parse(APP_CREDENTIAL_SHAPE)?;
         let key = EncodingKey::from_rsa_pem(credential.private_key.as_bytes())
             .context("reading the GitHub App private key")?;
         Ok(Self {
@@ -313,9 +317,16 @@ impl App {
                 refusal
             });
         }
-        response
-            .json()
-            .context("decoding the installation token answer")
+        // The answer holds the token, so its refusal is built without serde's message.
+        let text = response
+            .text()
+            .context("reading the installation token answer")?;
+        serde_json::from_str(&text).map_err(|error| {
+            anyhow!(
+                "decoding the installation token answer: the answer is not the expected JSON ({})",
+                credentials::json_refusal(&error, "{token, expires_at}")
+            )
+        })
     }
 
     fn get(&self, url: &str) -> reqwest::blocking::RequestBuilder {
