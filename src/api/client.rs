@@ -81,7 +81,7 @@ pub fn get_json_with_headers(
     for (name, value) in headers {
         request = request.header(*name, value);
     }
-    json_reply(send(request, "GET", url)?, "GET")
+    json_reply(send(request, "GET", url)?, "GET", Answer::Data)
 }
 
 /// `GET url` returning at most `limit` bytes, and whether the body was longer than that.
@@ -121,10 +121,12 @@ pub fn get_bytes(
 ///
 /// # Errors
 ///
-/// Returns an error when the request cannot be sent or the body is not JSON.
+/// Returns an error when the request cannot be sent or the body is not JSON. A body that is
+/// not JSON is refused without any of its characters, since a token endpoint can answer a
+/// token in a form-encoded body.
 pub fn post_form(url: &str, form: &[(&str, String)]) -> Result<JsonReply> {
     let request = client()?.post(url).form(form);
-    json_reply(send(request, "POST", url)?, "POST")
+    json_reply(send(request, "POST", url)?, "POST", Answer::Credential)
 }
 
 /// `POST url` with a form-encoded body, authenticated as an OAuth client with HTTP Basic
@@ -133,7 +135,9 @@ pub fn post_form(url: &str, form: &[(&str, String)]) -> Result<JsonReply> {
 ///
 /// # Errors
 ///
-/// Returns an error when the request cannot be sent or the body is not JSON.
+/// Returns an error when the request cannot be sent or the body is not JSON. A body that is
+/// not JSON is refused without any of its characters, since a token endpoint can answer a
+/// token in a form-encoded body.
 pub fn post_form_basic(
     url: &str,
     client_id: &str,
@@ -144,7 +148,7 @@ pub fn post_form_basic(
         .post(url)
         .basic_auth(client_id, Some(client_secret))
         .form(form);
-    json_reply(send(request, "POST", url)?, "POST")
+    json_reply(send(request, "POST", url)?, "POST", Answer::Credential)
 }
 
 /// `POST url` with a JSON body and `Authorization: Bearer <bearer>`, parsed as JSON.
@@ -154,7 +158,7 @@ pub fn post_form_basic(
 /// Returns an error when the request cannot be sent or the body is not JSON.
 pub fn post_json(url: &str, bearer: &str, body: &Value) -> Result<JsonReply> {
     let request = authorized(client()?.post(url), bearer).json(body);
-    json_reply(send(request, "POST", url)?, "POST")
+    json_reply(send(request, "POST", url)?, "POST", Answer::Data)
 }
 
 /// Percent-encodes `value` for a URL path segment or query value, so every byte outside
@@ -238,10 +242,23 @@ fn client() -> Result<&'static Client> {
         .map_err(|error| anyhow!("building the HTTP client: {error}"))
 }
 
-/// The status, headers and JSON body of `response`. A body that ends early is a [`NoAnswer`]
-/// when the status is a success, since the answer is missing, and a [`CutShort`] carrying the
-/// status and headers otherwise.
-fn json_reply(response: Response, method: &str) -> Result<JsonReply> {
+/// Whether an answer may carry a credential, which decides what a refusal of its body may
+/// show.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// Data an API serves, which a refusal may quote to say what came instead.
+    Data,
+    /// A credential fetched or refreshed, which may arrive in a body that is not JSON (GitHub
+    /// answers `access_token=…` form-encoded unless asked for JSON), so a refusal quotes none
+    /// of it.
+    Credential,
+}
+
+/// The status, headers and JSON body of `response`, an answer of the kind `answer`, which
+/// decides what a refusal of the body may show. A body that ends early is a [`NoAnswer`] when
+/// the status is a success, since the answer is missing, and a [`CutShort`] carrying the status
+/// and headers otherwise.
+fn json_reply(response: Response, method: &str, answer: Answer) -> Result<JsonReply> {
     let status = response.status();
     let headers = response.headers().clone();
     let url = response.url().clone();
@@ -266,23 +283,43 @@ fn json_reply(response: Response, method: &str) -> Result<JsonReply> {
             }));
         }
     };
-    let value = parse_json(&body, status, &request)?;
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("no content type");
+    let value = parse_json(&body, status, &request, answer, content_type)?;
     Ok((status, headers, value))
 }
 
-/// `body` as JSON. A body that is not says so first, then which request it answered, then how
-/// it starts.
-fn parse_json(body: &str, status: StatusCode, request: &str) -> Result<Value> {
+/// `body` as JSON; an empty body is `null`. A body that is not JSON says so first, then which
+/// request it answered. For [`Answer::Data`] it then shows how the body starts, which says what
+/// came instead. For [`Answer::Credential`] it names only the body's `content_type` and length,
+/// never a character of it, and carries no source, so not even the parser's message is in it.
+fn parse_json(
+    body: &str,
+    status: StatusCode,
+    request: &str,
+    answer: Answer,
+    content_type: &str,
+) -> Result<Value> {
     if body.trim().is_empty() {
         return Ok(Value::Null);
     }
-    serde_json::from_str(body).with_context(|| {
-        let mut excerpt: String = body.chars().take(200).collect();
-        if body.chars().count() > 200 {
-            excerpt.push('…');
-        }
-        format!("{status} with a body that is not JSON, from {request}: {excerpt}")
-    })
+    match answer {
+        Answer::Data => serde_json::from_str(body).with_context(|| {
+            let mut excerpt: String = body.chars().take(200).collect();
+            if body.chars().count() > 200 {
+                excerpt.push('…');
+            }
+            format!("{status} with a body that is not JSON, from {request}: {excerpt}")
+        }),
+        Answer::Credential => serde_json::from_str(body).map_err(|_| {
+            anyhow!(
+                "{status} with a body that is not JSON ({content_type}, {} bytes), from {request}",
+                body.len()
+            )
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +559,95 @@ mod tests {
             &received.head,
             "content-type: application/x-www-form-urlencoded"
         ));
+        Ok(())
+    }
+
+    /// The head of a token endpoint's answer in a form-encoded body.
+    const FORM_TOKEN_HEAD: &str = "200 OK\r\nContent-Type: application/x-www-form-urlencoded";
+
+    /// A token in a form-encoded body, the way GitHub answers a token request that does not
+    /// ask for JSON.
+    const FORM_TOKEN: &str =
+        "access_token=fixture-secret-not-a-real-token&token_type=bearer&scope=repo";
+
+    /// `error`, the refusal of a [`FORM_TOKEN`] answer, names its status, content type and
+    /// length, carries no source, and shows no character of the body.
+    fn assert_refused_without_the_body(error: &anyhow::Error) {
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("200 OK with a body that is not JSON"),
+            "{message}"
+        );
+        assert!(
+            message.contains("application/x-www-form-urlencoded"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("{} bytes", FORM_TOKEN.len())),
+            "{message}"
+        );
+        assert!(
+            !message.contains("fixture-secret-not-a-real-token"),
+            "{message}"
+        );
+        assert!(!message.contains("access_token"), "{message}");
+        assert_eq!(error.chain().count(), 1, "{message}");
+    }
+
+    /// A token endpoint can answer a token in a body that is not JSON, so its refusal names the
+    /// status, content type and length of the body and none of its characters.
+    #[test]
+    fn a_token_answer_that_is_not_json_is_refused_without_its_body() -> Result<()> {
+        let server = FakeServer::start(FORM_TOKEN_HEAD, FORM_TOKEN.as_bytes().to_vec())?;
+        let error = post_form(
+            &format!("{}/oauth/token", server.url),
+            &[("grant_type", "refresh_token".to_owned())],
+        )
+        .err()
+        .context("a form-encoded token answer was read as JSON")?;
+        server.received()?;
+
+        assert_refused_without_the_body(&error);
+        Ok(())
+    }
+
+    /// The same refusal for a token request authenticated as an OAuth client.
+    #[test]
+    fn post_form_basic_refuses_a_token_answer_without_its_body() -> Result<()> {
+        let server = FakeServer::start(FORM_TOKEN_HEAD, FORM_TOKEN.as_bytes().to_vec())?;
+        let error = post_form_basic(
+            &format!("{}/oauth/token", server.url),
+            "client-example",
+            "fixture-client-secret",
+            &[("grant_type", "refresh_token".to_owned())],
+        )
+        .err()
+        .context("a form-encoded token answer was read as JSON")?;
+        server.received()?;
+
+        assert_refused_without_the_body(&error);
+        Ok(())
+    }
+
+    /// An answer that carries no credential and is not JSON shows how it starts, which says
+    /// what came instead.
+    #[test]
+    fn a_data_answer_that_is_not_json_shows_how_it_starts() -> Result<()> {
+        let server = FakeServer::start(
+            "503 Service Unavailable\r\nContent-Type: text/html",
+            b"<html>maintenance</html>".to_vec(),
+        )?;
+        let error = get_json(&server.url, "token-example", &[])
+            .err()
+            .context("an HTML page was read as JSON")?;
+        server.received()?;
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("503 Service Unavailable with a body that is not JSON"),
+            "{message}"
+        );
+        assert!(message.contains("<html>maintenance</html>"), "{message}");
         Ok(())
     }
 
