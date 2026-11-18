@@ -318,7 +318,9 @@ pub fn locate_tree(cli: Option<&Path>, cwd: &Path, user: &UserConfig) -> Result<
     )
 }
 
-fn expand_home(path: &str) -> PathBuf {
+/// `~/` at the start of `path` names the directory `HOME` holds; any other path is kept as
+/// written, and so is a `~/` path when `HOME` is not set.
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
         (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => PathBuf::from(path),

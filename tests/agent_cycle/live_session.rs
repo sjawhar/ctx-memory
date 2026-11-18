@@ -238,8 +238,7 @@ impl FakeModel {
         Ok(tool
             .pointer("/input_schema/properties")
             .and_then(Value::as_object)
-            .map(|properties| properties.keys().cloned().collect())
-            .unwrap_or_default())
+            .map_or_default(|properties| properties.keys().cloned().collect()))
     }
 }
 

@@ -60,8 +60,7 @@ impl DriveApi for FakeDriveApi {
             .files
             .iter()
             .find(|(pattern, _)| query.contains(pattern.as_str()))
-            .map(|(_, files)| files.clone())
-            .unwrap_or_default())
+            .map_or_default(|(_, files)| files.clone()))
     }
 
     fn export(&self, id: &str, mime: &str, limit: usize) -> Result<Text> {

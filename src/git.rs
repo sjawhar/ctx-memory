@@ -103,13 +103,17 @@ static MINTED: LazyLock<Mutex<BTreeMap<(String, Access), Credential>>> =
 
 /// The credential a remote needs, or `None` when it needs none.
 ///
-/// A remote that is not GitHub, and a machine with no app key, keep whatever git itself is
-/// configured with. A token is only ever sent over HTTPS, or to a loopback address, which a
-/// test's own GitHub runs on and which no network carries.
+/// A remote that is not GitHub, and a machine where no source names the `github_app`
+/// credential, keep whatever git itself is configured with. A `github_app` credential that is
+/// named but cannot be read or parsed is an error, so `ctx` stops with that error instead of
+/// running git without a credential, which a private remote refuses without saying why. A
+/// token is only ever sent over HTTPS, or to a loopback address, which a test's own GitHub
+/// runs on and which no network carries.
 ///
 /// # Errors
 ///
-/// Returns an error when GitHub refuses the installation lookup or the mint.
+/// Returns an error when the `github_app` credential is named but cannot be read or parsed,
+/// or when GitHub refuses the installation lookup or the mint.
 pub fn credential_for(
     url: &str,
     config: &credentials::Config,
@@ -130,9 +134,10 @@ pub fn credential_for(
             return Ok(Some(credential.clone()));
         }
     }
-    let Ok(app) = github::App::load(config) else {
+    if !credentials::configured(config, github::CREDENTIAL) {
         return Ok(None);
-    };
+    }
+    let app = github::App::load(config).context("loading the github_app credential")?;
     let installation = app.installation_for(&owner, &repository)?;
     let request = match access {
         Access::Read => github::TokenRequest::contents_read(&repository),
@@ -238,7 +243,8 @@ impl Repo {
     /// # Errors
     ///
     /// Returns an error when `root` is not a git repository, when git cannot read its remote,
-    /// or when GitHub refuses to mint the token the remote needs.
+    /// when the `github_app` credential is named but cannot be read or parsed, or when GitHub
+    /// refuses to mint the token the remote needs.
     pub fn open_with_credential(
         root: &Path,
         config: &credentials::Config,
@@ -254,8 +260,9 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// Returns an error when git cannot read the remote, or GitHub refuses to mint the token
-    /// the remote needs.
+    /// Returns an error when git cannot read the remote, when the `github_app` credential is
+    /// named but cannot be read or parsed, or when GitHub refuses to mint the token the remote
+    /// needs.
     pub fn with_credential(mut self, config: &credentials::Config, access: Access) -> Result<Self> {
         if let Some(url) = self.remote_url()? {
             self.credential = credential_for(&url, config, access)?;
@@ -872,13 +879,13 @@ pub enum Push {
 ///
 /// The graph repository is private, so the clone and the pull carry a read credential, minted
 /// from the app key the environment names. There is no tree yet, so no `[credentials]` table
-/// is read here: a container names its app key with `CTX_SECRET_GITHUB_APP` or
-/// `CTX_CREDENTIAL_GITHUB_APP`.
+/// is read here: a container names its app key with `CTX_SECRET_GITHUB_APP`,
+/// `CTX_CREDENTIAL_GITHUB_APP_FILE` or `CTX_CREDENTIAL_GITHUB_APP`.
 ///
 /// # Errors
 ///
-/// Returns an error when the clone fails, or when `root` holds files that are not a clone of
-/// the remote.
+/// Returns an error when the clone fails, when `root` holds files that are not a clone of the
+/// remote, or when the `github_app` credential is named but cannot be read or parsed.
 pub fn clone_when_empty(root: &Path) -> Result<()> {
     let Some(remote) = std::env::var_os(REMOTE_ENV) else {
         return Ok(());

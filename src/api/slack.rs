@@ -341,14 +341,20 @@ impl SlackCredential {
     ///
     /// Returns an error when the JSON is neither shape. The error never carries a token.
     pub fn from_secret(secret: &Secret) -> Result<Self> {
-        let value: Value = secret.parse().context("parsing the Slack credential")?;
-        let credential = if value.get("kind").is_some() {
-            serde_json::from_value(value).map(Self::App)
+        let value: Value = secret
+            .parse("a JSON object")
+            .context("parsing the Slack credential")?;
+        let (credential, expected) = if value.get("kind").is_some() {
+            (serde_json::from_value(value).map(Self::App), APP_SHAPE)
         } else {
-            serde_json::from_value(value).map(Self::ClaudeCode)
+            (
+                serde_json::from_value(value).map(Self::ClaudeCode),
+                CLAUDE_CODE_SHAPE,
+            )
         };
         credential.map_err(|error| {
-            anyhow!("parsing the Slack credential: it is not the expected JSON ({error})")
+            credentials::not_the_expected_json(&error, expected)
+                .context("parsing the Slack credential")
         })
     }
 
@@ -391,6 +397,13 @@ impl SlackCredential {
         self.expires() - now <= chrono::Duration::seconds(FETCH_JOB_MAX_RUNTIME_SECONDS)
     }
 }
+
+/// The shape of an [`AppCredential`], as a refusal names it.
+const APP_SHAPE: &str =
+    r#"{kind: "app", access, refresh, expires, client_id, token_url, team_id, user_id}"#;
+
+/// The shape of a [`ClaudeCodeCredential`], as a refusal names it.
+const CLAUDE_CODE_SHAPE: &str = "{access, refresh, expires, client_id, token_url, resource}";
 
 /// The one `kind` an [`AppCredential`] carries, which tells it from a [`ClaudeCodeCredential`].
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,7 +505,7 @@ impl SlackApp {
             client_secret: String,
         }
         let stored: Stored = secret
-            .parse()
+            .parse("{client_id, client_secret}")
             .context("parsing the Slack app credential, the JSON {client_id, client_secret}")?;
         if stored.client_id.is_empty() || stored.client_secret.is_empty() {
             bail!("the Slack app credential needs a non-empty client_id and client_secret");
@@ -944,7 +957,7 @@ mod tests {
     fn an_app_credential_is_stored_with_its_kind_and_nothing_else() -> Result<()> {
         let expires = DateTime::parse_from_rfc3339("2026-10-29T16:00:00Z")?.with_timezone(&Utc);
         let stored = app_credential(SLACK_ACCESS_URL, expires).to_secret()?;
-        let value: Value = stored.parse()?;
+        let value: Value = stored.parse("a JSON object")?;
         assert_eq!(
             value,
             json!({
@@ -965,31 +978,65 @@ mod tests {
         Ok(())
     }
 
+    /// How [`SlackCredential::from_secret`] refuses JSON that names a `kind` but is not an
+    /// [`AppCredential`]: by the shape it expected, never by serde's message, which can quote a
+    /// token.
+    fn app_shape_refusal() -> String {
+        format!(
+            "parsing the Slack credential: the credential is not the expected JSON (its fields or \
+             values are not the expected ones; expected {APP_SHAPE})"
+        )
+    }
+
     /// An app credential with a field ctx does not know or without one it needs, or naming a
     /// kind ctx does not know, is refused rather than read as something it is not, and the
-    /// refusal names no token.
+    /// refusal names the app's shape and no token.
     #[test]
     fn a_credential_of_neither_shape_is_refused_without_its_token() {
         let complete = r#""access":"xoxp-secret-value","refresh":"xoxe-1-secret","expires":"2026-10-29T16:00:00Z","client_id":"1","token_url":"u","team_id":"T","user_id":"U""#;
-        for (json, why) in [
-            (format!(r#"{{"kind":"app",{complete},"resource":"r"}}"#), "unknown field"),
-            (format!(r#"{{"kind":"user",{complete}}}"#), "unknown variant"),
+        for (json, row) in [
+            (format!(r#"{{"kind":"app",{complete},"resource":"r"}}"#), "an unknown field"),
+            (format!(r#"{{"kind":"user",{complete}}}"#), "an unknown kind"),
             (
                 r#"{"kind":"app","access":"xoxp-secret-value","refresh":"xoxe-1-secret","client_id":"1"}"#
                     .to_owned(),
-                "missing field",
+                "a missing field",
             ),
         ] {
             let error = SlackCredential::from_secret(&Secret::new(json.clone()))
                 .err()
-                .map(|error| format!("{error:#}"))
-                .unwrap_or_default();
-            assert!(error.contains(why), "{json}: unexpected error {error:?}");
+                .map_or_default(|error| format!("{error:#}"));
+            assert_eq!(error, app_shape_refusal(), "{row}: {json}");
             assert!(
                 !error.contains("secret-value") && !error.contains("xoxe-1-secret"),
                 "{json}: the error carries a token: {error}"
             );
         }
+    }
+
+    /// A stored credential whose `kind` holds a token, as one written with its fields swapped
+    /// would, is refused by the app's shape, without serde's message, which quotes the token.
+    #[test]
+    fn a_stored_credential_whose_kind_is_a_token_is_refused_without_it() {
+        const TOKEN: &str = "fixture-secret-not-a-real-token";
+        let stored = json!({
+            "kind": TOKEN,
+            "access": "xoxe.xoxp-1-a",
+            "refresh": "xoxe-1-r",
+            "expires": "2026-10-29T16:00:00Z",
+            "client_id": "123.456",
+            "token_url": "https://slack.com/api/oauth.v2.access",
+            "team_id": "T0EXAMPLE1",
+            "user_id": "U0EXAMPLE9"
+        });
+        let error = SlackCredential::from_secret(&Secret::new(stored.to_string()))
+            .err()
+            .map_or_default(|error| format!("{error:#}"));
+        assert_eq!(error, app_shape_refusal());
+        assert!(
+            !error.contains(TOKEN),
+            "the error carries the token: {error}"
+        );
     }
 
     #[test]
@@ -1013,8 +1060,7 @@ mod tests {
         ] {
             let error = SlackApp::from_secret(&Secret::new(json.clone()))
                 .err()
-                .map(|error| format!("{error:#}"))
-                .unwrap_or_default();
+                .map_or_default(|error| format!("{error:#}"));
             assert!(!error.is_empty(), "{json} was accepted");
             assert!(
                 !error.contains(APP_CLIENT_SECRET),
@@ -1034,8 +1080,7 @@ mod tests {
         }
         let error = SlackApp::load()
             .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
+            .map_or_default(|error| format!("{error:#}"));
         assert!(
             error.contains("CTX_SECRET_SLACK_APP") && error.contains("ctx-memory Slack app"),
             "unexpected error: {error}"
@@ -1109,8 +1154,7 @@ mod tests {
         credential.client_id = "999.999".to_owned();
         let error = refresh_app_credential(&credential, &app()?, now)
             .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
+            .map_or_default(|error| format!("{error:#}"));
         assert!(
             error.contains("is for client 1234567890.0987654321"),
             "{error}"
@@ -1156,10 +1200,7 @@ mod tests {
         server
             .join()
             .map_err(|_| anyhow::anyhow!("fake API server failed"))??;
-        let error = result
-            .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
+        let error = result.err().map_or_default(|error| format!("{error:#}"));
         assert_eq!(error, r#"slack conversations.info: "channel_not_found""#);
         Ok(())
     }

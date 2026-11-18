@@ -211,7 +211,7 @@ A fetch records an instance of a recurring series only when it starts before the
 
 ## GitHub source
 
-The `github` kind reads every repository the deployment's GitHub App is installed on, through the installations its configuration's `installations` list names, or `CTX_GITHUB_INSTALLATIONS` (comma-separated ids) when the list is empty; no other installation is called. It mints a read-only installation token per installation from the `github_app` credential, the JSON `{app_id, private_key}`, which it reads from `CTX_SECRET_GITHUB_APP`, `CTX_CREDENTIAL_GITHUB_APP_FILE` or `CTX_CREDENTIAL_GITHUB_APP`. `CTX_GITHUB_API` points it at another host, which a test uses.
+The `github` kind reads every repository the deployment's GitHub App is installed on, through the installations its configuration's `installations` list names, or `CTX_GITHUB_INSTALLATIONS` (comma-separated ids) when the list is empty; no other installation is called. It mints a read-only installation token per installation from the `github_app` credential, the JSON `{app_id, private_key}`, which it reads from `CTX_SECRET_GITHUB_APP`, `CTX_CREDENTIAL_GITHUB_APP_FILE` or `CTX_CREDENTIAL_GITHUB_APP`. `CTX_GITHUB_API` points it at another host, which a test uses. `app_id` is a number, as GitHub's `GET /app` answer gives it, or a string of digits; other fields, such as `client_id`, are ignored. A credential that cannot be read or parsed fails the fetch with its own error; `ctx`'s git calls stop with that error too once the credential is named, and never run git without it.
 
 ```toml
 [[sources]]

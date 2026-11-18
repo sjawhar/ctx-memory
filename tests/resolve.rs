@@ -150,7 +150,7 @@ fn verify_provenance(label: &str, provenance: &str) -> Result<(Output, Value)> {
 fn unchecked(data: &Value) -> Vec<(String, String)> {
     data.get("unchecked")
         .and_then(Value::as_array)
-        .map(|findings| {
+        .map_or_default(|findings| {
             findings
                 .iter()
                 .map(|finding| {
@@ -165,7 +165,6 @@ fn unchecked(data: &Value) -> Vec<(String, String)> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 fn quotes_unchecked(data: &Value) -> Option<u64> {

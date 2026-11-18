@@ -401,14 +401,13 @@ fn pending_with(
         .get("delta")
         .and_then(|delta| delta.get("new_messages"))
         .and_then(Value::as_array)
-        .map(|messages| {
+        .map_or_default(|messages| {
             messages
                 .iter()
                 .filter_map(|message| message.get("pointer").and_then(Value::as_str))
                 .map(str::to_owned)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     Ok((counts, pointers))
 }
 
@@ -644,14 +643,13 @@ fn listed_page(output: &Output) -> Result<(Option<PageSpan>, Vec<String>)> {
     let pointers = data
         .pointer("/delta/new_messages")
         .and_then(Value::as_array)
-        .map(|messages| {
+        .map_or_default(|messages| {
             messages
                 .iter()
                 .filter_map(|message| message.get("pointer").and_then(Value::as_str))
                 .map(str::to_owned)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     Ok((page, pointers))
 }
 

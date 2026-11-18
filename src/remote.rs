@@ -978,7 +978,14 @@ fn impersonated_token(account: &str, audience: &str) -> Result<String> {
         let detail = response.text().unwrap_or_default();
         bail!("minting an identity token as {account} failed: {status} {detail}");
     }
-    let minted: Minted = response.json().context("decoding the identity token")?;
+    // The answer holds the token, so its refusal is built without serde's message.
+    let text = response.text().context("reading the identity token")?;
+    let minted: Minted = serde_json::from_str(&text).map_err(|error| {
+        anyhow!(
+            "decoding the identity token: the answer is not the expected JSON ({})",
+            credentials::json_refusal(&error, "{token}")
+        )
+    })?;
     Ok(minted.token)
 }
 

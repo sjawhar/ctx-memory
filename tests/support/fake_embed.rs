@@ -83,10 +83,7 @@ impl ConceptEmbedder {
     /// Every text this embedder was asked to embed, in order.
     #[must_use]
     pub fn texts(&self) -> Vec<String> {
-        self.texts
-            .lock()
-            .map(|texts| texts.clone())
-            .unwrap_or_default()
+        self.texts.lock().map_or_default(|texts| texts.clone())
     }
 }
 

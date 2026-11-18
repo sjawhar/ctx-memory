@@ -71,9 +71,8 @@ fn tree_with_source_for(
 }
 
 fn ask(server: &Server, window: &str, caller: Option<&str>) -> Result<support::Reply> {
-    let headers: Vec<(&str, &str)> = caller
-        .map(|caller| vec![("Tailscale-User-Login", caller)])
-        .unwrap_or_default();
+    let headers: Vec<(&str, &str)> =
+        caller.map_or_default(|caller| vec![("Tailscale-User-Login", caller)]);
     server.get(
         server.tailnet_address()?,
         &format!("/v1/windows/{window}/context"),

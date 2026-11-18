@@ -467,9 +467,8 @@ fn page_in(
     }
     // Where it falls among the messages the tree does not exclude now, which is how the answers
     // count them.
-    let mut kept = delta::read(&oldest, serving.exclusion)?
-        .map(|delta| delta.new_messages)
-        .unwrap_or_default();
+    let mut kept =
+        delta::read(&oldest, serving.exclusion)?.map_or_default(|delta| delta.new_messages);
     delta::oldest_first(&mut kept);
     let worked_through = end_message.holds(&kept);
     let listed = answer(data, vec![oldest], serving, recorded.as_ref())?;
@@ -576,18 +575,13 @@ pub fn page_pointers(context: &Context, window: &Window) -> Result<Option<BTreeS
         {
             return Ok(None);
         }
-        Ok(Some(
-            listed
-                .delta
-                .map(|delta| {
-                    delta
-                        .new_messages
-                        .into_iter()
-                        .map(|message| message.pointer)
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ))
+        Ok(Some(listed.delta.map_or_default(|delta| {
+            delta
+                .new_messages
+                .into_iter()
+                .map(|message| message.pointer)
+                .collect()
+        })))
     })
 }
 
@@ -1085,17 +1079,13 @@ mod tests {
     }
 
     fn listed(pending: &Pending) -> Vec<String> {
-        pending
-            .delta
-            .as_ref()
-            .map(|delta| {
-                delta
-                    .new_messages
-                    .iter()
-                    .map(|message| message.pointer.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        pending.delta.as_ref().map_or_default(|delta| {
+            delta
+                .new_messages
+                .iter()
+                .map(|message| message.pointer.clone())
+                .collect()
+        })
     }
 
     fn held(data: &DataDir) -> Result<Option<String>> {
@@ -1395,11 +1385,7 @@ mod tests {
         let next = pending_in(&data, None, &serving)?;
         record(WINDOWS[1], &w1(5), "cycle")?;
         let the_last = record(WINDOWS[1], &w1(6), "cycle");
-        let last_message = the_last
-            .as_ref()
-            .err()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let last_message = the_last.as_ref().err().map_or_default(ToString::to_string);
         let after_the_last = pending_in(&data, None, &serving)?;
         std::fs::remove_dir_all(&root)?;
 
@@ -1468,11 +1454,7 @@ mod tests {
         let spent = data.marker_page().exists();
         std::fs::remove_dir_all(&root)?;
 
-        let message = over_it
-            .as_ref()
-            .err()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let message = over_it.as_ref().err().map_or_default(ToString::to_string);
         assert!(
             is_refused(over_it),
             "the move over the large window went through"

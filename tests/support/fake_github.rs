@@ -98,6 +98,22 @@ impl FakeGithub {
         .to_string()
     }
 
+    /// The same app credential in the shape of a key copied from GitHub's `GET /app` answer:
+    /// `app_id` is a number, the `client_id` GitHub shows beside it comes along, and the key
+    /// is the PKCS#1 PEM GitHub hands out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PKCS#1 key cannot be made.
+    pub fn numeric_app_credential() -> Result<String> {
+        Ok(serde_json::json!({
+            "app_id": 1_234_567,
+            "client_id": "Iv23liFixture",
+            "private_key": super::signing_key_pkcs1()?,
+        })
+        .to_string())
+    }
+
     /// Every git request this GitHub received, oldest first.
     ///
     /// # Errors
@@ -201,8 +217,7 @@ fn serve_git(root: &Path, request: &Recorded, body: &[u8]) -> Result<Response> {
     let query = request
         .target
         .split_once('?')
-        .map(|(_, query)| query)
-        .unwrap_or_default();
+        .map_or_default(|(_, query)| query);
     let mut backend = Command::new("git");
     backend
         .arg("http-backend")

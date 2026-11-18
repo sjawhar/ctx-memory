@@ -16,6 +16,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde_json::error::Category;
 use serde_json::json;
 
 /// The default host of Google's metadata server.
@@ -44,11 +45,10 @@ impl Secret {
     ///
     /// # Errors
     ///
-    /// Returns an error when the secret is not JSON of the expected shape. The error never
-    /// carries the secret.
-    pub fn parse<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.0)
-            .map_err(|error| anyhow!("the credential is not the expected JSON ({error})"))
+    /// Returns an error when the secret is not JSON of the `expected` shape. The error names
+    /// where the JSON went wrong and the shape expected, and never carries the secret.
+    pub fn parse<T: DeserializeOwned>(&self, expected: &str) -> Result<T> {
+        serde_json::from_str(&self.0).map_err(|error| not_the_expected_json(&error, expected))
     }
 }
 
@@ -58,9 +58,50 @@ impl fmt::Debug for Secret {
     }
 }
 
+/// Why JSON that holds a secret was refused, from the error's category and position and the
+/// shape the caller `expected`, and never from serde's message, which can quote any value it
+/// was handed: a credential that is only its key, or whose fields are swapped, hands it the key.
+#[must_use]
+pub fn json_refusal(error: &serde_json::Error, expected: &str) -> String {
+    let why = match error.classify() {
+        Category::Syntax => "it is not valid JSON",
+        Category::Eof => "it ends before its JSON does",
+        Category::Data => "its fields or values are not the expected ones",
+        Category::Io => "it could not be read",
+    };
+    // An error from a value already parsed, as `serde_json::from_value` makes, has no position.
+    if error.line() > 0 {
+        format!(
+            "{why} at line {} column {}; expected {expected}",
+            error.line(),
+            error.column()
+        )
+    } else {
+        format!("{why}; expected {expected}")
+    }
+}
+
+/// The refusal of a credential as the JSON a caller `expected`, which never carries the
+/// credential: see [`json_refusal`].
+#[must_use]
+pub fn not_the_expected_json(error: &serde_json::Error, expected: &str) -> anyhow::Error {
+    anyhow!(
+        "the credential is not the expected JSON ({})",
+        json_refusal(error, expected)
+    )
+}
+
 /// Where one credential lives when it is not in Secret Manager.
+///
+/// An entry of `[credentials]` in `ctx.toml` is written `name = { file = "<path>" }`, where a
+/// path that starts with `~/` is read under `HOME`, or `name = { env = "<VARIABLE>" }`. A table
+/// that names both keys, or any other key, is refused.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
+#[serde(
+    untagged,
+    deny_unknown_fields,
+    expecting = "a table { file = \"<path>\" } or { env = \"<VARIABLE>\" }"
+)]
 pub enum Source {
     /// A file holding the credential.
     File { file: PathBuf },
@@ -94,6 +135,11 @@ pub fn load(name: &str) -> Result<Secret> {
 
 /// Loads a credential by name, including the sources the tree's configuration names.
 ///
+/// A `[credentials]` file entry that starts with `~/` is read under `HOME`, so
+/// `github_app = { file = "~/.config/ctx/github-app.json" }` names a file in the home
+/// directory. An `{ env = "<VARIABLE>" }` entry is read from that variable; one that is not set
+/// or not UTF-8 is refused by its name, never with its value.
+///
 /// # Errors
 ///
 /// Returns an error when no source is configured for the name or the source cannot be read.
@@ -102,10 +148,19 @@ pub fn load_with(config: &Config, name: &str) -> Result<Secret> {
         return Ok(secret);
     }
     match config.get(name) {
-        Some(Source::File { file }) => read_file(file),
-        Some(Source::Env { env }) => std::env::var(env)
-            .map(Secret)
-            .with_context(|| format!("reading {env}")),
+        Some(Source::File { file }) => match file.to_str() {
+            Some(text) => read_file(&crate::config::expand_home(text)),
+            None => read_file(file),
+        },
+        // Not `std::env::var`: its error for a value that is not UTF-8 prints the value.
+        Some(Source::Env { env }) => match std::env::var_os(env) {
+            Some(value) => Ok(Secret(
+                value
+                    .into_string()
+                    .map_err(|_| anyhow!("{env} is not valid UTF-8"))?,
+            )),
+            None => bail!("reading {env}: the variable is not set"),
+        },
         None => bail!(
             "no credential named {name}: set {} or {}, or name one under [credentials] in ctx.toml",
             secret_env(name),
@@ -123,7 +178,7 @@ fn from_environment(name: &str) -> Result<Option<Secret>> {
             .to_owned();
         return access(&resource).map(Some);
     }
-    if let Some(path) = std::env::var_os(format!("{}_FILE", credential_env(name))) {
+    if let Some(path) = std::env::var_os(credential_file_env(name)) {
         return read_file(&PathBuf::from(path)).map(Some);
     }
     if let Some(value) = std::env::var_os(credential_env(name)) {
@@ -135,6 +190,21 @@ fn from_environment(name: &str) -> Result<Option<Secret>> {
         )));
     }
     Ok(None)
+}
+
+/// Whether any source names the credential: `CTX_SECRET_<NAME>`, `CTX_CREDENTIAL_<NAME>_FILE`
+/// or `CTX_CREDENTIAL_<NAME>` is set, or the tree's `[credentials]` table has an entry for it.
+///
+/// Nothing is read, so a credential named here may still fail to load. A caller that can go
+/// on without the credential uses this to tell "no source names it", the one case it may
+/// treat as "no credential", from a credential that is named but cannot be read.
+#[must_use]
+pub fn configured(config: &Config, name: &str) -> bool {
+    // A variable that is set counts even when it is empty, as in `from_environment`.
+    std::env::var_os(secret_env(name)).is_some()
+        || std::env::var_os(credential_file_env(name)).is_some()
+        || std::env::var_os(credential_env(name)).is_some()
+        || config.contains_key(name)
 }
 
 /// Stores a new version of a credential, which only a rotated credential needs.
@@ -192,9 +262,16 @@ fn access(resource: &str) -> Result<Secret> {
         let detail = response.text().unwrap_or_default();
         bail!("reading {resource} failed: {status} {detail}");
     }
-    let access: Access = response
-        .json()
-        .with_context(|| format!("decoding {resource}"))?;
+    // The answer holds the credential, so its refusal is built without serde's message.
+    let text = response
+        .text()
+        .with_context(|| format!("reading {resource}"))?;
+    let access: Access = serde_json::from_str(&text).map_err(|error| {
+        anyhow!(
+            "decoding {resource}: the answer is not the expected JSON ({})",
+            json_refusal(&error, "{payload: {data}}")
+        )
+    })?;
     let decoded = STANDARD
         .decode(access.payload.data.as_bytes())
         .with_context(|| format!("decoding the payload of {resource}"))?;
@@ -226,7 +303,13 @@ pub fn metadata_token() -> Result<Secret> {
     if !status.is_success() {
         bail!("the metadata server answered {status}");
     }
-    let token: Token = response.json().context("decoding the metadata token")?;
+    let text = response.text().context("reading the metadata token")?;
+    let token: Token = serde_json::from_str(&text).map_err(|error| {
+        anyhow!(
+            "decoding the metadata token: the answer is not the expected JSON ({})",
+            json_refusal(&error, "{access_token}")
+        )
+    })?;
     Ok(Secret(token.access_token))
 }
 
@@ -301,6 +384,10 @@ fn credential_env(name: &str) -> String {
     format!("CTX_CREDENTIAL_{}", name.to_uppercase())
 }
 
+fn credential_file_env(name: &str) -> String {
+    format!("{}_FILE", credential_env(name))
+}
+
 /// Where the metadata server is, which a test points at its own.
 #[must_use]
 pub fn metadata_base() -> String {
@@ -323,7 +410,7 @@ fn with_scheme(host: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, load_with, Config, Secret, Source};
+    use super::{load, load_with, Config, Deserialize, Secret, Source};
 
     #[test]
     fn a_secret_never_prints_its_value() {
@@ -335,8 +422,7 @@ mod tests {
     fn a_missing_credential_names_both_variables() {
         let error = load_with(&Config::new(), "slack")
             .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            .map_or_default(|error| error.to_string());
         assert!(
             error.contains("CTX_SECRET_SLACK") && error.contains("CTX_CREDENTIAL_SLACK"),
             "unexpected error: {error}"
@@ -349,8 +435,7 @@ mod tests {
     fn a_caller_without_tree_configuration_is_not_sent_to_it() {
         let error = load("google")
             .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            .map_or_default(|error| error.to_string());
         assert!(
             error.contains("CTX_SECRET_GOOGLE") && error.contains("CTX_CREDENTIAL_GOOGLE"),
             "unexpected error: {error}"
@@ -362,8 +447,7 @@ mod tests {
     fn a_caller_that_reads_the_tree_is_sent_to_it() {
         let error = load_with(&Config::new(), "slack")
             .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            .map_or_default(|error| error.to_string());
         assert!(
             error.contains("[credentials] in ctx.toml"),
             "unexpected error: {error}"
@@ -379,6 +463,100 @@ mod tests {
         let secret = load_with(&config, "github_app")?;
         std::fs::remove_file(&path)?;
         assert_eq!(secret.expose(), "{\"app_id\":\"1\"}");
+        Ok(())
+    }
+
+    /// The two forms the README writes, as `ctx.toml` parses them, and a table naming both.
+    #[test]
+    fn a_credentials_entry_is_a_file_or_an_env_table() -> anyhow::Result<()> {
+        let parse = |entry: &str| toml::from_str::<Config>(&format!("github_app = {entry}\n"));
+        let file = std::path::PathBuf::from("~/github-app.json");
+        let env = "CTX_FIXTURE_APP".to_owned();
+        assert_eq!(
+            parse(r#"{ file = "~/github-app.json" }"#)?.get("github_app"),
+            Some(&Source::File { file })
+        );
+        assert_eq!(
+            parse(r#"{ env = "CTX_FIXTURE_APP" }"#)?.get("github_app"),
+            Some(&Source::Env { env })
+        );
+        let refused = parse(r#"{ file = "a", env = "B" }"#)
+            .err()
+            .map_or_default(|error| error.to_string());
+        assert!(
+            refused.contains(r#"a table { file = "<path>" } or { env = "<VARIABLE>" }"#),
+            "a table naming both keys was not refused with the two forms: {refused}"
+        );
+        Ok(())
+    }
+
+    /// serde names a value it was handed, so a token where the credential's JSON wants a
+    /// number, a struct or an enum tag, or a token that is the whole credential with text after
+    /// it, would reach serde's message. The refusal is built without that message: it says
+    /// where the JSON went wrong and what was expected, and never carries the token.
+    #[test]
+    fn a_refusal_never_carries_a_string_the_credential_holds() -> anyhow::Result<()> {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(rename_all = "snake_case")]
+        enum Kind {
+            App,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Fixture {
+            count: u64,
+            kind: Kind,
+        }
+        const TOKEN: &str = "fixture-secret-not-a-real-token";
+        const EXPECTED: &str = "{count, kind}";
+        let refusal = |json: &str| {
+            Secret::new(json.to_owned())
+                .parse::<Fixture>(EXPECTED)
+                .err()
+                .map_or_default(|error| format!("{error:#}"))
+        };
+        let well_formed = Secret::new(r#"{"count": 1, "kind": "app"}"#.to_owned());
+        let fixture: Fixture = well_formed.parse(EXPECTED)?;
+        assert_eq!((fixture.count, fixture.kind), (1, Kind::App));
+        for json in [
+            format!("{TOKEN:?}"),
+            format!(r#"{{"count": "{TOKEN}", "kind": "app"}}"#),
+            format!(r#"{{"count": 1, "kind": "{TOKEN}"}}"#),
+            format!("{TOKEN:?},"),
+            format!("{TOKEN:?}\n}}"),
+        ] {
+            let error = refusal(&json);
+            assert!(
+                error.starts_with(
+                    "the credential is not the expected JSON (its fields or values are not the \
+                     expected ones at line 1 column "
+                ),
+                "{json}: unexpected error {error:?}"
+            );
+            assert!(
+                !error.contains(TOKEN),
+                "{json}: the error carries the token: {error}"
+            );
+            assert!(
+                error.ends_with("; expected {count, kind})"),
+                "{json}: the error no longer says what was expected: {error}"
+            );
+        }
+        for (json, why) in [
+            (r#"{"count": "#, "it ends before its JSON does"),
+            ("{count: 1}", "it is not valid JSON"),
+        ] {
+            let error = refusal(json);
+            assert!(
+                error.starts_with(&format!(
+                    "the credential is not the expected JSON ({why} at line 1 column "
+                )),
+                "{json}: unexpected error {error:?}"
+            );
+            assert!(
+                error.ends_with("; expected {count, kind})") && !error.contains("EOF"),
+                "{json}: unexpected error {error:?}"
+            );
+        }
         Ok(())
     }
 }
