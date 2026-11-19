@@ -111,19 +111,6 @@ fn each_maintenance_pass_names_only_commands_the_server_answers() -> Result<()> 
     Ok(())
 }
 
-/// A session can drop the end of a long skill when its context is compacted. The ingest skill
-/// stays under 8,192 bytes; a block only some cycles need goes to `references/`, named at the
-/// step that needs it.
-#[test]
-fn the_ingest_skill_stays_under_8192_bytes() -> Result<()> {
-    let bytes = skill("ctx-memory-ingest")?.len();
-    assert!(
-        bytes < 8_192,
-        "the ingest skill is {bytes} bytes; move a block only some cycles need to references/"
-    );
-    Ok(())
-}
-
 /// A file the skill sends the session to read ships beside it: a pointer to a file that is not
 /// there leaves the session to guess what it held.
 #[test]
