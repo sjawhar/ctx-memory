@@ -57,8 +57,8 @@ pub enum NoRecords {
     /// The new messages carry no decision, commitment, question, metric or fact about a person
     /// or project: chatter, an acknowledgement, a message with nothing in it to keep.
     NothingNew,
-    /// Every new message is of a kind the ingest skill's "Not a record" names, such as a
-    /// payment receipt, a spend alert or pipeline bookkeeping.
+    /// Every new message is of a kind the ingest skill's references/not-a-record.md names, such
+    /// as a payment receipt, a spend alert or pipeline bookkeeping.
     NotARecord,
     /// The records the tree already holds carry what the new messages say, unchanged.
     AlreadyRecorded,
