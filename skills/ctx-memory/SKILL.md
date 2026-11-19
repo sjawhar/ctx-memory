@@ -1,6 +1,6 @@
 ---
 name: ctx-memory
-description: "Search team memory before a spec, plan, design, asking anyone, or for a named person; record facts"
+description: "Use when you start a spec, plan or design, ask anyone, look up a named person, or record a fact"
 ---
 
 # ctx-memory

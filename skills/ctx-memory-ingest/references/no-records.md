@@ -11,8 +11,8 @@ word that fits:
 
 - `nothing-new`: the messages carry no decision, commitment, question, metric or fact about a
   person or project.
-- `not-a-record`: each is of a kind the ingest skill's "Not a record" names, such as a payment
-  receipt, a spend alert or pipeline bookkeeping.
+- `not-a-record`: each is of a kind `skill://ctx-memory-ingest/references/not-a-record.md`
+  names, such as a payment receipt, a spend alert or pipeline bookkeeping.
 - `already-recorded`: the records the tree holds already carry what they say, unchanged.
 
 So, for a window, `ctx marker advance <that window id> --no-records nothing-new`, and for a
