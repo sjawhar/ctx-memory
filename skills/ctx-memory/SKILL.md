@@ -5,6 +5,8 @@ description: "Use when you start a spec, plan or design, ask anyone, look up a n
 
 # ctx-memory
 
+If this skill disagrees with the code, a command's output or its `--help`, follow those and say which line of this skill is wrong.
+
 A memory tree is a graph of markdown records with YAML frontmatter and wikilinks. It is not injected into an agent session. Consult this skill and the `ctx` CLI when a durable fact or prior decision may matter:
 
 - before you write or approve a spec, a plan or a design;

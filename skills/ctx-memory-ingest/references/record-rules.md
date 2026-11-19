@@ -4,6 +4,7 @@ Read this before you write or update the first record of a cycle (step 6 of the 
 
 ## Citations and tiers
 
+- Only configured sources are citable.
 - A citation points to committed tree content or to a pointer `ctx resolve` answers, copied
   from a window's `records.jsonl`. A web address a message holds is text of that message:
   never a record's source, nor a `tracked_by` entry but as
