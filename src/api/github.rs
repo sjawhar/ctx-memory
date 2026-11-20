@@ -1163,14 +1163,12 @@ mod tests {
         let installation = tokens
             .for_installation(1_000_009)
             .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
+            .map_or_default(|error| format!("{error:#}"));
         assert!(installation.contains("1000009"), "{installation}");
         let owner = tokens
             .for_owner("acme")
             .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_default();
+            .map_or_default(|error| format!("{error:#}"));
         assert!(owner.contains("acme"), "{owner}");
         assert!(!owner.contains("ghs_first"), "{owner}");
         Ok(())
@@ -1201,8 +1199,7 @@ mod tests {
         ] {
             let error = token_secret(&value)
                 .err()
-                .map(|error| format!("{error:#}"))
-                .unwrap_or_default();
+                .map_or_default(|error| format!("{error:#}"));
             assert!(
                 error.contains("the credential is not the expected JSON"),
                 "{value} gave {error}"
