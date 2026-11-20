@@ -4,7 +4,8 @@
 # in the shell that runs the tests, they send the test's commands, marker moves among them, to
 # that server instead of the test's own scratch tree. So no test binary starts while the
 # environment names a server, nor while the identity variables a remote call carries are set,
-# and every test binary reads an empty user configuration directory rather than the caller's.
+# and every test binary reads an empty user configuration directory rather than the caller's, and
+# an empty global git configuration rather than the caller's.
 # The session variables are unset too: Oh My Pi and Claude Code set theirs for every command
 # they run, cargo test among them, and a test's writes and requests name only a session the
 # test sets. A program `cargo run` starts is not a test, and passes through untouched.
@@ -24,9 +25,16 @@ case "$1" in
 	# test; a test that needs one sets XDG_CONFIG_HOME for the `ctx` it runs.
 	XDG_CONFIG_HOME="$(mktemp -d "${TMPDIR:-/tmp}/ctx-test-config.XXXXXX")"
 	export XDG_CONFIG_HOME
+	# Nor does the caller's git configuration: a hook it sets for every repository, such as a
+	# pre-push check, would run on the pushes tests make to their own loopback remotes and can
+	# refuse them. GIT_CONFIG_COUNT is how a shell adds configuration through the environment.
+	GIT_CONFIG_GLOBAL="$(mktemp "${TMPDIR:-/tmp}/ctx-test-gitconfig.XXXXXX")"
+	export GIT_CONFIG_GLOBAL
+	unset GIT_CONFIG_COUNT
 	status=0
 	"$@" || status=$?
 	rmdir "$XDG_CONFIG_HOME" 2>/dev/null || :
+	rm -f "$GIT_CONFIG_GLOBAL"
 	exit "$status"
 	;;
 esac
