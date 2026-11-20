@@ -582,7 +582,9 @@ struct SourceRunPayload<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error when `CTX_SECRET_GITHUB_APP` is set beside `CTX_SECRET_GITHUB_TOKENS`, or
+/// Returns an error when a variable that names an app key (`CTX_SECRET_GITHUB_APP`,
+/// `CTX_CREDENTIAL_GITHUB_APP_FILE` or `CTX_CREDENTIAL_GITHUB_APP`) is set beside
+/// `CTX_SECRET_GITHUB_TOKENS`, or
 /// when tree discovery, loading, command execution, or external dispatch fails.
 pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Outcome> {
     // A token secret beside an app key leaves which of them GitHub is read with undecided, so

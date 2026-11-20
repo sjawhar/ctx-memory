@@ -37,8 +37,15 @@ const TOKENS_CREDENTIAL: &str = "github_tokens";
 /// The variable that names the token secret, and so puts `ctx` in token-secret mode.
 const TOKENS_ENV: &str = "CTX_SECRET_GITHUB_TOKENS";
 
-/// The variable that names the app key's secret, which token-secret mode refuses beside it.
-const APP_ENV: &str = "CTX_SECRET_GITHUB_APP";
+/// The variables that name an app key, which token-secret mode refuses beside it: a process
+/// that holds both would read with the minter's read-only tokens and leave the key unused. A
+/// `github_app` entry under `[credentials]` in the tree's `ctx.toml` is not among them: it is
+/// read only once a tree is loaded, and token-secret mode reads no `github_app` source.
+const APP_ENVS: [&str; 3] = [
+    "CTX_SECRET_GITHUB_APP",
+    "CTX_CREDENTIAL_GITHUB_APP_FILE",
+    "CTX_CREDENTIAL_GITHUB_APP",
+];
 
 /// Whether `ctx` reads GitHub in token-secret mode: with the installation tokens a minter writes
 /// to the secret `CTX_SECRET_GITHUB_TOKENS` names, rather than with tokens it mints from the
@@ -47,17 +54,21 @@ const APP_ENV: &str = "CTX_SECRET_GITHUB_APP";
 ///
 /// # Errors
 ///
-/// Returns an error naming both variables when `CTX_SECRET_GITHUB_APP` is set beside
-/// `CTX_SECRET_GITHUB_TOKENS`: such a deployment has not said which of the two it reads with.
+/// Returns an error naming both variables when `CTX_SECRET_GITHUB_TOKENS` is set beside a
+/// variable that names an app key (`CTX_SECRET_GITHUB_APP`, `CTX_CREDENTIAL_GITHUB_APP_FILE` or
+/// `CTX_CREDENTIAL_GITHUB_APP`): such a deployment has not said which of the two it reads with.
 /// Returns an error naming `CTX_SECRET_GITHUB_TOKENS` when it is set but empty, so names no
 /// secret.
 pub fn reads_a_token_secret() -> Result<bool> {
     let Some(tokens) = std::env::var_os(TOKENS_ENV) else {
         return Ok(false);
     };
-    if std::env::var_os(APP_ENV).is_some() {
+    if let Some(app) = APP_ENVS
+        .iter()
+        .find(|name| std::env::var_os(name).is_some())
+    {
         bail!(
-            "{TOKENS_ENV} and {APP_ENV} are both set: ctx reads GitHub either with the installation tokens of the secret {TOKENS_ENV} names or with tokens it mints from the app key of {APP_ENV}, so unset one of them"
+            "{TOKENS_ENV} and {app} are both set: ctx reads GitHub either with the installation tokens of the secret {TOKENS_ENV} names or with tokens it mints from the app key {app} names, so unset one of them"
         );
     }
     if tokens.is_empty() {
@@ -571,7 +582,7 @@ impl GithubClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when `CTX_SECRET_GITHUB_APP` is set beside `CTX_SECRET_GITHUB_TOKENS`, or,
+    /// Returns an error when an app key variable is set beside `CTX_SECRET_GITHUB_TOKENS`, or,
     /// with no token secret, when the credential is missing or is not an app key.
     pub fn load(config: &credentials::Config) -> Result<Self> {
         if reads_a_token_secret()? {

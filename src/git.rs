@@ -126,7 +126,7 @@ static MINTED: LazyLock<Mutex<BTreeMap<(String, Access), github::InstallationTok
 /// # Errors
 ///
 /// Returns an error when the token secret cannot be read or holds no token for the remote's
-/// owner, when `CTX_SECRET_GITHUB_APP` is set beside `CTX_SECRET_GITHUB_TOKENS`, when the
+/// owner, when an app key variable is set beside `CTX_SECRET_GITHUB_TOKENS`, when the
 /// `github_app` credential is named but cannot be read or parsed, or when GitHub refuses the
 /// installation lookup or the mint.
 pub fn credential_for(

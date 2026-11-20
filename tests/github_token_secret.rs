@@ -1016,3 +1016,80 @@ fn both_github_credentials_refuse_before_the_tree_is_read() -> Result<()> {
     );
     Ok(())
 }
+
+/// Runs a cloning `ctx rules` with the token secret and `name` set to `value`, and checks that
+/// `ctx` refused to start, named both variables and asked no service anything.
+///
+/// # Errors
+///
+/// Returns an error when the stand-in or `ctx` cannot start.
+fn assert_refused_beside(label: &str, name: &str, value: &str) -> Result<()> {
+    let root = scratch(label)?;
+    let stand = Stand::start(&root, both_installations(1))?;
+    let remote = stand.remote();
+    let output = ctx(
+        &stand,
+        &root,
+        &root.join("tree"),
+        &["rules"],
+        &[("CTX_MEMORY_REMOTE", &remote), (name, value)],
+    )?;
+    let seen = stand.seen()?;
+    remove_scratch(&root)?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{}", says(&output));
+    assert!(
+        stderr.contains(&format!("CTX_SECRET_GITHUB_TOKENS and {name} are both set")),
+        "{stderr}"
+    );
+    assert!(seen.is_empty(), "ctx read before it refused: {seen:?}");
+    Ok(())
+}
+
+/// An app key given as a file beside the token secret refuses to start, as one in Secret Manager
+/// does: token mode would leave it unused and a push would get a read-only token.
+#[test]
+fn an_app_key_file_beside_the_token_secret_refuses_to_start() -> Result<()> {
+    assert_refused_beside(
+        "token-secret-app-file",
+        "CTX_CREDENTIAL_GITHUB_APP_FILE",
+        "/run/secrets/github-app.json",
+    )
+}
+
+/// An app key given in the environment beside the token secret refuses to start too.
+#[test]
+fn an_app_key_variable_beside_the_token_secret_refuses_to_start() -> Result<()> {
+    let credential =
+        json!({ "app_id": "1234567", "private_key": support::SIGNING_KEY }).to_string();
+    assert_refused_beside(
+        "token-secret-app-variable",
+        "CTX_CREDENTIAL_GITHUB_APP",
+        &credential,
+    )
+}
+
+/// A `github_app` entry under `[credentials]` in the tree's configuration is not refused: it is
+/// read only once a tree is loaded, and with the token secret nothing reads it.
+#[test]
+fn a_tree_credentials_entry_beside_the_token_secret_is_left_unread() -> Result<()> {
+    let root = scratch("token-secret-tree-credentials")?;
+    let stand = Stand::start(&root, both_installations(1))?;
+    let tree = local_tree(&root)?;
+    let config = std::fs::read_to_string(tree.join("ctx.toml"))?;
+    std::fs::write(
+        tree.join("ctx.toml"),
+        format!("{config}\n[credentials]\ngithub_app = {{ env = \"EXAMPLE_GITHUB_APP\" }}\n"),
+    )?;
+
+    let output = fetch(&stand, &root, &tree, &[])?;
+    let stored = stored_pointers(&root, &output);
+    let app_requests = stand.app_requests()?;
+    remove_scratch(&root)?;
+
+    assert!(output.status.success(), "{}", says(&output));
+    assert_eq!(stored?, both_notes());
+    assert!(app_requests.is_empty(), "{app_requests:?}");
+    Ok(())
+}
