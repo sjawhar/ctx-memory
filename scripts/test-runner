@@ -27,10 +27,11 @@ case "$1" in
 	export XDG_CONFIG_HOME
 	# Nor does the caller's git configuration: a hook it sets for every repository, such as a
 	# pre-push check, would run on the pushes tests make to their own loopback remotes and can
-	# refuse them. GIT_CONFIG_COUNT is how a shell adds configuration through the environment.
+	# refuse them. GIT_CONFIG_COUNT is how a shell adds configuration through the environment,
+	# and GIT_CONFIG_PARAMETERS how a `git -c` that started cargo passes its own on.
 	GIT_CONFIG_GLOBAL="$(mktemp "${TMPDIR:-/tmp}/ctx-test-gitconfig.XXXXXX")"
 	export GIT_CONFIG_GLOBAL
-	unset GIT_CONFIG_COUNT
+	unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
 	status=0
 	"$@" || status=$?
 	rmdir "$XDG_CONFIG_HOME" 2>/dev/null || :
