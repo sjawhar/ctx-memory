@@ -237,6 +237,144 @@ fn a_read_that_gets_no_answer_is_not_sent_again_past_the_budget() -> Result<()> 
     Ok(())
 }
 
+/// With a token secret, a page GitHub refuses with `401` makes the source read the secret again
+/// and send the page once more, and that second try is charged to the budget like the first.
+#[test]
+fn a_page_refused_with_401_is_read_again_and_charged_again() -> Result<()> {
+    let base = api_base();
+    let subject = repo("example-org", "example-repo");
+    let fake = FakeGithub {
+        repos: BTreeMap::from([(1, vec![subject.clone()])]),
+        ..FakeGithub::default()
+    };
+    let feed = issues_url(&base, &subject, SINCE);
+    let mut first = page(vec![issue(1, "2026-10-25T10:00:00Z")]);
+    first.next = Some("page-2".to_owned());
+    fake.page(&feed, first);
+    fake.unauthorized.borrow_mut().insert(feed.clone(), 1);
+    fake.page("page-2", page(Vec::new()));
+    fake.page(&issue_comments_url(&base, &subject, 1), page(Vec::new()));
+
+    let request = request(BTreeMap::from([(stream_id(&subject), CURSOR.to_owned())]))?;
+    let outcome = run(&fake, &request, &config(vec![1], 3, 2000))?;
+
+    // The refused page and its second try cost two of the three requests and the feed's second
+    // page the last one, so issue 1's comments wait for the next run. Charged once, the
+    // refused page would have left a request for the comments.
+    let sent = fake.get_log.borrow().clone();
+    assert_eq!(
+        sent,
+        vec![feed.clone(), feed, "page-2".to_owned()],
+        "{sent:?}"
+    );
+    // Once before the installation's first read, and once after the refusal.
+    assert_eq!(*fake.tokens_read_at.borrow(), vec![0, 1]);
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("request budget")),
+        "{:?}",
+        outcome.warnings
+    );
+    Ok(())
+}
+
+/// With the budget spent by the refused try, the page is not sent again: the budget, not the
+/// refusal, decides how many requests the run sends.
+#[test]
+fn a_page_refused_with_401_is_not_sent_again_past_the_budget() -> Result<()> {
+    let base = api_base();
+    let subject = repo("example-org", "example-repo");
+    let fake = FakeGithub {
+        repos: BTreeMap::from([(1, vec![subject.clone()])]),
+        ..FakeGithub::default()
+    };
+    let feed = issues_url(&base, &subject, SINCE);
+    fake.unauthorized.borrow_mut().insert(feed.clone(), 1);
+
+    let request = request(BTreeMap::from([(stream_id(&subject), CURSOR.to_owned())]))?;
+    let outcome = run(&fake, &request, &config(vec![1], 1, 2000))?;
+
+    assert_eq!(*fake.get_log.borrow(), vec![feed]);
+    let failed = outcome
+        .streams
+        .get(&stream_id(&subject))
+        .context("the repository has a stream result")?;
+    assert_eq!(failed.status, StreamStatus::Error);
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("401 Unauthorized")),
+        "{:?}",
+        failed.error
+    );
+    Ok(())
+}
+
+/// A page GitHub refuses again after the secret was read again is not sent a third time.
+#[test]
+fn a_page_refused_with_401_twice_is_not_sent_a_third_time() -> Result<()> {
+    let base = api_base();
+    let subject = repo("example-org", "example-repo");
+    let fake = FakeGithub {
+        repos: BTreeMap::from([(1, vec![subject.clone()])]),
+        ..FakeGithub::default()
+    };
+    let feed = issues_url(&base, &subject, SINCE);
+    fake.unauthorized.borrow_mut().insert(feed.clone(), 2);
+
+    let request = request(BTreeMap::from([(stream_id(&subject), CURSOR.to_owned())]))?;
+    let outcome = run(&fake, &request, &config(vec![1], 10, 2000))?;
+
+    assert_eq!(*fake.get_log.borrow(), vec![feed.clone(), feed]);
+    assert_eq!(*fake.tokens_read_at.borrow(), vec![0, 1]);
+    let failed = outcome
+        .streams
+        .get(&stream_id(&subject))
+        .context("the repository has a stream result")?;
+    assert_eq!(failed.status, StreamStatus::Error);
+    Ok(())
+}
+
+/// The run reads the token secret again when it moves on to another installation's
+/// repositories, so a version the minter wrote after the listings reaches that installation's
+/// reads; repositories of one installation share one read.
+#[test]
+fn each_installations_reads_start_from_a_fresh_read_of_the_tokens() -> Result<()> {
+    let first = repo("example-org", "first-repo");
+    let second = repo("example-org", "second-repo");
+    let third = repo("other-org", "third-repo");
+    let fake = FakeGithub {
+        repos: BTreeMap::from([
+            (1, vec![first.clone(), second.clone()]),
+            (2, vec![third.clone()]),
+        ]),
+        ..FakeGithub::default()
+    };
+    for subject in [&first, &second, &third] {
+        quiet(&fake, subject);
+    }
+
+    let request = request(
+        [&first, &second, &third]
+            .into_iter()
+            .map(|subject| (stream_id(subject), CURSOR.to_owned()))
+            .collect(),
+    )?;
+    run(&fake, &request, &config(vec![1, 2], 100, 2000))?;
+
+    let sent = fake.get_log.borrow().clone();
+    let read_at = fake.tokens_read_at.borrow().clone();
+    let other_org = sent
+        .iter()
+        .position(|url| url.contains("/other-org/"))
+        .context("the second installation was read")?;
+    assert_eq!(read_at, vec![0, other_org], "{sent:?}");
+    Ok(())
+}
+
 /// A read that gets no answer in three tries errors its stream, the three tries are charged,
 /// and the run goes on to the next repository with the budget that is left.
 #[test]

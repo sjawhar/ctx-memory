@@ -29,8 +29,8 @@ pub struct Recorded {
     pub body: String,
 }
 
-/// One answer: a status, its headers and the body. The transport adds `Content-Length` and
-/// `Connection: close`.
+/// One answer: a status, its headers and the body. The transport adds `Content-Length` unless
+/// supplied, and `Connection: close`.
 #[derive(Clone, Debug)]
 pub struct Response {
     pub status: u16,
@@ -185,11 +185,14 @@ fn write_response(stream: &mut TcpStream, response: &Response) -> Result<()> {
     for (name, value) in &response.headers {
         write!(head, "{name}: {value}\r\n")?;
     }
-    write!(
-        head,
-        "Content-Length: {}\r\nConnection: close\r\n\r\n",
-        response.body.len()
-    )?;
+    if !response
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        write!(head, "Content-Length: {}\r\n", response.body.len())?;
+    }
+    head.push_str("Connection: close\r\n\r\n");
     stream.write_all(head.as_bytes())?;
     stream.write_all(&response.body)?;
     stream.flush()?;

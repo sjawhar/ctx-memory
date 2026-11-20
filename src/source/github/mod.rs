@@ -1,9 +1,11 @@
 //! Built-in GitHub source: the deployment's GitHub App reads every repository it is installed on.
 //!
-//! The app mints a read-only installation token for each installation named in
-//! `CTX_GITHUB_INSTALLATIONS`, and no other installation is touched, so the one organization
-//! the spec does not read is never called. One repository is one stream (`github:<owner>/<repo>`)
-//! and its cursor is an `updated_at` high-water mark.
+//! The source reads with a read-only installation token for each installation its configuration
+//! or `CTX_GITHUB_INSTALLATIONS` names, and no other installation is touched, so the one
+//! organization the spec does not read is never called. It mints each token from the app's key,
+//! or reads it from the token secret `CTX_SECRET_GITHUB_TOKENS` names ([`GithubClient`]). One
+//! repository is one stream (`github:<owner>/<repo>`) and its cursor is an `updated_at`
+//! high-water mark.
 //!
 //! The run guards the App's rate limit, which other clients of the App share, three ways. A
 //! GraphQL pre-pass asks, for 50 repositories a query, when each last changed, so a repository
@@ -84,13 +86,18 @@ impl Source for GithubSource {
 
 /// What the source needs from GitHub, so a test can supply its own.
 trait GithubApi {
-    /// Mints a read-only token for `installation` and lists the repositories it covers, or
-    /// `None` when GitHub refused that to protect a rate limit.
+    /// Gets a read-only token for `installation`, minted or read from the token secret, and
+    /// lists the repositories it covers, or `None` when GitHub refused that to protect a rate
+    /// limit.
     fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>>;
-    /// `GET url` with `installation`'s token.
+    /// `GET url` with `installation`'s token. With a token secret, a `401` is an error carrying
+    /// [`crate::api::github::Unauthorized`].
     fn get(&self, installation: u64, url: &str) -> Result<Page>;
     /// Posts one GraphQL request with `installation`'s token and returns GitHub's answer.
     fn graphql(&self, installation: u64, request: &Value) -> Result<Value>;
+    /// Reads the token secret again, after GitHub refused one of its tokens; with an app key,
+    /// does nothing.
+    fn read_tokens_again(&self) -> Result<()>;
 }
 
 impl GithubApi for GithubClient {
@@ -104,6 +111,10 @@ impl GithubApi for GithubClient {
 
     fn graphql(&self, installation: u64, request: &Value) -> Result<Value> {
         Self::graphql(self, installation, request)
+    }
+
+    fn read_tokens_again(&self) -> Result<()> {
+        Self::read_tokens_again(self)
     }
 }
 
@@ -251,6 +262,10 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
         .unwrap_or(0);
     let unplanned = previous.filter(|first| !streams.contains(first));
     let mut first_stopped = None;
+    // The installation whose repositories were read last. Every installation is listed before
+    // any repository is read, so with a token secret the tokens the listings read can be a long
+    // run old by then: each installation's reads start from the secret's newest version.
+    let mut reading = None;
     for (installation, repo) in repos.iter().cycle().skip(start).take(repos.len()) {
         let stream = stream_id(repo);
         if let Some(head) = unchanged.get(&stream) {
@@ -269,7 +284,15 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
             super::emit_stream(&stream, Ok((Vec::new(), Vec::new(), cursor)), sink)?;
             continue;
         }
-        let collected = collect_repo(*installation, repo, request, &exclusion, &mut governor, api);
+        let fresh = if reading == Some(*installation) {
+            Ok(())
+        } else {
+            api.read_tokens_again()
+                .inspect(|()| reading = Some(*installation))
+        };
+        let collected = fresh.and_then(|()| {
+            collect_repo(*installation, repo, request, &exclusion, &mut governor, api)
+        });
         match &collected {
             Ok(collected) if collected.stop.is_none() && collected.held == 0 => {
                 state.settle(&stream, &collected.cursor);

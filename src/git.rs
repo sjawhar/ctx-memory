@@ -57,19 +57,22 @@ pub enum Access {
 /// of argv, so it is not readable from `/proc/<pid>/cmdline`.
 #[derive(Clone)]
 pub struct Credential {
-    minted: github::InstallationToken,
+    token: String,
     header: String,
 }
 
 impl Credential {
     /// Wraps one GitHub installation token as the header git sends.
     #[must_use]
-    fn github(minted: github::InstallationToken) -> Self {
+    fn github(token: &str) -> Self {
         let header = format!(
             "Authorization: Basic {}",
-            STANDARD.encode(format!("x-access-token:{}", minted.token))
+            STANDARD.encode(format!("x-access-token:{token}"))
         );
-        Self { minted, header }
+        Self {
+            token: token.to_owned(),
+            header,
+        }
     }
 
     /// Puts the credential in git's environment for one command.
@@ -80,12 +83,16 @@ impl Credential {
             .env("GIT_CONFIG_VALUE_0", &self.header);
     }
 
-    /// Text git printed, with the token taken out.
+    /// Text git printed, with the token and its reversible Basic credential taken out.
     ///
-    /// git quotes a URL it was given back in its errors, and those errors reach a caller of
-    /// the server as the body of an answer. Nothing a caller reads carries the token.
+    /// git errors and HTTP traces reach callers of the server, so neither representation may
+    /// appear in them.
     fn redact(&self, text: &str) -> String {
-        text.replace(&self.minted.token, "[redacted]")
+        text.replace(
+            self.header.trim_start_matches("Authorization: Basic "),
+            "[redacted]",
+        )
+        .replace(&self.token, "[redacted]")
     }
 }
 
@@ -95,15 +102,21 @@ impl std::fmt::Debug for Credential {
     }
 }
 
-/// The credentials minted so far, one per remote and access level, kept until they are nearly
+/// The tokens minted so far, one per remote and access level, kept until they are nearly
 /// expired. A copy of the server pulls every minute, and a token lives an hour: minting one
 /// per git call would cost two GitHub API calls a minute for nothing.
-static MINTED: LazyLock<Mutex<BTreeMap<(String, Access), Credential>>> =
+static MINTED: LazyLock<Mutex<BTreeMap<(String, Access), github::InstallationToken>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 /// The credential a remote needs, or `None` when it needs none.
 ///
-/// A remote that is not GitHub, and a machine where no source names the `github_app`
+/// With a token secret (`CTX_SECRET_GITHUB_TOKENS`), the credential is the token of the
+/// installation on the remote's owner's account, read from the secret's newest version on every
+/// call: the minter replaces each token well within its hour, and nothing here knows when the
+/// one it read runs out. It needs no JWT and no installation lookup, and the minter's tokens are
+/// read-only, so a push with one is refused.
+///
+/// Otherwise a remote that is not GitHub, and a machine where no source names the `github_app`
 /// credential, keep whatever git itself is configured with. A `github_app` credential that is
 /// named but cannot be read or parsed is an error, so `ctx` stops with that error instead of
 /// running git without a credential, which a private remote refuses without saying why. A
@@ -112,8 +125,10 @@ static MINTED: LazyLock<Mutex<BTreeMap<(String, Access), Credential>>> =
 ///
 /// # Errors
 ///
-/// Returns an error when the `github_app` credential is named but cannot be read or parsed,
-/// or when GitHub refuses the installation lookup or the mint.
+/// Returns an error when the token secret cannot be read or holds no token for the remote's
+/// owner, when an app key variable is set beside `CTX_SECRET_GITHUB_TOKENS`, when the
+/// `github_app` credential is named but cannot be read or parsed, or when GitHub refuses the
+/// installation lookup or the mint.
 pub fn credential_for(
     url: &str,
     config: &credentials::Config,
@@ -125,13 +140,20 @@ pub fn credential_for(
     let Some((owner, repository)) = github::repository_of(url) else {
         return Ok(None);
     };
+    if github::reads_a_token_secret()? {
+        let tokens = github::InstallationTokens::read()?;
+        let token = tokens
+            .for_owner(&owner)
+            .with_context(|| format!("no credential for {owner}/{repository}, the remote {url}"))?;
+        return Ok(Some(Credential::github(token)));
+    }
     let key = (url.to_owned(), access);
     {
         let held = MINTED
             .lock()
             .map_err(|_| anyhow!("the git credential cache was poisoned"))?;
-        if let Some(credential) = held.get(&key).filter(|held| held.minted.usable()) {
-            return Ok(Some(credential.clone()));
+        if let Some(minted) = held.get(&key).filter(|minted| minted.usable()) {
+            return Ok(Some(Credential::github(&minted.token)));
         }
     }
     if !credentials::configured(config, github::CREDENTIAL) {
@@ -143,11 +165,12 @@ pub fn credential_for(
         Access::Read => github::TokenRequest::contents_read(&repository),
         Access::Write => github::TokenRequest::contents_write(&repository),
     };
-    let credential = Credential::github(app.installation_token(installation, &request)?);
+    let minted = app.installation_token(installation, &request)?;
+    let credential = Credential::github(&minted.token);
     MINTED
         .lock()
         .map_err(|_| anyhow!("the git credential cache was poisoned"))?
-        .insert(key, credential.clone());
+        .insert(key, minted);
     Ok(Some(credential))
 }
 
@@ -877,15 +900,17 @@ pub enum Push {
 /// back the way the remote has it: whatever a stopped copy left in it is nobody's work, and a
 /// pull would refuse to run over it. Any other tree is somebody's, and is only fast-forwarded.
 ///
-/// The graph repository is private, so the clone and the pull carry a read credential, minted
-/// from the app key the environment names. There is no tree yet, so no `[credentials]` table
-/// is read here: a container names its app key with `CTX_SECRET_GITHUB_APP`,
-/// `CTX_CREDENTIAL_GITHUB_APP_FILE` or `CTX_CREDENTIAL_GITHUB_APP`.
+/// The graph repository is private, so the clone and the pull carry a read credential
+/// ([`credential_for`]): the token of the remote's owner from the token secret
+/// `CTX_SECRET_GITHUB_TOKENS` names, or one minted from the app key the environment names. There
+/// is no tree yet, so no `[credentials]` table is read here: a container names its app key with
+/// `CTX_SECRET_GITHUB_APP`, `CTX_CREDENTIAL_GITHUB_APP_FILE` or `CTX_CREDENTIAL_GITHUB_APP`.
 ///
 /// # Errors
 ///
 /// Returns an error when the clone fails, when `root` holds files that are not a clone of the
-/// remote, or when the `github_app` credential is named but cannot be read or parsed.
+/// remote, when the token secret cannot be read or holds no token for the remote's owner, or
+/// when the `github_app` credential is named but cannot be read or parsed.
 pub fn clone_when_empty(root: &Path) -> Result<()> {
     let Some(remote) = std::env::var_os(REMOTE_ENV) else {
         return Ok(());

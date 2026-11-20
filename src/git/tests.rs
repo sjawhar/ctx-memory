@@ -5,7 +5,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 
-use super::{clone_into, Author, Push, Repo};
+use super::{clone_into, Author, Credential, Push, Repo};
+
+#[test]
+fn a_git_error_hides_the_token_and_its_basic_header() {
+    let credential = Credential::github("ghs_example");
+    // A git HTTP trace can quote the reversible Basic header instead of the raw token.
+    let trace = format!("{}\nremote: ghs_example", credential.header);
+    let error = credential.redact(&trace);
+    assert_eq!(error, "Authorization: Basic [redacted]\nremote: [redacted]");
+}
 
 fn scratch(label: &str) -> Result<PathBuf> {
     let root = std::env::temp_dir().join(format!("ctx-git-{label}-{}", std::process::id()));

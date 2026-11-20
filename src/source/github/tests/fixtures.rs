@@ -9,7 +9,7 @@ pub(super) use anyhow::{anyhow, Context as _, Result};
 pub(super) use chrono::{DateTime, Utc};
 pub(super) use serde_json::{json, Value};
 
-pub(super) use crate::api::github::{api_base, Page, PageKind, Repo};
+pub(super) use crate::api::github::{api_base, Page, PageKind, Repo, Unauthorized};
 pub(super) use crate::pointer::Schemes;
 
 pub(super) use super::super::super::{
@@ -54,6 +54,11 @@ pub(super) struct FakeGithub {
     pub(super) graphql_log: RefCell<Vec<Value>>,
     /// How many more requests for each URL get no answer before GitHub answers it.
     pub(super) no_answer: RefCell<BTreeMap<String, u32>>,
+    /// How many more requests for each URL GitHub refuses with `401`, as it refuses a token from
+    /// the token secret that the minter has since replaced.
+    pub(super) unauthorized: RefCell<BTreeMap<String, u32>>,
+    /// For each time the source read the token secret again, how many reads it had sent then.
+    pub(super) tokens_read_at: RefCell<Vec<usize>>,
 }
 
 impl FakeGithub {
@@ -124,6 +129,18 @@ impl GithubApi for FakeGithub {
                 "connection closed before message completed, on GET {url}"
             ))));
         }
+        if let Some(left) = self
+            .unauthorized
+            .borrow_mut()
+            .get_mut(url)
+            .filter(|left| **left > 0)
+        {
+            *left -= 1;
+            return Err(
+                anyhow!("GitHub answered 401 Unauthorized Bad credentials, to GET {url}")
+                    .context(Unauthorized),
+            );
+        }
         self.pages
             .borrow()
             .get(url)
@@ -158,6 +175,12 @@ impl GithubApi for FakeGithub {
             fields.insert("errors".to_owned(), errors);
         }
         Ok(answer)
+    }
+
+    fn read_tokens_again(&self) -> Result<()> {
+        let sent = self.get_log.borrow().len();
+        self.tokens_read_at.borrow_mut().push(sent);
+        Ok(())
     }
 }
 

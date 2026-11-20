@@ -7,7 +7,7 @@ use anyhow::{bail, Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::api::github::{api_base, retry_after, Page, PageKind, Repo};
+use crate::api::github::{api_base, retry_after, Page, PageKind, Repo, Unauthorized};
 use crate::exclude::Exclusion;
 use crate::record::Record;
 
@@ -739,7 +739,9 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
     ///
     /// Each try is charged to the budget before it is sent, answered or not, since GitHub may
     /// have counted it. A try that got no answer is sent again ([`retry_after`]) while the
-    /// budget has a request left; when it has none, the read fails with that try's error.
+    /// budget has a request left; when it has none, the read fails with that try's error. A try
+    /// GitHub refused with a token from the token secret ([`Unauthorized`]) is sent once more,
+    /// after the secret is read again, on the same terms.
     fn page(&mut self, url: &str, needed: u32, missing_ok: bool) -> Result<Result<Page, Stop>> {
         if let Some(stop) = self.governor.blocked(self.installation) {
             return Ok(Err(stop));
@@ -748,11 +750,24 @@ impl<C: GithubApi + ?Sized> Reader<'_, C> {
             return Ok(Err(Stop::Truncated));
         }
         let mut attempt = 1;
+        let mut read_again = false;
         let page = loop {
             self.governor.charge();
             match self.api.get(self.installation, url) {
                 Ok(page) => break page,
                 Err(error) if self.governor.budget == 0 => return Err(error),
+                Err(error) if !read_again && error.downcast_ref::<Unauthorized>().is_some() => {
+                    self.api
+                        .read_tokens_again()
+                        .with_context(|| format!("{error:#}"))?;
+                    read_again = true;
+                    continue;
+                }
+                Err(error) if read_again && error.downcast_ref::<Unauthorized>().is_some() => {
+                    return Err(error.context(
+                        "GitHub refused the newest token too, after the token secret was read again",
+                    ));
+                }
                 Err(error) => retry_after(error, attempt)?,
             }
             attempt += 1;

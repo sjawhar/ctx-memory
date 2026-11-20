@@ -1,8 +1,11 @@
 //! The deployment's GitHub App: the only way this program touches GitHub.
 //!
-//! The app's key signs a short-lived JWT, and the JWT buys an installation token limited to
-//! the repositories and permissions the caller asks for. The server asks for one repository
-//! with contents write, so a token that leaks can write only the graph repository.
+//! This program acts with the app's installation tokens, which it gets in one of two ways. With
+//! the app's key, the key signs a short-lived JWT, and the JWT buys an installation token limited
+//! to the repositories and permissions the caller asks for. The server asks for one repository
+//! with contents write, so a token that leaks can write only the graph repository. With a token
+//! secret (`CTX_SECRET_GITHUB_TOKENS`), a minter outside this program holds the key and writes
+//! each installation's read-only token to a Secret Manager secret, which this program only reads.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -16,7 +19,7 @@ use reqwest::StatusCode;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::api::client::{self, CutShort, NoAnswer};
+use crate::api::client::{self, CutShort, JsonReply, NoAnswer};
 use crate::credentials::{self, Secret};
 use crate::redact::one_line;
 
@@ -27,6 +30,132 @@ const API: &str = "https://api.github.com";
 /// `CTX_CREDENTIAL_GITHUB_APP_FILE` or `CTX_CREDENTIAL_GITHUB_APP` names its source, or a
 /// `[credentials]` entry does.
 pub const CREDENTIAL: &str = "github_app";
+
+/// The name the token secret is loaded by: `CTX_SECRET_GITHUB_TOKENS` names it.
+const TOKENS_CREDENTIAL: &str = "github_tokens";
+
+/// The variable that names the token secret, and so puts `ctx` in token-secret mode.
+const TOKENS_ENV: &str = "CTX_SECRET_GITHUB_TOKENS";
+
+/// The variables that name an app key, which token-secret mode refuses beside it: a process
+/// that holds both would read with the minter's read-only tokens and leave the key unused. A
+/// `github_app` entry under `[credentials]` in the tree's `ctx.toml` is not among them: it is
+/// read only once a tree is loaded, and token-secret mode reads no `github_app` source.
+const APP_ENVS: [&str; 3] = [
+    "CTX_SECRET_GITHUB_APP",
+    "CTX_CREDENTIAL_GITHUB_APP_FILE",
+    "CTX_CREDENTIAL_GITHUB_APP",
+];
+
+/// Whether `ctx` reads GitHub in token-secret mode: with the installation tokens a minter writes
+/// to the secret `CTX_SECRET_GITHUB_TOKENS` names, rather than with tokens it mints from the
+/// `github_app` credential. A variable that is set counts even when it is empty, as in
+/// [`credentials::configured`].
+///
+/// # Errors
+///
+/// Returns an error naming both variables when `CTX_SECRET_GITHUB_TOKENS` is set beside a
+/// variable that names an app key (`CTX_SECRET_GITHUB_APP`, `CTX_CREDENTIAL_GITHUB_APP_FILE` or
+/// `CTX_CREDENTIAL_GITHUB_APP`): such a deployment has not said which of the two it reads with.
+/// Returns an error naming `CTX_SECRET_GITHUB_TOKENS` when it is set but empty, so names no
+/// secret.
+pub fn reads_a_token_secret() -> Result<bool> {
+    let Some(tokens) = std::env::var_os(TOKENS_ENV) else {
+        return Ok(false);
+    };
+    if let Some(app) = APP_ENVS
+        .iter()
+        .find(|name| std::env::var_os(name).is_some())
+    {
+        bail!(
+            "{TOKENS_ENV} and {app} are both set: ctx reads GitHub either with the installation tokens of the secret {TOKENS_ENV} names or with tokens it mints from the app key {app} names, so unset one of them"
+        );
+    }
+    if tokens.is_empty() {
+        bail!(
+            "{TOKENS_ENV} is set but empty: name the Secret Manager secret the GitHub tokens are in, projects/<project>/secrets/<secret>, or unset it"
+        );
+    }
+    Ok(true)
+}
+
+/// One installation's entry in the token secret. Other fields are ignored.
+#[derive(Deserialize)]
+struct TokenEntry {
+    /// The login of the account the installation is on.
+    owner: String,
+    /// The installation's token.
+    token: String,
+}
+
+/// The shape of the token secret, as its refusal names it.
+const TOKEN_SECRET_SHAPE: &str =
+    "an object from each installation id, a string of digits, to {owner, token}";
+
+/// What one read of the token secret holds: each installation's token, beside the login of the
+/// account it is installed on, as the minter writes them. It has no `Debug`, which would print
+/// the tokens.
+pub struct InstallationTokens(BTreeMap<u64, TokenEntry>);
+
+impl InstallationTokens {
+    /// Reads the newest version of the secret `CTX_SECRET_GITHUB_TOKENS` names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the secret cannot be read or is not the minter's form.
+    pub fn read() -> Result<Self> {
+        credentials::load(TOKENS_CREDENTIAL)
+            .and_then(|secret| Self::from_secret(&secret))
+            .context("reading the GitHub token secret")
+    }
+
+    /// Reads a token secret's value: one JSON object from each installation id to an object of
+    /// two strings, `owner` and `token`. An entry whose token is empty holds no token, so no
+    /// request carries an empty one and [`for_installation`](Self::for_installation) and
+    /// [`for_owner`](Self::for_owner) refuse it by its installation or owner, as they refuse an
+    /// entry that is not there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, which carries none of the value, when the value is not of that form.
+    pub fn from_secret(secret: &Secret) -> Result<Self> {
+        let mut entries: BTreeMap<u64, TokenEntry> = secret.parse(TOKEN_SECRET_SHAPE)?;
+        // An empty token would also reach `git::Credential::redact` as an empty pattern, which
+        // `str::replace` matches between every character of git's error.
+        entries.retain(|_, entry| !entry.token.is_empty());
+        Ok(Self(entries))
+    }
+
+    /// The token of one installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the installation when the secret holds no token for it.
+    pub fn for_installation(&self, installation: u64) -> Result<&str> {
+        self.0
+            .get(&installation)
+            .map(|entry| entry.token.as_str())
+            .ok_or_else(|| {
+                anyhow!("the GitHub token secret holds no token for installation {installation}")
+            })
+    }
+
+    /// The token of the installation on `owner`'s account. GitHub logins are case-insensitive,
+    /// so the owner a remote URL names matches the minter's login in either case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the owner when no entry on that account holds a token.
+    pub fn for_owner(&self, owner: &str) -> Result<&str> {
+        self.0
+            .values()
+            .find(|entry| entry.owner.eq_ignore_ascii_case(owner))
+            .map(|entry| entry.token.as_str())
+            .ok_or_else(|| {
+                anyhow!("the GitHub token secret holds no token of an installation on {owner}")
+            })
+    }
+}
 
 /// How long the app JWT is valid. GitHub refuses more than ten minutes.
 const JWT_LIFETIME: u64 = 540;
@@ -103,11 +232,21 @@ fn app_id_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::
 /// starts inside the margin can still be running when GitHub stops accepting the token.
 const TOKEN_MARGIN: TimeDelta = TimeDelta::minutes(5);
 
-/// One installation token, with the moment it stops working.
-#[derive(Clone, Debug, Deserialize)]
+/// One installation token, with the moment it stops working. Its `Debug` shows only that
+/// moment, never the token.
+#[derive(Clone, Deserialize)]
 pub struct InstallationToken {
     pub token: String,
     pub expires_at: String,
+}
+
+impl std::fmt::Debug for InstallationToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstallationToken")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl InstallationToken {
@@ -186,6 +325,23 @@ impl std::fmt::Display for Throttled {
 }
 
 impl std::error::Error for Throttled {}
+
+/// GitHub refused a token from the token secret with `401`: it expired or was revoked before the
+/// minter's newer version was read.
+///
+/// It travels as context on the error of a page read ([`GithubClient::get_page`]), so the
+/// caller, which charges each read to its budget, decides whether to read the secret again
+/// ([`GithubClient::read_tokens_again`]) and send the read once more.
+#[derive(Debug)]
+pub struct Unauthorized;
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GitHub refused the installation's token from the token secret")
+    }
+}
+
+impl std::error::Error for Unauthorized {}
 
 /// The GitHub App this program acts as.
 pub struct App {
@@ -399,22 +555,41 @@ pub struct Page {
     pub kind: PageKind,
 }
 
-/// The GitHub App as a reader: it mints a read-only token for each installation and
-/// reads the repositories that installation covers. One token is minted per installation and
-/// reused until it is nearly expired, so a fetch that runs longer than a token's hour mints a
-/// fresh one rather than failing on a stale one.
+/// The GitHub App as a reader: it gets a read-only token for each installation and reads the
+/// repositories that installation covers.
 pub struct GithubClient {
-    app: App,
-    tokens: RefCell<BTreeMap<u64, InstallationToken>>,
+    tokens: Tokens,
+}
+
+/// Where a [`GithubClient`] gets each installation's token.
+enum Tokens {
+    /// Minted from the app's key, one per installation, each reused until it is nearly expired,
+    /// so a fetch that runs longer than a token's hour mints a fresh one rather than failing on a
+    /// stale one.
+    Minted {
+        app: App,
+        held: RefCell<BTreeMap<u64, InstallationToken>>,
+    },
+    /// Read from the token secret, whose newest read is kept until the secret is read again:
+    /// before each installation's fetch, and when GitHub refuses a token with `401`.
+    Secret(RefCell<Option<InstallationTokens>>),
 }
 
 impl GithubClient {
-    /// Loads the client from the `github_app` credential.
+    /// Loads the client: from the token secret when `CTX_SECRET_GITHUB_TOKENS` names one, which
+    /// is read only once the client needs a token, and otherwise from the `github_app`
+    /// credential.
     ///
     /// # Errors
     ///
-    /// Returns an error when the credential is missing or is not an app key.
+    /// Returns an error when an app key variable is set beside `CTX_SECRET_GITHUB_TOKENS`, or,
+    /// with no token secret, when the credential is missing or is not an app key.
     pub fn load(config: &credentials::Config) -> Result<Self> {
+        if reads_a_token_secret()? {
+            return Ok(Self {
+                tokens: Tokens::Secret(RefCell::new(None)),
+            });
+        }
         Ok(Self::from_app(App::load(config)?))
     }
 
@@ -422,45 +597,116 @@ impl GithubClient {
     #[must_use]
     pub fn from_app(app: App) -> Self {
         Self {
-            app,
-            tokens: RefCell::new(BTreeMap::new()),
+            tokens: Tokens::Minted {
+                app,
+                held: RefCell::new(BTreeMap::new()),
+            },
         }
     }
 
-    /// The read-only token for one installation, minted when there is no usable one.
+    /// The read-only token for one installation: minted when there is no usable one, or taken
+    /// from the token secret's newest read, which is made now when none was.
     ///
     /// # Errors
     ///
-    /// Returns an error when GitHub refuses to mint the token.
+    /// Returns an error when GitHub refuses to mint the token, or when the token secret cannot be
+    /// read or holds no token for the installation.
     fn token(&self, installation: u64) -> Result<String> {
-        if let Some(held) = self
-            .tokens
-            .borrow()
-            .get(&installation)
-            .filter(|held| held.usable())
-        {
-            return Ok(held.token.clone());
+        match &self.tokens {
+            Tokens::Minted { app, held } => {
+                if let Some(token) = held
+                    .borrow()
+                    .get(&installation)
+                    .filter(|token| token.usable())
+                {
+                    return Ok(token.token.clone());
+                }
+                let minted = app.installation_token(installation, &TokenRequest::read_only())?;
+                held.borrow_mut().insert(installation, minted.clone());
+                Ok(minted.token)
+            }
+            Tokens::Secret(newest) => {
+                let mut newest = newest.borrow_mut();
+                let tokens = match &*newest {
+                    Some(tokens) => tokens,
+                    None => newest.insert(InstallationTokens::read()?),
+                };
+                tokens.for_installation(installation).map(str::to_owned)
+            }
         }
-        let minted = self
-            .app
-            .installation_token(installation, &TokenRequest::read_only())?;
-        self.tokens
-            .borrow_mut()
-            .insert(installation, minted.clone());
-        Ok(minted.token)
     }
 
-    /// The repositories one installation covers, after minting its read-only token.
+    /// Reads the token secret again and keeps what it holds. With an app key there is no secret,
+    /// and this does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the secret cannot be read or is not the minter's form.
+    pub fn read_tokens_again(&self) -> Result<()> {
+        if let Tokens::Secret(newest) = &self.tokens {
+            *newest.borrow_mut() = Some(InstallationTokens::read()?);
+        }
+        Ok(())
+    }
+
+    /// Whether `reply` is GitHub refusing a token from the token secret with `401`, its body
+    /// whole or cut short. A minted token's `401` is not: minting again gives no newer token.
+    fn refused_a_secret_token(&self, reply: &Result<JsonReply>) -> bool {
+        let status = match reply {
+            Ok((status, _, _)) => *status,
+            Err(error) => match error.downcast_ref::<CutShort>() {
+                Some(cut) => cut.status,
+                None => return false,
+            },
+        };
+        status == StatusCode::UNAUTHORIZED && matches!(self.tokens, Tokens::Secret(_))
+    }
+
+    /// Sends one request with `token`, the installation's, by `send`. When GitHub refuses a token
+    /// from the token secret with `401` ([`Unauthorized`]), it reads the secret again, puts the
+    /// installation's newest token in `token`, and sends the request once more with it, whose
+    /// answer stands. The repository listing and the GraphQL pre-pass, which the request budget
+    /// does not cover, send this way; a page read leaves the second try to its caller
+    /// ([`GithubClient::get_page`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `send` fails, or the secret cannot be read again or holds no token
+    /// for the installation.
+    fn send_with_token(
+        &self,
+        installation: u64,
+        token: &mut String,
+        send: impl Fn(&str) -> Result<JsonReply>,
+    ) -> Result<JsonReply> {
+        let reply = send(token);
+        if !self.refused_a_secret_token(&reply) {
+            return reply;
+        }
+        *token = self
+            .read_tokens_again()
+            .and_then(|()| self.token(installation))
+            .with_context(|| {
+                format!("GitHub refused the token of installation {installation} with 401")
+            })?;
+        send(token)
+    }
+
+    /// The repositories one installation covers, after getting its read-only token. With a token
+    /// secret, each installation's fetch starts here, so the secret is read again first: a token
+    /// read for an earlier installation of a long run is not the one this installation reads
+    /// with.
     ///
     /// `None` means GitHub refused the discovery to protect a rate limit, in the mint or in the
     /// listing: the installation is read by a later fetch, and nothing about it is known yet.
     ///
     /// # Errors
     ///
-    /// Returns an error when the token cannot be minted or GitHub refuses the listing for any
-    /// other reason.
+    /// Returns an error when the token cannot be minted or read, or GitHub refuses the listing
+    /// for any other reason.
     pub fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>> {
-        let token = match self.token(installation) {
+        self.read_tokens_again()?;
+        let mut token = match self.token(installation) {
             Ok(token) => token,
             Err(error) if error.downcast_ref::<Throttled>().is_some() => return Ok(None),
             Err(error) => return Err(error),
@@ -471,7 +717,10 @@ impl GithubClient {
             // The caller names the installation, so the error says it once.
             let mut attempt = 1;
             let (status, headers, body) = loop {
-                match client::get_json_with_headers(&current, &token, &[], &api_headers()) {
+                let listed = self.send_with_token(installation, &mut token, |token| {
+                    client::get_json_with_headers(&current, token, &[], &api_headers())
+                });
+                match listed {
                     Ok(reply) => break reply,
                     Err(error) if cut_short_throttle(&error).is_some() => return Ok(None),
                     Err(error) => retry_after(error, attempt)?,
@@ -510,30 +759,41 @@ impl GithubClient {
     /// (`/compare/<base>...<head>`), which wraps them in an object.
     ///
     /// It sends the request once: a caller that may send it again after it got no answer
-    /// ([`retry_after`]) counts each request it sends.
+    /// ([`retry_after`]) counts each request it sends. With a token secret, a `401` is an error
+    /// carrying [`Unauthorized`], after which the caller may read the secret again
+    /// ([`GithubClient::read_tokens_again`]) and send the request once more.
     ///
     /// # Errors
     ///
-    /// Returns an error when the token cannot be minted, the request fails, or GitHub refuses
-    /// it with a status that is none of those.
+    /// Returns an error when the token cannot be minted or read, the request fails, or GitHub
+    /// refuses it with a status that is none of those.
     pub fn get_page(&self, installation: u64, url: &str) -> Result<Page> {
         let token = self.token(installation)?;
-        let (status, headers, body) =
-            match client::get_json_with_headers(url, &token, &[], &api_headers()) {
-                Ok(reply) => reply,
-                Err(error) => {
-                    // A throttle whose body GitHub cut short is still a throttle.
-                    let Some(headers) = cut_short_throttle(&error) else {
-                        return Err(error);
-                    };
-                    return Ok(Page {
-                        rate_remaining: rate_remaining(&headers),
-                        rate_resource: header_value(&headers, "x-ratelimit-resource"),
-                        kind: PageKind::Throttled,
-                        ..Page::default()
-                    });
+        let reply = client::get_json_with_headers(url, &token, &[], &api_headers());
+        if self.refused_a_secret_token(&reply) {
+            let refusal = match reply {
+                Ok((status, _, body)) => {
+                    anyhow!("GitHub answered {status} {}, to GET {url}", excerpt(&body))
                 }
+                Err(error) => error,
             };
+            return Err(refusal.context(Unauthorized));
+        }
+        let (status, headers, body) = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                // A throttle whose body GitHub cut short is still a throttle.
+                let Some(headers) = cut_short_throttle(&error) else {
+                    return Err(error);
+                };
+                return Ok(Page {
+                    rate_remaining: rate_remaining(&headers),
+                    rate_resource: header_value(&headers, "x-ratelimit-resource"),
+                    kind: PageKind::Throttled,
+                    ..Page::default()
+                });
+            }
+        };
         let rated = Page {
             rate_remaining: rate_remaining(&headers),
             rate_resource: header_value(&headers, "x-ratelimit-resource"),
@@ -587,12 +847,14 @@ impl GithubClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the token cannot be minted, the request fails, or GitHub answers
-    /// with a status other than `200`.
+    /// Returns an error when the token cannot be minted or read, the request fails, or GitHub
+    /// answers with a status other than `200`.
     pub fn graphql(&self, installation: u64, request: &Value) -> Result<Value> {
-        let token = self.token(installation)?;
+        let mut token = self.token(installation)?;
         let url = format!("{}/graphql", base());
-        let (status, _, body) = client::post_json(&url, &token, request)?;
+        let (status, _, body) = self.send_with_token(installation, &mut token, |token| {
+            client::post_json(&url, token, request)
+        })?;
         if !status.is_success() {
             bail!("GitHub answered {status} {}, to POST {url}", excerpt(&body));
         }
@@ -777,7 +1039,8 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     use reqwest::StatusCode;
 
-    use super::{diff_unavailable, repository_of, throttled, TokenRequest};
+    use super::{diff_unavailable, repository_of, throttled, InstallationTokens, TokenRequest};
+    use crate::credentials::Secret;
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -877,5 +1140,82 @@ mod tests {
             );
         }
         assert_eq!(repository_of("/tmp/remote.git"), None);
+    }
+
+    fn token_secret(value: &serde_json::Value) -> anyhow::Result<InstallationTokens> {
+        InstallationTokens::from_secret(&Secret::new(value.to_string()))
+    }
+
+    #[test]
+    fn a_token_secret_gives_each_installation_and_each_owner_its_token() -> anyhow::Result<()> {
+        // The form the minter writes: each installation id to its account's login and token.
+        let tokens = token_secret(&serde_json::json!({
+            "1000001": { "owner": "sjawhar", "token": "ghs_first" },
+            "1000002": { "owner": "acme", "token": "ghs_second", "expires_at": "ignored" },
+        }))?;
+        assert_eq!(tokens.for_installation(1_000_002)?, "ghs_second");
+        assert_eq!(tokens.for_installation(1_000_001)?, "ghs_first");
+        assert_eq!(tokens.for_owner("acme")?, "ghs_second");
+        // GitHub logins are case-insensitive, and a remote URL may spell one either way.
+        assert_eq!(tokens.for_owner("Acme")?, "ghs_second");
+        let stored_mixed = token_secret(&serde_json::json!({
+            "1000003": { "owner": "WidgetCo", "token": "ghs_third" },
+        }))?;
+        assert_eq!(stored_mixed.for_owner("widgetco")?, "ghs_third");
+        assert_eq!(stored_mixed.for_owner("WIDGETCO")?, "ghs_third");
+        Ok(())
+    }
+
+    #[test]
+    fn a_token_secret_with_no_entry_names_what_it_lacks() -> anyhow::Result<()> {
+        let tokens = token_secret(&serde_json::json!({
+            "1000001": { "owner": "sjawhar", "token": "ghs_first" },
+        }))?;
+        let installation = tokens
+            .for_installation(1_000_009)
+            .err()
+            .map_or_default(|error| format!("{error:#}"));
+        assert!(installation.contains("1000009"), "{installation}");
+        let owner = tokens
+            .for_owner("acme")
+            .err()
+            .map_or_default(|error| format!("{error:#}"));
+        assert!(owner.contains("acme"), "{owner}");
+        assert!(!owner.contains("ghs_first"), "{owner}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_token_in_the_secret_is_no_token() -> anyhow::Result<()> {
+        // An empty token would be sent as no credential, and would reach git's error redaction
+        // as an empty pattern, which matches between every character.
+        let tokens = token_secret(&serde_json::json!({
+            "1000001": { "owner": "sjawhar", "token": "" },
+            "1000002": { "owner": "acme", "token": "ghs_second" },
+        }))?;
+        assert!(tokens.for_installation(1_000_001).is_err());
+        assert!(tokens.for_owner("sjawhar").is_err());
+        assert_eq!(tokens.for_installation(1_000_002)?, "ghs_second");
+        assert_eq!(tokens.for_owner("acme")?, "ghs_second");
+        Ok(())
+    }
+
+    #[test]
+    fn a_token_secret_that_does_not_parse_is_refused_without_its_tokens() {
+        // A token where its entry belongs, and an id that is not a number.
+        for value in [
+            serde_json::json!({ "1000001": "ghs_leaked_value" }),
+            serde_json::json!({ "ghs_leaked_value": { "owner": "acme", "token": "ghs_x" } }),
+            serde_json::json!({ "1000001": { "owner": "acme" } }),
+        ] {
+            let error = token_secret(&value)
+                .err()
+                .map_or_default(|error| format!("{error:#}"));
+            assert!(
+                error.contains("the credential is not the expected JSON"),
+                "{value} gave {error}"
+            );
+            assert!(!error.contains("ghs_leaked_value"), "{error}");
+        }
     }
 }

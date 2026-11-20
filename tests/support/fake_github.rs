@@ -212,8 +212,14 @@ fn route(root: &Path, seen: &Mutex<Seen>, request: &Recorded, body: &[u8]) -> Re
     serve_git(root, request, body)
 }
 
-/// Hands one request to `git http-backend` and relays what it answers.
-fn serve_git(root: &Path, request: &Recorded, body: &[u8]) -> Result<Response> {
+/// Hands one request to `git http-backend`, serving the bare repositories under `root`, and
+/// relays what it answers. A stand-in that guards its remote its own way calls this once it has
+/// let a request through.
+///
+/// # Errors
+///
+/// Returns an error when `git http-backend` cannot run or prints no headers.
+pub fn serve_git(root: &Path, request: &Recorded, body: &[u8]) -> Result<Response> {
     let query = request
         .target
         .split_once('?')
