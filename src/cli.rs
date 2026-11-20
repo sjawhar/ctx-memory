@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+use crate::api::github;
 use crate::context::Context;
 use crate::cursor::{self, AdvanceOutcome, Cursors};
 use crate::delta;
@@ -581,8 +582,13 @@ struct SourceRunPayload<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error when tree discovery, loading, command execution, or external dispatch fails.
+/// Returns an error when `CTX_SECRET_GITHUB_APP` is set beside `CTX_SECRET_GITHUB_TOKENS`, or
+/// when tree discovery, loading, command execution, or external dispatch fails.
 pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Outcome> {
+    // A token secret beside an app key leaves which of them GitHub is read with undecided, so
+    // `ctx` stops here, before it reads anything.
+    github::reads_a_token_secret()?;
+
     if let Command::External(arguments) = &cli.command {
         let environment = PluginEnv::resolve(&GlobalArgs::from(cli))?;
         return run_external(arguments, &environment).map(|never| match never {});
