@@ -69,6 +69,7 @@ fn ctx(tree: &Path, state: &Path, global: &[&str]) -> Result<Command> {
         "ECHO_SLEEP",
         "ECHO_WAIT_FOR",
         "ECHO_THREAD_STATE",
+        "ECHO_VERSION",
     ] {
         command.env_remove(name);
     }
@@ -1148,6 +1149,908 @@ mod stopping {
             !published,
             "the stopped fetch went on and published its window"
         );
+        Ok(())
+    }
+}
+
+/// `ctx fetch --replay`: the messages a cohort file lists, delivered again as new windows.
+mod replay {
+    use super::*;
+
+    use ctx_memory::pointer::Pointer;
+    use ctx_memory::store::Store;
+    use fs2::FileExt as _;
+    use sha2::{Digest as _, Sha256};
+
+    /// Writes the tree's `ctx.toml`: an echo source that reads `streams`, and `exclude` as the
+    /// deployment's `[ingest] exclude`.
+    fn configure(tree: &Path, streams: &[&str], exclude: &[&str]) -> Result<()> {
+        let quoted = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        fs::write(
+            tree.join("ctx.toml"),
+            format!(
+                "version = 1\nid = \"example\"\n\n[ingest]\nexclude = [{}]\n\n[[sources]]\nid = \"echo\"\nkind = \"echo\"\nscheme = \"echo\"\nstreams = [{}]\n",
+                quoted(exclude),
+                quoted(streams)
+            ),
+        )
+        .context("writing ctx.toml")
+    }
+
+    /// A fetch of `streams` ending at `window_end`, with the echo knobs `environment` sets.
+    /// Answers the window's id.
+    fn fetch_streams(
+        tree: &Path,
+        state: &Path,
+        streams: &[&str],
+        window_end: &str,
+        environment: &[(&str, &str)],
+    ) -> Result<String> {
+        configure(tree, streams, &[])?;
+        let output = command(tree, state)?
+            .args(["fetch", "--window-end", window_end])
+            .envs(environment.iter().copied())
+            .output()
+            .context("running ctx fetch")?;
+        ensure_success(&output)?;
+        window_id(&output)
+    }
+
+    fn ensure_success(output: &Output) -> Result<()> {
+        if !output.status.success() {
+            bail!(
+                "ctx exited {}: {}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    /// Writes the cohort file `name` beside the tree, one `<window>\t<pointer>` line each.
+    fn cohort_named(root: &Path, name: &str, lines: &[(&str, &str)]) -> Result<PathBuf> {
+        let path = root.join(name);
+        let text = lines
+            .iter()
+            .map(|(window, pointer)| [*window, "\t", *pointer, "\n"].concat())
+            .collect::<String>();
+        fs::write(&path, text).context("writing the cohort")?;
+        Ok(path)
+    }
+
+    fn cohort(root: &Path, lines: &[(&str, &str)]) -> Result<PathBuf> {
+        cohort_named(root, "cohort.tsv", lines)
+    }
+
+    /// `ctx --json fetch --replay <cohort> <arguments>`.
+    fn replay(tree: &Path, state: &Path, cohort: &Path, arguments: &[&str]) -> Result<Output> {
+        command(tree, state)?
+            .arg("fetch")
+            .arg("--replay")
+            .arg(cohort)
+            .args(arguments)
+            .output()
+            .context("running ctx fetch --replay")
+    }
+
+    /// A replay's JSON answer, read field by field: a field it lacks, or of another type, fails
+    /// the read rather than read as empty.
+    #[derive(Debug)]
+    struct Answer {
+        /// Each window it wrote, as `(window, replay_of, new messages)`.
+        windows: Vec<(String, String, u64)>,
+        replayed: Vec<String>,
+        excluded: u64,
+        remaining: u64,
+    }
+
+    impl Answer {
+        /// The origin and new messages of each window the run wrote.
+        fn origins(&self) -> Vec<(String, u64)> {
+            self.windows
+                .iter()
+                .map(|(_, of, new)| (of.clone(), *new))
+                .collect()
+        }
+    }
+
+    fn string(value: &Value, pointer: &str) -> Result<String> {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("the answer has no string at {pointer}: {value}"))
+    }
+
+    fn number(value: &Value, pointer: &str) -> Result<u64> {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .with_context(|| format!("the answer has no number at {pointer}: {value}"))
+    }
+
+    fn array<'v>(value: &'v Value, pointer: &str) -> Result<&'v Vec<Value>> {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .with_context(|| format!("the answer has no list at {pointer}: {value}"))
+    }
+
+    /// The answer of a replay, which must have exited 0 and answered as `ctx fetch`.
+    fn answer(output: &Output) -> Result<Answer> {
+        ensure_success(output)?;
+        let raw: Value =
+            serde_json::from_slice(&output.stdout).context("decoding the replay's answer")?;
+        if string(&raw, "/command")? != "fetch" {
+            bail!("the replay did not answer as ctx fetch: {raw}");
+        }
+        let windows = array(&raw, "/data/windows")?
+            .iter()
+            .map(|window| {
+                array(window, "/cursors/advanced")?;
+                array(window, "/cursors/skipped")?;
+                Ok((
+                    string(window, "/window")?,
+                    string(window, "/replay_of")?,
+                    number(window, "/delta/new_messages")?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let replayed = array(&raw, "/data/replayed")?
+            .iter()
+            .map(|origin| {
+                origin
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("a replayed origin is not a string")
+            })
+            .collect::<Result<_>>()?;
+        Ok(Answer {
+            windows,
+            replayed,
+            excluded: number(&raw, "/data/excluded")?,
+            remaining: number(&raw, "/data/remaining")?,
+        })
+    }
+
+    /// The error message of a replay that failed, which must have exited 2.
+    fn failure(output: &Output) -> Result<String> {
+        if output.status.code() != Some(2) {
+            bail!(
+                "the replay exited {}, not 2: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        string(&serde_json::from_slice(&output.stdout)?, "/error/message")
+    }
+
+    fn data(state: &Path) -> PathBuf {
+        state.join("example")
+    }
+
+    /// Every entry of the windows directory, staged ones among them, sorted.
+    fn window_entries(state: &Path) -> Result<Vec<String>> {
+        let mut entries = fs::read_dir(data(state).join("windows"))?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort();
+        Ok(entries)
+    }
+
+    /// The window's records, as `(pointer, text, context)`, in its order.
+    fn records(state: &Path, window: &str) -> Result<Vec<(String, String, bool)>> {
+        let path = data(state)
+            .join("windows")
+            .join(window)
+            .join("records.jsonl");
+        fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .lines()
+            .map(|line| {
+                let value: Value = serde_json::from_str(line)?;
+                let context = value
+                    .pointer("/record/context")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_default();
+                Ok((
+                    string(&value, "/record/pointer")?,
+                    string(&value, "/record/text")?,
+                    context,
+                ))
+            })
+            .collect()
+    }
+
+    fn manifest(state: &Path, window: &str) -> Result<Value> {
+        let path = data(state)
+            .join("windows")
+            .join(window)
+            .join("manifest.json");
+        Ok(serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+        )?)
+    }
+
+    /// How many windows of the data directory replay `origin`.
+    fn replays_of(state: &Path, origin: &str) -> Result<usize> {
+        let mut count = 0;
+        for entry in window_entries(state)? {
+            if !entry.starts_with('.')
+                && manifest(state, &entry)?
+                    .get("replay_of")
+                    .and_then(Value::as_str)
+                    == Some(origin)
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// The text of the version of `pointer` the store answers with now (`Store::get`).
+    fn current_text(state: &Path, pointer: &str) -> Result<Option<String>> {
+        let store = Store::open(
+            &data(state).join("store.sqlite3"),
+            &data(state).join("sources.json"),
+            &data(state).join("resolved"),
+        )?;
+        let (scheme, locator) = pointer.split_once(':').context("a pointer has a scheme")?;
+        Ok(store
+            .get(&Pointer {
+                scheme: scheme.to_owned(),
+                locator: locator.to_owned(),
+            })?
+            .map(|record| record.text))
+    }
+
+    /// The new messages `ctx pending` lists for `window`.
+    fn pending_new_messages(tree: &Path, state: &Path, window: &str) -> Result<Option<u64>> {
+        let pending = command(tree, state)?
+            .arg("pending")
+            .output()
+            .context("running ctx pending")?;
+        ensure_success(&pending)?;
+        let pending: Value = serde_json::from_slice(&pending.stdout)?;
+        Ok(array(&pending, "/data/windows")?
+            .iter()
+            .find(|listed| listed.get("window").and_then(Value::as_str) == Some(window))
+            .and_then(|listed| listed.get("new_messages"))
+            .and_then(Value::as_u64))
+    }
+
+    const ONE: &str = "echo:C0EXAMPLE01/record";
+    const TWO: &str = "echo:C0EXAMPLE02/record";
+    const THREE: &str = "echo:C0EXAMPLE03/record";
+    const FOUR: &str = "echo:C0EXAMPLE04/record";
+    const FIVE: &str = "echo:C0EXAMPLE05/record";
+
+    /// A message that changed after its origin window is replayed as the store holds it now, and
+    /// indexing the replay window leaves that version the current one.
+    #[test]
+    fn a_replayed_message_is_the_stores_current_version() -> Result<()> {
+        let root = scratch("replay-current")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let streams = ["C0EXAMPLE01", "C0EXAMPLE02"];
+        let origin = fetch_streams(
+            &tree,
+            &state,
+            &streams,
+            "2026-11-08T18:00:00Z",
+            &[("ECHO_VERSION", "v1")],
+        )?;
+        let later = fetch_streams(
+            &tree,
+            &state,
+            &streams,
+            "2026-11-09T18:00:00Z",
+            &[("ECHO_VERSION", "v2")],
+        )?;
+        let cohort = cohort(&root, &[(origin.as_str(), ONE)])?;
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&cohort)?));
+        let output = replay(&tree, &state, &cohort, &[])?;
+        let result = (|| -> Result<_> {
+            let answer = answer(&output)?;
+            let window = answer
+                .windows
+                .first()
+                .map(|(window, _, _)| window.clone())
+                .context("the replay wrote no window")?;
+            Ok((
+                records(&state, &window)?,
+                manifest(&state, &window)?,
+                current_text(&state, ONE)?,
+                records(&state, &origin)?,
+                records(&state, &later)?,
+                answer,
+            ))
+        })();
+        remove_scratch(&root)?;
+        let (replayed, manifest, current, origin_records, later_records, answer) = result?;
+
+        assert!(
+            origin_records.contains(&(ONE.to_owned(), "echo C0EXAMPLE01 v1".to_owned(), false))
+                && later_records
+                    .contains(&(ONE.to_owned(), "echo C0EXAMPLE01 v2".to_owned(), false)),
+            "the origin window does not hold the old version and the later one the new: {origin_records:?} {later_records:?}"
+        );
+        assert_eq!(answer.origins(), vec![(origin.clone(), 1)], "{answer:?}");
+        assert_eq!(
+            (replayed, current.as_deref()),
+            (
+                vec![(ONE.to_owned(), "echo C0EXAMPLE01 v2".to_owned(), false)],
+                Some("echo C0EXAMPLE01 v2")
+            ),
+            "the replay window does not hold the current version alone, or indexing it made \
+             another version current"
+        );
+        assert_eq!(
+            (
+                manifest.get("replay_of").and_then(Value::as_str),
+                manifest.get("replay_cohort").and_then(Value::as_str)
+            ),
+            (Some(origin.as_str()), Some(sha256.as_str())),
+            "{manifest}"
+        );
+        assert_eq!((answer.excluded, answer.remaining), (0, 0), "{answer:?}");
+        Ok(())
+    }
+
+    /// An excluded message is left out without the store being asked for it, so one the store
+    /// does not hold fails nothing; a message the store already delivered unchanged is a new
+    /// message of the replay window; and no cursor moves.
+    #[test]
+    fn a_replay_leaves_out_excluded_messages_delivers_held_ones_as_new_and_moves_no_cursor(
+    ) -> Result<()> {
+        let root = scratch("replay-exclude")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let streams = ["C0EXAMPLE01", "C0EXAMPLE02"];
+        let origin = fetch_streams(&tree, &state, &streams, "2026-11-08T18:00:00Z", &[])?;
+        configure(&tree, &streams, &["echo:C0EXAMPLE02/*"])?;
+        let cursors = data(&state).join("cursors.json");
+        let before = fs::read(&cursors)?;
+        let cohort = cohort(
+            &root,
+            &[
+                (origin.as_str(), ONE),
+                (origin.as_str(), "echo:C0EXAMPLE02/missing"),
+                (origin.as_str(), TWO),
+            ],
+        )?;
+        let output = replay(&tree, &state, &cohort, &[])?;
+        let result = (|| -> Result<_> {
+            let answer = answer(&output)?;
+            let window = answer
+                .windows
+                .first()
+                .map(|(window, _, _)| window.clone())
+                .context("the replay wrote no window")?;
+            Ok((
+                records(&state, &window)?,
+                pending_new_messages(&tree, &state, &window)?,
+                fs::read(&cursors)?,
+                answer,
+            ))
+        })();
+        remove_scratch(&root)?;
+        let (replayed, listed, after, answer) = result?;
+
+        assert_eq!(
+            replayed,
+            vec![(ONE.to_owned(), "echo C0EXAMPLE01".to_owned(), false)],
+            "the replay window does not hold the held message alone, as new"
+        );
+        assert_eq!(
+            (answer.origins(), answer.excluded),
+            (vec![(origin, 1)], 2),
+            "{answer:?}"
+        );
+        assert_eq!(
+            listed,
+            Some(1),
+            "ctx pending does not list the replay window's message as new"
+        );
+        assert_eq!(before, after, "the replay moved a cursor");
+        Ok(())
+    }
+
+    /// A message the store first held only as context, the way a source sends the message a
+    /// reply answers, is a new message of the replay window.
+    #[test]
+    fn a_message_first_stored_as_context_is_replayed_as_new() -> Result<()> {
+        let root = scratch("replay-context")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let origin = fetch_streams(
+            &tree,
+            &state,
+            &["C0EXAMPLE01"],
+            "2026-11-08T18:00:00Z",
+            &[("ECHO_CONTEXT", "1")],
+        )?;
+        let cohort = cohort(&root, &[(origin.as_str(), ONE)])?;
+        let output = replay(&tree, &state, &cohort, &[]);
+        let result = (|| -> Result<_> {
+            let answer = answer(&output?)?;
+            let window = answer
+                .windows
+                .first()
+                .map(|(window, _, _)| window.clone())
+                .context("the replay wrote no window")?;
+            Ok((records(&state, &origin)?, records(&state, &window)?, answer))
+        })();
+        remove_scratch(&root)?;
+        let (origin_records, replayed, answer) = result?;
+
+        assert_eq!(
+            origin_records,
+            vec![(ONE.to_owned(), "echo C0EXAMPLE01".to_owned(), true)],
+            "the origin window does not hold the message as context"
+        );
+        assert_eq!(
+            (replayed, answer.origins()),
+            (
+                vec![(ONE.to_owned(), "echo C0EXAMPLE01".to_owned(), false)],
+                vec![(origin, 1)]
+            ),
+            "the replay did not deliver the context message as new: {answer:?}"
+        );
+        Ok(())
+    }
+
+    /// A replay window holds its messages as a fetch's window does, by source, then time, then
+    /// pointer, not in the cohort's pointer order.
+    #[test]
+    fn a_replay_window_holds_its_messages_in_time_order() -> Result<()> {
+        let root = scratch("replay-order")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let earlier = fetch_streams(&tree, &state, &["C0EXAMPLE02"], "2026-11-08T18:00:00Z", &[])?;
+        fetch_streams(&tree, &state, &["C0EXAMPLE01"], "2026-11-09T18:00:00Z", &[])?;
+        let cohort = cohort(&root, &[(earlier.as_str(), ONE), (earlier.as_str(), TWO)])?;
+        let output = replay(&tree, &state, &cohort, &[]);
+        let result = (|| -> Result<_> {
+            let answer = answer(&output?)?;
+            let window = answer
+                .windows
+                .first()
+                .map(|(window, _, _)| window.clone())
+                .context("the replay wrote no window")?;
+            records(&state, &window)
+        })();
+        remove_scratch(&root)?;
+        let pointers = result?
+            .into_iter()
+            .map(|(pointer, _, _)| pointer)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            pointers,
+            vec![TWO.to_owned(), ONE.to_owned()],
+            "the replay window does not hold the older message first"
+        );
+        Ok(())
+    }
+
+    /// Each run goes on after the origin windows the runs before it replayed, in processes of
+    /// their own, within its message and window limits, and `remaining` counts down to 0.
+    #[test]
+    fn replay_runs_go_on_until_nothing_remains() -> Result<()> {
+        let root = scratch("replay-continue")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let first = fetch_streams(
+            &tree,
+            &state,
+            &["C0EXAMPLE01", "C0EXAMPLE02"],
+            "2026-11-08T18:00:00Z",
+            &[],
+        )?;
+        let second = fetch_streams(
+            &tree,
+            &state,
+            &["C0EXAMPLE03", "C0EXAMPLE04"],
+            "2026-11-09T18:00:00Z",
+            &[],
+        )?;
+        let third = fetch_streams(&tree, &state, &["C0EXAMPLE05"], "2026-11-10T18:00:00Z", &[])?;
+        let cohort = cohort(
+            &root,
+            &[
+                (first.as_str(), ONE),
+                (first.as_str(), TWO),
+                (second.as_str(), THREE),
+                (second.as_str(), FOUR),
+                (third.as_str(), FIVE),
+            ],
+        )?;
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&cohort)?));
+        let runs = [
+            &["--max-messages", "2"][..],
+            &["--max-messages", "350", "--max-windows", "1"][..],
+            &[][..],
+            &[][..],
+        ]
+        .iter()
+        .map(|arguments| answer(&replay(&tree, &state, &cohort, arguments)?))
+        .collect::<Result<Vec<_>>>();
+        let progress = fs::read(data(&state).join("replay/cohort.tsv.json"));
+        remove_scratch(&root)?;
+        let runs = runs?;
+        let progress: Value = serde_json::from_slice(&progress?)?;
+
+        let seen = runs
+            .iter()
+            .map(|answer| (answer.origins(), answer.replayed.clone(), answer.remaining))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            vec![
+                (vec![(first.clone(), 2)], vec![first.clone()], 2),
+                (vec![(second.clone(), 2)], vec![second.clone()], 1),
+                (vec![(third.clone(), 1)], vec![third.clone()], 0),
+                (vec![], vec![], 0),
+            ],
+            "{runs:?}"
+        );
+        assert_eq!(
+            progress,
+            serde_json::json!({"version": 1, "cohort": sha256, "replayed": [first, second, third]})
+        );
+        Ok(())
+    }
+
+    /// An origin window with more messages than one run may write is taken whole as the first
+    /// window of a run, and the next run goes on after it.
+    #[test]
+    fn an_origin_window_larger_than_a_run_is_taken_whole() -> Result<()> {
+        let root = scratch("replay-large")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let large = fetch_streams(
+            &tree,
+            &state,
+            &["C0EXAMPLE01", "C0EXAMPLE02", "C0EXAMPLE03"],
+            "2026-11-08T18:00:00Z",
+            &[],
+        )?;
+        let next = fetch_streams(&tree, &state, &["C0EXAMPLE04"], "2026-11-09T18:00:00Z", &[])?;
+        let cohort = cohort(
+            &root,
+            &[
+                (large.as_str(), ONE),
+                (large.as_str(), TWO),
+                (large.as_str(), THREE),
+                (next.as_str(), FOUR),
+            ],
+        )?;
+        let runs = (0..2)
+            .map(|_| answer(&replay(&tree, &state, &cohort, &["--max-messages", "2"])?))
+            .collect::<Result<Vec<_>>>();
+        remove_scratch(&root)?;
+        let runs = runs?;
+
+        let seen = runs
+            .iter()
+            .map(|answer| (answer.origins(), answer.remaining))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            vec![(vec![(large.clone(), 3)], 1), (vec![(next.clone(), 1)], 0)],
+            "{runs:?}"
+        );
+        Ok(())
+    }
+
+    /// `--max-messages` counts the messages a run keeps, not the cohort lines the deployment
+    /// excludes: an origin window that keeps one message of three leaves room for the next.
+    #[test]
+    fn max_messages_counts_the_messages_a_run_keeps() -> Result<()> {
+        let root = scratch("replay-kept")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let first = fetch_streams(
+            &tree,
+            &state,
+            &["C0EXAMPLE01", "C0EXAMPLE02", "C0EXAMPLE03"],
+            "2026-11-08T18:00:00Z",
+            &[],
+        )?;
+        let next = fetch_streams(&tree, &state, &["C0EXAMPLE04"], "2026-11-09T18:00:00Z", &[])?;
+        configure(
+            &tree,
+            &["C0EXAMPLE04"],
+            &["echo:C0EXAMPLE02/*", "echo:C0EXAMPLE03/*"],
+        )?;
+        let cohort = cohort(
+            &root,
+            &[
+                (first.as_str(), ONE),
+                (first.as_str(), TWO),
+                (first.as_str(), THREE),
+                (next.as_str(), FOUR),
+            ],
+        )?;
+        let output = replay(&tree, &state, &cohort, &["--max-messages", "2"]);
+        remove_scratch(&root)?;
+        let answer = answer(&output?)?;
+
+        assert_eq!(
+            (answer.origins(), answer.excluded, answer.remaining),
+            (vec![(first, 1), (next, 1)], 2, 0),
+            "{answer:?}"
+        );
+        Ok(())
+    }
+
+    /// An origin window none of whose messages is kept makes no window, and counts as replayed,
+    /// in this run's answer and in the next run's progress.
+    #[test]
+    fn an_origin_window_that_keeps_no_message_makes_no_window() -> Result<()> {
+        let root = scratch("replay-empty")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let excluded = fetch_streams(&tree, &state, &["C0EXAMPLE01"], "2026-11-08T18:00:00Z", &[])?;
+        let kept = fetch_streams(&tree, &state, &["C0EXAMPLE02"], "2026-11-09T18:00:00Z", &[])?;
+        configure(&tree, &["C0EXAMPLE02"], &["echo:C0EXAMPLE01/*"])?;
+        let cohort = cohort(&root, &[(excluded.as_str(), ONE), (kept.as_str(), TWO)])?;
+        let before = window_entries(&state)?;
+        let first = replay(&tree, &state, &cohort, &["--max-windows", "1"]);
+        let after = window_entries(&state);
+        let again = replay(&tree, &state, &cohort, &[]);
+        let last = window_entries(&state);
+        remove_scratch(&root)?;
+        let (first, again, after, last) = (answer(&first?)?, answer(&again?)?, after?, last?);
+
+        assert_eq!(
+            (
+                first.origins(),
+                first.replayed.clone(),
+                first.excluded,
+                first.remaining
+            ),
+            (vec![(kept.clone(), 1)], vec![excluded, kept], 1, 0),
+            "{first:?}"
+        );
+        assert_eq!(
+            after.len(),
+            before.len() + 1,
+            "the replay wrote other than one window: {before:?} {after:?}"
+        );
+        assert_eq!(
+            (again.windows.len(), again.replayed.len(), again.remaining),
+            (0, 0, 0),
+            "the next run did not find both origin windows replayed: {again:?}"
+        );
+        assert_eq!(after, last, "the next run wrote a window");
+        Ok(())
+    }
+
+    /// A run that published a window and could not note it in the progress file fails, and the
+    /// next run counts that window's origin as replayed rather than deliver it a second time.
+    #[test]
+    fn a_window_published_but_not_noted_is_not_replayed_again() -> Result<()> {
+        let root = scratch("replay-unnoted")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let origin = fetch_streams(&tree, &state, &["C0EXAMPLE01"], "2026-11-08T18:00:00Z", &[])?;
+        let cohort = cohort(&root, &[(origin.as_str(), ONE)])?;
+        let progress = data(&state).join("replay");
+        fs::create_dir(&progress)?;
+        fs::set_permissions(
+            &progress,
+            std::os::unix::fs::PermissionsExt::from_mode(0o555),
+        )?;
+        // The test rests on the mode refusing the write, which it does not for root.
+        if fs::write(progress.join("probe"), "").is_ok() {
+            remove_scratch(&root)?;
+            bail!("a directory of mode 0555 took a write, as it does for root: run this test as another user");
+        }
+        let unnoted = replay(&tree, &state, &cohort, &[]);
+        let published = replays_of(&state, &origin);
+        fs::set_permissions(
+            &progress,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )?;
+        let again = replay(&tree, &state, &cohort, &[]);
+        let total = replays_of(&state, &origin);
+        remove_scratch(&root)?;
+        let message = failure(&unnoted?)?;
+        let again = answer(&again?)?;
+
+        assert!(
+            message.contains("cohort.tsv.json"),
+            "the run did not fail on the progress file: {message}"
+        );
+        assert_eq!(published?, 1, "the failed run published no window to note");
+        assert_eq!(
+            (again.windows.len(), again.remaining, total?),
+            (0, 0, 1),
+            "the next run delivered the published origin window again: {again:?}"
+        );
+        Ok(())
+    }
+
+    /// The progress file holds its cohort's SHA-256: a cohort file changed under the same name is
+    /// refused, and another cohort, under another name, over the same origin windows is replayed
+    /// in its own right rather than read as already done.
+    #[test]
+    fn a_cohort_is_known_by_its_sha256() -> Result<()> {
+        let root = scratch("replay-sha")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let origin = fetch_streams(
+            &tree,
+            &state,
+            &["C0EXAMPLE01", "C0EXAMPLE02"],
+            "2026-11-08T18:00:00Z",
+            &[],
+        )?;
+        let first = cohort(&root, &[(origin.as_str(), ONE)])?;
+        let replayed = replay(&tree, &state, &first, &[]);
+        cohort(&root, &[(origin.as_str(), TWO)])?;
+        let changed = replay(&tree, &state, &first, &[]);
+        let second = cohort_named(&root, "second.tsv", &[(origin.as_str(), TWO)])?;
+        let another = replay(&tree, &state, &second, &[]);
+        remove_scratch(&root)?;
+        let (replayed, message, another) =
+            (answer(&replayed?)?, failure(&changed?)?, answer(&another?)?);
+
+        assert_eq!(
+            replayed.origins(),
+            vec![(origin.clone(), 1)],
+            "{replayed:?}"
+        );
+        assert!(
+            message.contains("SHA-256"),
+            "a changed cohort was not refused by its SHA-256: {message}"
+        );
+        assert_eq!(
+            another.origins(),
+            vec![(origin, 1)],
+            "another cohort over the same origin window was not replayed: {another:?}"
+        );
+        Ok(())
+    }
+
+    /// A replay window sorts after the newest window even when that window ends after the clock,
+    /// and after the window the marker holds even when no window on the share is as new, so `ctx
+    /// pending` lists it.
+    #[test]
+    fn a_replay_window_sorts_after_the_newest_window_and_the_marker() -> Result<()> {
+        let root = scratch("replay-ahead")?;
+        let tree = tree(&root)?;
+        let ahead_state = root.join("ahead");
+        let marker_state = root.join("marker");
+        let result = (|| -> Result<_> {
+            let origin = fetch_streams(
+                &tree,
+                &ahead_state,
+                &["C0EXAMPLE01"],
+                "2026-11-08T18:00:00Z",
+                &[],
+            )?;
+            let ahead = fetch_streams(
+                &tree,
+                &ahead_state,
+                &["C0EXAMPLE02"],
+                "2099-01-01T00:00:00Z",
+                &[],
+            )?;
+            let cohort = cohort(&root, &[(origin.as_str(), ONE)])?;
+            let after_newest = answer(&replay(&tree, &ahead_state, &cohort, &[])?)?;
+
+            let origin = fetch_streams(
+                &tree,
+                &marker_state,
+                &["C0EXAMPLE01"],
+                "2026-11-08T18:00:00Z",
+                &[],
+            )?;
+            let marker = "20990601T000000Z-0000";
+            fs::write(
+                data(&marker_state).join("marker.json"),
+                format!(
+                    "{{\"version\":1,\"window\":\"{marker}\",\"advanced_at\":\"2026-11-20T00:00:00Z\",\"by\":\"a test\"}}"
+                ),
+            )?;
+            let cohort = cohort_named(&root, "marker.tsv", &[(origin.as_str(), ONE)])?;
+            let after_marker = answer(&replay(&tree, &marker_state, &cohort, &[])?)?;
+            let window = after_marker
+                .windows
+                .first()
+                .map(|(window, _, _)| window.clone())
+                .context("the replay after the marker wrote no window")?;
+            let listed = pending_new_messages(&tree, &marker_state, &window)?;
+            Ok((ahead, after_newest, marker, window, listed))
+        })();
+        remove_scratch(&root)?;
+        let (ahead, after_newest, marker, window, listed) = result?;
+
+        let newest = after_newest
+            .windows
+            .first()
+            .map_or_default(|(window, _, _)| window.clone());
+        assert!(
+            newest > ahead,
+            "the replay window {newest} does not sort after the newest window {ahead}"
+        );
+        assert!(
+            window.as_str() > marker,
+            "the replay window {window} does not sort after the marker's window {marker}"
+        );
+        assert_eq!(
+            listed,
+            Some(1),
+            "ctx pending does not list the replay window"
+        );
+        Ok(())
+    }
+
+    /// A kept message the store does not hold stops the run, naming it, before any window of the
+    /// run is written, the windows before it in the run included.
+    #[test]
+    fn a_message_the_store_does_not_hold_fails_the_run_with_nothing_written() -> Result<()> {
+        let root = scratch("replay-unknown")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let first = fetch_streams(&tree, &state, &["C0EXAMPLE01"], "2026-11-08T18:00:00Z", &[])?;
+        let second = fetch_streams(&tree, &state, &["C0EXAMPLE02"], "2026-11-09T18:00:00Z", &[])?;
+        let unknown = "echo:C0EXAMPLE09/record";
+        let cohort = cohort(&root, &[(first.as_str(), ONE), (second.as_str(), unknown)])?;
+        let before = window_entries(&state)?;
+        let output = replay(&tree, &state, &cohort, &[]);
+        let after = window_entries(&state);
+        let progress = data(&state).join("replay/cohort.tsv.json").exists();
+        remove_scratch(&root)?;
+        let message = failure(&output?)?;
+
+        assert!(
+            message.contains(unknown) && message.contains(&second),
+            "the failure does not name the message and its origin window: {message}"
+        );
+        assert_eq!(before, after?, "the failed replay wrote a window");
+        assert!(!progress, "the failed replay noted a window as replayed");
+        Ok(())
+    }
+
+    /// A replay while another fetch holds the lock fails at once with the fetch's own error and
+    /// writes nothing; once the lock is free, the same replay runs.
+    #[test]
+    fn a_held_fetch_lock_fails_the_replay_with_nothing_written() -> Result<()> {
+        let root = scratch("replay-locked")?;
+        let tree = tree(&root)?;
+        let state = root.join("state");
+        let origin = fetch_streams(&tree, &state, &["C0EXAMPLE01"], "2026-11-08T18:00:00Z", &[])?;
+        let cohort = cohort(&root, &[(origin.as_str(), ONE)])?;
+        let before = window_entries(&state)?;
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .open(data(&state).join("fetch.lock"))?;
+        lock.try_lock_exclusive()?;
+        let locked = replay(&tree, &state, &cohort, &[]);
+        let after = window_entries(&state);
+        let progress = data(&state).join("replay/cohort.tsv.json").exists();
+        // Closing the file releases its lock.
+        drop(lock);
+        let unlocked = replay(&tree, &state, &cohort, &[]);
+        remove_scratch(&root)?;
+        let message = failure(&locked?)?;
+
+        assert!(message.contains("fetch already running"), "{message}");
+        assert_eq!(before, after?, "the locked replay wrote a window");
+        assert!(!progress, "the locked replay noted a window as replayed");
+        let unlocked = answer(&unlocked?)?;
+        assert_eq!(unlocked.windows.len(), 1, "{unlocked:?}");
         Ok(())
     }
 }

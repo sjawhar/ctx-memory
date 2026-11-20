@@ -28,6 +28,7 @@ pub mod records_schema;
 pub mod redact;
 pub mod remote;
 pub mod render;
+pub mod replay;
 pub mod resolve;
 pub mod schema;
 pub mod search;

@@ -154,6 +154,8 @@ fn share(data: &DataDir, windows: usize, records: usize) -> Result<()> {
             sources: BTreeMap::new(),
             warnings: Vec::new(),
             exit_status: Status::Ok,
+            replay_of: None,
+            replay_cohort: None,
         };
         fs::write(
             dir.join("manifest.json"),

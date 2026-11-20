@@ -468,6 +468,13 @@ impl DataDir {
         self.root.join("backfill.json")
     }
 
+    /// The origin windows `ctx fetch --replay` has replayed of the cohort file named `cohort`
+    /// ([`crate::replay`]).
+    #[must_use]
+    pub fn replay(&self, cohort: &str) -> PathBuf {
+        self.root.join("replay").join(format!("{cohort}.json"))
+    }
+
     #[must_use]
     pub fn marker(&self) -> PathBuf {
         self.root.join("marker.json")

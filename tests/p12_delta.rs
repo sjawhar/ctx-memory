@@ -102,6 +102,8 @@ fn window(root: &Path, name: &str, records: Vec<SourcedRecord>) -> Result<Window
         sources: BTreeMap::new(),
         warnings: Vec::new(),
         exit_status: Status::Ok,
+        replay_of: None,
+        replay_cohort: None,
     };
     write(
         &directory.join("manifest.json"),

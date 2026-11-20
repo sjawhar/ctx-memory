@@ -55,7 +55,7 @@ pub struct Skipped {
 }
 
 /// Results from one cursor advancement request.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct AdvanceOutcome {
     pub advanced: Vec<Advanced>,
     pub skipped: Vec<Skipped>,

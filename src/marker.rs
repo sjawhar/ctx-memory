@@ -895,7 +895,7 @@ pub fn print_page(page: &Page, out: &mut dyn Write) -> std::io::Result<()> {
 }
 
 /// The marker, and the window it holds.
-fn held(data: &DataDir) -> Result<(Option<Marker>, Option<WindowId>)> {
+pub(crate) fn held(data: &DataDir) -> Result<(Option<Marker>, Option<WindowId>)> {
     let path = data.marker();
     let marker = load(&path)?;
     let held = marker
@@ -1013,6 +1013,8 @@ mod tests {
             sources: BTreeMap::new(),
             warnings: Vec::new(),
             exit_status: Status::Ok,
+            replay_of: None,
+            replay_cohort: None,
         };
         std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
         std::fs::write(dir.join("records.jsonl"), b"")?;
