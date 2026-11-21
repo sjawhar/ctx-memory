@@ -186,3 +186,108 @@ pub(super) fn warnings(messages: &[Message]) -> Vec<String> {
         })
         .collect()
 }
+
+/// A message that carries `header` (its name and value) beside its subject.
+pub(super) fn with_header(mut message: Value, name: &str, value: &str) -> Value {
+    if let Some(headers) = message
+        .pointer_mut("/payload/headers")
+        .and_then(Value::as_array_mut)
+    {
+        headers.push(json!({"name": name, "value": value}));
+    }
+    message
+}
+
+/// What each path that reads a message stores of `messages` under `config`: a history walk, a
+/// listing, a resolve of each message, and a resolve of their thread.
+pub(super) fn stored_on_each_path(
+    config: &Value,
+    messages: &[Value],
+) -> Result<Vec<(&'static str, Vec<String>)>> {
+    stored_on_each_path_with(config, messages, BTreeMap::new())
+}
+
+/// [`stored_on_each_path`], with Gmail keeping `attachments` apart from the messages.
+pub(super) fn stored_on_each_path_with(
+    config: &Value,
+    messages: &[Value],
+    attachments: BTreeMap<(String, String), String>,
+) -> Result<Vec<(&'static str, Vec<String>)>> {
+    let ids = messages
+        .iter()
+        .map(|message| required_string(message, "id", "test message").map(str::to_owned))
+        .collect::<Result<Vec<_>>>()?;
+    let api = FakeGmailApi {
+        history: Some(History {
+            entries: vec![HistoryEntry {
+                id: "900".to_owned(),
+                added: ids.clone(),
+            }],
+            latest: Some("1000".to_owned()),
+        }),
+        candidates: ids.iter().map(|id| json!({ "id": id })).collect(),
+        messages: ids.iter().cloned().zip(messages.iter().cloned()).collect(),
+        threads: BTreeMap::from([("cccccccccccccccc".to_owned(), messages.to_vec())]),
+        latest_history_id: "4242".to_owned(),
+        attachments,
+        ..FakeGmailApi::default()
+    };
+    let mut stored = Vec::new();
+    for (path, cursor) in [
+        ("history", Some("850@2026-10-24T00:00:00Z")),
+        ("listing", None),
+    ] {
+        let mut request = fetch_request(cursor)?;
+        request.config = config.clone();
+        let messages = run_fetch(&api, &request)?;
+        assert!(
+            matches!(stream_end(&messages), Some((StreamStatus::Ok, Some(_)))),
+            "{path}: {:?}",
+            stream_end(&messages)
+        );
+        stored.push((path, pointers(&messages)));
+    }
+    let resolve = |pointers: Vec<String>| -> Result<Vec<String>> {
+        let request = ResolveRequest {
+            protocol: PROTOCOL_VERSION,
+            source: crate::source::SourceRef {
+                id: "gmail".to_owned(),
+                kind: "gmail".to_owned(),
+                scheme: "gmail".to_owned(),
+            },
+            config: config.clone(),
+            pointers,
+            state_dir: std::env::temp_dir(),
+        };
+        let mut output = Vec::new();
+        resolve_with_api(&request, &withheld_by(config)?, &api, &mut |message| {
+            output.push(message);
+            Ok(())
+        })?;
+        Ok(self::pointers(&output))
+    };
+    stored.push((
+        "resolve",
+        resolve(ids.iter().map(|id| format!("gmail:{id}")).collect())?,
+    ));
+    stored.push((
+        "thread resolve",
+        resolve(vec!["gmail:thread/cccccccccccccccc".to_owned()])?,
+    ));
+    Ok(stored)
+}
+
+/// Asserts that every path stores exactly `want` of the messages.
+pub(super) fn assert_each_path_stores(stored: &[(&str, Vec<String>)], want: &[&str], case: &str) {
+    let mut want = want
+        .iter()
+        .map(|id| format!("gmail:{id}"))
+        .collect::<Vec<_>>();
+    want.sort();
+    for (path, pointers) in stored {
+        let mut got = pointers.clone();
+        got.sort();
+        got.dedup();
+        assert_eq!(got, want, "{case}: {path}");
+    }
+}

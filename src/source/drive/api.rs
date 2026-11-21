@@ -30,7 +30,7 @@ pub(super) enum Permissions {
     Listed(Vec<Value>),
     /// Drive refused to list them for a reason that is the file or drive itself
     /// ([`google::PERMISSION_REFUSALS`]).
-    Refused { status: u16 },
+    Refused,
 }
 
 pub(super) trait DriveApi {
@@ -167,9 +167,7 @@ impl DriveApi for GoogleDriveApi {
         )?;
         Ok(match listed {
             Ok(pages) => Permissions::Listed(pages.items),
-            Err(refusal) => Permissions::Refused {
-                status: refusal.status,
-            },
+            Err(_) => Permissions::Refused,
         })
     }
 }

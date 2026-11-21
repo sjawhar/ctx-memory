@@ -2802,6 +2802,14 @@ mod tests {
                 described("EVENT-P", format!("<p>Notes</p><p><b>{key}</b>-12</p>")),
                 described("EVENT-BR", format!("Notes<br><b>{key}</b>-12")),
                 described("EVENT-PHRASE", format!("Project<br>{phrase} weekly")),
+                described(
+                    "EVENT-SECTION",
+                    format!("<section>Notes</section><section><b>{key}</b>-12</section>"),
+                ),
+                described(
+                    "EVENT-ARTICLE",
+                    format!("<article>Project</article><article>{phrase} weekly</article>"),
+                ),
             ];
             let fake = api(vec![listing("sync-2", items)]);
             let mut request = request(Some("sync-1@2026-10-24T18:00:00Z"))?;
@@ -2813,7 +2821,7 @@ mod tests {
             let stored = records(&run_fetch(&fake, &request)?);
             assert_eq!(
                 stored.len(),
-                if withheld { 0 } else { 3 },
+                if withheld { 0 } else { 5 },
                 "{key}: {stored:?}"
             );
         }

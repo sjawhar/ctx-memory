@@ -402,13 +402,18 @@ impl ContentNet {
     }
 
     /// Whether `text`, an address or a header that lists some (`"Ada" <ada@example.com>, …`),
-    /// names an excluded address.
+    /// names an excluded address, as a token alone or inside the single quotes a relay such as
+    /// Google Groups puts around the sender it writes into a display name
+    /// (`"'ada@example.com' via Synth" <synth@example.com>`).
     pub(super) fn names_address(&self, text: &str) -> bool {
         !self.addresses.is_empty()
             && text
                 .split(is_address_separator)
                 .filter(|token| token.contains('@'))
-                .any(|token| self.is_excluded_address(token))
+                .any(|token| {
+                    self.is_excluded_address(token)
+                        || self.is_excluded_address(token.trim_matches('\''))
+                })
     }
 
     /// Whether `address`, one address alone, is an excluded one, in any case.

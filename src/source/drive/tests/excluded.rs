@@ -425,10 +425,8 @@ fn a_shared_drive_file_is_checked_by_its_own_and_its_drives_permissions() -> Res
             listed("ada@theorem.example"),
         ),
     ]);
-    let permission_refusals = BTreeMap::from([
-        ("file-unlisted".to_owned(), 403),
-        ("drive-unlisted".to_owned(), 404),
-    ]);
+    let permission_refusals =
+        BTreeSet::from(["file-unlisted".to_owned(), "drive-unlisted".to_owned()]);
     for excluded in [true, false] {
         let mut api = listing_of(files.clone(), exports.clone(), BTreeMap::new());
         api.permission_lists = permission_lists.clone();

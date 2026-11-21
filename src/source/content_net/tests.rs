@@ -182,19 +182,24 @@ fn a_value_or_a_record_names_a_key_through_any_of_its_strings() -> Result<()> {
 }
 
 /// An excluded address is named whole and in any case, alone or in a header beside a display
-/// name and other addresses; an address that only contains it, or shares its domain, is
-/// not. A malformed entry is an error. Control: with no address, nothing is named.
+/// name and other addresses, and inside single quotes, as a relay such as Google Groups writes
+/// the sender into its display name; an address that only contains it, or shares its domain, is
+/// not, and a quote inside an address is its own. A malformed entry is an error. Control: with
+/// no address, nothing is named.
 #[test]
 fn an_address_is_named_whole_in_any_case() -> Result<()> {
     let addresses = ContentNet::default().with_addresses(
         &["Outside@Partner.example".to_owned()],
-        Some(" ,b@x.example"),
+        Some(" ,b@x.example,o'brien@partner.example"),
     )?;
     for text in [
         "outside@partner.example",
         "\"Out Side\" <OUTSIDE@partner.example>, ada@theorem.example",
         "mailto:outside@partner.example",
         "B@X.example",
+        "\"'outside@partner.example' via Synth\" <synth@theorem.example>",
+        "O'Brien <o'brien@partner.example>",
+        "'o'brien@partner.example'",
     ] {
         assert!(addresses.names_address(text), "{text}");
         assert!(!ContentNet::default().names_address(text), "{text}");
@@ -204,6 +209,8 @@ fn an_address_is_named_whole_in_any_case() -> Result<()> {
         "notoutside@partner.example",
         "outside@partner.example.org",
         "ada@theorem.example",
+        "\"'ada@theorem.example' via Synth\" <synth@theorem.example>",
+        "brien@partner.example",
     ] {
         assert!(!addresses.names_address(text), "{text}");
     }
@@ -326,8 +333,9 @@ fn a_term_is_bounded_as_a_key_is_and_a_repository_more_strictly() -> Result<()> 
 
 /// A block or line-break tag reads as a line break when it is taken out, and an inline tag as
 /// nothing: a key in the paragraph after `Notes` is a word of its own, and a phrase split over
-/// a `<br>` is still the phrase. Control: the same text naming another key or phrase is not
-/// named.
+/// a `<br>` is still the phrase. Every block element of HTML breaks a line, the sectioning ones
+/// (`section`, `article`, `header`, `footer`) and the rest (`center`, `dt`, `figure`, …) as `p`
+/// does. Control: the same text naming another key or phrase is not named.
 #[test]
 fn a_block_tag_reads_as_a_line_break_and_an_inline_tag_as_nothing() -> Result<()> {
     let net = ContentNet::build(
@@ -362,6 +370,33 @@ fn a_block_tag_reads_as_a_line_break_and_an_inline_tag_as_nothing() -> Result<()
     ] {
         assert!(net.hit_in(text).is_some(), "{text:?}");
         assert_eq!(net.hit_in(other), None, "{other:?}");
+    }
+    for tag in [
+        "address",
+        "article",
+        "aside",
+        "caption",
+        "center",
+        "details",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "header",
+        "main",
+        "nav",
+        "section",
+        "summary",
+    ] {
+        let key = |key: &str| format!("<{tag}>Notes</{tag}><{tag}><b>{key}</b>-12</{tag}>");
+        let phrase = |word: &str| format!("<{tag}>Project</{tag}><{tag}>{word} weekly</{tag}>");
+        assert!(net.hit_in(&key("SYNTH")).is_some(), "{tag}: key");
+        assert!(net.hit_in(&phrase("Falcon")).is_some(), "{tag}: phrase");
+        assert_eq!(net.hit_in(&key("SYNTHB")), None, "{tag}: other key");
+        assert_eq!(net.hit_in(&phrase("Falconer")), None, "{tag}: other phrase");
     }
     Ok(())
 }

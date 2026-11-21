@@ -73,11 +73,25 @@ pub const PERMISSION_REFUSALS: [(u16, &str); 2] =
     [(403, "insufficientFilePermissions"), (404, "notFound")];
 
 /// A refusal whose reason is what was asked for itself, with its status and Google's own words.
+/// It is an error, so a page that meets one ends the listing with it, and the listing's caller
+/// takes it back by its type.
 #[derive(Debug, Eq, PartialEq)]
 pub struct Refusal {
     pub status: u16,
     pub message: String,
 }
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Google refused {}: {}",
+            self.status, self.message
+        )
+    }
+}
+
+impl std::error::Error for Refusal {}
 
 /// A short-lived Google access token.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,21 +225,9 @@ impl Google {
         items_key: &str,
         refusals: &[(u16, &str)],
     ) -> Result<std::result::Result<Pages, Refusal>> {
-        let mut refused = None;
-        let pages = paginate_with(query, items_key, |page_query| {
-            let (status, body) = self.reply(path, page_query)?;
-            if (200..300).contains(&status) {
-                return Ok(body);
-            }
-            if let Some(refusal) = refusal_in(status, &body, refusals) {
-                refused = Some(refusal);
-            }
-            bail!("Google {path} returned {status}: {}", error_message(&body))
-        });
-        match (pages, refused) {
-            (_, Some(refusal)) => Ok(Err(refusal)),
-            (pages, None) => pages.map(Ok),
-        }
+        paginate_unless_refused_with(path, query, items_key, refusals, |page_query| {
+            self.reply(path, page_query)
+        })
     }
 
     /// Exports `path` as text, reading at most `limit` bytes.
@@ -293,6 +295,35 @@ fn refusal_in(status: u16, body: &Value, refusals: &[(u16, &str)]) -> Option<Ref
             status,
             message: error_message(body),
         })
+}
+
+/// [`Google::paginate_unless_refused`], with `reply` answering each page's status and body: a
+/// page that meets one of `refusals` ends the listing with that [`Refusal`] as its error, which
+/// is taken back by its type once the listing ends.
+fn paginate_unless_refused_with<F>(
+    path: &str,
+    query: &[(&str, String)],
+    items_key: &str,
+    refusals: &[(u16, &str)],
+    mut reply: F,
+) -> Result<std::result::Result<Pages, Refusal>>
+where
+    F: FnMut(&[(&str, String)]) -> Result<(u16, Value)>,
+{
+    let pages = paginate_with(query, items_key, |page_query| {
+        let (status, body) = reply(page_query)?;
+        if (200..300).contains(&status) {
+            return Ok(body);
+        }
+        if let Some(refusal) = refusal_in(status, &body, refusals) {
+            return Err(anyhow::Error::new(refusal));
+        }
+        bail!("Google {path} returned {status}: {}", error_message(&body))
+    });
+    match pages {
+        Ok(pages) => Ok(Ok(pages)),
+        Err(error) => error.downcast::<Refusal>().map(Err),
+    }
 }
 
 fn paginate_with<F>(query: &[(&str, String)], items_key: &str, mut page: F) -> Result<Pages>
@@ -753,6 +784,76 @@ mod tests {
                 "{status} {body}"
             );
         }
+    }
+
+    /// A listing whose page Drive refuses for the file or drive itself answers that refusal,
+    /// carried from the page as a typed error, on the first page or a later one; every page
+    /// listed answers the items of all of them. A refusal about the caller, a server error and a
+    /// failed call are errors. Control: the same replies, all listed, answer both pages' items.
+    #[test]
+    fn a_refused_page_is_the_listings_refusal_and_any_other_failure_an_error() -> Result<()> {
+        let page = |next: Option<&str>| json!({"permissions": [{"emailAddress": "ada@theorem.example"}], "nextPageToken": next});
+        let message = "The user does not have sufficient permissions for this file.";
+        let list = |replies: Vec<Result<(u16, Value)>>| {
+            let mut replies = replies.into_iter();
+            paginate_unless_refused_with(
+                "drive/v3/files/a/permissions",
+                &[],
+                "permissions",
+                &PERMISSION_REFUSALS,
+                |_| {
+                    replies
+                        .next()
+                        .unwrap_or_else(|| Err(anyhow!("the fake ran out of replies")))
+                },
+            )
+            .map(|listed| listed.map(|pages| pages.items.len()))
+        };
+        assert_eq!(
+            list(vec![Ok((200, page(Some("second")))), Ok((200, page(None)))])?,
+            Ok(2)
+        );
+        for (status, reason, first) in [
+            (403, "insufficientFilePermissions", true),
+            (403, "insufficientFilePermissions", false),
+            (404, "notFound", true),
+            (404, "notFound", false),
+        ] {
+            let refused = Ok((status, drive_error(status, reason, message)));
+            let replies = if first {
+                vec![refused]
+            } else {
+                vec![Ok((200, page(Some("second")))), refused]
+            };
+            assert_eq!(
+                list(replies)?,
+                Err(Refusal {
+                    status,
+                    message: message.to_owned()
+                }),
+                "{status} {reason}, first page: {first}"
+            );
+        }
+        for failed in [
+            Ok((
+                403,
+                drive_error(
+                    403,
+                    "insufficientPermissions",
+                    "Request had insufficient authentication scopes.",
+                ),
+            )),
+            Ok((404, json!({"error": {"code": 404, "message": "Not Found"}}))),
+            Ok((500, drive_error(500, "backendError", "Backend Error"))),
+            Err(anyhow!("connection reset")),
+        ] {
+            let shown = format!("{failed:?}");
+            assert!(
+                list(vec![Ok((200, page(Some("second")))), failed]).is_err(),
+                "{shown}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

@@ -116,29 +116,48 @@ fn unfold(text: &str) -> Cow<'_, str> {
     Cow::Owned(unfolded)
 }
 
-/// The tags a reader sees as a line break: a block, a list item, a table cell or a break. Any
+/// The tags a reader sees as a line break: HTML's block elements (a paragraph, a section, a
+/// list or list item, a table or its cells, a definition, a figure, a form), and a break. Any
 /// other tag, such as `b` or `a`, joins the text on either side of it.
-const BREAKING_TAGS: [&str; 20] = [
+const BREAKING_TAGS: [&str; 38] = [
+    "address",
+    "article",
+    "aside",
+    "blockquote",
     "br",
-    "p",
+    "caption",
+    "center",
+    "dd",
+    "details",
     "div",
-    "li",
-    "tr",
-    "td",
-    "th",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
     "h1",
     "h2",
     "h3",
     "h4",
     "h5",
     "h6",
-    "ul",
-    "ol",
-    "table",
-    "blockquote",
+    "header",
     "hr",
+    "li",
+    "main",
+    "nav",
+    "ol",
+    "p",
     "pre",
-    "dd",
+    "section",
+    "summary",
+    "table",
+    "td",
+    "th",
+    "tr",
+    "ul",
 ];
 
 /// `text` with its HTML tags taken out: each of the [`BREAKING_TAGS`], opening or closing, read

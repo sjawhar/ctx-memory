@@ -37,8 +37,8 @@ pub(super) struct FakeDriveApi {
     pub(super) export_limits: RefCell<Vec<usize>>,
     /// The addresses holding a permission on each file or shared drive, by id.
     pub(super) permission_lists: BTreeMap<String, Vec<String>>,
-    /// Files or shared drives whose permissions Drive refuses to list, with the status it answers.
-    pub(super) permission_refusals: BTreeMap<String, u16>,
+    /// Files or shared drives whose permissions Drive refuses to list.
+    pub(super) permission_refusals: BTreeSet<String>,
     /// Files or shared drives whose permissions listing fails, with the error the client returns.
     /// An id in none of the three fails too.
     pub(super) permission_failures: BTreeMap<String, String>,
@@ -92,8 +92,8 @@ impl DriveApi for FakeDriveApi {
 
     fn permissions(&self, id: &str) -> Result<Permissions> {
         self.calls.borrow_mut().push(format!("permissions {id}"));
-        if let Some(status) = self.permission_refusals.get(id) {
-            return Ok(Permissions::Refused { status: *status });
+        if self.permission_refusals.contains(id) {
+            return Ok(Permissions::Refused);
         }
         if let Some(addresses) = self.permission_lists.get(id) {
             return Ok(Permissions::Listed(

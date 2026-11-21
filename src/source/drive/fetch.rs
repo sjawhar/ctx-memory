@@ -229,7 +229,7 @@ fn permission_addresses<C: DriveApi + ?Sized>(api: &C, id: &str) -> Result<Optio
                 .map(str::to_owned)
                 .collect(),
         ),
-        Permissions::Refused { .. } => None,
+        Permissions::Refused => None,
     })
 }
 
