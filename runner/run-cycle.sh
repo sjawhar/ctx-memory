@@ -20,11 +20,13 @@
 # standard input), --no-lsp starts no language server, and omp keeps no shell snapshot, because
 # the directory it would write one to is root's. Before it starts, this script waits for the
 # server to answer a read quickly, checks that the server and its own ctx speak one protocol
-# version (check_protocol), and checks that ctx-agent can read the windows and write its
-# own transcript directory but nothing else on the share, nor anything in its home or working
-# directory (where omp reads its configuration, the shell its startup files, and omp and ctx
-# discover the tools and servers they start), omp's plugin directory and native module, or that
-# snapshot directory; if any check fails, no session runs. After the session, the transcript
+# version (check_protocol), and checks that ctx-agent can read the windows, each file of every
+# window after the marker among them, and write its own transcript directory but nothing else
+# on the share, nor anything in its home or working directory (where omp reads its configuration,
+# the shell its startup files, and omp and ctx discover the tools and servers they start), omp's
+# plugin directory and native module, or that snapshot directory; if any check fails, no session
+# runs, and a window ctx-agent cannot read fails the cycle with a line that names it. After each
+# session, the windows it moved the marker past are checked the same way, and the transcript
 # directory goes back to root, so no later cycle can rewrite it; the next cycle seals the
 # directory of one that was killed before it could.
 #
@@ -436,6 +438,119 @@ for capture in "$CTX_DATA_DIR"/agent-sessions/*.events.json; do
 	fi
 done
 
+# The window the marker holds now, in marker_window: nothing on a tree no cycle has handled. A
+# read that fails stops the cycle with that read's own status, and an answer that is not JSON
+# with status 1, each in one line that says when it was read ($1).
+read_marker_window() {
+	if marker_read="$(ctx marker show --json)"; then
+		:
+	else
+		marker_status=$?
+		printf '%s\n' "$marker_read" >&2
+		echo "run-cycle: ctx marker show failed $1 (exit $marker_status)" >&2
+		exit "$marker_status"
+	fi
+	if ! marker_window="$(printf '%s' "$marker_read" | jq -r '.data.marker.window? // ""')"; then
+		echo "run-cycle: could not read the marker ctx marker show answered $1" >&2
+		exit 1
+	fi
+}
+
+# The completed windows, one name a line: a staged window's name starts with a dot, so the glob
+# leaves it out, and a fetch that renames one meanwhile cannot fail the listing.
+completed_windows() {
+	for dir in "$CTX_DATA_DIR"/windows/*; do
+		[ ! -d "$dir" ] || printf '%s\n' "${dir##*/}"
+	done
+}
+
+# Each completed window after window $1 (every one when $1 is empty), and at or before window $2
+# (with no bound when $2 is empty), that the session's user cannot read: one `<window id> <file>`
+# line for each, oldest first, where <file> is the first file of the window it cannot read, or
+# windows/<window id> when it cannot list or search the window's directory. The windows are
+# listed first and only those in range walked, as that user, so each answer is the kernel's and
+# a window a fetch publishes meanwhile cannot fail the walk. A listing or a walk that fails stops
+# the cycle with status 1.
+unreadable_windows() {
+	if ! in_range="$(completed_windows | awk -v from="$1" -v to="$2" '
+		length($0) == 21 && $0 ~ /^[0-9]+T[0-9]+Z-[0-9A-Fa-f]+$/ && $0 > from && (to == "" || $0 <= to)')"; then
+		echo "run-cycle: could not list the windows under $CTX_DATA_DIR/windows" >&2
+		exit 1
+	fi
+	[ -n "$in_range" ] || return 0
+	set --
+	for window in $in_range; do
+		set -- "$@" "$CTX_DATA_DIR/windows/$window"
+	done
+	if ! found="$(as_agent_user find "$@" -maxdepth 1 -name '.*' -prune -o \
+		-type d \( ! -readable -o ! -executable \) -printf 'dir %p\n' -prune -o \
+		! -readable -printf 'file %p\n')" ||
+		! named="$(printf '%s\n' "$found" | awk -v prefix="$CTX_DATA_DIR/windows/" '
+			{ rest = substr($0, length($1) + 2 + length(prefix)) }
+			$1 == "dir" { window = rest; file = "windows/" rest }
+			$1 == "file" {
+				slash = index(rest, "/")
+				if (slash == 0) next
+				window = substr(rest, 1, slash - 1)
+				file = substr(rest, slash + 1)
+			}
+			$1 != "dir" && $1 != "file" { next }
+			!(window in first) || file < first[window] { first[window] = file }
+			END { for (window in first) print window, first[window] }')"; then
+		echo "run-cycle: could not check which windows $AGENT_USER can read under $CTX_DATA_DIR/windows" >&2
+		exit 1
+	fi
+	[ -z "$named" ] || printf '%s\n' "$named" | sort
+}
+
+# What on the share the session's user can write, one path a line: the share's top level, the
+# windows directory and every completed window in it, and every other cycle's transcript
+# directory, which is what a write or a rename on the share would go through. A deeper walk
+# would read every cached embedding on each run, and a window still staged is the fetch's until
+# it is published, when it is checked like the rest.
+share_writable() {
+	set --
+	for window in $(completed_windows); do
+		set -- "$@" "$CTX_DATA_DIR/windows/$window"
+	done
+	as_agent_user find "$CTX_DATA_DIR" "$CTX_DATA_DIR/agent-sessions" -maxdepth 1 \
+		-path "$CTX_DATA_DIR/windows" -prune -o -path "$session_dir" -prune -o -writable -print &&
+		as_agent_user find "$CTX_DATA_DIR/windows" "$@" -maxdepth 0 -writable -print
+}
+
+# Stops the cycle before a session unless the session's user can read every window after window
+# $1 (every window when $1 is empty): each file in it, and its directory listed and searched.
+# Every such window is checked, not only those a capped `ctx pending` read lists, since the
+# session reads its own answer later and may be handed a window published since. A session that
+# cannot open a window works from the answer's excerpts alone, and a cycle like that exits 0, so
+# the first window it cannot read fails the cycle instead, in one line that names the window and
+# the file, with status 1.
+refuse_unreadable_windows() {
+	unreadable="$(unreadable_windows "$1" "")" || exit 1
+	[ -n "$unreadable" ] || return 0
+	first="$(printf '%s\n' "$unreadable" | sed -n 1p)"
+	echo "run-cycle: window ${first%% *}: ${first#* } is not readable by $AGENT_USER" >&2
+	exit 1
+}
+
+# After a session: each window the marker moved past since the last check must be one the
+# session's user can read, since a fetch can publish a window while a session runs, after the
+# check before it. Every one it cannot read is named in one line, the cycle fails (the script's
+# end turns passed_unreadable into status 1), and the next check starts from where the marker is
+# now. $1 says when the marker is read.
+check_passed_windows() {
+	read_marker_window "$1"
+	[ -n "$marker_window" ] || return 0
+	unreadable="$(unreadable_windows "$cycle_checked_through" "$marker_window")" || exit 1
+	cycle_checked_through="$marker_window"
+	[ -n "$unreadable" ] || return 0
+	echo "run-cycle: the cycle moved the marker past windows $AGENT_USER cannot read: $(printf '%s\n' "$unreadable" |
+		awk '{ printf "%s%s (%s)", separator, $1, substr($0, length($1) + 2); separator = ", " }')" >&2
+	passed_unreadable=1
+}
+cycle_checked_through=
+passed_unreadable=
+
 # What the session may touch, checked as the session's user before it starts. It reads the
 # windows and writes its own transcript, and nothing else: one instruction it obeyed could
 # otherwise move cursors.json past material that was never stored, rewrite a window or the
@@ -445,11 +560,15 @@ if ! as_agent_user /usr/bin/test -r "$CTX_DATA_DIR/windows" ||
 	! as_agent_user /usr/bin/test -w "$session_dir"; then
 	refuse "$AGENT_USER cannot read $CTX_DATA_DIR/windows or write $session_dir"
 fi
-# The share's top level, every window directory and every other cycle's transcript directory:
-# what a write or a rename on the share would go through. A deeper walk would read every cached
-# embedding on each run.
-if ! writable="$(as_agent_user find "$CTX_DATA_DIR" "$CTX_DATA_DIR/windows" \
-	"$CTX_DATA_DIR/agent-sessions" -maxdepth 1 -path "$session_dir" -prune -o -writable -print)"; then
+# Every window the session can be handed: each one after the marker, each file of it as the
+# session reads it.
+if [ -z "$pass" ]; then
+	read_marker_window "before the cycle"
+	cycle_checked_through="$marker_window"
+	refuse_unreadable_windows "$marker_window"
+fi
+# Nothing on the share but the session's own transcript directory is the session's to write.
+if ! writable="$(share_writable)"; then
 	refuse "could not check what $AGENT_USER can write under $CTX_DATA_DIR"
 fi
 if [ -n "$writable" ]; then
@@ -1289,6 +1408,11 @@ echo "run-cycle: the session exited with status $status; sealing $session_dir"
 judge_session
 tally_session
 check_pass_marker
+# The windows the first session moved the marker past, checked now, before anything else can stop
+# the cycle and leave them unnamed.
+if [ -z "$pass" ]; then
+	check_passed_windows "after the session"
+fi
 
 # Whether the cycle's marker now holds the last window the session that just ended was handed
 # ($pending), so no window of it is left for a fresh session. Window ids are timestamps of one
@@ -1363,33 +1487,46 @@ if [ -n "$retry_reason" ]; then
 	if ! as_agent_user /usr/bin/test -w "$session_dir"; then
 		refuse "$AGENT_USER cannot write $session_dir"
 	fi
-	if ! writable="$(as_agent_user find "$CTX_DATA_DIR" "$CTX_DATA_DIR/windows" \
-		"$CTX_DATA_DIR/agent-sessions" -maxdepth 1 -path "$session_dir" -prune -o -writable -print)"; then
+	if ! writable="$(share_writable)"; then
 		refuse "could not check what $AGENT_USER can write under $CTX_DATA_DIR"
 	fi
 	if [ -n "$writable" ]; then
 		refuse "$AGENT_USER can write on the share: $(printf '%s\n' "$writable" | sort -u | tr '\n' ' ')"
 	fi
 	# A retried cycle reads what is still pending, which may hold windows the first context file
-	# never named, so it gets a context file and a prompt of its own. Whatever is pending is read
-	# again here; a read that fails leaves the retry without context, as a failed context read does.
+	# never named, so it gets a context file and a prompt of its own. The windows the first
+	# session passed are checked, and every window after the marker, before it starts, as before
+	# the first; a pending read that fails starts no fresh session, and the cycle fails with that
+	# read's status.
+	retry_ready=1
 	if [ -z "$pass" ]; then
 		context_file="$CTX_DATA_DIR/agent-sessions/$execution-retry.context.json"
+		refuse_unreadable_windows "$marker_window"
 		if pending="$(ctx pending --json ${CTX_CYCLE_MAX_WINDOWS:+--limit "$CTX_CYCLE_MAX_WINDOWS"})"; then
 			prepare_context "$pending"
+			cycle_prompt
 		else
-			echo "run-cycle: ctx pending failed before the retry; the retry goes on without context" >&2
-			context_prompt=
+			status=$?
+			printf '%s\n' "$pending" >&2
+			echo "run-cycle: ctx pending failed before the retry (exit $status); starting no fresh session" >&2
+			retry_ready=
 		fi
-		cycle_prompt
 	fi
-	status=0
-	run_session || status=$?
-	echo "run-cycle: the second session exited with status $status; sealing $session_dir"
-	judge_session
-	tally_session
-	check_pass_marker
+	if [ -n "$retry_ready" ]; then
+		status=0
+		run_session || status=$?
+		echo "run-cycle: the second session exited with status $status; sealing $session_dir"
+		judge_session
+		tally_session
+		check_pass_marker
+		if [ -z "$pass" ]; then
+			check_passed_windows "after the second session"
+		fi
+	fi
 fi
 check_skipped_windows
+if [ -n "$passed_unreadable" ] && [ "$status" -eq 0 ]; then
+	status=1
+fi
 # The EXIT trap seals the current attempt's transcript directory and moves its capture into it.
 exit "$status"

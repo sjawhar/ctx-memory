@@ -59,7 +59,7 @@ impl CycleRig {
         let omp_log = root.join("omp-started");
         write_ctx(
             &bin,
-            "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"data\":{\"windows\":[{\"id\":\"w1\"}]}}'\n",
+            "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"data\":{\"windows\":[{\"window\":\"w1\",\"dir\":\"windows/w1\"}]}}'\n",
         )?;
         write_executable(
             &bin.join("omp"),
@@ -224,6 +224,12 @@ impl CycleRig {
              find) exit 0 ;;\n\
              esac\nexec \"$@\"\n",
         )?;
+        self.run_with_stand_ins(ctx, omp)
+    }
+
+    /// Runs the whole runner with `ctx` and `omp` the stand-in programs given, and its key file
+    /// in the scratch directory, which the provider file then names; nothing else stands in.
+    fn run_with_stand_ins(&self, ctx: &str, omp: &str) -> Result<std::process::Output> {
         write_ctx(&self.bin, ctx)?;
         write_executable(&self.bin.join("omp"), omp)?;
         let key_file = self.root.join("run/model-key");
@@ -264,7 +270,7 @@ impl CycleRig {
         write_ctx(
             &self.bin,
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"${{CTX_SESSION-}}\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[{{\"id\":\"w1\"}}]}}}}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"${{CTX_SESSION-}}\" >> '{}'\nprintf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[{{\"window\":\"w1\",\"dir\":\"windows/w1\"}}]}}}}'\n",
                 calls.display()
             ),
         )?;
@@ -857,8 +863,10 @@ fn the_refusal_pattern_matches_a_real_refusal_and_not_an_escaped_copy() -> Resul
 /// to `/run/ctx-agent`, root's). The invariants: the marker is read before and after a pass, the
 /// two are compared, a move fails the job, and all of it is a pass alone, so a cycle (which moves
 /// the marker per window) is untouched. A cycle reads the marker once after its sessions, into a
-/// variable of its own, to find the windows it skipped (`outcome.rs` runs that check), and once
-/// after a first session a model error ended, to tell whether a window is left for a fresh one.
+/// variable of its own, to find the windows it skipped (`outcome.rs` runs that check), once after
+/// a first session a model error ended, to tell whether a window is left for a fresh one, and,
+/// through one function (`read_marker_window`), before its first session and after each, to
+/// check the windows after the marker and those it passed.
 #[test]
 fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
     let script = runner("run-cycle.sh")?;
@@ -873,17 +881,20 @@ fn the_maintenance_pass_fails_if_it_moved_the_marker() -> Result<()> {
         code.iter()
             .filter(|line| line.contains("=\"$(ctx marker show --json)\""))
             .count()
-            == 4,
+            == 5,
         "run-cycle.sh must read the marker into a variable before and after the pass, after a \
-         session a model error ended, and after the cycle, and nowhere else"
+         session a model error ended, after the cycle, and in read_marker_window, and nowhere \
+         else"
     );
     ensure!(
         has("marker_before=\"$(ctx marker show --json)\"")
             && has("marker_after=\"$(ctx marker show --json)\"")
             && has("marker_now=\"$(ctx marker show --json)\"")
-            && has("cycle_marker=\"$(ctx marker show --json)\""),
-        "run-cycle.sh does not capture the marker on each side of the pass, after a model error \
-         and after the cycle"
+            && has("cycle_marker=\"$(ctx marker show --json)\"")
+            && script_function("read_marker_window")?
+                .contains("marker_read=\"$(ctx marker show --json)\""),
+        "run-cycle.sh does not capture the marker on each side of the pass, after a model error, \
+         after the cycle and in read_marker_window"
     );
     let compared = code
         .iter()
@@ -1669,7 +1680,7 @@ fn the_runner_reads_context_before_the_session_and_names_it_in_the_prompt() -> R
         &format!(
             "#!/bin/sh\nprintf 'ctx %s\\n' \"$*\" >> '{calls}'\ncase \"$*\" in\n\
              *context*) printf '%s\\n' '{{\"ok\":true,\"data\":{{\"window\":\"20261102T110000Z-0001\",\"subjects\":[\"K-1\"],\"items\":[]}}}}' ;;\n\
-             *pending*) printf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[{{\"window\":\"20261102T110000Z-0001\"}}]}}}}' ;;\n\
+             *pending*) printf '%s\\n' '{{\"ok\":true,\"data\":{{\"windows\":[{{\"window\":\"20261102T110000Z-0001\",\"dir\":\"windows/20261102T110000Z-0001\"}}]}}}}' ;;\n\
              *) printf '%s\\n' '{{\"ok\":true}}' ;;\nesac\n",
             calls = calls.display()
         ),
@@ -1938,6 +1949,310 @@ fn the_whole_runner_works_a_large_window_a_page_a_cycle() -> Result<()> {
                 .contains(&format!("{window} (messages 1 to 3 of 7 new, recorded as pages)")),
         "the cycle that recorded a page unwritten did not fail with one line naming it ({}): {stderr}",
         unwritten.status
+    );
+    Ok(())
+}
+
+/// The session's user, `ctx-agent`, made for [`an_unreadable_window_fails_the_cycle_as_root`] and
+/// removed once the test is done with it. The test makes a system user, so it runs only on a
+/// machine made for it, and never beside a `ctx-agent` it did not make: it removes only its own.
+struct AgentUser;
+
+impl AgentUser {
+    fn make() -> Result<Self> {
+        let set = |name: &str, value: &str| std::env::var(name).is_ok_and(|set| set == value);
+        ensure!(
+            set("CI", "true") || set("CTX_TEST_THROWAWAY_MACHINE", "1"),
+            "this test makes and removes the system user ctx-agent, so it runs only on a \
+             throwaway machine or container: CI=true, as GitHub Actions sets it, or \
+             CTX_TEST_THROWAWAY_MACHINE=1"
+        );
+        let uid = String::from_utf8(Command::new("id").arg("-u").output()?.stdout)?;
+        ensure!(
+            uid.trim() == "0",
+            "this test hands the session to a real second user, which only root can do; run it \
+             as root (uid {})",
+            uid.trim()
+        );
+        ensure!(
+            !Command::new("id")
+                .arg("ctx-agent")
+                .output()?
+                .status
+                .success(),
+            "the user ctx-agent already exists here; this test makes its own and removes it, so \
+             it does not run beside one it did not make"
+        );
+        let status = Command::new("useradd")
+            .args(["--system", "--user-group", "--no-create-home"])
+            .args(["--shell", "/usr/sbin/nologin", "ctx-agent"])
+            .status()
+            .context("running useradd")?;
+        ensure!(status.success(), "useradd ctx-agent failed: {status}");
+        Ok(Self)
+    }
+}
+
+impl Drop for AgentUser {
+    fn drop(&mut self) {
+        let _ = Command::new("userdel").arg("ctx-agent").status();
+    }
+}
+
+/// How a window of [`run_as_root`]'s share is made.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// root's, its directory 0755 and its files 0644.
+    Open,
+    /// `records.jsonl` another user's (65534), mode 0600, as the deep-ingest driver left the
+    /// files of 1,723 windows in November 2026.
+    RecordsClosed,
+    /// `records.jsonl` that same other user's, mode 0644.
+    RecordsOpened,
+    /// The directory another user's, mode 0700, as the driver left those windows' directories.
+    DirectoryClosed,
+}
+
+fn make_window(dir: &std::path::Path, shape: Shape) -> Result<()> {
+    use std::os::unix::fs::chown;
+
+    std::fs::create_dir(dir)?;
+    for file in ["manifest.json", "records.jsonl", "rendered.md"] {
+        std::fs::write(dir.join(file), "{}\n")?;
+        std::fs::set_permissions(dir.join(file), std::fs::Permissions::from_mode(0o644))?;
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    let records = dir.join("records.jsonl");
+    match shape {
+        Shape::Open => {}
+        Shape::RecordsClosed | Shape::RecordsOpened => {
+            chown(&records, Some(65534), Some(65534))?;
+            let mode = if matches!(shape, Shape::RecordsClosed) {
+                0o600
+            } else {
+                0o644
+            };
+            std::fs::set_permissions(&records, std::fs::Permissions::from_mode(mode))?;
+        }
+        Shape::DirectoryClosed => {
+            chown(dir, Some(65534), Some(65534))?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+/// What [`run_as_root`] sets up around one cycle.
+struct RootCycle<'a> {
+    /// The windows on the share when the cycle starts.
+    windows: &'a [(&'a str, Shape)],
+    /// A window a fetch publishes while the first session runs: it reaches the share when the
+    /// runner reads the rules page after that session.
+    later: Option<(&'a str, Shape)>,
+    /// Whether the session moves the marker past `later`: the marker holds it once it is there.
+    marker_passes_later: bool,
+    /// What `omp` writes to its standard output, and its exit status.
+    events: &'a str,
+    status: i32,
+}
+
+const READABLE: &str = "20261108T182845Z-0000";
+const UNREADABLE: &str = "20261108T190000Z-0000";
+
+/// Runs the whole runner as root, with `ctx-agent` a real user, so `setpriv` really hands every
+/// check to that user: nothing pretends but `ctx`, which answers as `cycle` says, with every `ctx
+/// pending` read listing the first window, and `omp`. Returns the run and the share.
+fn run_as_root(label: &str, cycle: &RootCycle<'_>) -> Result<(std::process::Output, CycleRig)> {
+    let rig = CycleRig::new(label)?;
+    for (window, shape) in cycle.windows {
+        make_window(&rig.data.join("windows").join(window), *shape)?;
+    }
+    let later = rig.root.join("later");
+    std::fs::create_dir(&later)?;
+    if let Some((window, shape)) = cycle.later {
+        make_window(&later.join(window), shape)?;
+    }
+    rig.lock_share()?;
+    rig.lock_home()?;
+    rig.lock_xdg()?;
+    let listed = cycle
+        .windows
+        .first()
+        .map(|(window, _)| *window)
+        .or(cycle.later.map(|(window, _)| window))
+        .context("a cycle needs a window")?;
+    let pending = serde_json::json!({
+        "version": 1, "command": "pending",
+        "data": {"marker": null, "later_windows": 0, "windows": [{
+            "window": listed, "dir": format!("windows/{listed}"),
+            "window_end": "2026-11-08T19:00:00Z", "status": "ok",
+            "new_messages": 1, "listed_messages": 1
+        }]}
+    });
+    std::fs::write(rig.root.join("pending"), pending.to_string())?;
+    std::fs::write(rig.root.join("omp-events"), cycle.events)?;
+    let root = rig.root.display();
+    let windows = rig.data.join("windows");
+    let windows = windows.display();
+    let passed = match (cycle.marker_passes_later, cycle.later) {
+        (true, Some((window, _))) => window,
+        _ => "",
+    };
+    let output = rig.run_with_stand_ins(
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in\n\
+             *pending*) cat '{root}/pending' ;;\n\
+             *rules*) for dir in '{root}/later/'*; do [ ! -d \"$dir\" ] || mv \"$dir\" '{windows}/'; done\n\
+             printf '%s\\n' '{{\"version\":1,\"command\":\"rules\",\"data\":{{\"path\":\"rules.md\",\"cycle_log\":null}}}}' ;;\n\
+             *marker*) if [ -n '{passed}' ] && [ -d '{windows}/{passed}' ]; then \
+             printf '%s\\n' '{{\"version\":1,\"command\":\"marker show\",\"data\":{{\"marker\":{{\"version\":1,\"window\":\"{passed}\"}}}}}}'; \
+             else printf '%s\\n' '{{\"version\":1,\"command\":\"marker show\",\"data\":{{\"marker\":null}}}}'; fi ;;\n\
+             *context*) printf '%s\\n' '{{\"version\":1,\"command\":\"context\",\"data\":{{\"subjects\":[],\"items\":[]}}}}' ;;\n\
+             *) printf '%s\\n' '{{\"version\":1}}' ;;\nesac\n"
+        ),
+        &format!(
+            "#!/bin/sh\ncat '{root}/omp-events'\nexit {}\n",
+            cycle.status
+        ),
+    )?;
+    Ok((output, rig))
+}
+
+/// Whether the runner started the session of `attempt` (`ctx-agent-test-1`, or its retry's
+/// `ctx-agent-test-1-retry`): only a session that ran leaves omp's capture, which the seal moves
+/// into the transcript directory.
+fn session_started(rig: &CycleRig, attempt: &str) -> bool {
+    let sessions = rig.data.join("agent-sessions");
+    sessions.join(attempt).join("events.jsonl").exists()
+        || sessions.join(format!("{attempt}.events.json")).exists()
+}
+
+/// Runs `cycle` as root, removes its share, and answers its exit code, its standard output and
+/// error, and whether the first session and the retry started.
+fn root_cycle(label: &str, cycle: &RootCycle<'_>) -> Result<(Option<i32>, String, (bool, bool))> {
+    let (output, rig) = run_as_root(label, cycle)?;
+    let started = (
+        session_started(&rig, "ctx-agent-test-1"),
+        session_started(&rig, "ctx-agent-test-1-retry"),
+    );
+    rig.remove()?;
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok((output.status.code(), said, started))
+}
+
+/// A window the session's user cannot read fails the cycle before its session starts, in one
+/// line that names the window and the file: one on the share when the cycle starts, whether its
+/// `records.jsonl` or its directory is closed, and one a fetch publishes while the first session
+/// runs, before the retry. The same window, its file opened to 0644 for others, starts the
+/// session. A window the session moved the marker past that it cannot read fails the cycle once
+/// the session is over, naming it. The session's user is a real second user, so each check is
+/// the kernel's, which the harness of [`CycleRig::pretend_root`] cannot give.
+///
+/// The test makes and removes the system user `ctx-agent`, so it runs as root only where
+/// `CI=true` or `CTX_TEST_THROWAWAY_MACHINE=1` says the machine is a throwaway one, such as a CI
+/// runner (`.github/workflows/ci.yml`) or a container:
+/// `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="sudo -E env CTX_TEST_THROWAWAY_MACHINE=1 $PWD/scripts/test-runner" cargo test --test agent_cycle -- --ignored as_root`.
+#[test]
+#[ignore = "makes and removes the user ctx-agent: runs as root only with CI=true or CTX_TEST_THROWAWAY_MACHINE=1"]
+fn an_unreadable_window_fails_the_cycle_as_root() -> Result<()> {
+    let _user = AgentUser::make()?;
+    let named = |window: &str, file: &str| {
+        format!("run-cycle: window {window}: {file} is not readable by ctx-agent")
+    };
+    let finished = wrote(&[], answer("Handled 1 window."));
+    let refused = crate::outcome::refused();
+    let written = wrote(&[("ctx_record_put", true)], answer("Handled 1 window."));
+
+    for (label, shape, file) in [
+        (
+            "as-root-records-closed",
+            Shape::RecordsClosed,
+            "records.jsonl".to_owned(),
+        ),
+        (
+            "as-root-directory-closed",
+            Shape::DirectoryClosed,
+            format!("windows/{UNREADABLE}"),
+        ),
+    ] {
+        let (code, said, started) = root_cycle(
+            label,
+            &RootCycle {
+                windows: &[(UNREADABLE, shape)],
+                later: None,
+                marker_passes_later: false,
+                events: &finished,
+                status: 0,
+            },
+        )?;
+        ensure!(
+            code == Some(1)
+                && said.lines().any(|line| line == named(UNREADABLE, &file))
+                && started == (false, false),
+            "{label}: the cycle did not fail before its session, naming the window ({code:?}, \
+             sessions started: {started:?}): {said}"
+        );
+    }
+
+    let (code, said, started) = root_cycle(
+        "as-root-records-opened",
+        &RootCycle {
+            windows: &[(UNREADABLE, Shape::RecordsOpened)],
+            later: None,
+            marker_passes_later: false,
+            events: &finished,
+            status: 0,
+        },
+    )?;
+    ensure!(
+        code == Some(0) && started == (true, false) && !said.contains("not readable"),
+        "the same window with its records opened to 0644 did not start the session and finish \
+         ({code:?}, sessions started: {started:?}): {said}"
+    );
+
+    let (code, said, started) = root_cycle(
+        "as-root-retry",
+        &RootCycle {
+            windows: &[(READABLE, Shape::Open)],
+            later: Some((UNREADABLE, Shape::RecordsClosed)),
+            marker_passes_later: false,
+            events: &refused,
+            status: 1,
+        },
+    )?;
+    ensure!(
+        said.contains("starting one fresh session")
+            && code == Some(1)
+            && said
+                .lines()
+                .any(|line| line == named(UNREADABLE, "records.jsonl"))
+            && started == (true, false),
+        "the retry did not fail before its session, naming the window a fetch published during \
+         the first ({code:?}, sessions started: {started:?}): {said}"
+    );
+
+    let (code, said, started) = root_cycle(
+        "as-root-passed",
+        &RootCycle {
+            windows: &[(READABLE, Shape::Open)],
+            later: Some((UNREADABLE, Shape::RecordsClosed)),
+            marker_passes_later: true,
+            events: &written,
+            status: 0,
+        },
+    )?;
+    let passed = format!(
+        "run-cycle: the cycle moved the marker past windows ctx-agent cannot read: \
+         {UNREADABLE} (records.jsonl)"
+    );
+    ensure!(
+        code == Some(1) && started == (true, false) && said.lines().any(|line| line == passed),
+        "the cycle that moved the marker past a window ctx-agent cannot read did not fail \
+         naming it ({code:?}, sessions started: {started:?}): {said}"
     );
     Ok(())
 }

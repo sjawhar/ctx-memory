@@ -26,7 +26,8 @@ jobs:
       - run: cargo test
       # The ingest runner's live probe drives the omp release runner/omp.lock pins, with the
       # SHA-256 it names, and a digest that does not match fails the step. The probe is
-      # #[ignore]d in the plain run above, which has no omp.
+      # #[ignore]d in the plain run above, which has no omp. The test that needs root runs in the
+      # next step.
       - name: agent cycle live probe (pinned omp)
         run: |
           release="$(sed -n 's/^OMP_RELEASE=//p' runner/omp.lock)"
@@ -37,7 +38,15 @@ jobs:
           printf '%s  %s\n' "$digest" "$RUNNER_TEMP/omp.tar.gz" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/omp"
           tar -xzf "$RUNNER_TEMP/omp.tar.gz" -C "$RUNNER_TEMP/omp" --strip-components=2 --no-same-owner
-          CTX_TEST_OMP="$RUNNER_TEMP/omp/omp" cargo test --test agent_cycle -- --ignored
+          CTX_TEST_OMP="$RUNNER_TEMP/omp/omp" cargo test --test agent_cycle -- --ignored --skip as_root
+      # run-cycle.sh checks, as ctx-agent, that the session can read every window after the
+      # marker. Only a real second user makes that check the kernel's, so this test runs as root,
+      # which makes ctx-agent and hands the session to it; the plain run above skips it
+      # (#[ignore]). sudo drops CI=true, so the runner names this machine a throwaway one itself.
+      - name: agent cycle as root, with a real second user
+        run: |
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="sudo -E env CTX_TEST_THROWAWAY_MACHINE=1 $PWD/scripts/test-runner" \
+            cargo test --test agent_cycle -- --ignored as_root
       # The starter tree is what a new tree is copied from, so it must pass both checks its own
       # rules page asks for: the sweep, and cite verify, which exits 1 on a claim it cannot check.
       - run: cargo run -- --memory starter sweep

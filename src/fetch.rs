@@ -1,9 +1,10 @@
 //! Fetch execution, staging, and durable window completion.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+use std::path::PathBuf;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt as _;
 
@@ -18,6 +19,7 @@ use crate::lease::{self, Lease};
 use crate::record::Record;
 use crate::redact::one_line;
 use crate::render;
+use crate::replay::{self, Taken};
 use crate::source::{
     self, FetchRequest, Request as SourceRequest, Session, SourceOutcome, SourceRef, StreamResult,
     StreamStatus,
@@ -34,12 +36,10 @@ pub struct FetchOptions {
     pub only: Vec<String>,
 }
 
-/// The completed window, source results, and cursor movement from a fetch execution.
+/// The published window, source results, and cursor movement from a fetch execution.
 #[derive(Debug)]
 pub struct FetchOutcome {
-    pub window: Window,
-    pub manifest: Manifest,
-    pub delta: Delta,
+    pub published: Published,
     pub errored: Vec<(String, String)>,
     pub cursors: AdvanceOutcome,
 }
@@ -53,23 +53,9 @@ pub struct FetchOutcome {
 /// holds the state lock, state artifacts cannot be persisted, or an invalid selected source is
 /// requested. Source failures are retained in the returned outcome and its manifest.
 pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> {
-    // Cloud Scheduler can start the fetch job while its last execution still runs, and the two
-    // executions share the data directory but not the `flock` below, which is per machine. With
-    // no lease bucket neither would take a lease, so a fetch that runs as a Cloud Run job does
-    // not start, and writes nothing. Cloud Run names the job it runs in `CLOUD_RUN_JOB`.
-    if lease::bucket().is_none() && std::env::var_os("CLOUD_RUN_JOB").is_some() {
-        bail!(
-            "ctx fetch as a Cloud Run job needs CTX_LEASE_BUCKET: two executions can run at \
-             once, and the fetch lease is what keeps one of them the only writer"
-        );
-    }
+    let (_lock, lease) = become_the_writer(context)?;
     let state = context.state()?;
     let data = context.data()?;
-    let _lock = acquire_lock(state)?;
-    // The flock keeps one machine single; the share has no locks, so the lease is what keeps
-    // the fetch job single across machines. It is taken before anything is staged, so a run
-    // that may not write writes nothing at all.
-    let lease = lease::for_role("fetch")?;
     validate_selection(&context.config.sources, &options.only)?;
     let exclusion = Exclusion::configured(&context.config)?;
 
@@ -82,17 +68,30 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
     // What the windows this store has not indexed yet delivered — another machine's fetches, or
     // a window whose indexing failed after it was published — counts as delivered too.
     store.catch_up(data)?;
-    let schemes = source::configured_schemes(&context.config.sources)?;
+    let writer = Publisher {
+        context,
+        data,
+        store: &store,
+        lease: lease.as_ref(),
+        exclusion: &exclusion,
+        schemes: source::configured_schemes(&context.config.sources)?,
+        owners: delta::Owners::discover(&context.tree, &context.config.sources),
+    };
     let generated_at = Utc::now();
     let mut collected = Collected::default();
     let reads = begin_backfills(context, data, options, &mut backfills)?;
 
     for (spec, span) in reads {
-        lease
-            .as_ref()
-            .map_or(Ok(()), Lease::check)
-            .with_context(|| format!("before fetching {}", spec.id))?;
-        let result = run_source(context, data, spec, &span, &cursors, &schemes, &exclusion)?;
+        check_lease(lease.as_ref(), &format!("fetching {}", spec.id))?;
+        let result = run_source(
+            context,
+            data,
+            spec,
+            &span,
+            &cursors,
+            &writer.schemes,
+            &exclusion,
+        )?;
         collected.warnings.extend(span.warning(&spec.id, &result));
         collect_source_result(spec, result, &mut collected, &store, &exclusion)?;
     }
@@ -116,53 +115,119 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
         sources,
         warnings,
         exit_status,
+        replay_of: None,
+        replay_cohort: None,
     };
-    lease
-        .as_ref()
-        .map_or(Ok(()), Lease::check)
-        .context("before writing the window")?;
-    write_window(&staged, &records, &manifest)?;
-    let previous = windows::previous(&data.windows(), &staged.id)?;
-    let owners = delta::Owners::discover(&context.tree, &context.config.sources);
-    let snapshot = delta::open_snapshot(&context.tree, generated_at);
-    let delta = delta::compute(
-        &context.tree,
-        &schemes,
-        &owners,
-        &exclusion,
-        &staged,
-        previous.as_ref(),
-        generated_at,
-        context.embedding()?.embedder(),
-    )?;
-    // Write delta.json, delta.md, and open-snapshot.json before completing the staged window.
-    delta::write(&staged, &snapshot, &delta)?;
-    // The compute can wait on Vertex AI for a long time, long enough for this copy to lose the
-    // lease; a copy that lost it publishes nothing, so the window stays staged.
-    lease
-        .as_ref()
-        .map_or(Ok(()), Lease::check)
-        .context("before publishing the window")?;
-    let window = windows::complete(staged, &data.windows())?;
-    // The store learns what this window delivered only once the window is published: a message
-    // whose delivered version the store holds is one no later fetch delivers as new, so a run
-    // that stopped before publishing must leave nothing there. A store write that fails here
-    // leaves the window unindexed, and the next fetch indexes it first.
-    store.index_window(&window)?;
+    let published = writer.publish(staged, &records, manifest)?;
     // The streams that stored their messages move their own cursors; a failed stream holds only
     // its own, so the next fetch re-reads only what this one did not store.
-    lease
-        .as_ref()
-        .map_or(Ok(()), Lease::check)
-        .context("before moving the cursors")?;
-    let cursors = cursor::advance(&data.cursors(), &window.id, &manifest)?;
+    check_lease(lease.as_ref(), "moving the cursors")?;
+    let cursors = cursor::advance(&data.cursors(), &published.window.id, &published.manifest)?;
     // A source whose backfill reads are all stored reads the configured backfill next time.
-    if backfills.finish(&manifest) {
+    if backfills.finish(&published.manifest) {
         backfill::write(&data.backfill(), &backfills)?;
     }
+    release_the_lease(lease);
+    Ok(FetchOutcome {
+        published,
+        errored,
+        cursors,
+    })
+}
+
+/// A window this process published: its manifest and its delta.
+#[derive(Debug)]
+pub struct Published {
+    pub window: Window,
+    pub manifest: Manifest,
+    pub delta: Delta,
+}
+
+/// What a fetch and a replay both publish a staged window with.
+struct Publisher<'a> {
+    context: &'a Context,
+    data: &'a DataDir,
+    store: &'a Store,
+    lease: Option<&'a Lease>,
+    exclusion: &'a Exclusion,
+    schemes: crate::pointer::Schemes,
+    owners: delta::Owners,
+}
+
+impl Publisher<'_> {
+    /// Writes `records` and `manifest` into `staged`, computes and writes its delta against the
+    /// window before it, publishes the window and indexes it in the store.
+    fn publish(
+        &self,
+        staged: Window,
+        records: &[SourcedRecord],
+        manifest: Manifest,
+    ) -> Result<Published> {
+        check_lease(self.lease, "writing the window")?;
+        write_window(&staged, records, &manifest)?;
+        let previous = windows::previous(&self.data.windows(), &staged.id)?;
+        let snapshot = delta::open_snapshot(&self.context.tree, manifest.generated_at);
+        let delta = delta::compute(
+            &self.context.tree,
+            &self.schemes,
+            &self.owners,
+            self.exclusion,
+            &staged,
+            previous.as_ref(),
+            manifest.generated_at,
+            self.context.embedding()?.embedder(),
+        )?;
+        // Write delta.json, delta.md, and open-snapshot.json before completing the staged window.
+        delta::write(&staged, &snapshot, &delta)?;
+        // The compute can wait on Vertex AI for a long time, long enough for this copy to lose
+        // the lease; a copy that lost it publishes nothing, so the window stays staged.
+        check_lease(self.lease, "publishing the window")?;
+        let window = windows::complete(staged, &self.data.windows())?;
+        // The store learns what this window delivered only once the window is published: a
+        // message whose delivered version the store holds is one no later fetch delivers as new,
+        // so a run that stopped before publishing must leave nothing there. A store write that
+        // fails here leaves the window unindexed, and the next fetch indexes it first.
+        self.store.index_window(&window)?;
+        Ok(Published {
+            window,
+            manifest,
+            delta,
+        })
+    }
+}
+
+/// Fails unless this copy still holds the fetch lease, when it took one, naming what it was about
+/// to do.
+fn check_lease(lease: Option<&Lease>, before: &str) -> Result<()> {
+    lease
+        .map_or(Ok(()), Lease::check)
+        .with_context(|| format!("before {before}"))
+}
+
+/// Makes this process the one writer of the data directory a fetch writes: the state
+/// directory's lock, which keeps one machine single, and, where a lease bucket is set, the
+/// fetch lease, which keeps the fetch job single across machines. Both are taken before anything
+/// is staged, so a run that may not write writes nothing at all.
+fn become_the_writer(context: &Context) -> Result<(File, Option<Lease>)> {
+    // Cloud Scheduler can start the fetch job while its last execution still runs, and the two
+    // executions share the data directory but not the `flock` below, which is per machine. With
+    // no lease bucket neither would take a lease, so a fetch that runs as a Cloud Run job does
+    // not start, and writes nothing. Cloud Run names the job it runs in `CLOUD_RUN_JOB`.
+    if lease::bucket().is_none() && std::env::var_os("CLOUD_RUN_JOB").is_some() {
+        bail!(
+            "ctx fetch as a Cloud Run job needs CTX_LEASE_BUCKET: two executions can run at \
+             once, and the fetch lease is what keeps one of them the only writer"
+        );
+    }
+    let lock = acquire_lock(context.state()?)?;
+    let lease = lease::for_role("fetch")?;
+    Ok((lock, lease))
+}
+
+/// Lets the next run start at once rather than wait out the takeover window; a failure here
+/// costs that run the wait and nothing else.
+fn release_the_lease(lease: Option<Lease>) {
     if let Some(lease) = lease {
-        // The next run starts at once rather than waiting out the takeover window; a failure
-        // here costs that run the wait and nothing else.
         if let Err(error) = lease.release() {
             eprintln!(
                 "releasing the fetch lease: {}",
@@ -170,13 +235,260 @@ pub fn fetch(context: &Context, options: &FetchOptions) -> Result<FetchOutcome> 
             );
         }
     }
-    Ok(FetchOutcome {
-        window,
-        manifest,
-        delta,
-        errored,
-        cursors,
+}
+
+/// Parameters of one `ctx fetch --replay` run.
+#[derive(Clone, Debug)]
+pub struct ReplayOptions {
+    /// The cohort file ([`crate::replay`]).
+    pub cohort: PathBuf,
+    /// The most messages a run keeps, past the first origin window that keeps one, which it
+    /// takes whole however many it keeps.
+    pub max_messages: usize,
+    /// The most origin windows that keep a message a run takes.
+    pub max_windows: usize,
+}
+
+/// What one replay run did.
+#[derive(Debug)]
+pub struct ReplayOutcome {
+    /// The windows it wrote, oldest first: one for each origin window that kept a message.
+    pub windows: Vec<Published>,
+    /// The origin windows it took, in the cohort's order, those that kept no message among them.
+    pub replayed: Vec<String>,
+    /// How many cohort lines of those origin windows the deployment excludes.
+    pub excluded: usize,
+    /// The origin windows of the cohort that no run has replayed yet.
+    pub remaining: usize,
+}
+
+/// Delivers again, as new messages in new windows, the messages of the next whole origin windows
+/// of a cohort file that no run has replayed ([`crate::replay`]), and notes each origin window
+/// it took in the cohort's progress file.
+///
+/// A message the deployment excludes is left out, and the store is not asked for it. Each other
+/// message is written as the store holds it now ([`Store::get`]), not as its origin window held
+/// it: a message that changed since is delivered as it is now, and indexing the new window does
+/// not make an older version current again. It is new even when the store already delivered it
+/// unchanged. One window is written for each origin window that keeps a message, as a fetch
+/// writes one, with its delta, and it sorts after every window and after the marker. No source
+/// is contacted and no cursor moves. A window a run published counts as replayed in every later
+/// run of the same cohort, even when that run stopped before it could note it.
+///
+/// # Errors
+///
+/// Returns an error, and writes nothing, when another fetch holds the lock or the lease, the
+/// cohort or its progress file cannot be read or belong to different cohorts, or a kept message
+/// of the run is one the store does not hold. Returns an error when a window cannot be written.
+pub fn replay(context: &Context, options: &ReplayOptions) -> Result<ReplayOutcome> {
+    let (_lock, lease) = become_the_writer(context)?;
+    let state = context.state()?;
+    let data = context.data()?;
+    let cohort = replay::Cohort::read(&options.cohort)?;
+    let progress_path = data.replay(replay::cohort_name(&options.cohort)?);
+    let mut progress = replay::load(&progress_path, &cohort.sha256)?;
+    let exclusion = Exclusion::configured(&context.config)?;
+    let store = Store::load(data, state)?;
+    // What the windows this store has not indexed yet delivered is what the store holds now too.
+    store.catch_up(data)?;
+    let completed = windows::after(&data.windows(), None)?;
+    if note_published(&completed, &cohort.sha256, &mut progress)? {
+        check_lease(lease.as_ref(), "noting the replayed windows")?;
+        replay::write(&progress_path, &progress)?;
+    }
+    // Every kept message of the run is looked up before any window is staged, so a message the
+    // store does not hold stops the run with nothing written.
+    let planned = cohort
+        .batch(
+            &progress,
+            options.max_messages,
+            options.max_windows,
+            |pointer| !exclusion.matches(pointer),
+        )
+        .into_iter()
+        .map(|taken| Ok((replay_records(&store, &taken)?, taken)))
+        .collect::<Result<Vec<_>>>()?;
+    let window_end = replay_window_end(data, completed.last())?;
+    let writer = Publisher {
+        context,
+        data,
+        store: &store,
+        lease: lease.as_ref(),
+        exclusion: &exclusion,
+        schemes: source::configured_schemes(&context.config.sources)?,
+        owners: delta::Owners::discover(&context.tree, &context.config.sources),
+    };
+    let mut written = Vec::new();
+    let mut replayed = Vec::new();
+    let mut excluded = 0;
+    for (records, taken) in planned {
+        let origin = taken.origin.window.to_string();
+        if !records.is_empty() {
+            let staged = windows::stage(&data.windows(), window_end)?;
+            let manifest = Manifest {
+                version: 1,
+                window: staged.id.to_string(),
+                generated_at: Utc::now(),
+                window_end,
+                sources: replay_sources(context, &records),
+                warnings: Vec::new(),
+                exit_status: Status::Ok,
+                replay_of: Some(origin.clone()),
+                replay_cohort: Some(cohort.sha256.clone()),
+            };
+            written.push(writer.publish(staged, &records, manifest)?);
+        }
+        check_lease(lease.as_ref(), "noting the replayed window")?;
+        progress.replayed.insert(origin.clone());
+        replay::write(&progress_path, &progress)?;
+        excluded += taken.excluded;
+        replayed.push(origin);
+    }
+    release_the_lease(lease);
+    Ok(ReplayOutcome {
+        windows: written,
+        replayed,
+        excluded,
+        remaining: cohort.remaining(&progress),
     })
+}
+
+/// Notes in `progress` the origin window of each of `completed` that replays the cohort whose
+/// SHA-256 is `cohort`, and answers whether that added one. The published windows are what the
+/// runs did, whatever the progress file says: a run that stopped between publishing a window and
+/// noting it must not deliver that origin window again.
+fn note_published(
+    completed: &[Window],
+    cohort: &str,
+    progress: &mut replay::Progress,
+) -> Result<bool> {
+    let mut added = false;
+    for window in completed {
+        let manifest = window.manifest()?;
+        if manifest.replay_cohort.as_deref() == Some(cohort) {
+            if let Some(origin) = manifest.replay_of {
+                added |= progress.replayed.insert(origin);
+            }
+        }
+    }
+    Ok(added)
+}
+
+/// The window end a replay run stages its windows at: now, or a second after the newest window
+/// or the window the marker holds when either ends later, so every replay window sorts after
+/// both and `ctx pending` lists it.
+fn replay_window_end(data: &DataDir, newest: Option<&Window>) -> Result<DateTime<Utc>> {
+    let (_, held) = crate::marker::held(data)?;
+    let mut end = Utc::now();
+    for id in newest
+        .map(|window| &window.id)
+        .into_iter()
+        .chain(held.as_ref())
+    {
+        end = end.max(id.time()? + chrono::Duration::seconds(1));
+    }
+    Ok(end)
+}
+
+/// The records the kept messages of one origin window are replayed as: each as the store holds
+/// it now, from the source that delivered that version, and as a new message, ordered as a
+/// fetch's window reads, by source, then time, then pointer.
+fn replay_records(store: &Store, taken: &Taken<'_>) -> Result<Vec<SourcedRecord>> {
+    let mut records = taken
+        .kept
+        .iter()
+        .map(|pointer| {
+            let (source, mut record) = store.get_sourced(pointer)?.ok_or_else(|| {
+                anyhow!(
+                    "replay of {}: the store holds no message {pointer}",
+                    taken.origin.window
+                )
+            })?;
+            // The store keeps a version as the first window that delivered it held it, which
+            // may have been as context for a reply; replayed, it is a new message.
+            record.context = false;
+            Ok(SourcedRecord { source, record })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    records.sort_by(|left, right| {
+        (
+            left.source.as_str(),
+            left.record.ts,
+            left.record.pointer.as_str(),
+        )
+            .cmp(&(
+                right.source.as_str(),
+                right.record.ts,
+                right.record.pointer.as_str(),
+            ))
+    });
+    Ok(records)
+}
+
+/// The manifest entry of each source of a replay window's `records`: read, with every stream
+/// that holds a record, and no cursor, because a replay reads no source. A source `ctx.toml` no
+/// longer configures still delivered its messages; its kind is then unknown, and the entry names
+/// the messages' pointer scheme in its place.
+fn replay_sources(
+    context: &Context,
+    records: &[SourcedRecord],
+) -> BTreeMap<String, SourceManifest> {
+    let read = StreamResult {
+        status: StreamStatus::Ok,
+        cursor: None,
+        error: None,
+    };
+    let mut by_source = BTreeMap::<&str, Vec<&Record>>::new();
+    for sourced in records {
+        by_source
+            .entry(sourced.source.as_str())
+            .or_default()
+            .push(&sourced.record);
+    }
+    by_source
+        .into_iter()
+        .map(|(id, own)| {
+            let spec = context.config.sources.iter().find(|spec| spec.id == id);
+            let discovered = spec
+                .and_then(|spec| spec.discover_field.as_deref())
+                .map_or_else(Vec::new, |field| {
+                    source::discover_streams(&context.tree, field)
+                });
+            let streams = own
+                .iter()
+                .map(|record| record.stream.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|stream| {
+                    let manifest = stream_manifest(
+                        stream,
+                        &read,
+                        &BTreeMap::new(),
+                        &discovered,
+                        own.iter().copied(),
+                    );
+                    (stream.to_owned(), manifest)
+                })
+                .collect();
+            let kind = spec.map_or_else(
+                || {
+                    own.first()
+                        .and_then(|record| record.pointer.split_once(':'))
+                        .map_or_else(String::new, |(scheme, _)| scheme.to_owned())
+                },
+                |spec| spec.kind.clone(),
+            );
+            (
+                id.to_owned(),
+                SourceManifest {
+                    kind,
+                    status: Status::Ok,
+                    error: None,
+                    streams,
+                },
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn acquire_lock(state: &StateDir) -> Result<File> {
@@ -395,7 +707,7 @@ fn collect_source_result(
         }
         streams.insert(
             stream.clone(),
-            stream_manifest(stream, outcome, &cursors, &discovered, &records),
+            stream_manifest(stream, outcome, &cursors, &discovered, records.iter()),
         );
     }
     if let Some(error) = error.as_deref() {
@@ -453,14 +765,14 @@ fn window_records(fetched: &[Record], held: &[bool]) -> (Vec<Record>, BTreeMap<S
     (records, repeated)
 }
 
-fn stream_manifest(
+fn stream_manifest<'r>(
     stream: &str,
     outcome: &StreamResult,
     cursors: &BTreeMap<String, String>,
     discovered: &[source::DiscoveredStream],
-    records: &[Record],
+    records: impl Iterator<Item = &'r Record> + Clone,
 ) -> StreamManifest {
-    let matching = records.iter().filter(|record| record.stream == stream);
+    let matching = records.filter(|record| record.stream == stream);
     let label = matching.clone().find_map(|record| record.label.clone());
     let records = matching.count();
     let owner = discovered

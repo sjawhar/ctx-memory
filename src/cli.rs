@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context as _, Result};
@@ -15,7 +16,7 @@ use crate::context::Context;
 use crate::cursor::{self, AdvanceOutcome, Cursors};
 use crate::delta;
 use crate::exclude::Exclusion;
-use crate::fetch::{self, FetchOptions};
+use crate::fetch::{self, FetchOptions, ReplayOptions};
 use crate::git;
 use crate::lease::{self, Lease};
 use crate::marker::{self, Marker};
@@ -108,13 +109,9 @@ pub enum Command {
         #[arg(long)]
         overdue: bool,
     },
-    /// Fetch all configured sources into a durable window.
-    Fetch {
-        #[arg(long, value_parser = parse_window_end)]
-        window_end: Option<DateTime<Utc>>,
-        #[arg(long = "source", value_name = "ID", num_args = 1..)]
-        source: Vec<String>,
-    },
+    /// Fetch all configured sources into a durable window, or with --replay deliver a cohort's
+    /// messages again.
+    Fetch(FetchArgs),
     /// Inspect or write a window's record delta.
     Delta {
         #[arg(long)]
@@ -191,6 +188,36 @@ pub enum Command {
     Protocol,
     #[command(external_subcommand)]
     External(Vec<OsString>),
+}
+
+/// Arguments of `ctx fetch`.
+#[derive(clap::Args, Debug)]
+pub struct FetchArgs {
+    #[arg(long, value_parser = parse_window_end, conflicts_with = "replay")]
+    window_end: Option<DateTime<Utc>>,
+    #[arg(
+        long = "source",
+        value_name = "ID",
+        num_args = 1..,
+        conflicts_with = "replay"
+    )]
+    source: Vec<String>,
+    /// Deliver again, as new messages in new windows, the messages a cohort file lists, one line
+    /// each: the window that first delivered it, a tab, and its pointer, sorted by window, then
+    /// pointer. Each run takes the next whole windows of the file, writes one window for each
+    /// with every message as the store holds it now, leaves out what the deployment excludes,
+    /// and notes them in replay/<cohort file name>.json in the data directory, which holds the
+    /// cohort's SHA-256 and refuses another cohort of the same name. It reads no source and moves
+    /// no cursor.
+    #[arg(long, value_name = "COHORT")]
+    replay: Option<PathBuf>,
+    /// With --replay: the most messages one run keeps, excluded ones not counted. The first
+    /// window not yet replayed is taken whole even when it keeps more.
+    #[arg(long, value_name = "N", default_value = "350", requires = "replay")]
+    max_messages: NonZeroUsize,
+    /// With --replay: the most cohort windows that keep a message one run takes.
+    #[arg(long, value_name = "M", default_value = "25", requires = "replay")]
+    max_windows: NonZeroUsize,
 }
 
 #[derive(Subcommand)]
@@ -304,7 +331,7 @@ impl Command {
             Self::Search { .. } => "search".to_owned(),
             Self::Dossier { .. } => "dossier".to_owned(),
             Self::Open { .. } => "open".to_owned(),
-            Self::Fetch { .. } => "fetch".to_owned(),
+            Self::Fetch(_) => "fetch".to_owned(),
             Self::Delta { .. } => "delta".to_owned(),
             Self::Cursor {
                 command: CursorCommand::Show,
@@ -432,7 +459,7 @@ impl Command {
             Self::Delta { write: true, .. }
             // A fetch moves cursors and publishes a window, and a source run's scratch state,
             // the cursors and the state paths are this machine's own.
-            | Self::Fetch { .. }
+            | Self::Fetch(_)
             | Self::Source { .. }
             | Self::Cursor { .. }
             | Self::State { .. }
@@ -525,6 +552,9 @@ struct StatePathPayload {
 #[derive(Serialize)]
 struct FetchPayload<'a> {
     window: &'a str,
+    /// The window a `--replay` window delivers again; a fetch's own answer has no such field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_of: Option<&'a str>,
     exit_status: Status,
     sources: &'a BTreeMap<String, SourceManifest>,
     /// The window's warnings, as its manifest holds them.
@@ -533,10 +563,40 @@ struct FetchPayload<'a> {
     cursors: &'a AdvanceOutcome,
 }
 
+impl<'a> FetchPayload<'a> {
+    fn new(published: &'a fetch::Published, cursors: &'a AdvanceOutcome) -> Self {
+        let manifest = &published.manifest;
+        Self {
+            window: published.window.id.as_str(),
+            replay_of: manifest.replay_of.as_deref(),
+            exit_status: manifest.exit_status,
+            sources: &manifest.sources,
+            warnings: &manifest.warnings,
+            delta: FetchDeltaPayload {
+                summary: delta::summary(&published.delta),
+                new_messages: published.delta.new_messages.len(),
+            },
+            cursors,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct FetchDeltaPayload {
     summary: String,
     new_messages: usize,
+}
+
+/// What `ctx fetch --replay` answers: each window it wrote, in the shape a fetch answers with
+/// one, oldest first; the cohort's origin windows it took, those that kept no message among
+/// them; how many cohort lines of those the deployment excludes; and how many origin windows no
+/// run has replayed yet.
+#[derive(Serialize)]
+struct ReplayPayload<'a> {
+    windows: Vec<FetchPayload<'a>>,
+    replayed: &'a [String],
+    excluded: usize,
+    remaining: usize,
 }
 
 #[derive(Serialize)]
@@ -732,13 +792,7 @@ fn dispatch(command: &Command, run: &mut Run<'_, '_>) -> Result<Outcome> {
             })?;
             Ok(Outcome::Pass)
         }
-        Command::Fetch { window_end, source } => run_fetch(
-            run,
-            &FetchOptions {
-                window_end: window_end.unwrap_or_else(Utc::now),
-                only: source.clone(),
-            },
-        ),
+        Command::Fetch(arguments) => run_fetch_command(run, arguments),
         Command::Delta { window, write } => run_delta(run, window.as_deref(), *write),
         Command::Cursor { command } => run_cursor(run, command),
         Command::Pending { limit } => run_pending(run, *limit),
@@ -829,7 +883,7 @@ where
             let message = format!("{error:#}");
             if cli.json {
                 report_error(sink, &cli.command.name(), message);
-            } else if matches!(cli.command, Command::Serve(_) | Command::Fetch { .. }) {
+            } else if matches!(cli.command, Command::Serve(_) | Command::Fetch(_)) {
                 // The server and the fetch job run on Cloud Run, where each line of standard
                 // error is its own log entry, and every other line they write there is one
                 // line: so is the error that stops them, though it carries git's words or a
@@ -942,27 +996,58 @@ fn run_source(run: &mut Run<'_, '_>, id: &str, op: SourceOperation) -> Result<Ou
     })
 }
 
+/// `ctx fetch`: a fetch of the configured sources, or with `--replay`, the next windows of a
+/// cohort delivered again.
+fn run_fetch_command(run: &mut Run<'_, '_>, arguments: &FetchArgs) -> Result<Outcome> {
+    match &arguments.replay {
+        Some(cohort) => run_replay(
+            run,
+            &ReplayOptions {
+                cohort: cohort.clone(),
+                max_messages: arguments.max_messages.get(),
+                max_windows: arguments.max_windows.get(),
+            },
+        ),
+        None => run_fetch(
+            run,
+            &FetchOptions {
+                window_end: arguments.window_end.unwrap_or_else(Utc::now),
+                only: arguments.source.clone(),
+            },
+        ),
+    }
+}
+
 fn run_fetch(run: &mut Run<'_, '_>, options: &FetchOptions) -> Result<Outcome> {
     // A source the fetch runs is of no use once the fetch is gone, so it stops with the fetch.
     proc::stop_runs_with_this_process()?;
     let outcome = fetch::fetch(run.context, options)?;
-    let payload = FetchPayload {
-        window: outcome.window.id.as_str(),
-        exit_status: outcome.manifest.exit_status,
-        sources: &outcome.manifest.sources,
-        warnings: &outcome.manifest.warnings,
-        delta: FetchDeltaPayload {
-            summary: delta::summary(&outcome.delta),
-            new_messages: outcome.delta.new_messages.len(),
-        },
-        cursors: &outcome.cursors,
-    };
+    let payload = FetchPayload::new(&outcome.published, &outcome.cursors);
     run.emit("fetch", &payload, print_fetch)?;
     Ok(if outcome.errored.is_empty() {
         Outcome::Pass
     } else {
         Outcome::SourceErrors
     })
+}
+
+/// `ctx fetch --replay`: the next windows of a cohort, delivered again ([`fetch::replay`]).
+fn run_replay(run: &mut Run<'_, '_>, options: &ReplayOptions) -> Result<Outcome> {
+    let outcome = fetch::replay(run.context, options)?;
+    // A replay reads no source, so it moves no cursor.
+    let unmoved = AdvanceOutcome::default();
+    let payload = ReplayPayload {
+        windows: outcome
+            .windows
+            .iter()
+            .map(|published| FetchPayload::new(published, &unmoved))
+            .collect(),
+        replayed: &outcome.replayed,
+        excluded: outcome.excluded,
+        remaining: outcome.remaining,
+    };
+    run.emit("fetch", &payload, print_replay)?;
+    Ok(Outcome::Pass)
 }
 
 /// `ctx delta` prints the delta the fetch wrote for a window, and `ctx delta --write` computes
@@ -1276,4 +1361,46 @@ fn print_fetch(payload: &FetchPayload<'_>, out: &mut dyn Write) -> std::io::Resu
         writeln!(out, "warning: {}", crate::redact::one_line(warning))?;
     }
     cursor::print_advance(payload.cursors, out)
+}
+
+/// One line for each window a replay wrote, naming the origin window it delivers again and how
+/// many new messages it holds, then one for the origin windows it took that kept no message, one
+/// for the messages the deployment excludes, and one for how many origin windows the cohort has
+/// left.
+fn print_replay(payload: &ReplayPayload<'_>, out: &mut dyn Write) -> std::io::Result<()> {
+    for window in &payload.windows {
+        if let Some(origin) = window.replay_of {
+            writeln!(
+                out,
+                "{} replays {origin}: {} new message(s)",
+                window.window, window.delta.new_messages
+            )?;
+        }
+    }
+    let written = payload
+        .windows
+        .iter()
+        .filter_map(|window| window.replay_of)
+        .collect::<std::collections::BTreeSet<_>>();
+    let empty = payload
+        .replayed
+        .iter()
+        .map(String::as_str)
+        .filter(|origin| !written.contains(origin))
+        .collect::<Vec<_>>();
+    if !empty.is_empty() {
+        writeln!(
+            out,
+            "kept no message, so wrote no window: {}",
+            empty.join(", ")
+        )?;
+    }
+    if payload.excluded > 0 {
+        writeln!(
+            out,
+            "{} message(s) left out as the deployment excludes them",
+            payload.excluded
+        )?;
+    }
+    writeln!(out, "{} origin window(s) left to replay", payload.remaining)
 }

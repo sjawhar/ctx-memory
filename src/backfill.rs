@@ -169,6 +169,8 @@ mod tests {
             )]),
             warnings: Vec::new(),
             exit_status: Status::Ok,
+            replay_of: None,
+            replay_cohort: None,
         }
     }
 

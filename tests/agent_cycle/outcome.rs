@@ -251,6 +251,14 @@ fn run_after_launch(
 {prepare_context}
 {shell_rule}
 {cycle_prompt}
+{read_marker_window}
+{completed_windows}
+{unreadable_windows}
+{share_writable}
+{refuse_unreadable_windows}
+{check_passed_windows}
+cycle_checked_through={MARKER_BEFORE}
+passed_unreadable=
 SESSION_MINUTES={minutes}
 AGENT_USER=ctx-agent
 pass='{pass}'
@@ -288,6 +296,12 @@ run_session() {{
         prepare_context = script_function("prepare_context")?,
         shell_rule = script_function("shell_rule")?,
         cycle_prompt = script_function("cycle_prompt")?,
+        read_marker_window = script_function("read_marker_window")?,
+        completed_windows = script_function("completed_windows")?,
+        unreadable_windows = script_function("unreadable_windows")?,
+        share_writable = script_function("share_writable")?,
+        refuse_unreadable_windows = script_function("refuse_unreadable_windows")?,
+        check_passed_windows = script_function("check_passed_windows")?,
         ctx = ctx_stand_in(),
         pass = pass.unwrap_or_default(),
     );
@@ -501,7 +515,7 @@ fn stopped_while_the_model_answers() -> String {
     ])
 }
 
-fn refused() -> String {
+pub(crate) fn refused() -> String {
     events(&[prompt(), refusal()])
 }
 
@@ -2129,12 +2143,12 @@ fn a_refused_cycle_is_judged_for_skipped_windows_across_both_sessions() -> Resul
     )
 }
 
-/// A refused cycle whose retry cannot read what is pending still has the first session's read:
-/// the retry goes on without context, its failed answer adds no window, and a window with new
-/// messages that the first session's read listed and the marker passed, with nothing written, is
-/// still named.
+/// A refused cycle whose retry cannot read what is pending starts no fresh session: the runner
+/// cannot tell which windows that session would be handed. The cycle fails with the read's
+/// status, and a window with new messages that the first session's read listed and the marker
+/// passed, with nothing written, is still named.
 #[test]
-fn a_refused_cycle_whose_retry_cannot_read_pending_is_judged_by_the_first_read() -> Result<()> {
+fn a_refused_cycle_whose_retry_cannot_read_pending_starts_no_fresh_session() -> Result<()> {
     let first_read = pending_answer(&[(FIRST, 4), (SECOND, 0)]);
     let refused = refused();
     let finished = finished("Handled 1 window.");
@@ -2157,12 +2171,14 @@ fn a_refused_cycle_whose_retry_cannot_read_pending_is_judged_by_the_first_read()
         },
     )?;
     ensure!(
-        verdict.sessions == 2
+        verdict.sessions == 1
             && verdict
-                .lines_saying("ctx pending failed before the retry")
+                .lines_saying(
+                    "ctx pending failed before the retry (exit 1); starting no fresh session"
+                )
                 .len()
                 == 1,
-        "the retry did not go on without context after its pending read failed: {}",
+        "the retry started after its pending read failed, or did not say why it did not: {}",
         verdict.stderr
     );
     ensure_failed_saying(
@@ -2178,9 +2194,10 @@ fn a_refused_cycle_whose_retry_cannot_read_pending_is_judged_by_the_first_read()
     Ok(())
 }
 
-/// A cycle that wrote nothing reads the marker once it is over, and a read that fails ends the
-/// job with that read's status and one line saying so, as a pass's marker read does. A cycle that
-/// wrote a record does not read the marker at all.
+/// A cycle reads the marker once its session is over, to check the windows the session passed,
+/// and a read that fails ends the job with that read's status and one line saying so, as a
+/// pass's marker read does: whether the cycle wrote a record or not, it cannot tell which windows
+/// it passed.
 #[test]
 fn a_cycle_that_cannot_read_the_marker_afterwards_fails_with_that_status() -> Result<()> {
     let around = Around {
@@ -2188,42 +2205,35 @@ fn a_cycle_that_cannot_read_the_marker_afterwards_fails_with_that_status() -> Re
         ..Around::default()
     };
     let nothing = finished("Handled 1 window.");
-    let unwritten = verdict(
-        None,
-        &[Attempt {
-            status: 0,
-            events: &nothing,
-        }],
-        &around,
-    )?;
-    ensure_failed_saying(
-        &unwritten,
-        "ctx marker show failed after the cycle (exit 3)",
-        "the marker read after a cycle that wrote nothing failed",
-    )?;
-    ensure!(
-        unwritten.status.code() == Some(3),
-        "the runner did not exit with the failed read's status 3: {}",
-        unwritten.status
-    );
     let put = wrote(&[("ctx_record_put", true)], answer("Handled 1 window."));
-    let written = verdict(
-        None,
-        &[Attempt {
-            status: 0,
-            events: &put,
-        }],
-        &around,
-    )?;
-    ensure_succeeded(
-        &written,
-        "the cycle wrote a record, so it had no need to read the marker",
-    )
+    for (events, what) in [
+        (
+            &nothing,
+            "the marker read after a cycle that wrote nothing failed",
+        ),
+        (
+            &put,
+            "the marker read after a cycle that wrote a record failed",
+        ),
+    ] {
+        let failed = verdict(None, &[Attempt { status: 0, events }], &around)?;
+        ensure_failed_saying(
+            &failed,
+            "ctx marker show failed after the session (exit 3)",
+            what,
+        )?;
+        ensure!(
+            failed.status.code() == Some(3),
+            "{what}, and the runner did not exit with the read's status 3: {}",
+            failed.status
+        );
+    }
+    Ok(())
 }
 
 /// A marker answer the runner cannot read as JSON, such as a gateway's error page, leaves it
-/// unable to tell which windows the marker passed: the cycle that wrote nothing fails, with one
-/// line saying so, rather than pass as if no window had been skipped.
+/// unable to tell which windows the marker passed: the cycle fails, with one line saying so,
+/// rather than pass as if no window had been passed.
 #[test]
 fn a_cycle_whose_marker_answer_cannot_be_read_fails_saying_so() -> Result<()> {
     let nothing = finished("Handled 1 window.");
@@ -2240,8 +2250,8 @@ fn a_cycle_whose_marker_answer_cannot_be_read_fails_saying_so() -> Result<()> {
     )?;
     ensure_failed_saying(
         &verdict,
-        "could not tell whether the cycle moved the marker past windows it wrote nothing for",
-        "the marker answer after a cycle that wrote nothing was not JSON",
+        "could not read the marker ctx marker show answered after the session",
+        "the marker answer after the session was not JSON",
     )?;
     ensure!(
         verdict.status.code() == Some(1),

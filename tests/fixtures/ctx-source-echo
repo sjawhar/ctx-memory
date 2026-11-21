@@ -63,12 +63,20 @@ if [ "${ECHO_LATE-}" = "1" ]; then
     record_time=$(date -u -d "$window_end + 1 hour" +%Y-%m-%dT%H:%M:%SZ)
 fi
 
+# With ECHO_VERSION each record's text carries it, so a test can make a message change; with
+# ECHO_CONTEXT=1 each record is sent as context, as a source sends the parent a reply answers.
+text_suffix=${ECHO_VERSION:+ $ECHO_VERSION}
+context_field=
+if [ "${ECHO_CONTEXT-}" = "1" ]; then
+    context_field=',"context":true'
+fi
+
 for stream in $(printf '%s' "$streams" | tr ',' ' ' | tr -d '"'); do
     pointer_scheme=$scheme
     if [ "${ECHO_BAD_SCHEME-}" = "1" ]; then
         pointer_scheme=other
     fi
-    printf '{"type":"record","pointer":"%s:%s/record","stream":"%s","ts":"%s","text":"echo %s","raw":null}\n' "$pointer_scheme" "$stream" "$stream" "$record_time" "$stream"
+    printf '{"type":"record","pointer":"%s:%s/record","stream":"%s","ts":"%s","text":"echo %s%s"%s,"raw":null}\n' "$pointer_scheme" "$stream" "$stream" "$record_time" "$stream" "$text_suffix" "$context_field"
     # With ECHO_THREAD_STATE the source behaves like Slack: a reply whose parent is older than
     # the window is reachable only through the file the previous fetch left in state_dir.
     if [ "${ECHO_THREAD_STATE-}" = "1" ]; then

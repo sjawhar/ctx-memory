@@ -53,6 +53,22 @@ impl WindowId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The window end this identifier was made from, to the second.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identifier's timestamp does not parse, which [`Self::parse`]
+    /// never lets through.
+    pub fn time(&self) -> Result<DateTime<Utc>> {
+        let timestamp = self
+            .0
+            .rsplit_once('-')
+            .map_or(self.0.as_str(), |(time, _)| time);
+        NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%SZ")
+            .map(|time| time.and_utc())
+            .with_context(|| format!("reading the time of window id {:?}", self.0))
+    }
 }
 
 impl std::fmt::Display for WindowId {
@@ -208,6 +224,14 @@ pub struct Manifest {
     pub sources: BTreeMap<String, SourceManifest>,
     pub warnings: Vec<String>,
     pub exit_status: Status,
+    /// The window a `ctx fetch --replay` window delivers again ([`crate::replay`]); a fetch's
+    /// own window has none, and its manifest carries no such field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_of: Option<String>,
+    /// The SHA-256 of the cohort file a `ctx fetch --replay` window replays, so a later run of
+    /// that cohort counts the window's origin as replayed; absent from a fetch's own window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_cohort: Option<String>,
 }
 
 /// Persisted status of one configured source in a fetch window.
@@ -423,6 +447,8 @@ mod tests {
             sources: BTreeMap::new(),
             warnings: Vec::new(),
             exit_status: Status::Ok,
+            replay_of: None,
+            replay_cohort: None,
         };
         std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
         let mut jsonl = Vec::new();

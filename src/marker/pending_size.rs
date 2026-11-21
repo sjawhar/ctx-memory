@@ -108,6 +108,8 @@ fn window_with(
         sources: BTreeMap::new(),
         warnings: Vec::new(),
         exit_status: Status::Ok,
+        replay_of: None,
+        replay_cohort: None,
     };
     std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
     std::fs::write(dir.join("records.jsonl"), b"")?;

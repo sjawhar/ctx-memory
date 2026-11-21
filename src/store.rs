@@ -649,6 +649,29 @@ impl Store {
         json.map(|record| decode_record(&record)).transpose()
     }
 
+    /// [`Store::get`] by the pointer's text, with the id of the source that first delivered that
+    /// version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read the record or its stored JSON is invalid.
+    pub fn get_sourced(&self, pointer: &str) -> Result<Option<(String, Record)>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT source, json FROM record WHERE pointer = ?1
+                 ORDER BY last_seen DESC, rowid DESC
+                 LIMIT 1",
+                [pointer],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .context("reading record from store")?;
+        found
+            .map(|(source, json)| Ok((source, decode_record(&json)?)))
+            .transpose()
+    }
+
     /// Returns every stored version of one pointer with the fetch time that first saw it,
     /// oldest first.
     ///
@@ -1086,6 +1109,8 @@ mod tests {
             sources: std::collections::BTreeMap::new(),
             warnings: Vec::new(),
             exit_status: Status::Ok,
+            replay_of: None,
+            replay_cohort: None,
         };
         std::fs::write(
             dir.join("manifest.json"),
