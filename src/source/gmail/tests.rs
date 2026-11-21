@@ -9,8 +9,10 @@ use serde_json::json;
 
 use super::super::{FetchRequest, ResolveRequest, StreamStatus, PROTOCOL_VERSION};
 use super::fetch::{
-    excluded_labels, fetch_messages, GmailApi, History, HistoryEntry, Reach, MAX_HISTORY_MESSAGES,
+    excluded_labels, fetch_messages, Excluded, GmailApi, History, HistoryEntry, Reach,
+    MAX_HISTORY_MESSAGES,
 };
+use super::lists::ExcludedLists;
 use super::*;
 
 #[derive(Default)]
@@ -105,10 +107,13 @@ fn fetch_request(cursor: Option<&str>) -> Result<FetchRequest> {
     })
 }
 
+/// Runs a fetch with the request's configuration, `exclude_list_ids` among it, and no
+/// environment.
 fn run_fetch(api: &FakeGmailApi, request: &FetchRequest) -> Result<Vec<Message>> {
     let config = parse_config(&request.config)?;
+    let lists = ExcludedLists::from_parts(&config.exclude_list_ids, None)?;
     let mut messages = Vec::new();
-    fetch_with_api(request, &config, api, &mut |message| {
+    fetch_with_api(request, &config, &lists, api, &mut |message| {
         messages.push(message);
         Ok(())
     })?;
@@ -886,9 +891,8 @@ fn resolving_a_thread_uses_the_threads_endpoint_and_sorts_messages() -> Result<(
         pointers: vec!["gmail:thread/cccccccccccccccc".to_owned()],
         state_dir: std::env::temp_dir(),
     };
-    let config = parse_config(&request.config)?;
     let mut output = Vec::new();
-    resolve_with_api(&request, &config, &api, &mut |message| {
+    resolve_with_api(&request, &ExcludedLists::default(), &api, &mut |message| {
         output.push(message);
         Ok(())
     })?;
@@ -918,7 +922,10 @@ fn fetch_rejects_a_message_without_a_timestamp() -> Result<()> {
         start,
         Reach::WindowEnd(end),
         "",
-        &excluded_labels(""),
+        &Excluded {
+            labels: excluded_labels(""),
+            lists: &ExcludedLists::default(),
+        },
         &mut Vec::new(),
     )
     .err()
@@ -974,5 +981,250 @@ fn a_failure_part_way_through_the_history_leaves_the_cursor_alone() -> Result<()
     // stands: the next fetch reads that history again from where it was.
     assert_eq!(pointers(&messages), [] as [String; 0]);
     assert_eq!(stream_end(&messages), Some((StreamStatus::Error, None)));
+    Ok(())
+}
+
+/// GitHub's notification mail about a repository the deployment excludes, and mail from no list.
+const LISTED: &str = "dddddddddddddddd";
+const UNLISTED: &str = "aaaaaaaaaaaaaaaa";
+/// The List-ID GitHub gives that repository's mail, `<repo>.<owner>.github.com`.
+const PRIVATE_LIST: &str = "private.example-org.github.com";
+
+/// A message that carries `header` (its name and value) beside its subject.
+fn with_header(mut message: Value, name: &str, value: &str) -> Value {
+    if let Some(headers) = message
+        .pointer_mut("/payload/headers")
+        .and_then(Value::as_array_mut)
+    {
+        headers.push(json!({"name": name, "value": value}));
+    }
+    message
+}
+
+/// The repository's notification mail, as GitHub writes its `List-Id`
+/// (docs.github.com/en/subscriptions-and-notifications/reference/email-notification-headers,
+/// read 2026-11-21: `OWNER/REPOSITORY <REPOSITORY.OWNER.github.com>`).
+fn listed() -> Value {
+    with_header(
+        message(LISTED, "1792944000000", "Zmlyc3Q="),
+        "List-ID",
+        "example-org/private <private.example-org.github.com>",
+    )
+}
+
+/// The source's configuration with `PRIVATE_LIST` excluded, and without: the control.
+fn with_and_without_the_list() -> [(Value, bool); 2] {
+    [
+        (json!({"exclude_list_ids": [PRIVATE_LIST]}), true),
+        (json!({}), false),
+    ]
+}
+
+/// Mail from an excluded list is never a record on the history path, where no Gmail query
+/// applies, and the cursor moves past it as it moves past a promotion. Control: without the list
+/// configured, the same history stores both messages.
+#[test]
+fn mail_from_an_excluded_list_is_not_stored_from_the_history() -> Result<()> {
+    for (config, excluded) in with_and_without_the_list() {
+        let api = FakeGmailApi {
+            history: Some(History {
+                entries: vec![HistoryEntry {
+                    id: "900".to_owned(),
+                    added: vec![LISTED.to_owned(), UNLISTED.to_owned()],
+                }],
+                latest: Some("1000".to_owned()),
+            }),
+            messages: BTreeMap::from([
+                (LISTED.to_owned(), listed()),
+                (
+                    UNLISTED.to_owned(),
+                    message(UNLISTED, "1792944000000", "Zmlyc3Q="),
+                ),
+            ]),
+            ..FakeGmailApi::default()
+        };
+        let mut request = fetch_request(Some("850@2026-10-24T00:00:00Z"))?;
+        request.config = config;
+        let messages = run_fetch(&api, &request)?;
+
+        let stored = if excluded {
+            vec![format!("gmail:{UNLISTED}")]
+        } else {
+            vec![format!("gmail:{LISTED}"), format!("gmail:{UNLISTED}")]
+        };
+        assert_eq!(pointers(&messages), stored, "excluded: {excluded}");
+        assert_eq!(
+            stream_end(&messages),
+            Some((
+                StreamStatus::Ok,
+                Some("1000@2026-10-25T18:00:00Z".to_owned())
+            ))
+        );
+    }
+    Ok(())
+}
+
+/// Mail from an excluded list is never a record on the listing path either, a first fetch's or
+/// a relisting's, though the listing's query does not name the list. Control: without the list
+/// configured, the same listing stores both messages.
+#[test]
+fn mail_from_an_excluded_list_is_not_stored_from_a_listing() -> Result<()> {
+    for (config, excluded) in with_and_without_the_list() {
+        let api = FakeGmailApi {
+            candidates: vec![json!({"id": LISTED}), json!({"id": UNLISTED})],
+            messages: BTreeMap::from([
+                (LISTED.to_owned(), listed()),
+                (
+                    UNLISTED.to_owned(),
+                    message(UNLISTED, "1792944000000", "Zmlyc3Q="),
+                ),
+            ]),
+            latest_history_id: "4242".to_owned(),
+            ..FakeGmailApi::default()
+        };
+        let mut request = fetch_request(None)?;
+        request.config = config;
+        let messages = run_fetch(&api, &request)?;
+
+        let stored = if excluded {
+            vec![format!("gmail:{UNLISTED}")]
+        } else {
+            vec![format!("gmail:{LISTED}"), format!("gmail:{UNLISTED}")]
+        };
+        assert_eq!(pointers(&messages), stored, "excluded: {excluded}");
+        assert_eq!(
+            stream_end(&messages),
+            Some((
+                StreamStatus::Ok,
+                Some("4242@2026-10-25T18:00:00Z".to_owned())
+            ))
+        );
+    }
+    Ok(())
+}
+
+/// A resolve, of the message or of its thread, answers no message from an excluded list, so a
+/// live resolve stores and prints none of it. Control: without the list, both are answered.
+#[test]
+fn a_resolve_answers_no_mail_from_an_excluded_list() -> Result<()> {
+    for (config, excluded) in with_and_without_the_list() {
+        let api = FakeGmailApi {
+            messages: BTreeMap::from([(LISTED.to_owned(), listed())]),
+            threads: BTreeMap::from([(
+                "cccccccccccccccc".to_owned(),
+                vec![listed(), message(UNLISTED, "1792947600000", "c2Vjb25k")],
+            )]),
+            ..FakeGmailApi::default()
+        };
+        let request = ResolveRequest {
+            protocol: PROTOCOL_VERSION,
+            source: super::super::SourceRef {
+                id: "gmail".to_owned(),
+                kind: "gmail".to_owned(),
+                scheme: "gmail".to_owned(),
+            },
+            config,
+            pointers: vec![
+                format!("gmail:{LISTED}"),
+                "gmail:thread/cccccccccccccccc".to_owned(),
+            ],
+            state_dir: std::env::temp_dir(),
+        };
+        let config = parse_config(&request.config)?;
+        let lists = ExcludedLists::from_parts(&config.exclude_list_ids, None)?;
+        let mut output = Vec::new();
+        resolve_with_api(&request, &lists, &api, &mut |message| {
+            output.push(message);
+            Ok(())
+        })?;
+
+        let answered = if excluded {
+            vec![format!("gmail:{UNLISTED}")]
+        } else {
+            vec![
+                format!("gmail:{LISTED}"),
+                format!("gmail:{LISTED}"),
+                format!("gmail:{UNLISTED}"),
+            ]
+        };
+        assert_eq!(pointers(&output), answered, "excluded: {excluded}");
+    }
+    Ok(())
+}
+
+/// A `List-Id` header names its list whatever the case of the header's name or of the id, with
+/// or without a description and angle brackets, and names that list alone: not one whose id
+/// merely ends or starts like it. A message with no such header, or with no headers, is from no
+/// list. Control: with no list excluded, no message is.
+#[test]
+fn a_list_id_header_names_its_list_in_any_case_and_no_other_list() -> Result<()> {
+    let lists = ExcludedLists::from_parts(&[PRIVATE_LIST.to_owned()], None)?;
+    let plain = message(UNLISTED, "1792944000000", "Zmlyc3Q=");
+    let named = |name: &str, value: &str| with_header(plain.clone(), name, value);
+    for message in [
+        named(
+            "List-ID",
+            "example-org/private <private.example-org.github.com>",
+        ),
+        named(
+            "list-id",
+            "Example-Org/Private <Private.Example-Org.GitHub.com>",
+        ),
+        named("List-Id", "  private.example-org.github.com  "),
+        named("List-Id", "<private.example-org.github.com>"),
+    ] {
+        assert!(lists.names(&message), "{message}");
+        assert!(!ExcludedLists::default().names(&message), "{message}");
+    }
+    for message in [
+        plain.clone(),
+        json!({"id": UNLISTED, "threadId": "cccccccccccccccc"}),
+        named(
+            "List-Id",
+            "example-org/private-two <private-two.example-org.github.com>",
+        ),
+        named("List-Id", "<x-private.example-org.github.com>"),
+        named("List-Id", "<private.example-org.github.com.evil>"),
+        named("X-List-Id", "<private.example-org.github.com>"),
+    ] {
+        assert!(!lists.names(&message), "{message}");
+    }
+    Ok(())
+}
+
+/// `CTX_GMAIL_EXCLUDE_LIST_IDS` adds List-IDs to the configuration's, so neither list takes a
+/// list off the other, and an entry that is not an id alone is an error rather than one that
+/// matches nothing.
+#[test]
+fn the_environment_adds_list_ids_to_the_configurations() -> Result<()> {
+    let configured = vec!["Private.Example-Org.github.com".to_owned()];
+    let both = ExcludedLists::from_parts(
+        &configured,
+        Some(" other.example-org.github.com ,, private.example-org.github.com"),
+    )?;
+    let other = with_header(
+        message(UNLISTED, "1792944000000", "Zmlyc3Q="),
+        "List-Id",
+        "<other.example-org.github.com>",
+    );
+    assert!(both.names(&listed()));
+    assert!(both.names(&other));
+    let configured_alone = ExcludedLists::from_parts(&configured, None)?;
+    assert!(configured_alone.names(&listed()));
+    assert!(!configured_alone.names(&other));
+    assert_eq!(
+        ExcludedLists::from_parts(&[], Some(""))?,
+        ExcludedLists::default()
+    );
+    for refused in [
+        ExcludedLists::from_parts(&[" ".to_owned()], None),
+        ExcludedLists::from_parts(
+            &[],
+            Some("example-org/private <private.example-org.github.com>"),
+        ),
+        ExcludedLists::from_parts(&["<private.example-org.github.com>".to_owned()], None),
+    ] {
+        assert!(refused.is_err(), "{refused:?}");
+    }
     Ok(())
 }

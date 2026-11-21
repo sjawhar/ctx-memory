@@ -329,7 +329,7 @@ fn route(root: &Path, state: &Mutex<State>, request: &Recorded, body: &[u8]) -> 
             200,
             json!({
                 "total_count": 1,
-                "repositories": [{ "full_name": format!("{owner}/{NOTES}"), "default_branch": "main" }],
+                "repositories": [{ "id": 1007, "full_name": format!("{owner}/{NOTES}"), "default_branch": "main" }],
             })
             .to_string(),
         ));

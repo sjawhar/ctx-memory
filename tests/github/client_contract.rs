@@ -145,7 +145,7 @@ fn empty_repository_commits_409_is_not_a_stream_error() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "other-org/empty-repo", "default_branch": "main" },
+                { "id": 1001, "full_name": "other-org/empty-repo", "default_branch": "main" },
             ],
         })
         .to_string(),
@@ -217,7 +217,7 @@ fn an_empty_repository_is_a_quiet_stream_whose_cursor_moves() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "example-org/slack-tui", "default_branch": "main" },
+                { "id": 1002, "full_name": "example-org/slack-tui", "default_branch": "main" },
             ],
         })
         .to_string(),
@@ -287,7 +287,7 @@ fn a_rate_limited_listing_holds_its_cursor_instead_of_erroring() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "other-org/busy-repo", "default_branch": "main" },
+                { "id": 1003, "full_name": "other-org/busy-repo", "default_branch": "main" },
             ],
         })
         .to_string(),
@@ -377,7 +377,7 @@ fn a_throttled_repository_listing_skips_one_installation_only() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "example-org/example-repo", "default_branch": "main" },
+                { "id": 1004, "full_name": "example-org/example-repo", "default_branch": "main" },
             ],
         })
         .to_string(),
@@ -453,7 +453,7 @@ fn a_plus_in_the_default_branch_reaches_github_percent_encoded() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "other-org/coq-elpi", "default_branch": "v3.3.1+qvar" },
+                { "id": 1005, "full_name": "other-org/coq-elpi", "default_branch": "v3.3.1+qvar" },
             ],
         })
         .to_string(),

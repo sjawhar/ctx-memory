@@ -602,9 +602,8 @@ fn head_url_percent_encodes_the_branch() {
     // `404 Not Found` and the whole repository stream errors (observed in a real fetch,
     // 2026-10-27). The branch must be percent-encoded in the `sha` parameter.
     let subject = Repo {
-        owner: "other-org".to_owned(),
-        name: "coq-elpi".to_owned(),
         default_branch: "v3.3.1+qvar".to_owned(),
+        ..repo("other-org", "coq-elpi")
     };
     let url = head_url(&api_base(), &subject);
     assert!(
@@ -621,9 +620,8 @@ fn head_url_percent_encodes_the_branch() {
 fn a_default_branch_with_a_plus_still_reads_its_commits() -> Result<()> {
     let base = api_base();
     let subject = Repo {
-        owner: "other-org".to_owned(),
-        name: "coq-elpi".to_owned(),
         default_branch: "v3.3.1+qvar".to_owned(),
+        ..repo("other-org", "coq-elpi")
     };
     let fake = FakeGithub {
         repos: BTreeMap::from([(1, vec![subject.clone()])]),

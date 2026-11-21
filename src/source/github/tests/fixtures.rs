@@ -21,7 +21,8 @@ pub(super) use super::super::records::{
     pull_reviews_url, stream_id,
 };
 pub(super) use super::super::{
-    fetch_with_api, installations, GithubApi, GithubConfig, Request, PROTOCOL_VERSION,
+    excluded_repositories, fetch_with_api, installations, GithubApi, GithubConfig, Request,
+    PROTOCOL_VERSION,
 };
 
 pub(super) const WINDOW_END: &str = "2026-10-27T00:00:00Z";
@@ -184,8 +185,10 @@ impl GithubApi for FakeGithub {
     }
 }
 
+/// A repository with no id: a test that excludes repositories by id gives each its own.
 pub(super) fn repo(owner: &str, name: &str) -> Repo {
     Repo {
+        id: 0,
         owner: owner.to_owned(),
         name: name.to_owned(),
         default_branch: "main".to_owned(),
@@ -243,12 +246,18 @@ pub(super) fn run(
     config: &GithubConfig,
 ) -> Result<SourceOutcome> {
     let installations = installations(config)?;
+    let excluded = excluded_repositories(config, None)?;
     let schemes = Schemes::new(["github".to_owned()]);
     let request_enum = Request::Fetch(request.clone());
     let mut session = Session::new(&request_enum, &schemes);
-    let run = fetch_with_api(request, config, &installations, api, &mut |message| {
-        session.accept(message).map(|_| ())
-    });
+    let run = fetch_with_api(
+        request,
+        config,
+        &installations,
+        &excluded,
+        api,
+        &mut |message| session.accept(message).map(|_| ()),
+    );
     Ok(session.finish(run))
 }
 
@@ -257,6 +266,7 @@ pub(super) fn config(installations: Vec<u64>, budget: u32, floor: u32) -> Github
         installations,
         request_budget: budget,
         rate_limit_floor: floor,
+        exclude_repository_ids: Vec::new(),
     }
 }
 

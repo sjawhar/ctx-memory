@@ -107,6 +107,171 @@ fn gmail_message(id: &str, internal_date: &str) -> Value {
     })
 }
 
+/// `gmail_message` with the `List-Id` GitHub gives a repository's notification mail.
+fn notification(id: &str, internal_date: &str) -> Value {
+    let mut message = gmail_message(id, internal_date);
+    if let Some(headers) = message
+        .pointer_mut("/payload/headers")
+        .and_then(Value::as_array_mut)
+    {
+        headers.push(json!({
+            "name": "List-ID",
+            "value": "example-org/private <private.example-org.github.com>"
+        }));
+    }
+    message
+}
+
+/// With `CTX_GMAIL_EXCLUDE_LIST_IDS` naming a repository's List-ID, the built-in source stores
+/// none of that repository's notification mail from the history, and the cursor moves past it.
+/// Control: the same history without the variable stores it.
+#[test]
+fn mail_from_a_list_the_environment_excludes_is_not_fetched() -> Result<()> {
+    let _environment = environment_lock();
+    for excluded in [true, false] {
+        let root = scratch(&format!("gmail-list-{excluded}"))?;
+        let server = FakeGoogle::start(vec![
+            (
+                "/gmail/v1/users/me/history",
+                json!({
+                    "history": [{"id": "900", "messagesAdded": [
+                        {"message": {"id": "dddddddddddddddd"}},
+                        {"message": {"id": "aaaaaaaaaaaaaaaa"}}
+                    ]}],
+                    "historyId": "1000"
+                }),
+            ),
+            (
+                "/gmail/v1/users/me/messages/dddddddddddddddd",
+                notification("dddddddddddddddd", "1792944000000"),
+            ),
+            (
+                "/gmail/v1/users/me/messages/aaaaaaaaaaaaaaaa",
+                gmail_message("aaaaaaaaaaaaaaaa", "1792944000000"),
+            ),
+        ])?;
+        server.use_in_environment("ya29.gmail-test");
+        if excluded {
+            std::env::set_var(
+                "CTX_GMAIL_EXCLUDE_LIST_IDS",
+                "other.example-org.github.com,private.example-org.github.com",
+            );
+        }
+
+        let spec = source_spec("gmail", "")?;
+        let request = Request::Fetch(FetchRequest {
+            protocol: source::PROTOCOL_VERSION,
+            source: SourceRef {
+                id: "gmail".to_owned(),
+                kind: "gmail".to_owned(),
+                scheme: "gmail".to_owned(),
+            },
+            config: json!({}),
+            window_end: timestamp("2026-10-25T18:00:00Z")?,
+            backfill_hours: 24,
+            cursors: BTreeMap::from([("me".to_owned(), "850@2026-10-24T00:00:00Z".to_owned())]),
+            discovered: Vec::new(),
+            state_dir: root.join("state"),
+            exclude: Vec::new(),
+        });
+        let source = source::open(&spec, "gmail")?;
+        let outcome = run_conformance(source.as_ref(), &request);
+
+        std::env::remove_var("CTX_GMAIL_EXCLUDE_LIST_IDS");
+        clear_google_environment();
+        remove_scratch(&root)?;
+
+        assert!(!outcome.has_errors(), "{:#?}", outcome.error);
+        let pointers: Vec<String> = outcome
+            .records
+            .iter()
+            .map(|record| record.pointer.clone())
+            .collect();
+        let stored = if excluded {
+            vec!["gmail:aaaaaaaaaaaaaaaa".to_owned()]
+        } else {
+            vec![
+                "gmail:dddddddddddddddd".to_owned(),
+                "gmail:aaaaaaaaaaaaaaaa".to_owned(),
+            ]
+        };
+        assert_eq!(pointers, stored, "excluded: {excluded}");
+        assert_eq!(
+            outcome
+                .streams
+                .get("me")
+                .and_then(|stream| stream.cursor.clone()),
+            Some("1000@2026-10-25T18:00:00Z".to_owned())
+        );
+    }
+    Ok(())
+}
+
+/// `ctx resolve` of a thread, as the server runs it for a caller, answers none of the mail
+/// `CTX_GMAIL_EXCLUDE_LIST_IDS` names in the environment of the process that resolves, and the
+/// rest of the thread as before. Control: without the variable it answers the whole thread.
+#[test]
+fn a_resolve_answers_no_mail_from_a_list_the_environment_excludes() -> Result<()> {
+    let _environment = environment_lock();
+    for excluded in [true, false] {
+        let root = scratch(&format!("gmail-resolve-list-{excluded}"))?;
+        let server = FakeGoogle::start(vec![(
+            "/gmail/v1/users/me/threads/cccccccccccccccc",
+            json!({"messages": [
+                notification("dddddddddddddddd", "1792944000000"),
+                gmail_message("aaaaaaaaaaaaaaaa", "1792947600000"),
+            ]}),
+        )])?;
+        let tree = root.join("tree");
+        std::fs::create_dir(&tree).with_context(|| format!("creating {}", tree.display()))?;
+        std::fs::write(
+            tree.join("ctx.toml"),
+            "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"gmail\"\nkind = \"gmail\"\n",
+        )?;
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ctx"));
+        command
+            .args([
+                "--json",
+                "--memory",
+                tree.to_str().context("tree path is not valid UTF-8")?,
+                "resolve",
+                "gmail:thread/cccccccccccccccc",
+            ])
+            .env("CTX_STATE_DIR", root.join("state"))
+            .env("CTX_GOOGLE_API_BASE", server.base())
+            .env("CTX_CREDENTIAL_GOOGLE", "ya29.gmail-test")
+            .env_remove("CTX_GMAIL_EXCLUDE_LIST_IDS");
+        if excluded {
+            command.env(
+                "CTX_GMAIL_EXCLUDE_LIST_IDS",
+                "Private.Example-Org.github.com",
+            );
+        }
+        let output = command
+            .output()
+            .context("running Gmail thread resolution")?;
+        remove_scratch(&root)?;
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout)?;
+        let text = response
+            .pointer("/data/results/0/text")
+            .and_then(Value::as_str)
+            .context("Gmail thread resolution returned text")?;
+        assert!(text.contains("Message-Id: aaaaaaaaaaaaaaaa"), "{text}");
+        assert_eq!(
+            text.contains("Message-Id: dddddddddddddddd"),
+            !excluded,
+            "excluded: {excluded}: {text}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn a_gmail_history_id_that_expires_mid_catch_up_lists_again_from_the_start() -> Result<()> {
     let _environment = environment_lock();

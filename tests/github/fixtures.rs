@@ -132,6 +132,8 @@ pub(super) fn against<T>(address: SocketAddr, body: impl FnOnce() -> Result<T>) 
 pub(super) const BUSY: &str = "/repos/example-org/busy";
 /// Its stream.
 pub(super) const BUSY_STREAM: &str = "github:example-org/busy";
+/// GitHub's id of it.
+pub(super) const BUSY_ID: u64 = 9_000_000_001;
 
 /// A change the emulated GitHub makes to its data once.
 pub(super) type Change = Box<dyn FnOnce(&mut Busy) + Send>;
@@ -203,7 +205,7 @@ impl Busy {
             return Ok(Response::json(
                 200,
                 json!({ "total_count": 1, "repositories": [
-                    { "full_name": "example-org/busy", "default_branch": "main" } ] })
+                    { "id": BUSY_ID, "full_name": "example-org/busy", "default_branch": "main" } ] })
                 .to_string(),
             ));
         }

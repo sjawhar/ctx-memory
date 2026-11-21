@@ -22,7 +22,7 @@ mod collect;
 mod cursor_state;
 mod records;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::{DateTime, Utc};
@@ -40,6 +40,9 @@ use records::stream_id;
 
 /// The installations to read, one id per comma, when the configuration names none.
 const INSTALLATIONS_ENV: &str = "CTX_GITHUB_INSTALLATIONS";
+/// GitHub's ids of repositories the source never reads, one per comma, added to the
+/// configuration's `exclude_repository_ids`.
+const EXCLUDE_REPOSITORY_IDS_ENV: &str = "CTX_GITHUB_EXCLUDE_REPOSITORY_IDS";
 /// How many paid requests one run may spend before it holds every unfinished cursor.
 const DEFAULT_REQUEST_BUDGET: u32 = 600;
 /// A run stops reading an installation once GitHub reports its `core` rate limit under this.
@@ -76,8 +79,12 @@ impl Source for GithubSource {
             Request::Fetch(request) => {
                 let config = parse_config(&request.config)?;
                 let installations = installations(&config)?;
+                let excluded = excluded_repositories(
+                    &config,
+                    super::environment(EXCLUDE_REPOSITORY_IDS_ENV)?.as_deref(),
+                )?;
                 let client = GithubClient::load(&credentials::Config::new())?;
-                fetch_with_api(request, &config, &installations, &client, sink)
+                fetch_with_api(request, &config, &installations, &excluded, &client, sink)
             }
             Request::Resolve(request) => emit_resolve_hello(request, sink),
         }
@@ -131,6 +138,9 @@ struct GithubConfig {
     /// this.
     #[serde(default = "default_floor")]
     rate_limit_floor: u32,
+    /// GitHub's ids of repositories never read, whatever GitHub calls them now.
+    #[serde(default)]
+    exclude_repository_ids: Vec<u64>,
 }
 
 const fn default_budget() -> u32 {
@@ -147,6 +157,7 @@ fn parse_config(value: &Value) -> Result<GithubConfig> {
             installations: Vec::new(),
             request_budget: DEFAULT_REQUEST_BUDGET,
             rate_limit_floor: DEFAULT_RATE_FLOOR,
+            exclude_repository_ids: Vec::new(),
         });
     }
     serde_json::from_value(value.clone()).context("parsing GitHub source configuration")
@@ -173,6 +184,34 @@ fn installations(config: &GithubConfig) -> Result<Vec<u64>> {
     }
     if ids.is_empty() {
         bail!("{INSTALLATIONS_ENV} names no installations");
+    }
+    Ok(ids)
+}
+
+/// The repositories the source never reads, by GitHub's id of each: the configuration's
+/// `exclude_repository_ids` and those `environment`, the value of
+/// [`EXCLUDE_REPOSITORY_IDS_ENV`], names. Both lists apply, so neither can take a repository
+/// off the other.
+fn excluded_repositories(
+    config: &GithubConfig,
+    environment: Option<&str>,
+) -> Result<BTreeSet<u64>> {
+    let mut ids = config
+        .exclude_repository_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for part in environment.into_iter().flat_map(|value| value.split(',')) {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = trimmed.parse::<u64>().with_context(|| {
+            format!(
+                "{EXCLUDE_REPOSITORY_IDS_ENV} names {trimmed:?}, which is no GitHub repository id"
+            )
+        })?;
+        ids.insert(id);
     }
     Ok(ids)
 }
@@ -208,10 +247,13 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
     request: &FetchRequest,
     config: &GithubConfig,
     installations: &[u64],
+    excluded: &BTreeSet<u64>,
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
     let mut repos = Vec::new();
+    // The streams of the repositories the deployment excludes by id, as GitHub names them now.
+    let mut withheld = BTreeSet::new();
     let mut throttled = Vec::new();
     for &installation in installations {
         let listed = api
@@ -220,7 +262,14 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
         match listed {
             Some(listed) => {
                 for repo in listed {
-                    repos.push((installation, repo));
+                    // Every pointer, request and stream of a repository starts from its listing,
+                    // so one the deployment excludes by id is dropped here, under whatever name
+                    // GitHub gives it now.
+                    if excluded.contains(&repo.id) {
+                        withheld.insert(stream_id(&repo));
+                    } else {
+                        repos.push((installation, repo));
+                    }
                 }
             }
             // GitHub refused to say what this installation covers, so none of its streams are
@@ -260,7 +309,8 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
         .as_deref()
         .and_then(|first| repos.iter().position(|(_, repo)| stream_id(repo) == first))
         .unwrap_or(0);
-    let unplanned = previous.filter(|first| !streams.contains(first));
+    // A start at a repository the deployment excludes is no start: that repository is not read.
+    let unplanned = previous.filter(|first| !streams.contains(first) && !withheld.contains(first));
     let mut first_stopped = None;
     // The installation whose repositories were read last. Every installation is listed before
     // any repository is read, so with a token secret the tokens the listings read can be a long

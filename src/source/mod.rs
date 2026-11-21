@@ -227,6 +227,22 @@ pub fn config_json(spec: &SourceConfig) -> Result<serde_json::Value> {
         .with_context(|| format!("serializing source {} configuration", spec.id))
 }
 
+/// The value of the environment variable `name`, or `None` when it is not set.
+///
+/// # Errors
+///
+/// Returns an error when it is set to a value that is not Unicode, so a setting that cannot be
+/// read is never taken for one that is not set.
+pub(crate) fn environment(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("{name} is set to a value that is not Unicode")
+        }
+    }
+}
+
 /// Returns every tree record whose `field` starts with a stream identifier.
 #[must_use]
 pub fn discover_streams(tree: &Tree, field: &str) -> Vec<DiscoveredStream> {

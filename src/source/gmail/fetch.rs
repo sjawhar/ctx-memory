@@ -14,6 +14,7 @@ use crate::source::{
     PROTOCOL_VERSION,
 };
 
+use super::lists::ExcludedLists;
 use super::render::{message_timestamp, record_from_message_with_scheme, required_string};
 use super::{GmailConfig, STREAM};
 
@@ -247,11 +248,12 @@ struct Collected {
 pub(super) fn fetch_with_api<C: GmailApi + ?Sized>(
     request: &FetchRequest,
     config: &GmailConfig,
+    lists: &ExcludedLists,
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
     let mut warnings = Vec::new();
-    let result = collect(api, config, request, &mut warnings).and_then(|collected| {
+    let result = collect(api, config, lists, request, &mut warnings).and_then(|collected| {
         let records = collected
             .messages
             .iter()
@@ -300,10 +302,14 @@ pub(super) fn fetch_with_api<C: GmailApi + ?Sized>(
 fn collect<C: GmailApi + ?Sized>(
     api: &C,
     config: &GmailConfig,
+    lists: &ExcludedLists,
     request: &FetchRequest,
     warnings: &mut Vec<String>,
 ) -> Result<Collected> {
-    let excluded = excluded_labels(&config.query);
+    let excluded = Excluded {
+        labels: excluded_labels(&config.query),
+        lists,
+    };
     let cursor = request.cursors.get(STREAM).map(String::as_str);
     if let Some(slice) = cursor.and_then(SliceCursor::parse) {
         let listing = Listing::Resume(slice);
@@ -384,7 +390,7 @@ fn collect_from_history<C: GmailApi + ?Sized>(
     api: &C,
     history: &History,
     start: HistoryStart<'_>,
-    excluded: &BTreeSet<String>,
+    excluded: &Excluded<'_>,
     window_end: DateTime<Utc>,
     warnings: &mut Vec<String>,
 ) -> Result<Collected> {
@@ -420,7 +426,7 @@ fn collect_from_history<C: GmailApi + ?Sized>(
                 gone += 1;
                 continue;
             };
-            if is_excluded(&message, excluded) {
+            if excluded.message(&message) {
                 continue;
             }
             let arrived = message_timestamp(&message)?;
@@ -504,7 +510,7 @@ fn collect_from_listing<C: GmailApi + ?Sized>(
     config: &GmailConfig,
     listing: Listing<'_>,
     request: &FetchRequest,
-    excluded: &BTreeSet<String>,
+    excluded: &Excluded<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<Collected> {
     let (began, start, next) = match listing {
@@ -584,15 +590,30 @@ pub(super) fn excluded_labels(query: &str) -> BTreeSet<String> {
     labels
 }
 
-fn is_excluded(message: &Value, excluded: &BTreeSet<String>) -> bool {
+/// The mail a fetch never stores.
+pub(super) struct Excluded<'a> {
+    /// A message carrying one of these labels ([`excluded_labels`]).
+    pub(super) labels: BTreeSet<String>,
+    /// A message from one of these mailing lists.
+    pub(super) lists: &'a ExcludedLists,
+}
+
+impl Excluded<'_> {
+    /// Whether `message` is mail a fetch never stores, read as Gmail answers it and before it
+    /// is a record, on the history path and the listing path alike.
+    fn message(&self, message: &Value) -> bool {
+        has_label(message, &self.labels) || self.lists.names(message)
+    }
+}
+
+fn has_label(message: &Value, labels: &BTreeSet<String>) -> bool {
     message
         .get("labelIds")
         .and_then(Value::as_array)
-        .is_some_and(|labels| {
-            labels
-                .iter()
+        .is_some_and(|ids| {
+            ids.iter()
                 .filter_map(Value::as_str)
-                .any(|label| excluded.contains(label))
+                .any(|label| labels.contains(label))
         })
 }
 
@@ -621,7 +642,7 @@ pub(super) fn fetch_messages<C: GmailApi + ?Sized>(
     start: DateTime<Utc>,
     reach: Reach,
     extra_query: &str,
-    excluded: &BTreeSet<String>,
+    excluded: &Excluded<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<Listed> {
     let day_floor = (start - Duration::days(1)).format("%Y/%m/%d");
@@ -657,7 +678,7 @@ pub(super) fn fetch_messages<C: GmailApi + ?Sized>(
             gone += 1;
             continue;
         };
-        if is_excluded(&message, excluded) {
+        if excluded.message(&message) {
             continue;
         }
         let arrived = message_timestamp(&message)?;
@@ -680,9 +701,12 @@ pub(super) fn fetch_messages<C: GmailApi + ?Sized>(
     Ok(listed)
 }
 
+/// Resolves each pointer to its message, or to every message of its thread. A message from a
+/// list the deployment excludes is no answer, as it is never fetched, so a live resolve, the
+/// server's among them, stores and prints none of it.
 pub(super) fn resolve_with_api<C: GmailApi + ?Sized>(
     request: &ResolveRequest,
-    _config: &GmailConfig,
+    lists: &ExcludedLists,
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
@@ -705,9 +729,9 @@ pub(super) fn resolve_with_api<C: GmailApi + ?Sized>(
             }
             api.message(locator)?.into_iter().collect()
         };
-        for message in messages {
+        for message in messages.iter().filter(|message| !lists.names(message)) {
             records.push(record_from_message_with_scheme(
-                &message,
+                message,
                 &request.source.scheme,
             )?);
         }

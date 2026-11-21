@@ -10,8 +10,12 @@
 //! Mail that arrived after the window end waits for the next window. Mail dated later than any
 //! clock has reached ([`crate::source::latest_believable`]) is stored at the window end with a warning,
 //! so a wrong date cannot hold the cursor.
+//!
+//! Mail from a mailing list the deployment excludes by its `List-Id` ([`lists`]) is never stored,
+//! on any path that makes a record of a message: a history walk, a listing, and a resolve.
 
 mod fetch;
+mod lists;
 mod render;
 
 use anyhow::{Context as _, Result};
@@ -22,6 +26,7 @@ use super::{Message, Request, Source};
 use fetch::{
     emit_fetch_hello, emit_resolve_hello, fetch_with_api, resolve_with_api, GoogleGmailApi,
 };
+use lists::{ExcludedLists, EXCLUDE_LIST_IDS_ENV};
 
 pub use render::record_from_message;
 
@@ -51,15 +56,17 @@ impl Source for GmailSource {
         match request {
             Request::Fetch(request) => {
                 let config = parse_config(&request.config)?;
+                let lists = excluded_lists(&config)?;
                 emit_fetch_hello(request, sink)?;
                 let api = GoogleGmailApi::load()?;
-                fetch_with_api(request, &config, &api, sink)
+                fetch_with_api(request, &config, &lists, &api, sink)
             }
             Request::Resolve(request) => {
                 let config = parse_config(&request.config)?;
+                let lists = excluded_lists(&config)?;
                 emit_resolve_hello(request, sink)?;
                 let api = GoogleGmailApi::load()?;
-                resolve_with_api(request, &config, &api, sink)
+                resolve_with_api(request, &lists, &api, sink)
             }
         }
     }
@@ -70,6 +77,9 @@ impl Source for GmailSource {
 struct GmailConfig {
     #[serde(default = "default_query")]
     query: String,
+    /// List-IDs whose mail is never stored ([`lists`]).
+    #[serde(default)]
+    exclude_list_ids: Vec<String>,
 }
 
 fn default_query() -> String {
@@ -78,6 +88,17 @@ fn default_query() -> String {
 
 fn parse_config(value: &Value) -> Result<GmailConfig> {
     serde_json::from_value(value.clone()).context("parsing Gmail source configuration")
+}
+
+/// The lists whose mail this source never stores: the configuration's `exclude_list_ids` and
+/// those [`EXCLUDE_LIST_IDS_ENV`] names, in the environment of the process that runs the source,
+/// the fetch or the server, and never a caller's.
+fn excluded_lists(config: &GmailConfig) -> Result<ExcludedLists> {
+    ExcludedLists::from_parts(
+        &config.exclude_list_ids,
+        super::environment(EXCLUDE_LIST_IDS_ENV)?.as_deref(),
+    )
+    .context("reading the Gmail source's excluded List-IDs")
 }
 
 #[cfg(test)]

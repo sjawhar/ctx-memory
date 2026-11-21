@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::fixtures::{
     against, busy_comment, busy_issue, fetch_busy, guard, minute, pointers, run_fetch,
-    run_fetch_excluding, run_fetch_until, scratch, stream_ends, Busy, BUSY, BUSY_STREAM,
+    run_fetch_excluding, run_fetch_until, scratch, stream_ends, Busy, BUSY, BUSY_ID, BUSY_STREAM,
 };
 use crate::support::fake_http::FakeHttp;
 
@@ -34,7 +34,7 @@ fn a_run_the_budget_stopped_reads_the_follow_up_it_did_not_reach_next_time() -> 
         200,
         &json!({
             "total_count": 1,
-            "repositories": [{ "full_name": "example-org/example-repo", "default_branch": "main" }],
+            "repositories": [{ "id": 1004, "full_name": "example-org/example-repo", "default_branch": "main" }],
         })
         .to_string(),
     )?;
@@ -119,7 +119,7 @@ fn a_review_held_over_two_runs(api: &FakeHttp) -> Result<()> {
         200,
         &json!({
             "total_count": 1,
-            "repositories": [{ "full_name": "example-org/example-repo", "default_branch": "main" }],
+            "repositories": [{ "id": 1004, "full_name": "example-org/example-repo", "default_branch": "main" }],
         })
         .to_string(),
     )?;
@@ -731,6 +731,61 @@ fn an_excluded_commit_stream_is_not_read() -> Result<()> {
         Some("2026-10-27T00:00:00Z"),
         "the stream is read to the window end, with no head to compare from"
     );
+    Ok(())
+}
+
+/// A repository `CTX_GITHUB_EXCLUDE_REPOSITORY_IDS` names by GitHub's id of it is not read at
+/// all: the source lists no stream for it and sends no request about it, so a renamed or
+/// transferred repository, whose pointers no longer match a pattern written for its old name,
+/// stays out. Control: the same run without the variable reads its issue.
+#[test]
+fn a_repository_the_environment_excludes_by_id_is_not_read() -> Result<()> {
+    let _guard = guard();
+    for excluded in [true, false] {
+        let busy = Busy {
+            issues: vec![busy_issue(1, "2026-10-26T12:00:00Z")],
+            ..Busy::default()
+        };
+        let (address, shared) = busy.serve()?;
+        let messages = against(address, || {
+            if excluded {
+                std::env::set_var(
+                    "CTX_GITHUB_EXCLUDE_REPOSITORY_IDS",
+                    format!("9000000003,{BUSY_ID}"),
+                );
+            }
+            let run = run_fetch(
+                json!({ "installations": [1_000_002] }),
+                scratch(&format!("excluded-by-id-{excluded}"))?,
+                BTreeMap::from([(BUSY_STREAM.to_owned(), "2026-10-01T00:00:00Z".to_owned())]),
+            );
+            std::env::remove_var("CTX_GITHUB_EXCLUDE_REPOSITORY_IDS");
+            run
+        })?;
+        let requests = shared
+            .lock()
+            .map_err(|_| anyhow!("the emulated GitHub was poisoned"))?
+            .requests
+            .clone();
+        let read = requests.iter().any(|target| target.starts_with(BUSY));
+        let streams = stream_ends(&messages)
+            .into_iter()
+            .map(|(stream, ..)| stream)
+            .collect::<Vec<_>>();
+        if excluded {
+            assert!(pointers(&messages).is_empty(), "{:?}", pointers(&messages));
+            assert!(streams.is_empty(), "{streams:?}");
+            assert!(!read, "no request names the repository: {requests:?}");
+        } else {
+            assert!(
+                pointers(&messages).contains("github:example-org/busy#1"),
+                "{:?}",
+                pointers(&messages)
+            );
+            assert_eq!(streams, [BUSY_STREAM]);
+            assert!(read, "{requests:?}");
+        }
+    }
     Ok(())
 }
 
