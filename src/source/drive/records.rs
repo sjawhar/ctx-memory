@@ -66,9 +66,18 @@ impl Bounds {
     }
 }
 
+/// What reading one file gave: its record, or the key of the content net its export names.
+pub(super) enum Read {
+    Kept(Box<Record>),
+    Withheld(String),
+}
+
+const NET_ONLY_FIELDS: [&str; 2] = ["description", "permissions"];
+
 /// Builds one record: a Google document's exported text, or metadata with a warning when the
-/// file is not a Google document or Drive will not export this file. `None` when the export, all
-/// of it Drive gives, names a key of `net`: the file is not stored, and no warning names it.
+/// file is not a Google document or Drive will not export this file. The record stores none of
+/// the [`NET_ONLY_FIELDS`]. [`Read::Withheld`] when the export, all of it Drive gives, names a
+/// key of `net`: the file is not stored, and no warning names it.
 ///
 /// A file changed after the window ends is a context record: the window must not carry a
 /// record after its end, and the file is still searchable and citable. A file dated later than
@@ -83,7 +92,7 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
     net: &ContentNet,
     bounds: Bounds,
     warnings: &mut Vec<String>,
-) -> Result<Option<Record>> {
+) -> Result<Read> {
     let modified = file_timestamp(file, "modifiedTime")?;
     let id = required_file_string(file, "id")?;
     let name = file.get("name").and_then(Value::as_str);
@@ -92,10 +101,10 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let named = name.unwrap_or("(unnamed)");
-    let read = if net.is_empty() {
-        limit
-    } else {
+    let read = if net.has_keys() {
         limit.max(DRIVE_EXPORT_CEILING)
+    } else {
+        limit
     };
     let exported = export_mime(mime)
         .map(|export| api.export(id, export, read))
@@ -106,8 +115,8 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
             mut text,
             mut truncated,
         }) => {
-            if net.matches(&text) {
-                return Ok(None);
+            if let Some(key) = net.key_in(&text) {
+                return Ok(Read::Withheld(key.to_owned()));
             }
             // Read past the cap for the net alone: the record keeps what the cap allows.
             if read > limit && text.len() > limit {
@@ -160,7 +169,13 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
             .and_then(|owners| owners.first())
             .and_then(|owner| display_name(Some(owner)))
     });
-    Ok(Some(Record {
+    let mut raw = file.clone();
+    if let Some(fields) = raw.as_object_mut() {
+        for field in NET_ONLY_FIELDS {
+            fields.remove(field);
+        }
+    }
+    Ok(Read::Kept(Box::new(Record {
         pointer: format!("{scheme}:{id}"),
         stream: stream.to_owned(),
         ts,
@@ -176,8 +191,8 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
         text,
         aliases: vec![id.to_owned()],
         context,
-        raw: file.clone(),
-    }))
+        raw,
+    })))
 }
 
 /// The text export a Google document kind is stored as.

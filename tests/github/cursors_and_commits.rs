@@ -741,6 +741,7 @@ fn an_excluded_commit_stream_is_not_read() -> Result<()> {
 #[test]
 fn a_repository_the_environment_excludes_by_id_is_not_read() -> Result<()> {
     let _guard = guard();
+    ctx_memory::source::enable_content_net();
     for excluded in [true, false] {
         let busy = Busy {
             issues: vec![busy_issue(1, "2026-10-26T12:00:00Z")],

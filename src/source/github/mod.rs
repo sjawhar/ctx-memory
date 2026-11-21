@@ -42,7 +42,7 @@ use records::stream_id;
 const INSTALLATIONS_ENV: &str = "CTX_GITHUB_INSTALLATIONS";
 /// GitHub's ids of repositories the source never reads, one per comma, added to the
 /// configuration's `exclude_repository_ids`.
-const EXCLUDE_REPOSITORY_IDS_ENV: &str = "CTX_GITHUB_EXCLUDE_REPOSITORY_IDS";
+pub(super) const EXCLUDE_REPOSITORY_IDS_ENV: &str = "CTX_GITHUB_EXCLUDE_REPOSITORY_IDS";
 /// How many paid requests one run may spend before it holds every unfinished cursor.
 const DEFAULT_REQUEST_BUDGET: u32 = 600;
 /// A run stops reading an installation once GitHub reports its `core` rate limit under this.
@@ -83,7 +83,19 @@ impl Source for GithubSource {
                     &config,
                     super::environment(EXCLUDE_REPOSITORY_IDS_ENV)?.as_deref(),
                 )?;
+                if !excluded.is_empty() {
+                    super::content_net::require(
+                        "exclude_repository_ids or CTX_GITHUB_EXCLUDE_REPOSITORY_IDS",
+                    )?;
+                }
+                let list_ids = declared_list_ids(
+                    super::environment(super::gmail::EXCLUDE_LIST_IDS_ENV)?.as_deref(),
+                );
                 let client = GithubClient::load(&credentials::Config::new())?;
+                let excluded = Excluded {
+                    ids: excluded,
+                    list_ids,
+                };
                 fetch_with_api(request, &config, &installations, &excluded, &client, sink)
             }
             Request::Resolve(request) => emit_resolve_hello(request, sink),
@@ -255,14 +267,37 @@ struct Listed {
     warnings: Vec<String>,
 }
 
-/// Lists each installation's repositories and drops those the deployment excludes by id. Every
-/// pointer, request and stream of a repository starts from its listing, so one excluded by id is
-/// dropped here, under whatever name GitHub gives it now. An entry with no id is not read, since
-/// no exclusion by id could be checked against it; the warning counts such entries and names
-/// none, as a name may be one the deployment excludes.
+/// The repositories the deployment excludes by id, and the List-IDs its Gmail source excludes,
+/// lowercased, which a renamed repository's mail needs.
+#[derive(Default)]
+struct Excluded {
+    ids: BTreeSet<u64>,
+    list_ids: BTreeSet<String>,
+}
+
+/// The List-IDs `environment`, the value of `CTX_GMAIL_EXCLUDE_LIST_IDS`, names, lowercased.
+fn declared_list_ids(environment: Option<&str>) -> BTreeSet<String> {
+    environment
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Lists each installation's repositories and drops those the deployment excludes by id, each
+/// drop logged by the repository's stream ([`super::content_net::withheld`]). Every pointer,
+/// request and stream of a repository starts from its listing, so one excluded by id is dropped
+/// here, under whatever name GitHub gives it now. Its notification mail, though, the Gmail
+/// source drops by the List-ID of a name, `<repo>.<owner>.github.com`: a warning names an
+/// excluded repository whose current List-ID `CTX_GMAIL_EXCLUDE_LIST_IDS` does not, so a rename
+/// or a transfer is seen. An entry with no id is not read, since no exclusion by id could be
+/// checked against it; the warning counts such entries and names none, as a name may be one
+/// the deployment excludes.
 fn list_repositories<C: GithubApi + ?Sized>(
     installations: &[u64],
-    excluded: &BTreeSet<u64>,
+    excluded: &Excluded,
     api: &C,
 ) -> Result<Listed> {
     let mut listed = Listed {
@@ -289,11 +324,21 @@ fn list_repositories<C: GithubApi + ?Sized>(
             unidentified.push((installation, listing.without_id));
         }
         for repo in listing.repos {
-            if excluded.contains(&repo.id) {
-                listed.withheld.insert(stream_id(&repo));
-            } else {
+            if !excluded.ids.contains(&repo.id) {
                 listed.repos.push((installation, repo));
+                continue;
             }
+            let stream = stream_id(&repo);
+            super::content_net::withheld(&super::content_net::Hit::RepositoryId, &stream);
+            let mut list_id = format!("{}.{}.github.com", repo.name, repo.owner);
+            list_id.make_ascii_lowercase();
+            if !excluded.list_ids.contains(&list_id) {
+                listed.warnings.push(format!(
+                    "repository {}, which the deployment excludes by id, is {}/{} now; the Gmail source drops its notification mail by the List-ID {list_id}, which CTX_GMAIL_EXCLUDE_LIST_IDS does not name, so its mail is stored until the deployment names it",
+                    repo.id, repo.owner, repo.name
+                ));
+            }
+            listed.withheld.insert(stream);
         }
     }
     for (installation, count) in unidentified {
@@ -310,7 +355,7 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
     request: &FetchRequest,
     config: &GithubConfig,
     installations: &[u64],
-    excluded: &BTreeSet<u64>,
+    excluded: &Excluded,
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {

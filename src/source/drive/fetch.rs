@@ -12,8 +12,9 @@ use crate::source::{
     SliceCursor, TokenCursor, MAX_SLICE_DAYS, PROTOCOL_VERSION,
 };
 
+use super::super::content_net::{self, Hit};
 use super::api::DriveApi;
-use super::records::{file_timestamp, record_from_file, required_file_string, Bounds, Place};
+use super::records::{file_timestamp, record_from_file, required_file_string, Bounds, Place, Read};
 use super::DriveConfig;
 
 /// Everything the user can see, through the Drive changes feed.
@@ -79,13 +80,14 @@ struct Collected {
 
 impl Collected {
     /// Reads `file` into a record of `stream` and keeps it, with the warnings reading it raised,
-    /// unless the file names a key of the content net (`config.net`): then neither is kept, so
-    /// the window holds nothing of the file, not even a warning naming it. A file whose metadata
-    /// (its name, its description or any other field the listing gives) names a key is not
-    /// exported at all; one whose export does, read up to Drive's own export limit though the
-    /// record keeps `max_export_bytes` of it, is dropped after. A file that is not a Google
-    /// document, or whose export Drive refuses, is stored as its metadata alone, which the net
-    /// checks. The description is asked for the net alone: the record does not store it.
+    /// unless the content net (`config.net`) withholds it: then neither is kept, so the window
+    /// holds nothing of the file, not even a warning naming it, and the drop is logged by its
+    /// pointer ([`content_net::withheld`]). A file is withheld when an excluded address owns it
+    /// or holds a permission on it, or its metadata (its name, its description or any other
+    /// field the listing gives) names a key, before it is exported at all; or when its export,
+    /// read up to Drive's own export limit though the record keeps `max_export_bytes` of it, or
+    /// its record names one. A file that is not a Google document, or whose export Drive
+    /// refuses, is stored as its metadata alone, which the net checks.
     fn read<C: DriveApi + ?Sized>(
         &mut self,
         file: &Value,
@@ -95,34 +97,52 @@ impl Collected {
         config: &DriveConfig,
         bounds: Bounds,
     ) -> Result<()> {
-        if config.net.matches_value(file) {
+        let pointer = || {
+            format!(
+                "{}:{}",
+                request.source.scheme,
+                file.get("id").and_then(Value::as_str).unwrap_or_default()
+            )
+        };
+        let net = &config.net;
+        let held_by_an_address = ["owners", "permissions"]
+            .iter()
+            .filter_map(|field| file.get(field).and_then(Value::as_array))
+            .flatten()
+            .filter_map(|holder| holder.get("emailAddress").and_then(Value::as_str))
+            .any(|address| net.names_address(address));
+        if held_by_an_address {
+            content_net::withheld(&Hit::Address, &pointer());
             return Ok(());
         }
-        let described;
-        let file = match file.as_object() {
-            Some(fields) if fields.contains_key("description") => {
-                let mut fields = fields.clone();
-                fields.remove("description");
-                described = Value::Object(fields);
-                &described
-            }
-            _ => file,
-        };
+        if let Some(key) = net.key_in_value(file) {
+            content_net::withheld(&Hit::Key(key.to_owned()), &pointer());
+            return Ok(());
+        }
         let mut warnings = Vec::new();
-        let record = record_from_file(
+        let read = record_from_file(
             file,
             stream,
             &request.source.scheme,
             api,
             config.max_export_bytes,
-            &config.net,
+            net,
             bounds,
             &mut warnings,
         )?;
-        if let Some(record) = record.filter(|record| !config.net.matches_record(record)) {
-            self.records.push(record);
-            self.warnings.extend(warnings);
+        let record = match read {
+            Read::Kept(record) => record,
+            Read::Withheld(key) => {
+                content_net::withheld(&Hit::Key(key), &pointer());
+                return Ok(());
+            }
+        };
+        if let Some(hit) = net.hit_in_record(&record) {
+            content_net::withheld(&hit, &record.pointer);
+            return Ok(());
         }
+        self.records.push(*record);
+        self.warnings.extend(warnings);
         Ok(())
     }
 }

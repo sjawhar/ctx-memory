@@ -14,10 +14,10 @@ use crate::source::{
     PROTOCOL_VERSION,
 };
 
-use super::super::content_net::ContentNet;
+use super::super::content_net::{self, ContentNet, Hit};
 use super::lists::ExcludedLists;
 use super::render::{
-    any_text_part, external_text_parts, message_timestamp, part_holds,
+    decode_body, external_text_parts, find_in_inline_parts, message_timestamp,
     record_from_message_with_scheme, render_gmail, required_string,
 };
 use super::{GmailConfig, STREAM};
@@ -331,6 +331,7 @@ fn collect<C: GmailApi + ?Sized>(
     let excluded = Excluded {
         labels: excluded_labels(&config.query),
         withheld,
+        scheme: &request.source.scheme,
     };
     let cursor = request.cursors.get(STREAM).map(String::as_str);
     if let Some(slice) = cursor.and_then(SliceCursor::parse) {
@@ -448,7 +449,7 @@ fn collect_from_history<C: GmailApi + ?Sized>(
                 gone += 1;
                 continue;
             };
-            if excluded.message(&message, api)? {
+            if excluded.message(&message, api, warnings)? {
                 continue;
             }
             let arrived = message_timestamp(&message)?;
@@ -612,45 +613,57 @@ pub(super) fn excluded_labels(query: &str) -> BTreeSet<String> {
     labels
 }
 
+const ADDRESS_HEADERS: [&str; 6] = ["From", "Sender", "To", "Cc", "Bcc", "Reply-To"];
+
 /// The mail the deployment never stores, on every path that reads a message: a fetch's and a
 /// resolve's.
 #[derive(Default)]
 pub(super) struct Withheld {
     /// Mail from one of these mailing lists.
     pub(super) lists: ExcludedLists,
-    /// Mail whose text names one of these keys.
+    /// Mail whose text names one of these keys, or that one of these addresses takes part in.
     pub(super) net: ContentNet,
 }
 
 impl Withheld {
-    /// Whether `message`, as Gmail answers it, is from an excluded list, or names an excluded key
-    /// in any string Gmail gives (its headers, snippet and file names among them), in any of its
-    /// text parts, decoded, HTML ones also with their tags taken out and entities decoded, in a
-    /// text part Gmail keeps apart, which `api` reads, or in the text its record would store. A
-    /// part that is not text, such as a PDF, is not read: its record holds its file name alone,
-    /// which is checked.
+    /// Why `message`, as Gmail answers it, is never stored, if it is not: it is from an excluded
+    /// list; an excluded address is in its `From`, `Sender`, `To`, `Cc`, `Bcc` or `Reply-To`; or
+    /// it names an excluded key in any string Gmail gives (its headers, snippet and file names
+    /// among them), in any part Gmail sends inline, whatever its type, in a text part Gmail keeps
+    /// apart, which `api` reads, or in the text its record would store. A part that is not text
+    /// and that Gmail keeps apart, such as a PDF, is not read: the record holds its file name
+    /// alone, which is checked.
     ///
     /// # Errors
     ///
-    /// Returns an error when Gmail does not answer for a text part it keeps apart, so a message
-    /// that could not be checked is never stored.
-    fn message<C: GmailApi + ?Sized>(&self, message: &Value, api: &C) -> Result<bool> {
+    /// Returns an error naming `pointer` when Gmail does not answer for a text part it keeps
+    /// apart, so a message that could not be checked is never stored.
+    fn hit<C: GmailApi + ?Sized>(
+        &self,
+        message: &Value,
+        pointer: &str,
+        api: &C,
+    ) -> Result<Option<Hit>> {
         if self.lists.names(message) {
-            return Ok(true);
+            return Ok(Some(Hit::ListId));
         }
         if self.net.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
-        let names = |text: &str| self.net.matches(text);
-        if self.net.matches_value(message)
-            || any_text_part(message, &names)
-            || names(&render_gmail(message))
-        {
-            return Ok(true);
+        if self.names_an_address(message) {
+            return Ok(Some(Hit::Address));
+        }
+        let net = &self.net;
+        let key = net
+            .key_in_value(message)
+            .or_else(|| find_in_inline_parts(message, &|text| net.key_in(text)))
+            .or_else(|| net.key_in(&render_gmail(message)));
+        if let Some(key) = key {
+            return Ok(Some(Hit::Key(key.to_owned())));
         }
         let external = external_text_parts(message);
         if external.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let id = required_string(message, "id", "Gmail message")?;
         for part in external {
@@ -658,14 +671,35 @@ impl Withheld {
                 .pointer("/body/attachmentId")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let data = api
-                .attachment(id, attachment)
-                .with_context(|| format!("reading a text part of Gmail message {id}"))?;
-            if part_holds(part, &data, &names) {
-                return Ok(true);
+            let data = api.attachment(id, attachment).with_context(|| {
+                format!("Gmail did not answer for a text part of {pointer} that it keeps apart")
+            })?;
+            if let Some(key) = net.key_in(&decode_body(part, &data)) {
+                return Ok(Some(Hit::Key(key.to_owned())));
             }
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// Whether an excluded address is in one of the [`ADDRESS_HEADERS`] of `message`.
+    fn names_an_address(&self, message: &Value) -> bool {
+        message
+            .pointer("/payload/headers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|header| {
+                header
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| {
+                        ADDRESS_HEADERS
+                            .iter()
+                            .any(|address| address.eq_ignore_ascii_case(name))
+                    })
+            })
+            .filter_map(|header| header.get("value").and_then(Value::as_str))
+            .any(|value| self.net.names_address(value))
     }
 }
 
@@ -675,16 +709,46 @@ pub(super) struct Excluded<'a> {
     pub(super) labels: BTreeSet<String>,
     /// Mail the deployment never stores.
     pub(super) withheld: &'a Withheld,
+    /// The scheme of the source's pointers, which a drop is logged by.
+    pub(super) scheme: &'a str,
 }
 
 impl Excluded<'_> {
     /// Whether `message` is mail a fetch never stores, read as Gmail answers it and before it
-    /// is a record, on the history path and the listing path alike.
-    fn message<C: GmailApi + ?Sized>(&self, message: &Value, api: &C) -> Result<bool> {
+    /// is a record, on the history path and the listing path alike. A message the deployment
+    /// withholds is logged by its pointer ([`content_net::withheld`]); a promotion is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the message could not be checked, after a warning that names its
+    /// pointer and the cause, and nothing of its content.
+    fn message<C: GmailApi + ?Sized>(
+        &self,
+        message: &Value,
+        api: &C,
+        warnings: &mut Vec<String>,
+    ) -> Result<bool> {
         if has_label(message, &self.labels) {
             return Ok(true);
         }
-        self.withheld.message(message, api)
+        let pointer = format!(
+            "{}:{}",
+            self.scheme,
+            required_string(message, "id", "Gmail message")?
+        );
+        match self.withheld.hit(message, &pointer, api) {
+            Ok(Some(hit)) => {
+                content_net::withheld(&hit, &pointer);
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(error) => {
+                warnings.push(format!(
+                    "{error:#}; the stream stops before this message, and the next fetch reads it again"
+                ));
+                Err(error)
+            }
+        }
     }
 }
 
@@ -760,7 +824,7 @@ pub(super) fn fetch_messages<C: GmailApi + ?Sized>(
             gone += 1;
             continue;
         };
-        if excluded.message(&message, api)? {
+        if excluded.message(&message, api, warnings)? {
             continue;
         }
         let arrived = message_timestamp(&message)?;
@@ -812,7 +876,13 @@ pub(super) fn resolve_with_api<C: GmailApi + ?Sized>(
             api.message(locator)?.into_iter().collect()
         };
         for message in &messages {
-            if withheld.message(message, api)? {
+            let pointer = format!(
+                "{}:{}",
+                request.source.scheme,
+                required_string(message, "id", "Gmail message")?
+            );
+            if let Some(hit) = withheld.hit(message, &pointer, api)? {
+                content_net::withheld(&hit, &pointer);
                 continue;
             }
             records.push(record_from_message_with_scheme(

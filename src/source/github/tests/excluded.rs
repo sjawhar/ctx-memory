@@ -133,6 +133,54 @@ fn a_repository_excluded_by_id_is_never_read_under_any_name() -> Result<()> {
     Ok(())
 }
 
+/// A repository excluded by id is logged by its stream at each run, and a warning names it when
+/// its current List-ID, which follows its name, is not one `CTX_GMAIL_EXCLUDE_LIST_IDS` names:
+/// after a rename its notification mail would be stored. Control: with its current List-ID
+/// named, in any case, no warning names it; the drop is still logged.
+#[test]
+fn a_repository_excluded_by_id_under_a_new_name_is_warned_of() -> Result<()> {
+    for (declared, warned) in [
+        ("private.example-org.github.com", true),
+        (
+            "Private-Renamed.Example-Org.github.com,other.example-org.github.com",
+            false,
+        ),
+    ] {
+        let (fake, excluded, kept) = installation("example-org", "private-renamed");
+        let cursors = BTreeMap::from([
+            (stream_id(&excluded), CURSOR.to_owned()),
+            (stream_id(&kept), CURSOR.to_owned()),
+        ]);
+        let config = GithubConfig {
+            exclude_repository_ids: vec![EXCLUDED_ID],
+            ..config(vec![1], 600, 2000)
+        };
+        crate::source::content_net::tests::take_logged();
+        let outcome = run_declaring(&fake, &request(cursors)?, &config, Some(declared))?;
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let named = outcome
+            .warnings
+            .iter()
+            .filter(|warning| warning.message.contains("example-org/private-renamed"))
+            .collect::<Vec<_>>();
+        assert_eq!(named.len(), usize::from(warned), "{declared}: {named:?}");
+        assert!(
+            named.iter().all(|warning| warning
+                .message
+                .contains("private-renamed.example-org.github.com")),
+            "{named:?}"
+        );
+        assert_eq!(
+            crate::source::content_net::tests::take_logged(),
+            [format!(
+                r#"{{"event":"withheld","reason":"private-repository-id","pointer":"{}"}}"#,
+                stream_id(&excluded)
+            )]
+        );
+    }
+    Ok(())
+}
+
 /// `CTX_GITHUB_EXCLUDE_REPOSITORY_IDS` adds ids to the configuration's, so neither list takes a
 /// repository off the other, and an entry that is no id is an error, so a run never reads what
 /// a mistyped setting meant to exclude.

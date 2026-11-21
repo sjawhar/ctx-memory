@@ -203,6 +203,69 @@ fn a_file_whose_description_names_a_key_is_not_exported_or_stored() -> Result<()
     Ok(())
 }
 
+/// A file an excluded address owns, or holds a permission on, is not exported and not stored,
+/// though it names no key; the drop is logged by pointer, never by name or address. A file only
+/// public addresses hold is kept, and its record stores no permission. Control: with no address
+/// configured, all three files are stored.
+#[test]
+fn a_file_an_excluded_address_owns_or_is_shared_with_is_not_stored() -> Result<()> {
+    let held_by = |id: &str, field: &str, address: &str| {
+        let mut file = document(id, "Quarterly plan");
+        if let Some(fields) = file.as_object_mut() {
+            fields.insert(field.to_owned(), json!([{"emailAddress": address}]));
+        }
+        file
+    };
+    let files = vec![
+        held_by(NAMED, "owners", "Outside@Partner.example"),
+        held_by(INSIDE, "permissions", "outside@partner.example"),
+        held_by(KEPT, "permissions", "ada@theorem.example"),
+    ];
+    let exports = BTreeMap::from([
+        (NAMED.to_owned(), ("plan".to_owned(), false)),
+        (INSIDE.to_owned(), ("plan".to_owned(), false)),
+        (KEPT.to_owned(), ("plan".to_owned(), false)),
+    ]);
+    for excluded in [true, false] {
+        let api = listing_of(files.clone(), exports.clone(), BTreeMap::new());
+        let config = listing_config(if excluded {
+            json!({"exclude_emails": ["outside@partner.example"]})
+        } else {
+            json!({})
+        });
+        crate::source::content_net::tests::take_logged();
+        let messages = run_fetch(&api, &request(config, None)?)?;
+        let logged = crate::source::content_net::tests::take_logged();
+        let mut stored = records(&messages)
+            .into_iter()
+            .map(|record| {
+                assert!(record.raw.get("permissions").is_none(), "{}", record.raw);
+                record.pointer
+            })
+            .collect::<Vec<_>>();
+        stored.sort();
+        if excluded {
+            assert_eq!(stored, [format!("drive:{KEPT}")]);
+            assert!(!exported(&api, NAMED) && !exported(&api, INSIDE));
+            let mut want = [NAMED, INSIDE].map(|id| {
+                format!(
+                    r#"{{"event":"withheld","reason":"private-address","pointer":"drive:{id}"}}"#
+                )
+            });
+            want.sort();
+            let mut logged = logged;
+            logged.sort();
+            assert_eq!(logged, want);
+        } else {
+            let mut all = [NAMED, INSIDE, KEPT].map(|id| format!("drive:{id}"));
+            all.sort();
+            assert_eq!(stored, all);
+            assert!(logged.is_empty(), "{logged:?}");
+        }
+    }
+    Ok(())
+}
+
 /// An export longer than `max_export_bytes` is read whole, up to Drive's own export limit, while
 /// a net is set: a key past the cap withholds the file, and no warning names it. Control: under a
 /// net that names another key, the file is stored with the first `max_export_bytes` of its text

@@ -26,6 +26,7 @@ impl Run<'_> {
         let root = scratch(&format!("content-net-{}-{excluded}", self.kind))?;
         let server = FakeGoogle::start(self.routes)?;
         server.use_in_environment("ya29.content-net-test");
+        ctx_memory::source::enable_content_net();
         if excluded {
             std::env::set_var("CTX_EXCLUDE_KEYS", "OTHER,SYNTH");
         }

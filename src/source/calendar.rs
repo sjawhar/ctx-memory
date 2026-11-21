@@ -31,7 +31,7 @@ use crate::atomic::write_replace;
 use crate::exclude::Exclusion;
 use crate::record::Record;
 
-use super::content_net::ContentNet;
+use super::content_net::{self, ContentNet, Hit};
 use super::{
     token_cursor, window_start, FetchRequest, Message, Op, Request, ResolveRequest, Source,
     TokenCursor, PROTOCOL_VERSION,
@@ -86,7 +86,7 @@ impl Source for CalendarSource {
         match request {
             Request::Fetch(request) => {
                 let mut config = parse_config(&request.config)?;
-                config.net = ContentNet::configured(&config.exclude_keys)?;
+                config.net = ContentNet::configured(&config.exclude_keys, &config.exclude_emails)?;
                 emit_fetch_hello(request, &config, sink)?;
                 let api = GoogleCalendarApi::load()?;
                 fetch_with_api(request, &config, &api, sink)
@@ -106,8 +106,11 @@ struct CalendarConfig {
     /// Keys of the content net: an event whose text names one is never stored.
     #[serde(default)]
     exclude_keys: Vec<String>,
-    /// The net `exclude_keys` and `CTX_EXCLUDE_KEYS` make, built by the process that runs the
-    /// fetch, after the configuration is read.
+    /// Addresses of the content net: an event one organizes, creates or attends is never stored.
+    #[serde(default)]
+    exclude_emails: Vec<String>,
+    /// The net `exclude_keys`, `exclude_emails`, `CTX_EXCLUDE_KEYS` and `CTX_EXCLUDE_EMAILS`
+    /// make, built by the process that runs the fetch, after the configuration is read.
     #[serde(skip)]
     net: ContentNet,
 }
@@ -539,11 +542,31 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
 
 impl Collected {
     /// Adds `record`, of `event` at `start`, and lists the event as recorded there, unless the
-    /// record names a key of the content net: then the record is dropped and the event is taken
-    /// off the list, though a stored window listed it before, so nothing more of it is recorded,
-    /// its later cancellation included, while it is about a private project.
+    /// content net withholds it: an excluded address organizes, created or attends it, or the
+    /// record names a key. Then the record is dropped, the drop is logged by its pointer
+    /// ([`content_net::withheld`]), and the event is taken off the list, though a stored window
+    /// listed it before, so nothing more of it is recorded, its later cancellation included,
+    /// while it is about a private project.
     fn keep(&mut self, net: &ContentNet, record: Record, event: &Value, start: DateTime<Utc>) {
-        if net.matches_record(&record) {
+        let taken_part_in = ["organizer", "creator"]
+            .iter()
+            .filter_map(|role| event.get(role))
+            .chain(
+                event
+                    .get("attendees")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten(),
+            )
+            .filter_map(|person| person.get("email").and_then(Value::as_str))
+            .any(|address| net.names_address(address));
+        let hit = if taken_part_in {
+            Some(Hit::Address)
+        } else {
+            net.hit_in_record(&record)
+        };
+        if let Some(hit) = hit {
+            content_net::withheld(&hit, &record.pointer);
             if let Some(id) = event_id(event) {
                 self.recorded.remove(id);
             }
@@ -982,7 +1005,8 @@ mod tests {
     /// environment.
     fn run_fetch(api: &FakeCalendarApi, request: &FetchRequest) -> Result<Vec<Message>> {
         let mut config = parse_config(&request.config)?;
-        config.net = ContentNet::from_parts(&config.exclude_keys, None)?;
+        config.net = ContentNet::from_parts(&config.exclude_keys, None)?
+            .with_addresses(&config.exclude_emails, None)?;
         let mut messages = Vec::new();
         fetch_with_api(request, &config, api, &mut |message| {
             messages.push(message);
@@ -2598,6 +2622,85 @@ mod tests {
                 withheld,
                 "{agenda}: {list}"
             );
+        }
+        Ok(())
+    }
+
+    /// An event an excluded address organizes, created or attends is not stored, though it names
+    /// no key, and nor is one whose HTML description splits a key with markup; each drop is
+    /// logged by pointer alone. An event only public addresses take part in is kept. Control:
+    /// with no key or address configured, all five are stored and nothing is logged.
+    #[test]
+    fn an_event_an_excluded_address_takes_part_in_is_not_stored() -> Result<()> {
+        let with = |id: &str, field: &str, value: Value| {
+            let mut item = event(id, "2026-10-25T09:00:00Z", "2026-10-25T10:00:00Z", None);
+            if let Some(fields) = item.as_object_mut() {
+                fields.insert(field.to_owned(), value);
+            }
+            item
+        };
+        let items = vec![
+            with(
+                "EVENT-ORGANIZED",
+                "organizer",
+                json!({"email": "Outside@Partner.example"}),
+            ),
+            with(
+                "EVENT-CREATED",
+                "creator",
+                json!({"email": "outside@partner.example"}),
+            ),
+            with(
+                "EVENT-ATTENDED",
+                "attendees",
+                json!([{"email": "ada@theorem.example"}, {"email": "outside@partner.example"}]),
+            ),
+            with(
+                "EVENT-HTML",
+                "description",
+                json!("<p>Review <b>SYNTH</b>-12</p>"),
+            ),
+            with(
+                "EVENT-PUBLIC",
+                "attendees",
+                json!([{"email": "ada@theorem.example"}]),
+            ),
+        ];
+        for excluded in [true, false] {
+            let fake = api(vec![listing("sync-2", items.clone())]);
+            let mut request = request(Some("sync-1@2026-10-24T18:00:00Z"))?;
+            request.config = if excluded {
+                json!({
+                    "calendars": ["team@example.com"],
+                    "exclude_keys": ["SYNTH"],
+                    "exclude_emails": ["outside@partner.example"]
+                })
+            } else {
+                json!({"calendars": ["team@example.com"]})
+            };
+            crate::source::content_net::tests::take_logged();
+            let messages = run_fetch(&fake, &request)?;
+            let logged = crate::source::content_net::tests::take_logged();
+            let mut stored = records(&messages)
+                .into_iter()
+                .map(|record| record.pointer)
+                .collect::<Vec<_>>();
+            stored.sort();
+            if excluded {
+                assert_eq!(stored, ["gcal:team@example.com/EVENT-PUBLIC"]);
+                assert_eq!(
+                    logged,
+                    [
+                        r#"{"event":"withheld","reason":"private-address","pointer":"gcal:team@example.com/EVENT-ORGANIZED"}"#,
+                        r#"{"event":"withheld","reason":"private-address","pointer":"gcal:team@example.com/EVENT-CREATED"}"#,
+                        r#"{"event":"withheld","reason":"private-address","pointer":"gcal:team@example.com/EVENT-ATTENDED"}"#,
+                        r#"{"event":"withheld","reason":"private-content-net","key":"SYNTH","pointer":"gcal:team@example.com/EVENT-HTML"}"#,
+                    ]
+                );
+            } else {
+                assert_eq!(stored.len(), 5, "{stored:?}");
+                assert!(logged.is_empty(), "{logged:?}");
+            }
         }
         Ok(())
     }

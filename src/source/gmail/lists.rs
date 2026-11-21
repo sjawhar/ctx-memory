@@ -12,7 +12,7 @@ use serde_json::Value;
 
 /// The environment variable that adds List-IDs, one per comma, to the source's
 /// `exclude_list_ids`.
-pub(super) const EXCLUDE_LIST_IDS_ENV: &str = "CTX_GMAIL_EXCLUDE_LIST_IDS";
+pub(in crate::source) const EXCLUDE_LIST_IDS_ENV: &str = "CTX_GMAIL_EXCLUDE_LIST_IDS";
 
 /// The List-IDs whose mail is never stored, lowercased: a List-ID is a domain-like name, so
 /// `Busy.Example-Org.github.com` and `busy.example-org.github.com` are one list.
@@ -48,6 +48,10 @@ impl ExcludedLists {
             ids.insert(id.to_ascii_lowercase());
         }
         Ok(Self(ids))
+    }
+    /// Whether this names no list.
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Whether `message`, a Gmail API message in `full` format, came from a list this names: one

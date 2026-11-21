@@ -1,6 +1,6 @@
 //! Mail the deployment withholds: by its `List-Id`, and by the content net's keys.
 
-use super::*;
+use super::fixtures::*;
 
 /// GitHub's notification mail about a repository the deployment excludes, and mail from no list.
 const LISTED: &str = "dddddddddddddddd";
@@ -473,10 +473,10 @@ fn encoded(text: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text)
 }
 
-/// An HTML alternative whose key markup (`SYNTH<b>-12</b>`) or an entity (`SYNTH&#45;12`) splits
-/// is read as a record's text reads HTML, tags out and entities decoded, though the record takes
-/// the plain alternative, which names nothing: the message is stored on no path. Control: with no
-/// key configured, every path stores both.
+/// An HTML alternative whose key markup (`SYNTH<b>-12</b>`, `<a href=…>SYNTH</a>-12`) or an
+/// entity (`SYNTH&#45;12`, beside a bare `&` in `Q&A`) splits is read as a reader sees it,
+/// though the record takes the plain alternative, which names nothing: the message is stored
+/// on no path. Control: with no key configured, every path stores them all.
 #[test]
 fn an_html_alternative_that_names_a_key_through_markup_is_not_stored_on_any_path() -> Result<()> {
     let messages = [
@@ -487,15 +487,255 @@ fn an_html_alternative_that_names_a_key_through_markup_is_not_stored_on_any_path
             "<p>SYNTH<b>-12</b></p>",
         ),
         multipart("00000000000000f2", "Notes", "plan", "<p>SYNTH&#45;12</p>"),
+        multipart(
+            "00000000000000f3",
+            "Notes",
+            "plan",
+            r#"<a href="https://example.com/x?a=1&b=2">SYNTH</a>-12"#,
+        ),
+        multipart(
+            "00000000000000f4",
+            "Notes",
+            "plan",
+            "<p>Q&A on SYNTH&#45;12</p>",
+        ),
+    ];
+    let ids = [
+        "00000000000000f1",
+        "00000000000000f2",
+        "00000000000000f3",
+        "00000000000000f4",
     ];
     let stored = stored_on_each_path(&json!({"exclude_keys": ["SYNTH"]}), &messages)?;
     assert_each_path_stores(&stored, &[], "SYNTH excluded");
     let stored = stored_on_each_path(&json!({}), &messages)?;
+    assert_each_path_stores(&stored, &ids, "no key excluded");
+    Ok(())
+}
+
+/// Every part Gmail sends inline is read and checked, whatever its type: a JSON part, a
+/// delivery status, an octet stream, an AMP alternative, and an invitation whose iCalendar
+/// folds a key across two lines. Each such message is stored on no path. Control: with no key
+/// configured, every path stores them all.
+#[test]
+fn every_inline_part_is_checked_whatever_its_type() -> Result<()> {
+    let parts = [
+        (
+            "00000000000000c1",
+            "application/json",
+            r#"{"issue":"SYNTH-12"}"#,
+        ),
+        (
+            "00000000000000c2",
+            "message/delivery-status",
+            "Final-Recipient: rfc822; x@example.com\nDiagnostic: SYNTH-12",
+        ),
+        (
+            "00000000000000c3",
+            "application/octet-stream",
+            "blob SYNTH-12 blob",
+        ),
+        ("00000000000000c4", "text/x-amp-html", "<b>SYNTH</b>-12"),
+        (
+            "00000000000000c5",
+            "text/calendar",
+            "BEGIN:VEVENT\r\nSUMMARY:Review SYN\r\n TH-12\r\nEND:VEVENT",
+        ),
+    ];
+    let messages = parts
+        .iter()
+        .map(|(id, mime, text)| with_part(id, "see the attachment", &part(mime, text)))
+        .collect::<Vec<_>>();
+    let ids = parts.iter().map(|(id, ..)| *id).collect::<Vec<_>>();
+    let stored = stored_on_each_path(&json!({"exclude_keys": ["SYNTH"]}), &messages)?;
+    assert_each_path_stores(&stored, &[], "SYNTH excluded");
+    let stored = stored_on_each_path(&json!({}), &messages)?;
+    assert_each_path_stores(&stored, &ids, "no key excluded");
+    Ok(())
+}
+
+/// Mail from, to, cc or reply-to an excluded address, named whole in any case beside a display
+/// name, is stored on no path, though it names no key. Mail between public addresses is kept.
+/// Control: with no address configured, every path stores all five.
+#[test]
+fn mail_an_excluded_address_takes_part_in_is_not_stored_on_any_path() -> Result<()> {
+    let plain = |id: &str| message(id, "1792944000000", "Zmlyc3Q=");
+    let messages = [
+        with_header(
+            plain("00000000000000d1"),
+            "From",
+            "\"Out Side\" <Outside@Partner.example>",
+        ),
+        with_header(
+            plain("00000000000000d2"),
+            "To",
+            "ada@theorem.example, outside@partner.example",
+        ),
+        with_header(plain("00000000000000d3"), "Cc", "<outside@partner.example>"),
+        with_header(
+            plain("00000000000000d4"),
+            "Reply-To",
+            "outside@partner.example",
+        ),
+        with_header(
+            plain("00000000000000d5"),
+            "From",
+            "Ada <ada@theorem.example>",
+        ),
+    ];
+    let config = json!({"exclude_emails": ["outside@partner.example"]});
+    let stored = stored_on_each_path(&config, &messages)?;
+    assert_each_path_stores(&stored, &["00000000000000d5"], "the address excluded");
+    let stored = stored_on_each_path(&json!({}), &messages)?;
     assert_each_path_stores(
         &stored,
-        &["00000000000000f1", "00000000000000f2"],
-        "no key excluded",
+        &[
+            "00000000000000d1",
+            "00000000000000d2",
+            "00000000000000d3",
+            "00000000000000d4",
+            "00000000000000d5",
+        ],
+        "no address excluded",
     );
+    Ok(())
+}
+
+/// Each message a fetch withholds is logged to standard error by its reason, its key when a key
+/// withheld it, and its pointer, and never by its subject, file name or address; no warning of
+/// the window names it. Control: a message the net does not withhold is logged by nothing.
+#[test]
+fn a_withheld_message_is_logged_by_key_and_pointer_and_never_warned_of() -> Result<()> {
+    let titled = with_header(
+        with_part(
+            "00000000000000e1",
+            "plan",
+            &kept_apart("application/pdf", "secret-roadmap.pdf", "att-1"),
+        ),
+        "Subject",
+        "SYNTH-12 secret roadmap",
+    );
+    let addressed = with_header(
+        message("00000000000000e2", "1792944000000", "Zmlyc3Q="),
+        "From",
+        "Out Side <outside@partner.example>",
+    );
+    let kept = message("00000000000000e3", "1792944000000", "Zmlyc3Q=");
+    let ids = ["00000000000000e1", "00000000000000e2", "00000000000000e3"];
+    let api = FakeGmailApi {
+        history: Some(History {
+            entries: vec![HistoryEntry {
+                id: "900".to_owned(),
+                added: ids.iter().map(|id| (*id).to_owned()).collect(),
+            }],
+            latest: Some("1000".to_owned()),
+        }),
+        messages: ids
+            .iter()
+            .map(|id| (*id).to_owned())
+            .zip([titled, addressed, kept])
+            .collect(),
+        ..FakeGmailApi::default()
+    };
+    let mut request = fetch_request(Some("850@2026-10-24T00:00:00Z"))?;
+    request.config = json!({
+        "exclude_keys": ["SYNTH"],
+        "exclude_emails": ["outside@partner.example"]
+    });
+    crate::source::content_net::tests::take_logged();
+    let messages = run_fetch(&api, &request)?;
+    let logged = crate::source::content_net::tests::take_logged();
+    assert_eq!(pointers(&messages), ["gmail:00000000000000e3"]);
+    assert_eq!(
+        logged,
+        [
+            r#"{"event":"withheld","reason":"private-content-net","key":"SYNTH","pointer":"gmail:00000000000000e1"}"#,
+            r#"{"event":"withheld","reason":"private-address","pointer":"gmail:00000000000000e2"}"#,
+        ]
+    );
+    for line in &logged {
+        for private in ["secret", "roadmap", "outside", "partner"] {
+            assert!(!line.contains(private), "{line}");
+        }
+    }
+    let warned = messages.iter().any(|message| {
+        matches!(message, Message::Warning { message, .. }
+            if message.contains("00000000000000e1") || message.contains("00000000000000e2"))
+    });
+    assert!(!warned, "{messages:?}");
+    Ok(())
+}
+
+/// A text part Gmail keeps apart and does not answer for stops the stream before its message,
+/// which could not be checked, with a warning that names the message's pointer and the cause and
+/// nothing of its content; the stream keeps no cursor, so the next fetch reads it again.
+/// Control: when Gmail answers, the stream ends with its cursor and no such warning.
+#[test]
+fn a_text_part_gmail_does_not_answer_for_stops_the_stream_with_a_warning() -> Result<()> {
+    for answered in [false, true] {
+        let attached = with_header(
+            with_part(
+                "00000000000000a9",
+                "see the notes",
+                &kept_apart("text/plain", "notes.txt", "att-9"),
+            ),
+            "Subject",
+            "Quarterly roadmap",
+        );
+        let api = FakeGmailApi {
+            history: Some(History {
+                entries: vec![HistoryEntry {
+                    id: "900".to_owned(),
+                    added: vec!["00000000000000a9".to_owned()],
+                }],
+                latest: Some("1000".to_owned()),
+            }),
+            messages: BTreeMap::from([("00000000000000a9".to_owned(), attached)]),
+            attachments: if answered {
+                BTreeMap::from([(
+                    ("00000000000000a9".to_owned(), "att-9".to_owned()),
+                    encoded("agenda"),
+                )])
+            } else {
+                BTreeMap::new()
+            },
+            ..FakeGmailApi::default()
+        };
+        let mut request = fetch_request(Some("850@2026-10-24T00:00:00Z"))?;
+        request.config = json!({"exclude_keys": ["SYNTH"]});
+        let messages = run_fetch(&api, &request)?;
+        let warnings = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Warning { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let named = warnings
+            .iter()
+            .filter(|warning| warning.contains("gmail:00000000000000a9"))
+            .collect::<Vec<_>>();
+        if answered {
+            assert!(named.is_empty(), "{warnings:?}");
+            assert!(matches!(
+                stream_end(&messages),
+                Some((StreamStatus::Ok, Some(_)))
+            ));
+        } else {
+            let [warning] = named.as_slice() else {
+                bail!("want one warning naming the message, got {warnings:?}");
+            };
+            assert!(
+                warning.contains("missing fake attachment att-9"),
+                "{warning}"
+            );
+            assert!(
+                !warning.contains("roadmap") && !warning.contains("notes"),
+                "{warning}"
+            );
+            assert_eq!(stream_end(&messages), Some((StreamStatus::Error, None)));
+        }
+    }
     Ok(())
 }
 

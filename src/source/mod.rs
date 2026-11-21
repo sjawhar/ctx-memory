@@ -244,6 +244,32 @@ pub(crate) fn environment(name: &str) -> Result<Option<String>> {
     }
 }
 
+/// The variables that set an exclusion setting of a built-in source, which only
+/// `--content-net` lets a source apply.
+pub const EXCLUSION_VARIABLES: [&str; 4] = [
+    gmail::EXCLUDE_LIST_IDS_ENV,
+    github::EXCLUDE_REPOSITORY_IDS_ENV,
+    content_net::EXCLUDE_KEYS_ENV,
+    content_net::EXCLUDE_EMAILS_ENV,
+];
+
+/// Turns the exclusion settings of the built-in sources on, as `--content-net` does. Until
+/// then a source refuses each it is given, so a deployment that sets them runs only a ctx that
+/// takes `--content-net`, which every ctx that applies them does.
+pub fn enable_content_net() {
+    content_net::enable();
+}
+
+/// Refuses each of [`EXCLUSION_VARIABLES`] that names anything, unless [`enable_content_net`]
+/// turned the settings on: `fetch` and `serve` call it before they read anything.
+///
+/// # Errors
+///
+/// Returns an error naming the first such variable, or one that cannot be read.
+pub fn refuse_exclusions_without_content_net() -> Result<()> {
+    content_net::refuse_unless_enabled(&EXCLUSION_VARIABLES)
+}
+
 /// Returns every tree record whose `field` starts with a stream identifier.
 #[must_use]
 pub fn discover_streams(tree: &Tree, field: &str) -> Vec<DiscoveredStream> {

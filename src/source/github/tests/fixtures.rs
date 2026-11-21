@@ -21,8 +21,8 @@ pub(super) use super::super::records::{
     pull_reviews_url, stream_id,
 };
 pub(super) use super::super::{
-    excluded_repositories, fetch_with_api, installations, GithubApi, GithubConfig, Request,
-    PROTOCOL_VERSION,
+    declared_list_ids, excluded_repositories, fetch_with_api, installations, Excluded, GithubApi,
+    GithubConfig, Request, PROTOCOL_VERSION,
 };
 
 pub(super) const WINDOW_END: &str = "2026-10-27T00:00:00Z";
@@ -251,8 +251,21 @@ pub(super) fn run(
     request: &FetchRequest,
     config: &GithubConfig,
 ) -> Result<SourceOutcome> {
+    run_declaring(api, request, config, None)
+}
+
+/// [`run`], with `list_ids` as the value of `CTX_GMAIL_EXCLUDE_LIST_IDS`.
+pub(super) fn run_declaring(
+    api: &FakeGithub,
+    request: &FetchRequest,
+    config: &GithubConfig,
+    list_ids: Option<&str>,
+) -> Result<SourceOutcome> {
     let installations = installations(config)?;
-    let excluded = excluded_repositories(config, None)?;
+    let excluded = Excluded {
+        ids: excluded_repositories(config, None)?,
+        list_ids: declared_list_ids(list_ids),
+    };
     let schemes = Schemes::new(["github".to_owned()]);
     let request_enum = Request::Fetch(request.clone());
     let mut session = Session::new(&request_enum, &schemes);

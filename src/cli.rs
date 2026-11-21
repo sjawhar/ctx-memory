@@ -56,6 +56,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Apply the exclusion settings of the built-in sources (`exclude_list_ids`,
+    /// `exclude_repository_ids`, `exclude_keys`, `exclude_emails` and their variables). Without
+    /// it they are refused, and `fetch` and `serve` stop before they read anything; a ctx too
+    /// old to apply them refuses this argument instead.
+    #[arg(long, global = true)]
+    pub content_net: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -650,6 +657,15 @@ pub fn run(cli: &Cli, sink: &mut Sink<'_>) -> Result<Outcome> {
     // A token secret beside an app key leaves which of them GitHub is read with undecided, so
     // `ctx` stops here, before it reads anything.
     github::reads_a_token_secret()?;
+
+    // Only a ctx that applies the exclusion settings takes `--content-net`, so a deployment
+    // that sets them and passes it never runs one that would store what they exclude.
+    if cli.content_net {
+        crate::source::enable_content_net();
+    }
+    if matches!(cli.command, Command::Serve(_) | Command::Fetch(_)) {
+        crate::source::refuse_exclusions_without_content_net()?;
+    }
 
     if let Command::External(arguments) = &cli.command {
         let environment = PluginEnv::resolve(&GlobalArgs::from(cli))?;

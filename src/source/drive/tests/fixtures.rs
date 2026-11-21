@@ -121,10 +121,12 @@ pub(super) fn request(config: Value, cursor: Option<(&str, &str)>) -> Result<Fet
     })
 }
 
-/// Runs a fetch with the request's configuration, `exclude_keys` among it, and no environment.
+/// Runs a fetch with the request's configuration, `exclude_keys` and `exclude_emails` among it,
+/// and no environment.
 pub(super) fn run_fetch(api: &FakeDriveApi, request: &FetchRequest) -> Result<Vec<Message>> {
     let mut config = parse_config(&request.config)?;
-    config.net = ContentNet::from_parts(&config.exclude_keys, None)?;
+    config.net = ContentNet::from_parts(&config.exclude_keys, None)?
+        .with_addresses(&config.exclude_emails, None)?;
     let mut messages = Vec::new();
     emit_fetch_hello(request, &config, &mut |message| {
         messages.push(message);

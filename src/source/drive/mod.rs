@@ -63,7 +63,7 @@ impl Source for DriveSource {
         match request {
             Request::Fetch(request) => {
                 let mut config = parse_config(&request.config)?;
-                config.net = ContentNet::configured(&config.exclude_keys)?;
+                config.net = ContentNet::configured(&config.exclude_keys, &config.exclude_emails)?;
                 emit_fetch_hello(request, &config, sink)?;
                 let api = GoogleDriveApi::load()?;
                 fetch_with_api(request, &config, &api, sink)
@@ -92,8 +92,11 @@ struct DriveConfig {
     /// Keys of the content net: a file whose metadata or text names one is never stored.
     #[serde(default)]
     exclude_keys: Vec<String>,
-    /// The net `exclude_keys` and `CTX_EXCLUDE_KEYS` make, built by the process that runs the
-    /// fetch, after the configuration is read.
+    /// Addresses of the content net: a file one owns or holds a permission on is never stored.
+    #[serde(default)]
+    exclude_emails: Vec<String>,
+    /// The net `exclude_keys`, `exclude_emails`, `CTX_EXCLUDE_KEYS` and `CTX_EXCLUDE_EMAILS`
+    /// make, built by the process that runs the fetch, after the configuration is read.
     #[serde(skip)]
     net: ContentNet,
 }

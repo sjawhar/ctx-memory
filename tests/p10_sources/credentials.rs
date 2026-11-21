@@ -176,14 +176,21 @@ fn a_stored_occurrence_moved_past_the_horizon_resolves_at_its_new_start() -> Res
     ])?;
     let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
     let ctx = |arguments: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_ctx"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ctx"));
+        command
             .args(["--json", "--memory", tree_text])
             .args(arguments)
             .env("CTX_STATE_DIR", root.join("state"))
             .env("CTX_DATA_DIR", root.join("data"))
             .env("CTX_GOOGLE_API_BASE", server.base())
             .env("CTX_CREDENTIAL_GOOGLE", "ya29.calendar-test")
-            .env_remove("CTX_SERVER")
+            .env_remove("CTX_SERVER");
+        // This test holds no lock on the environment, which another test may set an exclusion
+        // variable in while this one runs.
+        for variable in ctx_memory::source::EXCLUSION_VARIABLES {
+            command.env_remove(variable);
+        }
+        command
             .output()
             .with_context(|| format!("running ctx {}", arguments.join(" ")))
     };
@@ -272,14 +279,21 @@ fn a_stored_event_named_cancelled_resolves_as_cancelled() -> Result<()> {
     ])?;
     let tree_text = tree.to_str().context("tree path is not valid UTF-8")?;
     let ctx = |arguments: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_ctx"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ctx"));
+        command
             .args(["--json", "--memory", tree_text])
             .args(arguments)
             .env("CTX_STATE_DIR", root.join("state"))
             .env("CTX_DATA_DIR", root.join("data"))
             .env("CTX_GOOGLE_API_BASE", server.base())
             .env("CTX_CREDENTIAL_GOOGLE", "ya29.calendar-test")
-            .env_remove("CTX_SERVER")
+            .env_remove("CTX_SERVER");
+        // This test holds no lock on the environment, which another test may set an exclusion
+        // variable in while this one runs.
+        for variable in ctx_memory::source::EXCLUSION_VARIABLES {
+            command.env_remove(variable);
+        }
+        command
             .output()
             .with_context(|| format!("running ctx {}", arguments.join(" ")))
     };
