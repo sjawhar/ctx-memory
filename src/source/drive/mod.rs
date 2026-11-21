@@ -31,7 +31,7 @@ use anyhow::{bail, Context as _, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::content_net::ContentNet;
+use super::content_net::{ContentNet, NetLists};
 use super::{emit_stream, Message, Request, Source};
 use api::GoogleDriveApi;
 use fetch::{emit_fetch_hello, emit_resolve_hello, fetch_with_api};
@@ -63,7 +63,7 @@ impl Source for DriveSource {
         match request {
             Request::Fetch(request) => {
                 let mut config = parse_config(&request.config)?;
-                config.net = ContentNet::configured(&config.exclude_keys, &config.exclude_emails)?;
+                config.net = ContentNet::configured(&config.net_lists())?;
                 emit_fetch_hello(request, &config, sink)?;
                 let api = GoogleDriveApi::load()?;
                 fetch_with_api(request, &config, &api, sink)
@@ -92,13 +92,32 @@ struct DriveConfig {
     /// Keys of the content net: a file whose metadata or text names one is never stored.
     #[serde(default)]
     exclude_keys: Vec<String>,
-    /// Addresses of the content net: a file one owns or holds a permission on is never stored.
+    /// Terms of the content net: a file whose metadata or text names one whole is never stored.
+    #[serde(default)]
+    exclude_terms: Vec<String>,
+    /// Repositories of the content net, `owner/name`: a file whose metadata or text names one is
+    /// never stored.
+    #[serde(default)]
+    exclude_repositories: Vec<String>,
+    /// Addresses of the content net: a file one owns, last modified, shared or holds a permission
+    /// on is never stored.
     #[serde(default)]
     exclude_emails: Vec<String>,
-    /// The net `exclude_keys`, `exclude_emails`, `CTX_EXCLUDE_KEYS` and `CTX_EXCLUDE_EMAILS`
-    /// make, built by the process that runs the fetch, after the configuration is read.
+    /// The net these lists and their variables make, built by the process that runs the fetch,
+    /// after the configuration is read.
     #[serde(skip)]
     net: ContentNet,
+}
+
+impl DriveConfig {
+    fn net_lists(&self) -> NetLists<'_> {
+        NetLists {
+            keys: &self.exclude_keys,
+            terms: &self.exclude_terms,
+            repositories: &self.exclude_repositories,
+            addresses: &self.exclude_emails,
+        }
+    }
 }
 
 const fn enabled() -> bool {

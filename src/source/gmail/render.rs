@@ -192,16 +192,16 @@ fn gmail_body(message: &Value) -> String {
 
 /// The first of `find`'s answers for a part of `message` that Gmail sends inline, whatever its
 /// type (`text/plain`, `text/html`, `text/x-amp-html`, `text/calendar`, `application/json`,
-/// `message/delivery-status` and the rest): each body decoded with the character set its part
-/// declares, or as UTF-8, lossily. It stops at the first part `find` answers for.
-pub(super) fn find_in_inline_parts<'a>(
+/// `message/delivery-status` and the rest), each body read as [`readings`] gives it. It stops at
+/// the first part `find` answers for.
+pub(super) fn find_in_inline_parts<T>(
     message: &Value,
-    find: &impl Fn(&str) -> Option<&'a str>,
-) -> Option<&'a str> {
-    fn in_part<'a>(part: &Value, find: &impl Fn(&str) -> Option<&'a str>) -> Option<&'a str> {
+    find: &impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    fn in_part<T>(part: &Value, find: &impl Fn(&str) -> Option<T>) -> Option<T> {
         part.pointer("/body/data")
             .and_then(Value::as_str)
-            .and_then(|data| find(&decode_body(part, data)))
+            .and_then(|data| readings(part, data).iter().find_map(|text| find(text)))
             .or_else(|| {
                 part.get("parts")
                     .and_then(Value::as_array)?
@@ -248,6 +248,24 @@ pub(super) fn external_text_parts(message: &Value) -> Vec<&Value> {
 /// or as UTF-8, lossily.
 pub(super) fn decode_body(part: &Value, data: &str) -> String {
     decode_part(&base64url_decode(data), part_charset(part).as_deref())
+}
+
+/// Each way the content net reads one part's body `data`: decoded with the character set the part
+/// declares, and, when that is not UTF-8, also as UTF-8, lossily, since a sender may declare one
+/// character set over the bytes of another.
+pub(super) fn readings(part: &Value, data: &str) -> Vec<String> {
+    let bytes = base64url_decode(data);
+    let charset = part_charset(part);
+    let declared = decode_part(&bytes, charset.as_deref());
+    let other = charset
+        .as_deref()
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .is_some_and(|encoding| encoding != encoding_rs::UTF_8);
+    if other {
+        vec![declared, String::from_utf8_lossy(&bytes).into_owned()]
+    } else {
+        vec![declared]
+    }
 }
 
 fn is_text(part: &Value) -> bool {

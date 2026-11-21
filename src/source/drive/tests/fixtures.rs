@@ -35,6 +35,9 @@ pub(super) struct FakeDriveApi {
     /// about the file, which `google::text_reply` turns into an error.
     pub(super) failed: BTreeMap<String, String>,
     pub(super) export_limits: RefCell<Vec<usize>>,
+    /// The addresses holding a permission on each file or shared drive, by id; an id missing
+    /// here is one whose permissions Drive will not list.
+    pub(super) permission_lists: BTreeMap<String, Vec<String>>,
 }
 
 impl DriveApi for FakeDriveApi {
@@ -82,6 +85,19 @@ impl DriveApi for FakeDriveApi {
             .map(|(text, truncated)| Text::Body { text, truncated })
             .ok_or_else(|| anyhow!("missing fake Drive export {id}"))
     }
+
+    fn permissions(&self, id: &str) -> Result<Vec<Value>> {
+        self.calls.borrow_mut().push(format!("permissions {id}"));
+        self.permission_lists
+            .get(id)
+            .map(|addresses| {
+                addresses
+                    .iter()
+                    .map(|address| json!({"emailAddress": address}))
+                    .collect()
+            })
+            .ok_or_else(|| anyhow!("Drive answered 403 for the permissions of {id}"))
+    }
 }
 
 pub(super) fn document(id: &str, name: &str) -> Value {
@@ -121,12 +137,11 @@ pub(super) fn request(config: Value, cursor: Option<(&str, &str)>) -> Result<Fet
     })
 }
 
-/// Runs a fetch with the request's configuration, `exclude_keys` and `exclude_emails` among it,
-/// and no environment.
+/// Runs a fetch with the request's configuration, the content net's lists among it, and no
+/// environment.
 pub(super) fn run_fetch(api: &FakeDriveApi, request: &FetchRequest) -> Result<Vec<Message>> {
     let mut config = parse_config(&request.config)?;
-    config.net = ContentNet::from_parts(&config.exclude_keys, None)?
-        .with_addresses(&config.exclude_emails, None)?;
+    config.net = ContentNet::from_lists(&config.net_lists())?;
     let mut messages = Vec::new();
     emit_fetch_hello(request, &config, &mut |message| {
         messages.push(message);

@@ -1,6 +1,6 @@
 //! Drive feed and backfill fetching.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -76,18 +76,25 @@ struct Collected {
     cursor: String,
     /// Folders this stream already read, which another stream must not repeat.
     covered_parents: BTreeSet<String>,
+    /// The addresses holding a permission on each shared drive this stream asked about, or
+    /// `None` when Drive would not list them: each drive is asked once a stream.
+    drive_members: BTreeMap<String, Option<Vec<String>>>,
 }
+
+/// The fields of a file whose `emailAddress` names someone who takes part in it: its owners,
+/// whoever last modified it, whoever shared it with the caller, and its permissions.
+const PEOPLE_FIELDS: [&str; 4] = ["owners", "lastModifyingUser", "sharingUser", "permissions"];
 
 impl Collected {
     /// Reads `file` into a record of `stream` and keeps it, with the warnings reading it raised,
     /// unless the content net (`config.net`) withholds it: then neither is kept, so the window
     /// holds nothing of the file, not even a warning naming it, and the drop is logged by its
-    /// pointer ([`content_net::withheld`]). A file is withheld when an excluded address owns it
-    /// or holds a permission on it, or its metadata (its name, its description or any other
-    /// field the listing gives) names a key, before it is exported at all; or when its export,
-    /// read up to Drive's own export limit though the record keeps `max_export_bytes` of it, or
-    /// its record names one. A file that is not a Google document, or whose export Drive
-    /// refuses, is stored as its metadata alone, which the net checks.
+    /// pointer ([`content_net::withheld`]). Before anything is exported, a file is withheld when
+    /// its metadata (its name, its description or any other field the listing gives) names a key
+    /// or term, or an excluded address takes part in it ([`Collected::address_hit`]); after, when
+    /// its export, read up to Drive's own export limit though the record keeps
+    /// `max_export_bytes` of it, or its record names one. A file that is not a Google document,
+    /// or whose export Drive refuses, is stored as its metadata alone, which the net checks.
     fn read<C: DriveApi + ?Sized>(
         &mut self,
         file: &Value,
@@ -105,18 +112,11 @@ impl Collected {
             )
         };
         let net = &config.net;
-        let held_by_an_address = ["owners", "permissions"]
-            .iter()
-            .filter_map(|field| file.get(field).and_then(Value::as_array))
-            .flatten()
-            .filter_map(|holder| holder.get("emailAddress").and_then(Value::as_str))
-            .any(|address| net.names_address(address));
-        if held_by_an_address {
-            content_net::withheld(&Hit::Address, &pointer());
-            return Ok(());
-        }
-        if let Some(key) = net.key_in_value(file) {
-            content_net::withheld(&Hit::Key(key.to_owned()), &pointer());
+        if let Some(hit) = net
+            .hit_in_value(file)
+            .or_else(|| self.address_hit(file, api, config))
+        {
+            content_net::withheld(&hit, &pointer());
             return Ok(());
         }
         let mut warnings = Vec::new();
@@ -132,8 +132,8 @@ impl Collected {
         )?;
         let record = match read {
             Read::Kept(record) => record,
-            Read::Withheld(key) => {
-                content_net::withheld(&Hit::Key(key), &pointer());
+            Read::Withheld(hit) => {
+                content_net::withheld(&hit, &pointer());
                 return Ok(());
             }
         };
@@ -145,6 +145,73 @@ impl Collected {
         self.warnings.extend(warnings);
         Ok(())
     }
+
+    /// Why the net withholds `file` by who takes part in it, while it names an address: one is
+    /// among the file's [`PEOPLE_FIELDS`]; or, when the listing gives no `permissions`, as Drive
+    /// lists a shared-drive file or one the caller cannot share, among the file's own
+    /// permissions or, for a shared-drive file, its drive's members, which Drive is asked for.
+    /// [`Hit::PermissionsUnread`] when Drive will not list those: the file is withheld, since no
+    /// address could be checked.
+    fn address_hit<C: DriveApi + ?Sized>(
+        &mut self,
+        file: &Value,
+        api: &C,
+        config: &DriveConfig,
+    ) -> Option<Hit> {
+        let net = &config.net;
+        if !net.has_addresses() {
+            return None;
+        }
+        let listed = PEOPLE_FIELDS
+            .iter()
+            .filter_map(|field| file.get(field))
+            .flat_map(|people| match people {
+                Value::Array(people) => people.as_slice(),
+                person => std::slice::from_ref(person),
+            })
+            .filter_map(|person| person.get("emailAddress").and_then(Value::as_str))
+            .any(|address| net.is_excluded_address(address));
+        if listed {
+            return Some(Hit::Address);
+        }
+        if file.get("permissions").is_some() {
+            return None;
+        }
+        let id = file.get("id").and_then(Value::as_str).unwrap_or_default();
+        let Some(own) = permission_addresses(api, id) else {
+            return Some(Hit::PermissionsUnread);
+        };
+        let drive = match file.get("driveId").and_then(Value::as_str) {
+            Some(drive) => {
+                let members = self
+                    .drive_members
+                    .entry(drive.to_owned())
+                    .or_insert_with(|| permission_addresses(api, drive));
+                match members {
+                    Some(members) => members.as_slice(),
+                    None => return Some(Hit::PermissionsUnread),
+                }
+            }
+            None => &[],
+        };
+        own.iter()
+            .chain(drive)
+            .any(|address| net.is_excluded_address(address))
+            .then_some(Hit::Address)
+    }
+}
+
+/// The addresses holding a permission on the file or shared drive `id`, or `None` when Drive
+/// will not list them.
+fn permission_addresses<C: DriveApi + ?Sized>(api: &C, id: &str) -> Option<Vec<String>> {
+    let permissions = api.permissions(id).ok()?;
+    Some(
+        permissions
+            .iter()
+            .filter_map(|permission| permission.get("emailAddress").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 pub(super) fn fetch_with_api<C: DriveApi + ?Sized>(

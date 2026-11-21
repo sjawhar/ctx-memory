@@ -246,10 +246,12 @@ pub(crate) fn environment(name: &str) -> Result<Option<String>> {
 
 /// The variables that set an exclusion setting of a built-in source, which only
 /// `--content-net` lets a source apply.
-pub const EXCLUSION_VARIABLES: [&str; 4] = [
+pub const EXCLUSION_VARIABLES: [&str; 6] = [
     gmail::EXCLUDE_LIST_IDS_ENV,
     github::EXCLUDE_REPOSITORY_IDS_ENV,
     content_net::EXCLUDE_KEYS_ENV,
+    content_net::EXCLUDE_TERMS_ENV,
+    content_net::EXCLUDE_REPOSITORIES_ENV,
     content_net::EXCLUDE_EMAILS_ENV,
 ];
 

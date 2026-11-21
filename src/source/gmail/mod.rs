@@ -17,6 +17,7 @@
 //! message: a history walk, a listing, and a resolve. Each drop is logged to standard error by
 //! its pointer ([`super::content_net::withheld`]).
 
+mod addresses;
 mod fetch;
 mod lists;
 mod render;
@@ -25,7 +26,7 @@ use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::content_net::ContentNet;
+use super::content_net::{ContentNet, NetLists};
 use super::{Message, Request, Source};
 use fetch::{
     emit_fetch_hello, emit_resolve_hello, fetch_with_api, resolve_with_api, GoogleGmailApi,
@@ -89,9 +90,26 @@ struct GmailConfig {
     /// Keys of the content net: mail whose text names one is never stored.
     #[serde(default)]
     exclude_keys: Vec<String>,
+    /// Terms of the content net: mail whose text names one whole is never stored.
+    #[serde(default)]
+    exclude_terms: Vec<String>,
+    /// Repositories of the content net, `owner/name`: mail whose text names one is never stored.
+    #[serde(default)]
+    exclude_repositories: Vec<String>,
     /// Addresses of the content net: mail from, to, cc or reply-to one is never stored.
     #[serde(default)]
     exclude_emails: Vec<String>,
+}
+
+impl GmailConfig {
+    fn net_lists(&self) -> NetLists<'_> {
+        NetLists {
+            keys: &self.exclude_keys,
+            terms: &self.exclude_terms,
+            repositories: &self.exclude_repositories,
+            addresses: &self.exclude_emails,
+        }
+    }
 }
 
 fn default_query() -> String {
@@ -103,10 +121,10 @@ fn parse_config(value: &Value) -> Result<GmailConfig> {
 }
 
 /// The mail this source never stores, by its list, its text and its addresses: the
-/// configuration's `exclude_list_ids`, `exclude_keys` and `exclude_emails`, and what
-/// [`EXCLUDE_LIST_IDS_ENV`], `CTX_EXCLUDE_KEYS` and `CTX_EXCLUDE_EMAILS` add, read in the
-/// environment of the process that runs the source, the fetch or the server, and never a
-/// caller's. Refused while `--content-net` did not turn the settings on.
+/// configuration's `exclude_list_ids` and the content net's lists, and what
+/// [`EXCLUDE_LIST_IDS_ENV`] and the net's variables add, read in the environment of the process
+/// that runs the source, the fetch or the server, and never a caller's. Refused while
+/// `--content-net` did not turn the settings on.
 fn withheld(config: &GmailConfig) -> Result<Withheld> {
     let lists = ExcludedLists::from_parts(
         &config.exclude_list_ids,
@@ -116,7 +134,7 @@ fn withheld(config: &GmailConfig) -> Result<Withheld> {
     if !lists.is_empty() {
         super::content_net::require("exclude_list_ids or CTX_GMAIL_EXCLUDE_LIST_IDS")?;
     }
-    let net = ContentNet::configured(&config.exclude_keys, &config.exclude_emails)?;
+    let net = ContentNet::configured(&config.net_lists())?;
     Ok(Withheld { lists, net })
 }
 

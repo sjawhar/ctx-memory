@@ -488,6 +488,7 @@ dependencies = [
  "sha2",
  "tokio",
  "toml",
+ "unicode-general-category",
  "unicode-normalization",
 ]
 

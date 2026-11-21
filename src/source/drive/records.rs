@@ -8,7 +8,7 @@ use crate::api::google::Text;
 use crate::record::Record;
 use crate::source::{latest_believable, CLOCK_SKEW_MARGIN};
 
-use super::super::content_net::ContentNet;
+use super::super::content_net::{ContentNet, Hit};
 use super::api::DriveApi;
 
 /// Google document kinds and the text export each one is stored as.
@@ -66,18 +66,34 @@ impl Bounds {
     }
 }
 
-/// What reading one file gave: its record, or the key of the content net its export names.
+/// What reading one file gave: its record, or why the content net withholds its export.
 pub(super) enum Read {
     Kept(Box<Record>),
-    Withheld(String),
+    Withheld(Hit),
 }
 
-const NET_ONLY_FIELDS: [&str; 2] = ["description", "permissions"];
+/// The fields a listing asks for the content net alone, which a record never stores.
+const NET_ONLY_FIELDS: [&str; 4] = ["description", "permissions", "sharingUser", "driveId"];
+
+/// `file` as its record stores it: none of the [`NET_ONLY_FIELDS`], and no address of the
+/// person who last modified it, which only the net reads; the display name stays the author.
+fn stored_raw(file: &Value) -> Value {
+    let mut raw = file.clone();
+    if let Some(fields) = raw.as_object_mut() {
+        for field in NET_ONLY_FIELDS {
+            fields.remove(field);
+        }
+        if let Some(Value::Object(user)) = fields.get_mut("lastModifyingUser") {
+            user.remove("emailAddress");
+        }
+    }
+    raw
+}
 
 /// Builds one record: a Google document's exported text, or metadata with a warning when the
-/// file is not a Google document or Drive will not export this file. The record stores none of
-/// the [`NET_ONLY_FIELDS`]. [`Read::Withheld`] when the export, all of it Drive gives, names a
-/// key of `net`: the file is not stored, and no warning names it.
+/// file is not a Google document or Drive will not export this file. The record stores what
+/// [`stored_raw`] keeps of the file. [`Read::Withheld`] when the export, all of it Drive gives,
+/// names a key or term of `net`: the file is not stored, and no warning names it.
 ///
 /// A file changed after the window ends is a context record: the window must not carry a
 /// record after its end, and the file is still searchable and citable. A file dated later than
@@ -101,7 +117,7 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let named = name.unwrap_or("(unnamed)");
-    let read = if net.has_keys() {
+    let read = if net.has_text_net() {
         limit.max(DRIVE_EXPORT_CEILING)
     } else {
         limit
@@ -115,8 +131,8 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
             mut text,
             mut truncated,
         }) => {
-            if let Some(key) = net.key_in(&text) {
-                return Ok(Read::Withheld(key.to_owned()));
+            if let Some(hit) = net.hit_in(&text) {
+                return Ok(Read::Withheld(hit));
             }
             // Read past the cap for the net alone: the record keeps what the cap allows.
             if read > limit && text.len() > limit {
@@ -169,12 +185,7 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
             .and_then(|owners| owners.first())
             .and_then(|owner| display_name(Some(owner)))
     });
-    let mut raw = file.clone();
-    if let Some(fields) = raw.as_object_mut() {
-        for field in NET_ONLY_FIELDS {
-            fields.remove(field);
-        }
-    }
+    let raw = stored_raw(file);
     Ok(Read::Kept(Box::new(Record {
         pointer: format!("{scheme}:{id}"),
         stream: stream.to_owned(),

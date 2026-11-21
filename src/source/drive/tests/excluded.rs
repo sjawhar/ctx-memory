@@ -203,6 +203,47 @@ fn a_file_whose_description_names_a_key_is_not_exported_or_stored() -> Result<()
     Ok(())
 }
 
+/// A file whose name names a private repository, or whose export names the project's name, is
+/// not stored, and the one named by its name is not even exported. A public repository is
+/// kept. Control: with no term configured, all three are stored.
+#[test]
+fn a_file_that_names_a_repository_or_the_projects_name_is_not_stored() -> Result<()> {
+    let files = vec![
+        document(NAMED, "theorem-labs/synth design notes"),
+        document(INSIDE, "Weekly notes"),
+        document(KEPT, "theorem-labs/public-repo design notes"),
+    ];
+    let exports = BTreeMap::from([
+        (NAMED.to_owned(), ("notes".to_owned(), false)),
+        (
+            INSIDE.to_owned(),
+            ("the project falcon plan".to_owned(), false),
+        ),
+        (KEPT.to_owned(), ("notes".to_owned(), false)),
+    ]);
+    for excluded in [true, false] {
+        let api = listing_of(files.clone(), exports.clone(), BTreeMap::new());
+        let config = listing_config(if excluded {
+            json!({"exclude_repositories": ["theorem-labs/synth"], "exclude_terms": ["Project Falcon"]})
+        } else {
+            json!({})
+        });
+        let messages = run_fetch(&api, &request(config, None)?)?;
+        let mut stored = records(&messages)
+            .into_iter()
+            .map(|record| record.pointer)
+            .collect::<Vec<_>>();
+        stored.sort();
+        if excluded {
+            assert_eq!(stored, [format!("drive:{KEPT}")]);
+            assert!(!exported(&api, NAMED), "{:?}", api.calls.borrow());
+        } else {
+            assert_eq!(stored.len(), 3, "{stored:?}");
+        }
+    }
+    Ok(())
+}
+
 /// A file an excluded address owns, or holds a permission on, is not exported and not stored,
 /// though it names no key; the drop is logged by pointer, never by name or address. A file only
 /// public addresses hold is kept, and its record stores no permission. Control: with no address
@@ -261,6 +302,168 @@ fn a_file_an_excluded_address_owns_or_is_shared_with_is_not_stored() -> Result<(
             all.sort();
             assert_eq!(stored, all);
             assert!(logged.is_empty(), "{logged:?}");
+        }
+    }
+    Ok(())
+}
+
+/// A document with the given extra fields.
+fn document_with(id: &str, extra: Value) -> Value {
+    let mut file = document(id, "Quarterly plan");
+    if let (Some(fields), Value::Object(extra)) = (file.as_object_mut(), extra) {
+        fields.extend(extra);
+    }
+    file
+}
+
+/// A file an excluded address last modified, or shared with the caller, is not stored, and the
+/// record of a file kept stores neither address. Control: with no address configured, all three
+/// are stored.
+#[test]
+fn a_file_an_excluded_address_modified_or_shared_is_not_stored() -> Result<()> {
+    let by = |address: &str| json!({"displayName": "Someone", "emailAddress": address});
+    let files = vec![
+        document_with(
+            NAMED,
+            json!({"lastModifyingUser": by("Outside@Partner.example"), "permissions": []}),
+        ),
+        document_with(
+            INSIDE,
+            json!({"sharingUser": by("outside@partner.example"), "permissions": []}),
+        ),
+        document_with(
+            KEPT,
+            json!({"lastModifyingUser": by("ada@theorem.example"), "sharingUser": by("ada@theorem.example"), "permissions": []}),
+        ),
+    ];
+    let exports =
+        BTreeMap::from([NAMED, INSIDE, KEPT].map(|id| (id.to_owned(), ("plan".to_owned(), false))));
+    for excluded in [true, false] {
+        let api = listing_of(files.clone(), exports.clone(), BTreeMap::new());
+        let config = listing_config(if excluded {
+            json!({"exclude_emails": ["outside@partner.example"]})
+        } else {
+            json!({})
+        });
+        let messages = run_fetch(&api, &request(config, None)?)?;
+        let stored = records(&messages);
+        for record in &stored {
+            let raw = record.raw.to_string();
+            assert!(
+                !raw.contains("theorem.example") && !raw.contains("partner.example"),
+                "{raw}"
+            );
+        }
+        let mut pointers = stored
+            .into_iter()
+            .map(|record| record.pointer)
+            .collect::<Vec<_>>();
+        pointers.sort();
+        if excluded {
+            assert_eq!(pointers, [format!("drive:{KEPT}")]);
+        } else {
+            assert_eq!(pointers.len(), 3, "{pointers:?}");
+        }
+    }
+    Ok(())
+}
+
+/// A file a listing gives no permissions for, as Drive lists a shared-drive file, is checked by
+/// its permissions and its shared drive's members, which the source asks Drive for, each drive
+/// once a run. A file an excluded address holds a permission on, or whose drive it is a member
+/// of, is not stored, nor is one whose permissions Drive will not list: that drop is logged as
+/// `permissions-unread`, by pointer. Control: with no address configured, no permissions are
+/// asked for and all five are stored.
+#[test]
+fn a_shared_drive_file_is_checked_by_its_own_and_its_drives_permissions() -> Result<()> {
+    let files = vec![
+        document_with("file-member", json!({"driveId": "drive-outside"})),
+        document_with("file-shared", json!({"driveId": "drive-public"})),
+        document_with("file-public", json!({"driveId": "drive-public"})),
+        document_with("file-unlisted", json!({})),
+        document_with("file-drive-unlisted", json!({"driveId": "drive-unlisted"})),
+    ];
+    let ids = [
+        "file-member",
+        "file-shared",
+        "file-public",
+        "file-unlisted",
+        "file-drive-unlisted",
+    ];
+    let exports = BTreeMap::from(ids.map(|id| (id.to_owned(), ("plan".to_owned(), false))));
+    let permission_lists = BTreeMap::from([
+        (
+            "file-member".to_owned(),
+            vec!["ada@theorem.example".to_owned()],
+        ),
+        (
+            "drive-outside".to_owned(),
+            vec!["Outside@Partner.example".to_owned()],
+        ),
+        (
+            "file-shared".to_owned(),
+            vec!["outside@partner.example".to_owned()],
+        ),
+        (
+            "file-public".to_owned(),
+            vec!["ada@theorem.example".to_owned()],
+        ),
+        (
+            "drive-public".to_owned(),
+            vec!["ada@theorem.example".to_owned()],
+        ),
+        (
+            "file-drive-unlisted".to_owned(),
+            vec!["ada@theorem.example".to_owned()],
+        ),
+    ]);
+    for excluded in [true, false] {
+        let mut api = listing_of(files.clone(), exports.clone(), BTreeMap::new());
+        api.permission_lists = permission_lists.clone();
+        let config = listing_config(if excluded {
+            json!({"exclude_emails": ["outside@partner.example"]})
+        } else {
+            json!({})
+        });
+        crate::source::content_net::tests::take_logged();
+        let messages = run_fetch(&api, &request(config, None)?)?;
+        let mut logged = crate::source::content_net::tests::take_logged();
+        logged.sort();
+        let stored = records(&messages)
+            .into_iter()
+            .map(|record| record.pointer)
+            .collect::<BTreeSet<_>>();
+        let asked = |id: &str| {
+            api.calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == format!("permissions {id}"))
+                .count()
+        };
+        if excluded {
+            assert_eq!(stored, BTreeSet::from(["drive:file-public".to_owned()]));
+            let line = |reason: &str, id: &str| {
+                format!(r#"{{"event":"withheld","reason":"{reason}","pointer":"drive:{id}"}}"#)
+            };
+            let mut want = vec![
+                line("private-address", "file-member"),
+                line("private-address", "file-shared"),
+                line("permissions-unread", "file-unlisted"),
+                line("permissions-unread", "file-drive-unlisted"),
+            ];
+            want.sort();
+            assert_eq!(logged, want);
+            assert_eq!(asked("drive-public"), 1, "{:?}", api.calls.borrow());
+        } else {
+            assert_eq!(stored.len(), 5, "{stored:?}");
+            assert!(
+                !api.calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call.starts_with("permissions")),
+                "{:?}",
+                api.calls.borrow()
+            );
         }
     }
     Ok(())

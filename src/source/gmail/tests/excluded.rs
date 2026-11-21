@@ -473,6 +473,36 @@ fn encoded(text: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text)
 }
 
+/// A text part whose declared charset is not UTF-8 is also read as UTF-8, lossily: a sender
+/// that declares ISO-8859-1 over UTF-8 bytes (`SYNTH‑12`, a non-breaking hyphen) hides the key
+/// from the declared decoding alone. Such a message is stored on no path. Control: the same
+/// bytes naming another key are stored on every path.
+#[test]
+fn a_part_declared_in_another_charset_is_also_read_as_utf8() -> Result<()> {
+    let declared = |id: &str, text: &str| {
+        json!({
+            "id": id,
+            "threadId": "cccccccccccccccc",
+            "internalDate": "1792944000000",
+            "payload": {
+                "headers": [
+                    {"name": "Subject", "value": "Notes"},
+                    {"name": "Content-Type", "value": "text/plain; charset=ISO-8859-1"}
+                ],
+                "mimeType": "text/plain",
+                "body": {"data": encoded(text)}
+            }
+        })
+    };
+    let messages = [
+        declared("00000000000000g1", "agenda: SYNTH\u{2011}12"),
+        declared("00000000000000g2", "agenda: SYNTHB\u{2011}12"),
+    ];
+    let stored = stored_on_each_path(&json!({"exclude_keys": ["SYNTH"]}), &messages)?;
+    assert_each_path_stores(&stored, &["00000000000000g2"], "SYNTH excluded");
+    Ok(())
+}
+
 /// An HTML alternative whose key markup (`SYNTH<b>-12</b>`, `<a href=…>SYNTH</a>-12`) or an
 /// entity (`SYNTH&#45;12`, beside a bare `&` in `Q&A`) splits is read as a reader sees it,
 /// though the record takes the plain alternative, which names nothing: the message is stored
@@ -598,6 +628,118 @@ fn mail_an_excluded_address_takes_part_in_is_not_stored_on_any_path() -> Result<
         ],
         "no address excluded",
     );
+    Ok(())
+}
+
+/// Mail that names no key or link, but a private repository as `owner/name` (or in a GitHub
+/// URL) or the project's name, is stored on no path. A public repository of the same owner and
+/// a public phrase are kept, and so is mail that names the repository's bare name. Control: with
+/// no term configured, every path stores them all.
+#[test]
+fn mail_that_names_a_repository_or_the_projects_name_is_not_stored_on_any_path() -> Result<()> {
+    let plain = |id: &str, subject: &str| {
+        with_header(message(id, "1792944000000", "Zmlyc3Q="), "Subject", subject)
+    };
+    let messages = [
+        plain(
+            "00000000000000t1",
+            "Review theorem-labs/synth before Friday",
+        ),
+        plain(
+            "00000000000000t2",
+            "https://github.com/Theorem-Labs/Synth/pull/3",
+        ),
+        plain("00000000000000t3", "Project Falcon kickoff"),
+        plain("00000000000000t4", "Review theorem-labs/public-repo"),
+        plain("00000000000000t5", "Quarterly plan"),
+        plain("00000000000000t6", "the synth notes"),
+    ];
+    let config = json!({
+        "exclude_repositories": ["theorem-labs/synth"],
+        "exclude_terms": ["Project Falcon"]
+    });
+    let stored = stored_on_each_path(&config, &messages)?;
+    assert_each_path_stores(
+        &stored,
+        &["00000000000000t4", "00000000000000t5", "00000000000000t6"],
+        "the terms excluded",
+    );
+    let stored = stored_on_each_path(&json!({}), &messages)?;
+    assert_each_path_stores(
+        &stored,
+        &[
+            "00000000000000t1",
+            "00000000000000t2",
+            "00000000000000t3",
+            "00000000000000t4",
+            "00000000000000t5",
+            "00000000000000t6",
+        ],
+        "no term excluded",
+    );
+    Ok(())
+}
+
+/// An excluded address is named however an address header writes it, read as RFC 5322 reads a
+/// mailbox list: a quoted local part, a comment or folding inside the address, a group, an
+/// encoded word in a display name (base64 or quoted-printable); and in the headers a list or a
+/// relay carries the original sender and recipients in (`X-Original-From`, `X-Original-Sender`,
+/// `Resent-From`, `Resent-Sender`, `Resent-To`, `Resent-Cc`). Each such message is stored on no
+/// path. Control: the same forms naming a public address are stored on every path.
+#[test]
+fn an_excluded_address_is_named_however_a_header_writes_it() -> Result<()> {
+    let forms = |address: &str| {
+        use base64::Engine as _;
+        let (local, domain) = address.split_once('@').unwrap_or((address, ""));
+        let b = base64::engine::general_purpose::STANDARD.encode(address);
+        vec![
+            ("From", format!("\"{local}\"@{domain}")),
+            ("To", format!("Side <{local}(the partner)@{domain}>")),
+            ("Cc", format!("{local} @\r\n {domain}")),
+            ("To", format!("Partners: ada@theorem.example, {address};")),
+            ("From", format!("=?UTF-8?B?{b}?= <list@lists.example>")),
+            (
+                "Reply-To",
+                format!(
+                    "=?utf-8?Q?{}?= <list@lists.example>",
+                    address.replace('@', "=40")
+                ),
+            ),
+            ("X-Original-From", address.to_owned()),
+            ("X-Original-Sender", address.to_owned()),
+            ("Resent-From", address.to_owned()),
+            ("Resent-Sender", address.to_owned()),
+            ("Resent-To", address.to_owned()),
+            ("Resent-Cc", address.to_owned()),
+        ]
+    };
+    let config = json!({"exclude_emails": ["outside@partner.example"]});
+    for (address, excluded) in [
+        ("Outside@Partner.example", true),
+        ("ada@theorem.example", false),
+    ] {
+        let messages = forms(address)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, value))| {
+                with_header(
+                    message(&format!("{index:016x}"), "1792944000000", "Zmlyc3Q="),
+                    name,
+                    &value,
+                )
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..messages.len())
+            .map(|index| format!("{index:016x}"))
+            .collect::<Vec<_>>();
+        let stored = stored_on_each_path(&config, &messages)?;
+        if excluded {
+            assert_each_path_stores(&stored, &[], address);
+        } else {
+            let ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_each_path_stores(&stored, &ids, address);
+        }
+    }
     Ok(())
 }
 

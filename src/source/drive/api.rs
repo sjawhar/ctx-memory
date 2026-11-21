@@ -6,11 +6,12 @@ use serde_json::Value;
 use crate::api::client;
 use crate::api::google::{self, Google, Text};
 
-/// The file fields every listing asks for. `description` and `permissions(emailAddress)` are
-/// asked for the content net alone: the record stores neither.
-const FILE_FIELDS: &str = "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),parents,description,permissions(emailAddress)),nextPageToken";
+/// The file fields every listing asks for. `description`, `permissions(emailAddress)`,
+/// `sharingUser` and `driveId` are asked for the content net alone, and the record stores none
+/// of them, nor `lastModifyingUser`'s address.
+const FILE_FIELDS: &str = "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),sharingUser(displayName,emailAddress),parents,driveId,description,permissions(emailAddress)),nextPageToken";
 /// The change fields the changes feed asks for.
-const CHANGE_FIELDS: &str = "changes(removed,fileId,file(id,name,mimeType,modifiedTime,trashed,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),parents,description,permissions(emailAddress))),nextPageToken,newStartPageToken";
+const CHANGE_FIELDS: &str = "changes(removed,fileId,file(id,name,mimeType,modifiedTime,trashed,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),sharingUser(displayName,emailAddress),parents,driveId,description,permissions(emailAddress))),nextPageToken,newStartPageToken";
 
 /// One page of the changes feed: the files it carries and the token that follows it.
 #[derive(Clone, Debug, Default)]
@@ -32,6 +33,9 @@ pub(super) trait DriveApi {
     fn files(&self, query: &str) -> Result<Vec<Value>>;
     /// The text export of one file, or Drive's refusal to make it.
     fn export(&self, id: &str, mime: &str, limit: usize) -> Result<Text>;
+    /// The permissions on the file, or the shared drive, `id` names, each with its
+    /// `emailAddress`: what a listing leaves out for a shared-drive file.
+    fn permissions(&self, id: &str) -> Result<Vec<Value>>;
 }
 
 pub(super) struct GoogleDriveApi {
@@ -136,22 +140,41 @@ impl DriveApi for GoogleDriveApi {
             limit,
         )
     }
+
+    fn permissions(&self, id: &str) -> Result<Vec<Value>> {
+        let pages = self.google.paginate(
+            &format!("drive/v3/files/{}/permissions", client::percent_encode(id)),
+            &[
+                ("supportsAllDrives", "true".to_owned()),
+                ("pageSize", "100".to_owned()),
+                (
+                    "fields",
+                    "permissions(emailAddress),nextPageToken".to_owned(),
+                ),
+            ],
+            "permissions",
+        )?;
+        Ok(pages.items)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{CHANGE_FIELDS, FILE_FIELDS};
 
-    /// Both listings ask Drive for each file's description and who holds a permission on it, so
-    /// the content net reads them on the changes feed and on a listing alike: Drive answers only
-    /// the fields a request names.
+    /// Both listings ask Drive for the fields the content net reads, on the changes feed and on
+    /// a listing alike: Drive answers only the fields a request names.
     #[test]
-    fn both_listings_ask_for_the_description_and_the_permissions() {
+    fn both_listings_ask_for_the_fields_the_net_reads() {
         for fields in [FILE_FIELDS, CHANGE_FIELDS] {
-            assert!(
-                fields.contains(",description,permissions(emailAddress))"),
-                "{fields}"
-            );
+            for wanted in [
+                "lastModifyingUser(displayName,emailAddress)",
+                "sharingUser(displayName,emailAddress)",
+                ",driveId,",
+                ",description,permissions(emailAddress))",
+            ] {
+                assert!(fields.contains(wanted), "{wanted}: {fields}");
+            }
         }
     }
 }

@@ -15,9 +15,10 @@ use crate::source::{
 };
 
 use super::super::content_net::{self, ContentNet, Hit};
+use super::addresses::mailboxes;
 use super::lists::ExcludedLists;
 use super::render::{
-    decode_body, external_text_parts, find_in_inline_parts, message_timestamp,
+    external_text_parts, find_in_inline_parts, message_timestamp, readings,
     record_from_message_with_scheme, render_gmail, required_string,
 };
 use super::{GmailConfig, STREAM};
@@ -613,7 +614,22 @@ pub(super) fn excluded_labels(query: &str) -> BTreeSet<String> {
     labels
 }
 
-const ADDRESS_HEADERS: [&str; 6] = ["From", "Sender", "To", "Cc", "Bcc", "Reply-To"];
+/// The headers whose addresses take part in a message: its sender and recipients, and the ones
+/// a mailing list or a relay carries the original sender and recipients in.
+const ADDRESS_HEADERS: [&str; 12] = [
+    "From",
+    "Sender",
+    "To",
+    "Cc",
+    "Bcc",
+    "Reply-To",
+    "X-Original-From",
+    "X-Original-Sender",
+    "Resent-From",
+    "Resent-Sender",
+    "Resent-To",
+    "Resent-Cc",
+];
 
 /// The mail the deployment never stores, on every path that reads a message: a fetch's and a
 /// resolve's.
@@ -654,15 +670,15 @@ impl Withheld {
             return Ok(Some(Hit::Address));
         }
         let net = &self.net;
-        let key = net
-            .key_in_value(message)
-            .or_else(|| find_in_inline_parts(message, &|text| net.key_in(text)))
-            .or_else(|| net.key_in(&render_gmail(message)));
-        if let Some(key) = key {
-            return Ok(Some(Hit::Key(key.to_owned())));
+        let hit = net
+            .hit_in_value(message)
+            .or_else(|| find_in_inline_parts(message, &|text| net.hit_in(text)))
+            .or_else(|| net.hit_in(&render_gmail(message)));
+        if hit.is_some() {
+            return Ok(hit);
         }
         let external = external_text_parts(message);
-        if external.is_empty() {
+        if external.is_empty() || !net.has_text_net() {
             return Ok(None);
         }
         let id = required_string(message, "id", "Gmail message")?;
@@ -674,14 +690,19 @@ impl Withheld {
             let data = api.attachment(id, attachment).with_context(|| {
                 format!("Gmail did not answer for a text part of {pointer} that it keeps apart")
             })?;
-            if let Some(key) = net.key_in(&decode_body(part, &data)) {
-                return Ok(Some(Hit::Key(key.to_owned())));
+            let hit = readings(part, &data)
+                .iter()
+                .find_map(|text| net.hit_in(text));
+            if hit.is_some() {
+                return Ok(hit);
             }
         }
         Ok(None)
     }
 
-    /// Whether an excluded address is in one of the [`ADDRESS_HEADERS`] of `message`.
+    /// Whether an excluded address is in one of the [`ADDRESS_HEADERS`] of `message`, read as a
+    /// mailbox list ([`mailboxes`]): as a mailbox's address, or written in a display name or
+    /// comment.
     fn names_an_address(&self, message: &Value) -> bool {
         message
             .pointer("/payload/headers")
@@ -699,7 +720,13 @@ impl Withheld {
                     })
             })
             .filter_map(|header| header.get("value").and_then(Value::as_str))
-            .any(|value| self.net.names_address(value))
+            .any(|value| {
+                let read = mailboxes(value);
+                read.addresses
+                    .iter()
+                    .any(|address| self.net.is_excluded_address(address))
+                    || self.net.names_address(&read.display)
+            })
     }
 }
 

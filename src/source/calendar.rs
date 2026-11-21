@@ -31,7 +31,7 @@ use crate::atomic::write_replace;
 use crate::exclude::Exclusion;
 use crate::record::Record;
 
-use super::content_net::{self, ContentNet, Hit};
+use super::content_net::{self, ContentNet, Hit, NetLists};
 use super::{
     token_cursor, window_start, FetchRequest, Message, Op, Request, ResolveRequest, Source,
     TokenCursor, PROTOCOL_VERSION,
@@ -86,7 +86,7 @@ impl Source for CalendarSource {
         match request {
             Request::Fetch(request) => {
                 let mut config = parse_config(&request.config)?;
-                config.net = ContentNet::configured(&config.exclude_keys, &config.exclude_emails)?;
+                config.net = ContentNet::configured(&config.net_lists())?;
                 emit_fetch_hello(request, &config, sink)?;
                 let api = GoogleCalendarApi::load()?;
                 fetch_with_api(request, &config, &api, sink)
@@ -106,13 +106,31 @@ struct CalendarConfig {
     /// Keys of the content net: an event whose text names one is never stored.
     #[serde(default)]
     exclude_keys: Vec<String>,
+    /// Terms of the content net: an event whose text names one whole is never stored.
+    #[serde(default)]
+    exclude_terms: Vec<String>,
+    /// Repositories of the content net, `owner/name`: an event whose text names one is never
+    /// stored.
+    #[serde(default)]
+    exclude_repositories: Vec<String>,
     /// Addresses of the content net: an event one organizes, creates or attends is never stored.
     #[serde(default)]
     exclude_emails: Vec<String>,
-    /// The net `exclude_keys`, `exclude_emails`, `CTX_EXCLUDE_KEYS` and `CTX_EXCLUDE_EMAILS`
-    /// make, built by the process that runs the fetch, after the configuration is read.
+    /// The net these lists and their variables make, built by the process that runs the fetch,
+    /// after the configuration is read.
     #[serde(skip)]
     net: ContentNet,
+}
+
+impl CalendarConfig {
+    fn net_lists(&self) -> NetLists<'_> {
+        NetLists {
+            keys: &self.exclude_keys,
+            terms: &self.exclude_terms,
+            repositories: &self.exclude_repositories,
+            addresses: &self.exclude_emails,
+        }
+    }
 }
 
 fn parse_config(value: &Value) -> Result<CalendarConfig> {
@@ -1001,12 +1019,11 @@ mod tests {
         })
     }
 
-    /// Runs a fetch with the request's configuration, `exclude_keys` among it, and no
+    /// Runs a fetch with the request's configuration, the content net's lists among it, and no
     /// environment.
     fn run_fetch(api: &FakeCalendarApi, request: &FetchRequest) -> Result<Vec<Message>> {
         let mut config = parse_config(&request.config)?;
-        config.net = ContentNet::from_parts(&config.exclude_keys, None)?
-            .with_addresses(&config.exclude_emails, None)?;
+        config.net = ContentNet::from_lists(&config.net_lists())?;
         let mut messages = Vec::new();
         fetch_with_api(request, &config, api, &mut |message| {
             messages.push(message);
@@ -2700,6 +2717,69 @@ mod tests {
             } else {
                 assert_eq!(stored.len(), 5, "{stored:?}");
                 assert!(logged.is_empty(), "{logged:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// An event that names a private repository as `owner/name` or the project's name, and no
+    /// key, is not stored, and its drop is logged without the term. A public repository and a
+    /// public phrase are kept. Control: with no term configured, all four are stored.
+    #[test]
+    fn an_event_that_names_a_repository_or_the_projects_name_is_not_stored() -> Result<()> {
+        let described = |id: &str, description: &str| {
+            let mut item = event(id, "2026-10-25T09:00:00Z", "2026-10-25T10:00:00Z", None);
+            if let Some(fields) = item.as_object_mut() {
+                fields.insert("description".to_owned(), json!(description));
+            }
+            item
+        };
+        let items = vec![
+            described(
+                "EVENT-REPO",
+                "Walk through github.com/theorem-labs/synth/pull/3",
+            ),
+            described("EVENT-NAME", "Project  Falcon weekly"),
+            described("EVENT-PUBLIC-REPO", "Walk through theorem-labs/public-repo"),
+            described("EVENT-PUBLIC", "Quarterly plan"),
+        ];
+        for excluded in [true, false] {
+            let fake = api(vec![listing("sync-2", items.clone())]);
+            let mut request = request(Some("sync-1@2026-10-24T18:00:00Z"))?;
+            request.config = if excluded {
+                json!({
+                    "calendars": ["team@example.com"],
+                    "exclude_repositories": ["theorem-labs/synth"],
+                    "exclude_terms": ["Project Falcon"]
+                })
+            } else {
+                json!({"calendars": ["team@example.com"]})
+            };
+            crate::source::content_net::tests::take_logged();
+            let messages = run_fetch(&fake, &request)?;
+            let logged = crate::source::content_net::tests::take_logged();
+            let mut stored = records(&messages)
+                .into_iter()
+                .map(|record| record.pointer)
+                .collect::<Vec<_>>();
+            stored.sort();
+            if excluded {
+                assert_eq!(
+                    stored,
+                    [
+                        "gcal:team@example.com/EVENT-PUBLIC",
+                        "gcal:team@example.com/EVENT-PUBLIC-REPO"
+                    ]
+                );
+                assert_eq!(
+                    logged,
+                    [
+                        r#"{"event":"withheld","reason":"private-term","pointer":"gcal:team@example.com/EVENT-REPO"}"#,
+                        r#"{"event":"withheld","reason":"private-term","pointer":"gcal:team@example.com/EVENT-NAME"}"#,
+                    ]
+                );
+            } else {
+                assert_eq!(stored.len(), 4, "{stored:?}");
             }
         }
         Ok(())

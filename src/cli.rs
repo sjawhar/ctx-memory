@@ -57,7 +57,8 @@ pub struct Cli {
     pub json: bool,
 
     /// Apply the exclusion settings of the built-in sources (`exclude_list_ids`,
-    /// `exclude_repository_ids`, `exclude_keys`, `exclude_emails` and their variables). Without
+    /// `exclude_repository_ids`, `exclude_keys`, `exclude_terms`, `exclude_repositories`,
+    /// `exclude_emails` and their variables). Without
     /// it they are refused, and `fetch` and `serve` stop before they read anything; a ctx too
     /// old to apply them refuses this argument instead.
     #[arg(long, global = true)]
