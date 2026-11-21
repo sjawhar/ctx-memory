@@ -29,7 +29,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::api::github::{GithubClient, Page, Repo};
+use crate::api::github::{GithubClient, Listing, Page, Repo};
 use crate::credentials;
 use crate::exclude::Exclusion;
 
@@ -96,7 +96,7 @@ trait GithubApi {
     /// Gets a read-only token for `installation`, minted or read from the token secret, and
     /// lists the repositories it covers, or `None` when GitHub refused that to protect a rate
     /// limit.
-    fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>>;
+    fn repositories(&self, installation: u64) -> Result<Option<Listing>>;
     /// `GET url` with `installation`'s token. With a token secret, a `401` is an error carrying
     /// [`crate::api::github::Unauthorized`].
     fn get(&self, installation: u64, url: &str) -> Result<Page>;
@@ -108,7 +108,7 @@ trait GithubApi {
 }
 
 impl GithubApi for GithubClient {
-    fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>> {
+    fn repositories(&self, installation: u64) -> Result<Option<Listing>> {
         Self::repositories(self, installation)
     }
 
@@ -243,6 +243,69 @@ fn emit_resolve_hello(
     })
 }
 
+/// What every installation's listing names, as one run reads it.
+struct Listed {
+    /// The repositories to read, each with its installation, in listing order.
+    repos: Vec<(u64, Repo)>,
+    /// The streams of the repositories the deployment excludes by id, as GitHub names them now.
+    withheld: BTreeSet<String>,
+    /// Whether GitHub refused to list an installation, to protect a rate limit.
+    any_throttled: bool,
+    /// What the run says of the listings: each refused one, and each that gave entries no id.
+    warnings: Vec<String>,
+}
+
+/// Lists each installation's repositories and drops those the deployment excludes by id. Every
+/// pointer, request and stream of a repository starts from its listing, so one excluded by id is
+/// dropped here, under whatever name GitHub gives it now. An entry with no id is not read, since
+/// no exclusion by id could be checked against it; the warning counts such entries and names
+/// none, as a name may be one the deployment excludes.
+fn list_repositories<C: GithubApi + ?Sized>(
+    installations: &[u64],
+    excluded: &BTreeSet<u64>,
+    api: &C,
+) -> Result<Listed> {
+    let mut listed = Listed {
+        repos: Vec::new(),
+        withheld: BTreeSet::new(),
+        any_throttled: false,
+        warnings: Vec::new(),
+    };
+    let mut unidentified = Vec::new();
+    for &installation in installations {
+        let listing = api
+            .repositories(installation)
+            .with_context(|| format!("listing repositories for installation {installation}"))?;
+        // GitHub refused to say what this installation covers, so none of its streams are known
+        // this run. Their stored cursors stand untouched and the next fetch asks again.
+        let Some(listing) = listing else {
+            listed.any_throttled = true;
+            listed.warnings.push(format!(
+                "installation {installation}: GitHub refused its repository listing to protect its rate limit; its repositories are read by the next fetch"
+            ));
+            continue;
+        };
+        if listing.without_id > 0 {
+            unidentified.push((installation, listing.without_id));
+        }
+        for repo in listing.repos {
+            if excluded.contains(&repo.id) {
+                listed.withheld.insert(stream_id(&repo));
+            } else {
+                listed.repos.push((installation, repo));
+            }
+        }
+    }
+    for (installation, count) in unidentified {
+        listed.warnings.push(format!(
+            "installation {installation}: GitHub listed {count} repository entr{} without an id; {} not read",
+            if count == 1 { "y" } else { "ies" },
+            if count == 1 { "it is" } else { "they are" }
+        ));
+    }
+    Ok(listed)
+}
+
 fn fetch_with_api<C: GithubApi + ?Sized>(
     request: &FetchRequest,
     config: &GithubConfig,
@@ -251,40 +314,18 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
-    let mut repos = Vec::new();
-    // The streams of the repositories the deployment excludes by id, as GitHub names them now.
-    let mut withheld = BTreeSet::new();
-    let mut throttled = Vec::new();
-    for &installation in installations {
-        let listed = api
-            .repositories(installation)
-            .with_context(|| format!("listing repositories for installation {installation}"))?;
-        match listed {
-            Some(listed) => {
-                for repo in listed {
-                    // Every pointer, request and stream of a repository starts from its listing,
-                    // so one the deployment excludes by id is dropped here, under whatever name
-                    // GitHub gives it now.
-                    if excluded.contains(&repo.id) {
-                        withheld.insert(stream_id(&repo));
-                    } else {
-                        repos.push((installation, repo));
-                    }
-                }
-            }
-            // GitHub refused to say what this installation covers, so none of its streams are
-            // known this run. Their stored cursors stand untouched and the next fetch asks again.
-            None => throttled.push(installation),
-        }
-    }
+    let Listed {
+        repos,
+        withheld,
+        any_throttled,
+        warnings: listing_warnings,
+    } = list_repositories(installations, excluded, api)?;
     let streams: Vec<String> = repos.iter().map(|(_, repo)| stream_id(repo)).collect();
     emit_fetch_hello(request, &streams, sink)?;
-    for &installation in &throttled {
+    for message in listing_warnings {
         sink(Message::Warning {
             stream: None,
-            message: format!(
-                "installation {installation}: GitHub refused its repository listing to protect its rate limit; its repositories are read by the next fetch"
-            ),
+            message,
         })?;
     }
 
@@ -362,7 +403,11 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
         )?;
     }
     state.first = first_stopped.or(unplanned);
-    if throttled.is_empty() {
+    // A repository the deployment excludes by id keeps no state, whichever installations answered.
+    for stream in &withheld {
+        state.unsettle(stream);
+    }
+    if !any_throttled {
         // Every installation answered, so a stream that is missing from this run is a
         // repository the app no longer reads.
         state.retain(&streams);

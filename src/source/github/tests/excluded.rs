@@ -8,12 +8,13 @@ const EXCLUDED_ID: u64 = 9_000_000_001;
 const KEPT_ID: u64 = 9_000_000_002;
 
 /// One installation holding two repositories, each with one issue: the one whose id is
-/// `EXCLUDED_ID`, called `name` now, and `kept`.
-fn installation(name: &str) -> (FakeGithub, Repo, Repo) {
+/// `EXCLUDED_ID`, `owner/name` now, and `kept`. The pre-pass knows both as unchanged since long
+/// before the window, so a settled stream of either is asked about and not read through REST.
+fn installation(owner: &str, name: &str) -> (FakeGithub, Repo, Repo) {
     let base = api_base();
     let excluded = Repo {
         id: EXCLUDED_ID,
-        ..repo("example-org", name)
+        ..repo(owner, name)
     };
     let kept = Repo {
         id: KEPT_ID,
@@ -30,55 +31,102 @@ fn installation(name: &str) -> (FakeGithub, Repo, Repo) {
             page(vec![issue(1, "2026-10-25T10:00:00Z")]),
         );
         fake.page(&issue_comments_url(&base, subject, 1), page(Vec::new()));
+        fake.changed(subject, "2026-09-01T00:00:00Z");
     }
     (fake, excluded, kept)
 }
 
+/// Whether a GraphQL request the source sent asks about a repository called `owner/name`.
+fn asked_about(fake: &FakeGithub, owner: &str, name: &str) -> bool {
+    fake.graphql_log.borrow().iter().any(|request| {
+        request
+            .get("variables")
+            .and_then(Value::as_object)
+            .is_some_and(|variables| {
+                (0..variables.len() / 2).any(|index| {
+                    variables.get(&format!("o{index}")) == Some(&json!(owner))
+                        && variables.get(&format!("n{index}")) == Some(&json!(name))
+                })
+            })
+    })
+}
+
 /// A repository the deployment excludes by its id is never read, and stays excluded under the
-/// name GitHub gives it after a rename or a transfer: the run lists no stream for it and sends
-/// no request for it, so none of its issues becomes a record. A pointer pattern names a
-/// repository by the name it had when the pattern was written, which a rename leaves behind.
-/// Control: with no id excluded, the same repository, under either name, is read.
+/// name GitHub gives it after a rename or a transfer to another owner. A first run, with no id
+/// excluded, reads both repositories and settles their streams. The second, with the id excluded,
+/// lists no stream for the repository, asks the GraphQL pre-pass nothing of it, sends no REST
+/// request about it and keeps no settled state for it, though a second installation's refused
+/// listing keeps the run from forgetting the streams it did not plan, so none of its issues
+/// becomes a record. Control: a second run with no id excluded asks the pre-pass about it and
+/// lists its stream.
 #[test]
 fn a_repository_excluded_by_id_is_never_read_under_any_name() -> Result<()> {
-    for name in ["private", "private-renamed"] {
+    for (owner, name) in [
+        ("example-org", "private"),
+        ("example-org", "private-renamed"),
+        ("other-org", "private"),
+    ] {
         for exclude in [vec![EXCLUDED_ID], Vec::new()] {
-            let (fake, excluded, kept) = installation(name);
+            let (mut fake, excluded, kept) = installation(owner, name);
+            fake.throttled = BTreeSet::from([2]);
             let cursors = BTreeMap::from([
                 (stream_id(&excluded), CURSOR.to_owned()),
                 (stream_id(&kept), CURSOR.to_owned()),
             ]);
-            let config = GithubConfig {
-                exclude_repository_ids: exclude.clone(),
-                ..config(vec![1], 600, 2000)
-            };
-            let outcome = run(&fake, &request(cursors)?, &config)?;
-            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            let first_request = request(cursors)?;
+            let first = run(&fake, &first_request, &config(vec![1, 2], 600, 2000))?;
+            assert!(first.error.is_none(), "{:?}", first.error);
+            assert!(
+                pointers(&first).contains(&format!("{}#1", stream_id(&excluded))),
+                "the first run, with no id excluded, reads {owner}/{name}"
+            );
+            let rest_before = fake.get_log.borrow().len();
 
-            let excluded_pointer = format!("{}#1", stream_id(&excluded));
-            let kept_pointer = format!("{}#1", stream_id(&kept));
-            let streams: BTreeSet<String> = outcome.streams.keys().cloned().collect();
-            let read_excluded = fake
+            let second_config = GithubConfig {
+                exclude_repository_ids: exclude.clone(),
+                ..config(vec![1, 2], 600, 2000)
+            };
+            let second = run(
+                &fake,
+                &next_request(&first_request, &first)?,
+                &second_config,
+            )?;
+            assert!(second.error.is_none(), "{:?}", second.error);
+            let streams: BTreeSet<String> = second.streams.keys().cloned().collect();
+            let read_by_rest = fake
                 .get_log
                 .borrow()
                 .iter()
-                .any(|url| url.contains(&format!("/repos/example-org/{name}/")));
+                .skip(rest_before)
+                .any(|url| url.contains(&format!("/repos/{owner}/{name}/")));
+            let settled = std::fs::read_to_string(first_request.state_dir.join(STATE_FILE))?;
+            let case = format!("{owner}/{name}, excluded {}", !exclude.is_empty());
             if exclude.is_empty() {
-                assert_eq!(
-                    pointers(&outcome),
-                    BTreeSet::from([excluded_pointer, kept_pointer]),
-                    "with no id excluded, {name} is read"
+                assert!(
+                    asked_about(&fake, owner, name),
+                    "{case}: the pre-pass is reached"
                 );
-                assert!(streams.contains(&stream_id(&excluded)), "{streams:?}");
-                assert!(read_excluded, "{:?}", fake.get_log.borrow());
+                assert!(
+                    streams.contains(&stream_id(&excluded)),
+                    "{case}: {streams:?}"
+                );
             } else {
-                assert_eq!(
-                    pointers(&outcome),
-                    BTreeSet::from([kept_pointer]),
-                    "{name}, excluded by its id, makes no record"
+                assert_eq!(streams, BTreeSet::from([stream_id(&kept)]), "{case}");
+                assert!(
+                    !asked_about(&fake, owner, name),
+                    "{case}: {:?}",
+                    fake.graphql_log
                 );
-                assert_eq!(streams, BTreeSet::from([stream_id(&kept)]));
-                assert!(!read_excluded, "{:?}", fake.get_log.borrow());
+                assert!(!read_by_rest, "{case}: {:?}", fake.get_log.borrow());
+                assert!(
+                    pointers(&second).is_empty(),
+                    "{case}: {:?}",
+                    pointers(&second)
+                );
+                assert!(
+                    !settled.contains(&stream_id(&excluded)),
+                    "{case}: the state names it: {settled}"
+                );
             }
         }
     }

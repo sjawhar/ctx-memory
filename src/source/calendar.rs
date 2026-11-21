@@ -6,7 +6,9 @@
 //! in the series both lie [`HORIZON`] or more past the window end, reckoned to the second, unless
 //! it recorded that instance before, and lists no event that far ahead by time. A record's
 //! timestamp is the event's start, so an event that starts after the window ends is a context
-//! record. A cancelled event it recorded before is recorded again as cancelled (`Emitted`).
+//! record. A cancelled event it recorded before is recorded again as cancelled (`Emitted`). An
+//! event whose text names a key of the content net ([`super::content_net`]) is never stored, on
+//! either listing, and the list of recorded events does not name it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -29,6 +31,7 @@ use crate::atomic::write_replace;
 use crate::exclude::Exclusion;
 use crate::record::Record;
 
+use super::content_net::ContentNet;
 use super::{
     token_cursor, window_start, FetchRequest, Message, Op, Request, ResolveRequest, Source,
     TokenCursor, PROTOCOL_VERSION,
@@ -82,7 +85,8 @@ impl Source for CalendarSource {
     fn run(&self, request: &Request, sink: &mut dyn FnMut(Message) -> Result<()>) -> Result<()> {
         match request {
             Request::Fetch(request) => {
-                let config = parse_config(&request.config)?;
+                let mut config = parse_config(&request.config)?;
+                config.net = ContentNet::configured(&config.exclude_keys)?;
                 emit_fetch_hello(request, &config, sink)?;
                 let api = GoogleCalendarApi::load()?;
                 fetch_with_api(request, &config, &api, sink)
@@ -99,6 +103,13 @@ impl Source for CalendarSource {
 #[serde(deny_unknown_fields)]
 struct CalendarConfig {
     calendars: Vec<String>,
+    /// Keys of the content net: an event whose text names one is never stored.
+    #[serde(default)]
+    exclude_keys: Vec<String>,
+    /// The net `exclude_keys` and `CTX_EXCLUDE_KEYS` make, built by the process that runs the
+    /// fetch, after the configuration is read.
+    #[serde(skip)]
+    net: ContentNet,
 }
 
 fn parse_config(value: &Value) -> Result<CalendarConfig> {
@@ -371,34 +382,36 @@ fn fetch_with_api<C: CalendarApi + ?Sized>(
         // The list is saved before any record is sent: a record stored without its entry would
         // leave its cancellation unrecorded, so a save that fails stores nothing and leaves the
         // cursor, and the next fetch reads the same changes again.
-        let collected = collect_calendar(request, calendar, api, held.as_ref()).and_then(|c| {
-            let mut recorded = c.recorded;
-            // The fetch drops the record of an excluded event, so this fetch's record of one is
-            // not listed; one listed before, whose record the tree may hold, stays as it was.
-            // This comes before the old entries are forgotten, so a move the fetch dropped does
-            // not make the tree's record forgotten either.
-            if !exclusion.is_empty() {
-                let scheme = &request.source.scheme;
-                let excluded = |id: &str| exclusion.matches(&format!("{scheme}:{calendar}/{id}"));
-                recorded.retain(|id, _| !excluded(id.as_str()));
-                if let Some(held) = &held {
-                    for (id, start) in held.iter().filter(|(id, _)| excluded(id.as_str())) {
-                        recorded.insert(id.clone(), *start);
+        let collected = collect_calendar(request, calendar, api, held.as_ref(), &config.net)
+            .and_then(|c| {
+                let mut recorded = c.recorded;
+                // The fetch drops the record of an excluded event, so this fetch's record of one is
+                // not listed; one listed before, whose record the tree may hold, stays as it was.
+                // This comes before the old entries are forgotten, so a move the fetch dropped does
+                // not make the tree's record forgotten either.
+                if !exclusion.is_empty() {
+                    let scheme = &request.source.scheme;
+                    let excluded =
+                        |id: &str| exclusion.matches(&format!("{scheme}:{calendar}/{id}"));
+                    recorded.retain(|id, _| !excluded(id.as_str()));
+                    if let Some(held) = &held {
+                        for (id, start) in held.iter().filter(|(id, _)| excluded(id.as_str())) {
+                            recorded.insert(id.clone(), *start);
+                        }
                     }
                 }
-            }
-            recorded.retain(|_, start| *start >= forget_before(request));
-            let list = CalendarList {
-                stored: held.unwrap_or_default(),
-                proposed: Some(Proposed {
-                    cursor: c.cursor.clone(),
-                    recorded,
-                }),
-            };
-            Emitted::save(&request.state_dir, calendar, list)?;
-            let warnings: Vec<String> = missing.into_iter().chain(c.warnings).collect();
-            Ok((warnings, c.records, c.cursor))
-        });
+                recorded.retain(|_, start| *start >= forget_before(request));
+                let list = CalendarList {
+                    stored: held.unwrap_or_default(),
+                    proposed: Some(Proposed {
+                        cursor: c.cursor.clone(),
+                        recorded,
+                    }),
+                };
+                Emitted::save(&request.state_dir, calendar, list)?;
+                let warnings: Vec<String> = missing.into_iter().chain(c.warnings).collect();
+                Ok((warnings, c.records, c.cursor))
+            });
         super::emit_stream(calendar, collected, sink)?;
     }
     Ok(())
@@ -414,6 +427,7 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
     calendar: &str,
     api: &C,
     held: Option<&Recorded>,
+    net: &ContentNet,
 ) -> Result<Collected> {
     let cursor = request
         .cursors
@@ -505,7 +519,7 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
                 if is_cancelled(event) {
                     let mut cancelled = record(event, stored)?;
                     CANCELLED.clone_into(&mut cancelled.text);
-                    collected.records.push(cancelled);
+                    collected.keep(net, cancelled, event, stored);
                     continue;
                 }
                 recorded_start(event, &..)?
@@ -514,18 +528,27 @@ fn collect_calendar<C: CalendarApi + ?Sized>(
             _ => recorded_start(event, &(..horizon))?,
         };
         if let Some(start) = start {
-            collected.keep(record(event, start)?, event, start);
+            collected.keep(net, record(event, start)?, event, start);
         }
     }
     if let Some((kept, listing)) = &horizon_listing {
-        collect_horizon_listing(&mut collected, &page.items, kept, listing, &record)?;
+        collect_horizon_listing(&mut collected, net, &page.items, kept, listing, &record)?;
     }
     Ok(collected)
 }
 
 impl Collected {
-    /// Adds `record`, of `event` at `start`, and lists the event as recorded there.
-    fn keep(&mut self, record: Record, event: &Value, start: DateTime<Utc>) {
+    /// Adds `record`, of `event` at `start`, and lists the event as recorded there, unless the
+    /// record names a key of the content net: then the record is dropped and the event is taken
+    /// off the list, though a stored window listed it before, so nothing more of it is recorded,
+    /// its later cancellation included, while it is about a private project.
+    fn keep(&mut self, net: &ContentNet, record: Record, event: &Value, start: DateTime<Utc>) {
+        if net.matches_record(&record) {
+            if let Some(id) = event_id(event) {
+                self.recorded.remove(id);
+            }
+            return;
+        }
         self.records.push(record);
         if let Some(id) = event_id(event) {
             self.recorded.insert(id.to_owned(), start);
@@ -537,6 +560,7 @@ impl Collected {
 /// as well is recorded once, as that listing has it.
 fn collect_horizon_listing(
     collected: &mut Collected,
+    net: &ContentNet,
     named: &[Value],
     kept: &Range<DateTime<Utc>>,
     listing: &EventPage,
@@ -549,7 +573,7 @@ fn collect_horizon_listing(
         .filter(|event| event_id(event).is_none_or(|id| !named.contains(id)));
     for event in unnamed {
         if let Some(start) = recorded_start(event, kept)? {
-            collected.keep(record(event, start)?, event, start);
+            collected.keep(net, record(event, start)?, event, start);
         }
     }
     Ok(())
@@ -954,8 +978,11 @@ mod tests {
         })
     }
 
+    /// Runs a fetch with the request's configuration, `exclude_keys` among it, and no
+    /// environment.
     fn run_fetch(api: &FakeCalendarApi, request: &FetchRequest) -> Result<Vec<Message>> {
-        let config = parse_config(&request.config)?;
+        let mut config = parse_config(&request.config)?;
+        config.net = ContentNet::from_parts(&config.exclude_keys, None)?;
         let mut messages = Vec::new();
         fetch_with_api(request, &config, api, &mut |message| {
             messages.push(message);
@@ -2434,6 +2461,144 @@ mod tests {
         let messages = run_fetch(&api, &request_after(&first_cursor, &first.state_dir)?)?;
 
         assert!(records(&messages).is_empty(), "{messages:?}");
+        Ok(())
+    }
+
+    /// An event whose text names an excluded key, an issue in its description or a link in its
+    /// title, is stored on neither listing, a sync token's and a first fetch's by time, and the
+    /// list of recorded events does not name it, so its later cancellation records nothing
+    /// either. An event that names another key is kept. Control: with no key configured, both
+    /// listings store all three and list them.
+    #[test]
+    fn an_event_that_names_an_excluded_key_is_not_stored_on_either_listing() -> Result<()> {
+        let mut described = event(
+            "EVENT-DESCRIBED",
+            "2026-10-25T09:00:00Z",
+            "2026-10-25T10:00:00Z",
+            None,
+        );
+        let mut titled = event(
+            "EVENT-TITLED",
+            "2026-10-25T11:00:00Z",
+            "2026-10-25T12:00:00Z",
+            None,
+        );
+        let mut other = event(
+            "EVENT-OTHER",
+            "2026-10-25T13:00:00Z",
+            "2026-10-25T14:00:00Z",
+            None,
+        );
+        for (event, field, value) in [
+            (
+                &mut described,
+                "description",
+                "Agenda: SYNTH-12, then INFRA-4.",
+            ),
+            (
+                &mut titled,
+                "summary",
+                "Review dispatch://SYNTH/artifact/plan",
+            ),
+            (&mut other, "description", "Agenda: SYNTHB-12."),
+        ] {
+            if let Some(fields) = event.as_object_mut() {
+                fields.insert(field.to_owned(), json!(value));
+            }
+        }
+        let items = vec![described, titled, other];
+        for start in [Some("sync-1@2026-10-24T18:00:00Z"), None] {
+            for excluded in [true, false] {
+                let fake = api(vec![listing("sync-2", items.clone())]);
+                let mut request = request(start)?;
+                request.config = if excluded {
+                    json!({"calendars": ["team@example.com"], "exclude_keys": ["SYNTH"]})
+                } else {
+                    json!({"calendars": ["team@example.com"]})
+                };
+                let messages = run_fetch(&fake, &request)?;
+                let mut stored = records(&messages)
+                    .into_iter()
+                    .map(|record| record.pointer)
+                    .collect::<Vec<_>>();
+                stored.sort();
+                let list = std::fs::read_to_string(request.state_dir.join("emitted.json"))?;
+                let case = format!("cursor {start:?}, excluded {excluded}");
+                if excluded {
+                    assert_eq!(stored, ["gcal:team@example.com/EVENT-OTHER"], "{case}");
+                    assert!(!list.contains("EVENT-DESCRIBED"), "{case}: {list}");
+                    assert!(!list.contains("EVENT-TITLED"), "{case}: {list}");
+                } else {
+                    assert_eq!(stored.len(), 3, "{case}: {stored:?}");
+                    assert!(list.contains("EVENT-DESCRIBED"), "{case}: {list}");
+                }
+                assert!(list.contains("EVENT-OTHER"), "{case}: {list}");
+                let next = cursor(&messages).context("the fetch moved on")?;
+                let cancelled = json!({"id": "EVENT-DESCRIBED", "status": "cancelled"});
+                let later = api(vec![listing("sync-3", vec![cancelled])]);
+                let mut after = request_after(&next, &request.state_dir)?;
+                after.config = request.config.clone();
+                let cancellations = records(&run_fetch(&later, &after)?);
+                assert_eq!(
+                    cancellations.is_empty(),
+                    excluded,
+                    "{case}: {cancellations:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// An event a window stored before it named an excluded key is taken off the list of
+    /// recorded events once an update names one: the update is not stored, and nor is its later
+    /// cancellation, which Google names by its id alone. Control: an update that names no key is
+    /// stored and keeps the event listed, so its cancellation is recorded.
+    #[test]
+    fn an_event_that_comes_to_name_an_excluded_key_is_forgotten() -> Result<()> {
+        for (agenda, withheld) in [("Agenda: SYNTH-12", true), ("Agenda: INFRA-4", false)] {
+            let config = json!({"calendars": ["team@example.com"], "exclude_keys": ["SYNTH"]});
+            let ordinary = event(
+                "EVENT-LATER",
+                "2026-10-25T09:00:00Z",
+                "2026-10-25T10:00:00Z",
+                None,
+            );
+            let mut updated = ordinary.clone();
+            if let Some(fields) = updated.as_object_mut() {
+                fields.insert("description".to_owned(), json!(agenda));
+            }
+            let cancelled = json!({"id": "EVENT-LATER", "status": "cancelled"});
+
+            let mut first = request(Some("sync-1@2026-10-24T18:00:00Z"))?;
+            first.config = config.clone();
+            let stored = run_fetch(&api(vec![listing("sync-2", vec![ordinary])]), &first)?;
+            assert_eq!(
+                records(&stored).len(),
+                1,
+                "{agenda}: the ordinary event is stored"
+            );
+
+            let mut second = request_after(
+                &cursor(&stored).context("the first fetch moved on")?,
+                &first.state_dir,
+            )?;
+            second.config = config.clone();
+            let update = run_fetch(&api(vec![listing("sync-3", vec![updated])]), &second)?;
+            let list = std::fs::read_to_string(first.state_dir.join("emitted.json"))?;
+            assert_eq!(records(&update).is_empty(), withheld, "{agenda}");
+
+            let mut third = request_after(
+                &cursor(&update).context("the second fetch moved on")?,
+                &first.state_dir,
+            )?;
+            third.config = config;
+            let cancellation = run_fetch(&api(vec![listing("sync-4", vec![cancelled])]), &third)?;
+            assert_eq!(
+                records(&cancellation).is_empty(),
+                withheld,
+                "{agenda}: {list}"
+            );
+        }
         Ok(())
     }
 

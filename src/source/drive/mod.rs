@@ -19,6 +19,9 @@
 //! restricted, too large to export, of a kind Drive does not export, not readable by the user,
 //! or gone — so one such file cannot stop the stream on every run. Any other refusal, such as a
 //! spent daily limit, ends the stream with an error, so its cursor stays before the file.
+//!
+//! A file whose metadata or text names a key of the content net ([`super::content_net`]) is
+//! never stored, on every stream: the changes feed, the listing by time and the Meet folder.
 
 mod api;
 mod fetch;
@@ -28,6 +31,7 @@ use anyhow::{bail, Context as _, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::content_net::ContentNet;
 use super::{emit_stream, Message, Request, Source};
 use api::GoogleDriveApi;
 use fetch::{emit_fetch_hello, emit_resolve_hello, fetch_with_api};
@@ -58,7 +62,8 @@ impl Source for DriveSource {
     fn run(&self, request: &Request, sink: &mut dyn FnMut(Message) -> Result<()>) -> Result<()> {
         match request {
             Request::Fetch(request) => {
-                let config = parse_config(&request.config)?;
+                let mut config = parse_config(&request.config)?;
+                config.net = ContentNet::configured(&config.exclude_keys)?;
                 emit_fetch_hello(request, &config, sink)?;
                 let api = GoogleDriveApi::load()?;
                 fetch_with_api(request, &config, &api, sink)
@@ -84,6 +89,13 @@ struct DriveConfig {
     meet_folder: String,
     #[serde(default = "default_export_bytes")]
     max_export_bytes: usize,
+    /// Keys of the content net: a file whose metadata or text names one is never stored.
+    #[serde(default)]
+    exclude_keys: Vec<String>,
+    /// The net `exclude_keys` and `CTX_EXCLUDE_KEYS` make, built by the process that runs the
+    /// fetch, after the configuration is read.
+    #[serde(skip)]
+    net: ContentNet,
 }
 
 const fn enabled() -> bool {

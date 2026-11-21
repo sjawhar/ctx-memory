@@ -26,9 +26,12 @@ impl ExcludedLists {
     ///
     /// # Errors
     ///
-    /// Returns an error when an entry is empty in the configuration, or is more than the
-    /// identifier alone: it holds whitespace, `<` or `>`, as a whole header value does. Such an
-    /// entry would match no message, so the mail it was meant to exclude would be stored.
+    /// Returns an error when an entry is not a List-ID of RFC 2919's form: at most 255 octets of
+    /// two or more labels joined by dots, each of one or more of the characters a dot-atom allows
+    /// (letters, digits and ``!#$%&'*+-/=?^_`{|}~``), such as `busy.example-org.github.com`. An
+    /// empty entry in the configuration, a whole header value, `busy..example-org.github.com` or
+    /// `busy.example-org.github.com;` would match no message, so the mail it was meant to exclude
+    /// would be stored.
     pub(super) fn from_parts(configured: &[String], environment: Option<&str>) -> Result<Self> {
         let listed = environment
             .into_iter()
@@ -37,12 +40,9 @@ impl ExcludedLists {
             .filter(|id| !id.is_empty());
         let mut ids = BTreeSet::new();
         for id in configured.iter().map(|id| id.trim()).chain(listed) {
-            if id.is_empty() {
-                bail!("exclude_list_ids holds an empty List-ID");
-            }
-            if id.contains(|c: char| c.is_whitespace() || c == '<' || c == '>') {
+            if !is_list_id(id) {
                 bail!(
-                    "{id:?} is not a List-ID alone; name the identifier between the angle brackets of the header, such as busy.example-org.github.com"
+                    "{id:?} is not a List-ID: name the identifier between the angle brackets of the header alone, labels joined by dots, such as busy.example-org.github.com"
                 );
             }
             ids.insert(id.to_ascii_lowercase());
@@ -68,18 +68,38 @@ impl ExcludedLists {
                     .is_some_and(|name| name.eq_ignore_ascii_case("list-id"))
             })
             .filter_map(|header| header.get("value").and_then(Value::as_str))
-            .any(|value| self.0.contains(&list_id(value).to_ascii_lowercase()))
+            .any(|value| {
+                let mut id = list_id(value);
+                id.make_ascii_lowercase();
+                self.0.contains(&id)
+            })
     }
 }
 
 /// The identifier a `List-Id` header value carries: what its last `<…>` holds, after the
-/// optional description (`example-org/busy <busy.example-org.github.com>`), or the whole value,
-/// trimmed, when it has no angle brackets.
-fn list_id(value: &str) -> &str {
+/// optional description (`example-org/busy <busy.example-org.github.com>`), or the whole value
+/// when it has no angle brackets, with every whitespace character taken out. RFC 2919 §3 has a
+/// reader ignore whitespace inside the brackets, which a header folded across lines, or a
+/// transport that breaks one, puts there (`<busy.\r\n\texample-org.github.com>`).
+fn list_id(value: &str) -> String {
     value
         .rsplit_once('<')
         .map_or(value, |(_, bracketed)| {
             bracketed.split_once('>').map_or(bracketed, |(id, _)| id)
         })
-        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// Whether `id` is a List-ID of RFC 2919's form: at most 255 octets (§2) of
+/// `list-label "." list-id-namespace`, two or more dot-atom labels, each one or more `atext`
+/// characters (RFC 5322 §3.2.3).
+fn is_list_id(id: &str) -> bool {
+    let atext = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~".contains(c);
+    id.len() <= 255
+        && id.contains('.')
+        && id
+            .split('.')
+            .all(|label| !label.is_empty() && label.chars().all(atext))
 }

@@ -3,13 +3,14 @@
 pub(super) use std::cell::RefCell;
 pub(super) use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) use anyhow::{anyhow, Context as _, Result};
+pub(super) use anyhow::{anyhow, bail, Context as _, Result};
 pub(super) use chrono::{DateTime, SecondsFormat, Utc};
 pub(super) use serde_json::{json, Value};
 
 pub(super) use crate::api::google::Text;
 pub(super) use crate::record::Record;
 
+pub(super) use super::super::super::content_net::ContentNet;
 pub(super) use super::super::super::{FetchRequest, SourceRef, StreamStatus, PROTOCOL_VERSION};
 pub(super) use super::super::api::{Changes, DriveApi};
 pub(super) use super::super::fetch::{MAX_CHANGED_FILES, STREAM_CHANGES, STREAM_MEET};
@@ -120,8 +121,10 @@ pub(super) fn request(config: Value, cursor: Option<(&str, &str)>) -> Result<Fet
     })
 }
 
+/// Runs a fetch with the request's configuration, `exclude_keys` among it, and no environment.
 pub(super) fn run_fetch(api: &FakeDriveApi, request: &FetchRequest) -> Result<Vec<Message>> {
-    let config = parse_config(&request.config)?;
+    let mut config = parse_config(&request.config)?;
+    config.net = ContentNet::from_parts(&config.exclude_keys, None)?;
     let mut messages = Vec::new();
     emit_fetch_hello(request, &config, &mut |message| {
         messages.push(message);

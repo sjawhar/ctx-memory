@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::Value;
 
@@ -14,8 +14,12 @@ use crate::source::{
     PROTOCOL_VERSION,
 };
 
+use super::super::content_net::ContentNet;
 use super::lists::ExcludedLists;
-use super::render::{message_timestamp, record_from_message_with_scheme, required_string};
+use super::render::{
+    any_text_part, external_text_parts, message_timestamp, part_holds,
+    record_from_message_with_scheme, render_gmail, required_string,
+};
 use super::{GmailConfig, STREAM};
 
 /// Labels never fetched, because a listing never returns them either.
@@ -55,6 +59,9 @@ pub(super) trait GmailApi {
     fn holds_history(&self, start: &str) -> Result<bool>;
     /// The mailbox's current history ID.
     fn latest_history_id(&self) -> Result<String>;
+    /// The body of part `attachment` of message `message`, which Gmail keeps apart from the
+    /// message (its `body.attachmentId`), base64url as Gmail sends it.
+    fn attachment(&self, message: &str, attachment: &str) -> Result<String>;
 }
 
 pub(super) struct GoogleGmailApi {
@@ -178,6 +185,21 @@ impl GmailApi for GoogleGmailApi {
             .map(str::to_owned)
             .ok_or_else(|| anyhow!("the Gmail profile has no historyId"))
     }
+
+    fn attachment(&self, message: &str, attachment: &str) -> Result<String> {
+        let body = self.google.get(
+            &format!(
+                "gmail/v1/users/me/messages/{}/attachments/{}",
+                client::percent_encode(message),
+                client::percent_encode(attachment)
+            ),
+            &[],
+        )?;
+        body.get("data")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("Gmail attachment {attachment} of {message} has no data"))
+    }
 }
 
 fn history_entries(body: &Value) -> Vec<HistoryEntry> {
@@ -248,12 +270,12 @@ struct Collected {
 pub(super) fn fetch_with_api<C: GmailApi + ?Sized>(
     request: &FetchRequest,
     config: &GmailConfig,
-    lists: &ExcludedLists,
+    withheld: &Withheld,
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
     let mut warnings = Vec::new();
-    let result = collect(api, config, lists, request, &mut warnings).and_then(|collected| {
+    let result = collect(api, config, withheld, request, &mut warnings).and_then(|collected| {
         let records = collected
             .messages
             .iter()
@@ -302,13 +324,13 @@ pub(super) fn fetch_with_api<C: GmailApi + ?Sized>(
 fn collect<C: GmailApi + ?Sized>(
     api: &C,
     config: &GmailConfig,
-    lists: &ExcludedLists,
+    withheld: &Withheld,
     request: &FetchRequest,
     warnings: &mut Vec<String>,
 ) -> Result<Collected> {
     let excluded = Excluded {
         labels: excluded_labels(&config.query),
-        lists,
+        withheld,
     };
     let cursor = request.cursors.get(STREAM).map(String::as_str);
     if let Some(slice) = cursor.and_then(SliceCursor::parse) {
@@ -426,7 +448,7 @@ fn collect_from_history<C: GmailApi + ?Sized>(
                 gone += 1;
                 continue;
             };
-            if excluded.message(&message) {
+            if excluded.message(&message, api)? {
                 continue;
             }
             let arrived = message_timestamp(&message)?;
@@ -590,19 +612,79 @@ pub(super) fn excluded_labels(query: &str) -> BTreeSet<String> {
     labels
 }
 
+/// The mail the deployment never stores, on every path that reads a message: a fetch's and a
+/// resolve's.
+#[derive(Default)]
+pub(super) struct Withheld {
+    /// Mail from one of these mailing lists.
+    pub(super) lists: ExcludedLists,
+    /// Mail whose text names one of these keys.
+    pub(super) net: ContentNet,
+}
+
+impl Withheld {
+    /// Whether `message`, as Gmail answers it, is from an excluded list, or names an excluded key
+    /// in any string Gmail gives (its headers, snippet and file names among them), in any of its
+    /// text parts, decoded, HTML ones also with their tags taken out and entities decoded, in a
+    /// text part Gmail keeps apart, which `api` reads, or in the text its record would store. A
+    /// part that is not text, such as a PDF, is not read: its record holds its file name alone,
+    /// which is checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Gmail does not answer for a text part it keeps apart, so a message
+    /// that could not be checked is never stored.
+    fn message<C: GmailApi + ?Sized>(&self, message: &Value, api: &C) -> Result<bool> {
+        if self.lists.names(message) {
+            return Ok(true);
+        }
+        if self.net.is_empty() {
+            return Ok(false);
+        }
+        let names = |text: &str| self.net.matches(text);
+        if self.net.matches_value(message)
+            || any_text_part(message, &names)
+            || names(&render_gmail(message))
+        {
+            return Ok(true);
+        }
+        let external = external_text_parts(message);
+        if external.is_empty() {
+            return Ok(false);
+        }
+        let id = required_string(message, "id", "Gmail message")?;
+        for part in external {
+            let attachment = part
+                .pointer("/body/attachmentId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let data = api
+                .attachment(id, attachment)
+                .with_context(|| format!("reading a text part of Gmail message {id}"))?;
+            if part_holds(part, &data, &names) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// The mail a fetch never stores.
 pub(super) struct Excluded<'a> {
     /// A message carrying one of these labels ([`excluded_labels`]).
     pub(super) labels: BTreeSet<String>,
-    /// A message from one of these mailing lists.
-    pub(super) lists: &'a ExcludedLists,
+    /// Mail the deployment never stores.
+    pub(super) withheld: &'a Withheld,
 }
 
 impl Excluded<'_> {
     /// Whether `message` is mail a fetch never stores, read as Gmail answers it and before it
     /// is a record, on the history path and the listing path alike.
-    fn message(&self, message: &Value) -> bool {
-        has_label(message, &self.labels) || self.lists.names(message)
+    fn message<C: GmailApi + ?Sized>(&self, message: &Value, api: &C) -> Result<bool> {
+        if has_label(message, &self.labels) {
+            return Ok(true);
+        }
+        self.withheld.message(message, api)
     }
 }
 
@@ -678,7 +760,7 @@ pub(super) fn fetch_messages<C: GmailApi + ?Sized>(
             gone += 1;
             continue;
         };
-        if excluded.message(&message) {
+        if excluded.message(&message, api)? {
             continue;
         }
         let arrived = message_timestamp(&message)?;
@@ -701,12 +783,12 @@ pub(super) fn fetch_messages<C: GmailApi + ?Sized>(
     Ok(listed)
 }
 
-/// Resolves each pointer to its message, or to every message of its thread. A message from a
-/// list the deployment excludes is no answer, as it is never fetched, so a live resolve, the
-/// server's among them, stores and prints none of it.
+/// Resolves each pointer to its message, or to every message of its thread. A message the
+/// deployment withholds is no answer, as it is never fetched, so a live resolve, the server's
+/// among them, stores and prints none of it.
 pub(super) fn resolve_with_api<C: GmailApi + ?Sized>(
     request: &ResolveRequest,
-    lists: &ExcludedLists,
+    withheld: &Withheld,
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
@@ -729,7 +811,10 @@ pub(super) fn resolve_with_api<C: GmailApi + ?Sized>(
             }
             api.message(locator)?.into_iter().collect()
         };
-        for message in messages.iter().filter(|message| !lists.names(message)) {
+        for message in &messages {
+            if withheld.message(message, api)? {
+                continue;
+            }
             records.push(record_from_message_with_scheme(
                 message,
                 &request.source.scheme,

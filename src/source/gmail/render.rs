@@ -190,6 +190,74 @@ fn gmail_body(message: &Value) -> String {
     html.map_or_else(String::new, |part| strip_tags(&decoded(part)))
 }
 
+/// Whether `wanted` holds for any text part of `message` that Gmail sends inline (`text/plain`,
+/// `text/html` or any other `text/*`), each decoded with the character set it declares: what a
+/// reader of the message could see, beyond the one part its record's text takes. It stops at the
+/// first part that holds.
+pub(super) fn any_text_part(message: &Value, wanted: &impl Fn(&str) -> bool) -> bool {
+    fn holds(part: &Value, wanted: &impl Fn(&str) -> bool) -> bool {
+        let inline = is_text(part)
+            .then(|| part.pointer("/body/data").and_then(Value::as_str))
+            .flatten()
+            .is_some_and(|data| part_holds(part, data, wanted));
+        inline
+            || part
+                .get("parts")
+                .and_then(Value::as_array)
+                .is_some_and(|children| children.iter().any(|child| holds(child, wanted)))
+    }
+    message
+        .get("payload")
+        .is_some_and(|payload| holds(payload, wanted))
+}
+
+/// The text parts of `message` whose body Gmail keeps apart from it, under `body.attachmentId`:
+/// an attached text file, or a part too large to send inline. A part of any other type, such as
+/// a PDF or an image, is not text ctx reads.
+pub(super) fn external_text_parts(message: &Value) -> Vec<&Value> {
+    fn walk<'a>(part: &'a Value, found: &mut Vec<&'a Value>) {
+        if is_text(part)
+            && part.pointer("/body/data").is_none()
+            && part
+                .pointer("/body/attachmentId")
+                .and_then(Value::as_str)
+                .is_some()
+        {
+            found.push(part);
+        }
+        for child in part
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            walk(child, found);
+        }
+    }
+    let mut found = Vec::new();
+    if let Some(payload) = message.get("payload") {
+        walk(payload, &mut found);
+    }
+    found
+}
+
+/// Whether `wanted` holds for one text part's body `data`, base64url as Gmail sends it, decoded
+/// with the part's character set, and, for an HTML part, for that text with its tags taken out
+/// and its entities decoded, as a record's text reads it: `SYNTH<b>-12</b>` and `SYNTH&#45;12`
+/// are both `SYNTH-12` there.
+pub(super) fn part_holds(part: &Value, data: &str, wanted: &impl Fn(&str) -> bool) -> bool {
+    let text = decode_part(&base64url_decode(data), part_charset(part).as_deref());
+    wanted(&text)
+        || (part.get("mimeType").and_then(Value::as_str) == Some("text/html")
+            && wanted(&strip_tags(&text)))
+}
+
+fn is_text(part: &Value) -> bool {
+    part.get("mimeType")
+        .and_then(Value::as_str)
+        .is_some_and(|mime| mime.starts_with("text/"))
+}
+
 fn strip_tags(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -204,7 +272,7 @@ fn strip_tags(html: &str) -> String {
     html_unescape(&text)
 }
 
-fn render_gmail(message: &Value) -> String {
+pub(super) fn render_gmail(message: &Value) -> String {
     let headers = gmail_headers(message);
     let mut lines = vec![
         format!(

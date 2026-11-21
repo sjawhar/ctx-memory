@@ -9,7 +9,7 @@ pub(super) use anyhow::{anyhow, Context as _, Result};
 pub(super) use chrono::{DateTime, Utc};
 pub(super) use serde_json::{json, Value};
 
-pub(super) use crate::api::github::{api_base, Page, PageKind, Repo, Unauthorized};
+pub(super) use crate::api::github::{api_base, Listing, Page, PageKind, Repo, Unauthorized};
 pub(super) use crate::pointer::Schemes;
 
 pub(super) use super::super::super::{
@@ -45,6 +45,8 @@ pub(super) struct FakeGithub {
     pub(super) repos: BTreeMap<u64, Vec<Repo>>,
     pub(super) pages: RefCell<BTreeMap<String, Page>>,
     pub(super) installations_called: RefCell<Vec<u64>>,
+    /// Installations whose repository listing GitHub refuses to protect a rate limit.
+    pub(super) throttled: BTreeSet<u64>,
     pub(super) get_log: RefCell<Vec<String>>,
     /// What the GraphQL API knows of each repository (`owner/name`), as one alias's answer.
     /// A repository with no entry is left out of the answer.
@@ -110,11 +112,15 @@ impl FakeGithub {
 }
 
 impl GithubApi for FakeGithub {
-    fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>> {
+    fn repositories(&self, installation: u64) -> Result<Option<Listing>> {
         self.installations_called.borrow_mut().push(installation);
-        Ok(Some(
-            self.repos.get(&installation).cloned().unwrap_or_default(),
-        ))
+        if self.throttled.contains(&installation) {
+            return Ok(None);
+        }
+        Ok(Some(Listing {
+            repos: self.repos.get(&installation).cloned().unwrap_or_default(),
+            without_id: 0,
+        }))
     }
 
     fn get(&self, _installation: u64, url: &str) -> Result<Page> {

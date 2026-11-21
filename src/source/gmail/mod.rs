@@ -11,8 +11,9 @@
 //! clock has reached ([`crate::source::latest_believable`]) is stored at the window end with a warning,
 //! so a wrong date cannot hold the cursor.
 //!
-//! Mail from a mailing list the deployment excludes by its `List-Id` ([`lists`]) is never stored,
-//! on any path that makes a record of a message: a history walk, a listing, and a resolve.
+//! Mail from a mailing list the deployment excludes by its `List-Id` ([`lists`]), or whose text
+//! names a key of the content net ([`super::content_net`]), is never stored, on any path that
+//! makes a record of a message: a history walk, a listing, and a resolve.
 
 mod fetch;
 mod lists;
@@ -22,9 +23,11 @@ use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::content_net::ContentNet;
 use super::{Message, Request, Source};
 use fetch::{
     emit_fetch_hello, emit_resolve_hello, fetch_with_api, resolve_with_api, GoogleGmailApi,
+    Withheld,
 };
 use lists::{ExcludedLists, EXCLUDE_LIST_IDS_ENV};
 
@@ -56,17 +59,17 @@ impl Source for GmailSource {
         match request {
             Request::Fetch(request) => {
                 let config = parse_config(&request.config)?;
-                let lists = excluded_lists(&config)?;
+                let withheld = withheld(&config)?;
                 emit_fetch_hello(request, sink)?;
                 let api = GoogleGmailApi::load()?;
-                fetch_with_api(request, &config, &lists, &api, sink)
+                fetch_with_api(request, &config, &withheld, &api, sink)
             }
             Request::Resolve(request) => {
                 let config = parse_config(&request.config)?;
-                let lists = excluded_lists(&config)?;
+                let withheld = withheld(&config)?;
                 emit_resolve_hello(request, sink)?;
                 let api = GoogleGmailApi::load()?;
-                resolve_with_api(request, &lists, &api, sink)
+                resolve_with_api(request, &withheld, &api, sink)
             }
         }
     }
@@ -80,6 +83,9 @@ struct GmailConfig {
     /// List-IDs whose mail is never stored ([`lists`]).
     #[serde(default)]
     exclude_list_ids: Vec<String>,
+    /// Keys of the content net: mail whose text names one is never stored.
+    #[serde(default)]
+    exclude_keys: Vec<String>,
 }
 
 fn default_query() -> String {
@@ -90,15 +96,18 @@ fn parse_config(value: &Value) -> Result<GmailConfig> {
     serde_json::from_value(value.clone()).context("parsing Gmail source configuration")
 }
 
-/// The lists whose mail this source never stores: the configuration's `exclude_list_ids` and
-/// those [`EXCLUDE_LIST_IDS_ENV`] names, in the environment of the process that runs the source,
-/// the fetch or the server, and never a caller's.
-fn excluded_lists(config: &GmailConfig) -> Result<ExcludedLists> {
-    ExcludedLists::from_parts(
+/// The mail this source never stores, by its list and by its text: the configuration's
+/// `exclude_list_ids` and `exclude_keys`, and those [`EXCLUDE_LIST_IDS_ENV`] and
+/// `CTX_EXCLUDE_KEYS` add, read in the environment of the process that runs the source, the
+/// fetch or the server, and never a caller's.
+fn withheld(config: &GmailConfig) -> Result<Withheld> {
+    let lists = ExcludedLists::from_parts(
         &config.exclude_list_ids,
         super::environment(EXCLUDE_LIST_IDS_ENV)?.as_deref(),
     )
-    .context("reading the Gmail source's excluded List-IDs")
+    .context("reading the Gmail source's excluded List-IDs")?;
+    let net = ContentNet::configured(&config.exclude_keys)?;
+    Ok(Withheld { lists, net })
 }
 
 #[cfg(test)]

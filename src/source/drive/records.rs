@@ -8,6 +8,7 @@ use crate::api::google::Text;
 use crate::record::Record;
 use crate::source::{latest_believable, CLOCK_SKEW_MARGIN};
 
+use super::super::content_net::ContentNet;
 use super::api::DriveApi;
 
 /// Google document kinds and the text export each one is stored as.
@@ -16,6 +17,12 @@ const EXPORTS: [(&str, &str); 3] = [
     ("application/vnd.google-apps.spreadsheet", "text/csv"),
     ("application/vnd.google-apps.presentation", "text/plain"),
 ];
+
+/// The most text Drive exports of one document: "exported content is limited to 10MB" (Drive
+/// API v3 `files.export`), and a larger document is refused. While a content net is set, an
+/// export is read this far, so the net checks all of it, and the record keeps the first
+/// `max_export_bytes`.
+const DRIVE_EXPORT_CEILING: usize = 10 * 1024 * 1024;
 
 /// Where a file's modified time puts it against the window, as of the moment a run read the
 /// listing or page that names it.
@@ -60,20 +67,23 @@ impl Bounds {
 }
 
 /// Builds one record: a Google document's exported text, or metadata with a warning when the
-/// file is not a Google document or Drive will not export this file.
+/// file is not a Google document or Drive will not export this file. `None` when the export, all
+/// of it Drive gives, names a key of `net`: the file is not stored, and no warning names it.
 ///
 /// A file changed after the window ends is a context record: the window must not carry a
 /// record after its end, and the file is still searchable and citable. A file dated later than
 /// any clock has reached is stored at the window end, with a warning that names its date.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record_from_file<C: DriveApi + ?Sized>(
     file: &Value,
     stream: &str,
     scheme: &str,
     api: &C,
     limit: usize,
+    net: &ContentNet,
     bounds: Bounds,
     warnings: &mut Vec<String>,
-) -> Result<Record> {
+) -> Result<Option<Record>> {
     let modified = file_timestamp(file, "modifiedTime")?;
     let id = required_file_string(file, "id")?;
     let name = file.get("name").and_then(Value::as_str);
@@ -82,12 +92,32 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let named = name.unwrap_or("(unnamed)");
+    let read = if net.is_empty() {
+        limit
+    } else {
+        limit.max(DRIVE_EXPORT_CEILING)
+    };
     let exported = export_mime(mime)
-        .map(|export| api.export(id, export, limit))
+        .map(|export| api.export(id, export, read))
         .transpose()
         .with_context(|| format!("exporting {scheme}:{id} {named}"))?;
     let text = match exported {
-        Some(Text::Body { text, truncated }) => {
+        Some(Text::Body {
+            mut text,
+            mut truncated,
+        }) => {
+            if net.matches(&text) {
+                return Ok(None);
+            }
+            // Read past the cap for the net alone: the record keeps what the cap allows.
+            if read > limit && text.len() > limit {
+                let mut end = limit;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                truncated = true;
+            }
             if truncated {
                 warnings.push(format!(
                     "{scheme}:{id} {named} is longer than {limit} bytes; its export stops there"
@@ -130,7 +160,7 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
             .and_then(|owners| owners.first())
             .and_then(|owner| display_name(Some(owner)))
     });
-    Ok(Record {
+    Ok(Some(Record {
         pointer: format!("{scheme}:{id}"),
         stream: stream.to_owned(),
         ts,
@@ -147,7 +177,7 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
         aliases: vec![id.to_owned()],
         context,
         raw: file.clone(),
-    })
+    }))
 }
 
 /// The text export a Google document kind is stored as.

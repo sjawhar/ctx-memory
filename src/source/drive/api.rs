@@ -6,10 +6,11 @@ use serde_json::Value;
 use crate::api::client;
 use crate::api::google::{self, Google, Text};
 
-/// The file fields every listing asks for.
-const FILE_FIELDS: &str = "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),parents),nextPageToken";
+/// The file fields every listing asks for. `description` is asked for the content net alone: the
+/// record does not store it.
+const FILE_FIELDS: &str = "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),parents,description),nextPageToken";
 /// The change fields the changes feed asks for.
-const CHANGE_FIELDS: &str = "changes(removed,fileId,file(id,name,mimeType,modifiedTime,trashed,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),parents)),nextPageToken,newStartPageToken";
+const CHANGE_FIELDS: &str = "changes(removed,fileId,file(id,name,mimeType,modifiedTime,trashed,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),parents,description)),nextPageToken,newStartPageToken";
 
 /// One page of the changes feed: the files it carries and the token that follows it.
 #[derive(Clone, Debug, Default)]
@@ -134,5 +135,18 @@ impl DriveApi for GoogleDriveApi {
             &[("mimeType", mime.to_owned())],
             limit,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CHANGE_FIELDS, FILE_FIELDS};
+
+    /// Both listings ask Drive for each file's description, so the content net reads it on the
+    /// changes feed and on a listing alike: Drive answers only the fields a request names.
+    #[test]
+    fn both_listings_ask_for_the_description() {
+        assert!(FILE_FIELDS.contains(",description)"), "{FILE_FIELDS}");
+        assert!(CHANGE_FIELDS.contains(",description))"), "{CHANGE_FIELDS}");
     }
 }

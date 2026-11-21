@@ -77,6 +77,56 @@ struct Collected {
     covered_parents: BTreeSet<String>,
 }
 
+impl Collected {
+    /// Reads `file` into a record of `stream` and keeps it, with the warnings reading it raised,
+    /// unless the file names a key of the content net (`config.net`): then neither is kept, so
+    /// the window holds nothing of the file, not even a warning naming it. A file whose metadata
+    /// (its name, its description or any other field the listing gives) names a key is not
+    /// exported at all; one whose export does, read up to Drive's own export limit though the
+    /// record keeps `max_export_bytes` of it, is dropped after. A file that is not a Google
+    /// document, or whose export Drive refuses, is stored as its metadata alone, which the net
+    /// checks. The description is asked for the net alone: the record does not store it.
+    fn read<C: DriveApi + ?Sized>(
+        &mut self,
+        file: &Value,
+        stream: &str,
+        request: &FetchRequest,
+        api: &C,
+        config: &DriveConfig,
+        bounds: Bounds,
+    ) -> Result<()> {
+        if config.net.matches_value(file) {
+            return Ok(());
+        }
+        let described;
+        let file = match file.as_object() {
+            Some(fields) if fields.contains_key("description") => {
+                let mut fields = fields.clone();
+                fields.remove("description");
+                described = Value::Object(fields);
+                &described
+            }
+            _ => file,
+        };
+        let mut warnings = Vec::new();
+        let record = record_from_file(
+            file,
+            stream,
+            &request.source.scheme,
+            api,
+            config.max_export_bytes,
+            &config.net,
+            bounds,
+            &mut warnings,
+        )?;
+        if let Some(record) = record.filter(|record| !config.net.matches_record(record)) {
+            self.records.push(record);
+            self.warnings.extend(warnings);
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn fetch_with_api<C: DriveApi + ?Sized>(
     request: &FetchRequest,
     config: &DriveConfig,
@@ -204,16 +254,7 @@ fn follow_changes<C: DriveApi + ?Sized>(
                 held += 1;
                 continue;
             }
-            let record = record_from_file(
-                file,
-                STREAM_CHANGES,
-                &request.source.scheme,
-                api,
-                config.max_export_bytes,
-                bounds,
-                &mut collected.warnings,
-            )?;
-            collected.records.push(record);
+            collected.read(file, STREAM_CHANGES, request, api, config, bounds)?;
             read += 1;
         }
         if held > 0 {
@@ -293,16 +334,7 @@ fn list_changes<C: DriveApi + ?Sized>(
             after_window += 1;
             continue;
         }
-        let record = record_from_file(
-            file,
-            STREAM_CHANGES,
-            &request.source.scheme,
-            api,
-            config.max_export_bytes,
-            bounds,
-            &mut collected.warnings,
-        )?;
-        collected.records.push(record);
+        collected.read(file, STREAM_CHANGES, request, api, config, bounds)?;
     }
     if after_window > 0 {
         collected.warnings.push(format!(
@@ -364,16 +396,7 @@ fn collect_meet<C: DriveApi + ?Sized>(
             if is_folder(entry) {
                 collect_meeting_folder(entry, api, config, request, &mut collected)?;
             } else if !is_reference(entry) {
-                let record = record_from_file(
-                    entry,
-                    STREAM_MEET,
-                    &request.source.scheme,
-                    api,
-                    config.max_export_bytes,
-                    bounds,
-                    &mut collected.warnings,
-                )?;
-                collected.records.push(record);
+                collected.read(entry, STREAM_MEET, request, api, config, bounds)?;
             }
         }
     }
@@ -403,16 +426,7 @@ fn collect_meeting_folder<C: DriveApi + ?Sized>(
         if is_reference(file) {
             continue;
         }
-        let record = record_from_file(
-            file,
-            STREAM_MEET,
-            &request.source.scheme,
-            api,
-            config.max_export_bytes,
-            bounds,
-            &mut collected.warnings,
-        )?;
-        collected.records.push(record);
+        collected.read(file, STREAM_MEET, request, api, config, bounds)?;
     }
     Ok(())
 }

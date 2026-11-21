@@ -517,6 +517,16 @@ pub struct Repo {
     pub default_branch: String,
 }
 
+/// The repositories one installation's listing names.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Listing {
+    /// Each repository the listing names with an id, an owner and a name.
+    pub repos: Vec<Repo>,
+    /// How many entries the listing gives with no id: they are not read, since no exclusion by
+    /// id could be checked against them.
+    pub without_id: usize,
+}
+
 /// What one request to a GitHub listing came back as.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PageKind {
@@ -706,14 +716,14 @@ impl GithubClient {
     ///
     /// Returns an error when the token cannot be minted or read, or GitHub refuses the listing
     /// for any other reason.
-    pub fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>> {
+    pub fn repositories(&self, installation: u64) -> Result<Option<Listing>> {
         self.read_tokens_again()?;
         let mut token = match self.token(installation) {
             Ok(token) => token,
             Err(error) if error.downcast_ref::<Throttled>().is_some() => return Ok(None),
             Err(error) => return Err(error),
         };
-        let mut repositories = Vec::new();
+        let mut listing = Listing::default();
         let mut url = Some(format!("{}/installation/repositories?per_page=100", base()));
         while let Some(current) = url {
             // The caller names the installation, so the error says it once.
@@ -740,14 +750,18 @@ impl GithubClient {
             }
             if let Some(items) = body.get("repositories").and_then(Value::as_array) {
                 for item in items {
-                    if let Some(repository) = parse_repo(item) {
-                        repositories.push(repository);
+                    match parse_repo(item) {
+                        Some(repository) => listing.repos.push(repository),
+                        None if item.get("id").and_then(Value::as_u64).is_none() => {
+                            listing.without_id += 1;
+                        }
+                        None => {}
                     }
                 }
             }
             url = link(&headers, "next");
         }
-        Ok(Some(repositories))
+        Ok(Some(listing))
     }
 
     /// `GET url` with the installation's token.

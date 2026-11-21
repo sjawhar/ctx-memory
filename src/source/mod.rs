@@ -1,6 +1,7 @@
 //! Source protocol types and validation shared by built-in and external sources.
 
 mod calendar;
+mod content_net;
 mod drive;
 mod external;
 pub mod github;
