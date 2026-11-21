@@ -174,7 +174,7 @@ fn gmail_body(message: &Value) -> String {
             .pointer("/body/data")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        decode_part(&base64url_decode(data), part_charset(part).as_deref())
+        decode_body(part, data)
     }
 
     let Some(payload) = message.get("payload") else {
@@ -188,6 +188,90 @@ fn gmail_body(message: &Value) -> String {
     let mut html = None;
     find_part(payload, "text/html", &mut html);
     html.map_or_else(String::new, |part| strip_tags(&decoded(part)))
+}
+
+/// The first of `find`'s answers for a part of `message` that Gmail sends inline, whatever its
+/// type (`text/plain`, `text/html`, `text/x-amp-html`, `text/calendar`, `application/json`,
+/// `message/delivery-status` and the rest), each body read as [`readings`] gives it. It stops at
+/// the first part `find` answers for.
+pub(super) fn find_in_inline_parts<T>(
+    message: &Value,
+    find: &impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    fn in_part<T>(part: &Value, find: &impl Fn(&str) -> Option<T>) -> Option<T> {
+        part.pointer("/body/data")
+            .and_then(Value::as_str)
+            .and_then(|data| readings(part, data).iter().find_map(|text| find(text)))
+            .or_else(|| {
+                part.get("parts")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .find_map(|child| in_part(child, find))
+            })
+    }
+    message
+        .get("payload")
+        .and_then(|payload| in_part(payload, find))
+}
+
+/// The text parts of `message` whose body Gmail keeps apart from it, under `body.attachmentId`:
+/// an attached text file, or a part too large to send inline. A part of any other type, such as
+/// a PDF or an image, is not text ctx reads.
+pub(super) fn external_text_parts(message: &Value) -> Vec<&Value> {
+    fn walk<'a>(part: &'a Value, found: &mut Vec<&'a Value>) {
+        if is_text(part)
+            && part.pointer("/body/data").is_none()
+            && part
+                .pointer("/body/attachmentId")
+                .and_then(Value::as_str)
+                .is_some()
+        {
+            found.push(part);
+        }
+        for child in part
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            walk(child, found);
+        }
+    }
+    let mut found = Vec::new();
+    if let Some(payload) = message.get("payload") {
+        walk(payload, &mut found);
+    }
+    found
+}
+
+/// One part's body `data`, base64url as Gmail sends it, decoded with the part's character set,
+/// or as UTF-8, lossily.
+pub(super) fn decode_body(part: &Value, data: &str) -> String {
+    decode_part(&base64url_decode(data), part_charset(part).as_deref())
+}
+
+/// Each way the content net reads one part's body `data`: decoded with the character set the part
+/// declares, and, when that is not UTF-8, also as UTF-8, lossily, since a sender may declare one
+/// character set over the bytes of another.
+pub(super) fn readings(part: &Value, data: &str) -> Vec<String> {
+    let bytes = base64url_decode(data);
+    let charset = part_charset(part);
+    let declared = decode_part(&bytes, charset.as_deref());
+    let other = charset
+        .as_deref()
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .is_some_and(|encoding| encoding != encoding_rs::UTF_8);
+    if other {
+        vec![declared, String::from_utf8_lossy(&bytes).into_owned()]
+    } else {
+        vec![declared]
+    }
+}
+
+fn is_text(part: &Value) -> bool {
+    part.get("mimeType")
+        .and_then(Value::as_str)
+        .is_some_and(|mime| mime.starts_with("text/"))
 }
 
 fn strip_tags(html: &str) -> String {
@@ -204,7 +288,7 @@ fn strip_tags(html: &str) -> String {
     html_unescape(&text)
 }
 
-fn render_gmail(message: &Value) -> String {
+pub(super) fn render_gmail(message: &Value) -> String {
     let headers = gmail_headers(message);
     let mut lines = vec![
         format!(

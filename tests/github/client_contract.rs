@@ -145,7 +145,7 @@ fn empty_repository_commits_409_is_not_a_stream_error() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "other-org/empty-repo", "default_branch": "main" },
+                { "id": 1001, "full_name": "other-org/empty-repo", "default_branch": "main" },
             ],
         })
         .to_string(),
@@ -202,6 +202,85 @@ fn empty_repository_commits_409_is_not_a_stream_error() -> Result<()> {
     Ok(())
 }
 
+/// A listing entry GitHub gives without an id is not read, since no exclusion by id could be
+/// checked against it, and the run says so in a warning that counts the entries and names none.
+/// Control: the entry beside it, which has an id, is read.
+#[test]
+fn a_repository_listed_without_an_id_is_not_read_and_a_warning_says_so() -> Result<()> {
+    let _guard = guard();
+    let api = FakeHttp::start()?;
+    api.json(
+        "/app/installations/1000002/access_tokens",
+        201,
+        &json!({ "token": "ghs_other", "expires_at": "2026-10-27T09:00:00Z" }).to_string(),
+    )?;
+    api.json(
+        "/installation/repositories",
+        200,
+        &json!({
+            "total_count": 2,
+            "repositories": [
+                { "full_name": "other-org/unidentified", "default_branch": "main" },
+                { "id": 1001, "full_name": "other-org/empty-repo", "default_branch": "main" },
+            ],
+        })
+        .to_string(),
+    )?;
+    api.json("/repos/other-org/empty-repo/issues", 200, "[]")?;
+    api.json(
+        "/repos/other-org/empty-repo/commits",
+        409,
+        &json!({ "message": "Git Repository is empty." }).to_string(),
+    )?;
+
+    let credential = json!({
+        "app_id": "1234567",
+        "private_key": include_str!("../fixtures/jwt-signing-key.pem"),
+    })
+    .to_string();
+    std::env::set_var("CTX_GITHUB_API", api.url(""));
+    std::env::set_var("CTX_CREDENTIAL_GITHUB_APP", &credential);
+    let outcome = (|| -> Result<Vec<Message>> {
+        let request = fetch_request(json!({ "installations": [1_000_002] }), scratch("no-id")?)?;
+        let mut messages = Vec::new();
+        GithubSource::new().run(&request, &mut |message| {
+            messages.push(message);
+            Ok(())
+        })?;
+        Ok(messages)
+    })();
+    std::env::remove_var("CTX_CREDENTIAL_GITHUB_APP");
+    std::env::remove_var("CTX_GITHUB_API");
+
+    let messages = outcome?;
+    let streams = stream_ends(&messages)
+        .into_iter()
+        .map(|(stream, ..)| stream)
+        .collect::<Vec<_>>();
+    assert_eq!(streams, ["github:other-org/empty-repo"]);
+    assert_eq!(api.hits("/repos/other-org/unidentified/issues")?, 0);
+    let warnings = messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Warning { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected =
+        "installation 1000002: GitHub listed 1 repository entry without an id; it is not read";
+    assert!(
+        warnings.iter().any(|warning| warning == expected),
+        "{warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("unidentified")),
+        "{warnings:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn an_empty_repository_is_a_quiet_stream_whose_cursor_moves() -> Result<()> {
     let _guard = guard();
@@ -217,7 +296,7 @@ fn an_empty_repository_is_a_quiet_stream_whose_cursor_moves() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "example-org/slack-tui", "default_branch": "main" },
+                { "id": 1002, "full_name": "example-org/slack-tui", "default_branch": "main" },
             ],
         })
         .to_string(),
@@ -287,7 +366,7 @@ fn a_rate_limited_listing_holds_its_cursor_instead_of_erroring() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "other-org/busy-repo", "default_branch": "main" },
+                { "id": 1003, "full_name": "other-org/busy-repo", "default_branch": "main" },
             ],
         })
         .to_string(),
@@ -377,7 +456,7 @@ fn a_throttled_repository_listing_skips_one_installation_only() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "example-org/example-repo", "default_branch": "main" },
+                { "id": 1004, "full_name": "example-org/example-repo", "default_branch": "main" },
             ],
         })
         .to_string(),
@@ -453,7 +532,7 @@ fn a_plus_in_the_default_branch_reaches_github_percent_encoded() -> Result<()> {
         &json!({
             "total_count": 1,
             "repositories": [
-                { "full_name": "other-org/coq-elpi", "default_branch": "v3.3.1+qvar" },
+                { "id": 1005, "full_name": "other-org/coq-elpi", "default_branch": "v3.3.1+qvar" },
             ],
         })
         .to_string(),

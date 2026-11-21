@@ -2,5 +2,6 @@
 
 mod collect;
 mod cursor_state;
+mod excluded;
 mod fixtures;
 mod records;

@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "ctx-memory"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -488,6 +488,7 @@ dependencies = [
  "sha2",
  "tokio",
  "toml",
+ "unicode-general-category",
  "unicode-normalization",
 ]
 

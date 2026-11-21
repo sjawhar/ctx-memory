@@ -8,6 +8,7 @@ use crate::api::google::Text;
 use crate::record::Record;
 use crate::source::{latest_believable, CLOCK_SKEW_MARGIN};
 
+use super::super::content_net::{ContentNet, Hit};
 use super::api::DriveApi;
 
 /// Google document kinds and the text export each one is stored as.
@@ -16,6 +17,12 @@ const EXPORTS: [(&str, &str); 3] = [
     ("application/vnd.google-apps.spreadsheet", "text/csv"),
     ("application/vnd.google-apps.presentation", "text/plain"),
 ];
+
+/// The most text Drive exports of one document: "exported content is limited to 10MB" (Drive
+/// API v3 `files.export`), and a larger document is refused. While a content net is set, an
+/// export is read this far, so the net checks all of it, and the record keeps the first
+/// `max_export_bytes`.
+const DRIVE_EXPORT_CEILING: usize = 10 * 1024 * 1024;
 
 /// Where a file's modified time puts it against the window, as of the moment a run read the
 /// listing or page that names it.
@@ -59,21 +66,53 @@ impl Bounds {
     }
 }
 
+/// What reading one file gave: its record, or why the content net withholds its export.
+pub(super) enum Read {
+    Kept(Box<Record>),
+    Withheld(Hit),
+}
+
+/// The fields a listing asks for the content net alone, which a record never stores.
+const NET_ONLY_FIELDS: [&str; 4] = ["description", "permissions", "sharingUser", "driveId"];
+
+/// `file` as its record stores it: none of the [`NET_ONLY_FIELDS`], which the listing asks for the
+/// net alone; and, while the net names an address (`strip_addresses`), no address of the person
+/// who last modified it, which then only the net reads. With no address set the record keeps it,
+/// as it did before the net.
+fn stored_raw(file: &Value, strip_addresses: bool) -> Value {
+    let mut raw = file.clone();
+    if let Some(fields) = raw.as_object_mut() {
+        for field in NET_ONLY_FIELDS {
+            fields.remove(field);
+        }
+        if strip_addresses {
+            if let Some(Value::Object(user)) = fields.get_mut("lastModifyingUser") {
+                user.remove("emailAddress");
+            }
+        }
+    }
+    raw
+}
+
 /// Builds one record: a Google document's exported text, or metadata with a warning when the
-/// file is not a Google document or Drive will not export this file.
+/// file is not a Google document or Drive will not export this file. The record stores what
+/// [`stored_raw`] keeps of the file. [`Read::Withheld`] when the export, all of it Drive gives,
+/// names a key or term of `net`: the file is not stored, and no warning names it.
 ///
 /// A file changed after the window ends is a context record: the window must not carry a
 /// record after its end, and the file is still searchable and citable. A file dated later than
 /// any clock has reached is stored at the window end, with a warning that names its date.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record_from_file<C: DriveApi + ?Sized>(
     file: &Value,
     stream: &str,
     scheme: &str,
     api: &C,
     limit: usize,
+    net: &ContentNet,
     bounds: Bounds,
     warnings: &mut Vec<String>,
-) -> Result<Record> {
+) -> Result<Read> {
     let modified = file_timestamp(file, "modifiedTime")?;
     let id = required_file_string(file, "id")?;
     let name = file.get("name").and_then(Value::as_str);
@@ -82,12 +121,32 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let named = name.unwrap_or("(unnamed)");
+    let read = if net.has_text_net() {
+        limit.max(DRIVE_EXPORT_CEILING)
+    } else {
+        limit
+    };
     let exported = export_mime(mime)
-        .map(|export| api.export(id, export, limit))
+        .map(|export| api.export(id, export, read))
         .transpose()
         .with_context(|| format!("exporting {scheme}:{id} {named}"))?;
     let text = match exported {
-        Some(Text::Body { text, truncated }) => {
+        Some(Text::Body {
+            mut text,
+            mut truncated,
+        }) => {
+            if let Some(hit) = net.hit_in(&text) {
+                return Ok(Read::Withheld(hit));
+            }
+            // Read past the cap for the net alone: the record keeps what the cap allows.
+            if read > limit && text.len() > limit {
+                let mut end = limit;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                truncated = true;
+            }
             if truncated {
                 warnings.push(format!(
                     "{scheme}:{id} {named} is longer than {limit} bytes; its export stops there"
@@ -124,13 +183,10 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
             (bounds.window_end, false)
         }
     };
-    let author = display_name(file.get("lastModifyingUser")).or_else(|| {
-        file.get("owners")
-            .and_then(Value::as_array)
-            .and_then(|owners| owners.first())
-            .and_then(|owner| display_name(Some(owner)))
-    });
-    Ok(Record {
+    let strip_addresses = net.has_addresses();
+    let author = record_author(file, strip_addresses);
+    let raw = stored_raw(file, strip_addresses);
+    Ok(Read::Kept(Box::new(Record {
         pointer: format!("{scheme}:{id}"),
         stream: stream.to_owned(),
         ts,
@@ -146,8 +202,8 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
         text,
         aliases: vec![id.to_owned()],
         context,
-        raw: file.clone(),
-    })
+        raw,
+    })))
 }
 
 /// The text export a Google document kind is stored as.
@@ -170,6 +226,28 @@ pub(super) fn file_timestamp(file: &Value, field: &str) -> Result<DateTime<Utc>>
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
         .with_context(|| format!("parsing Drive file {field} {value:?}"))
+}
+
+/// The author of `file`'s record: whoever last modified it, by display name, else by address,
+/// else its first owner the same way. While the net names an address (`strip_addresses`) the last
+/// modifier is named by display name alone, since the record then keeps no address of that
+/// person.
+fn record_author(file: &Value, strip_addresses: bool) -> Option<String> {
+    let last = file.get("lastModifyingUser");
+    let by_last = if strip_addresses {
+        last.and_then(|user| user.get("displayName"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    } else {
+        display_name(last)
+    };
+    by_last.or_else(|| {
+        file.get("owners")
+            .and_then(Value::as_array)
+            .and_then(|owners| owners.first())
+            .and_then(|owner| display_name(Some(owner)))
+    })
 }
 
 fn display_name(user: Option<&Value>) -> Option<String> {

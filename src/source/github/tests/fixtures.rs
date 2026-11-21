@@ -9,7 +9,7 @@ pub(super) use anyhow::{anyhow, Context as _, Result};
 pub(super) use chrono::{DateTime, Utc};
 pub(super) use serde_json::{json, Value};
 
-pub(super) use crate::api::github::{api_base, Page, PageKind, Repo, Unauthorized};
+pub(super) use crate::api::github::{api_base, Listing, Page, PageKind, Repo, Unauthorized};
 pub(super) use crate::pointer::Schemes;
 
 pub(super) use super::super::super::{
@@ -21,7 +21,8 @@ pub(super) use super::super::records::{
     pull_reviews_url, stream_id,
 };
 pub(super) use super::super::{
-    fetch_with_api, installations, GithubApi, GithubConfig, Request, PROTOCOL_VERSION,
+    declared_list_ids, excluded_repositories, fetch_with_api, installations, Excluded, GithubApi,
+    GithubConfig, Request, PROTOCOL_VERSION,
 };
 
 pub(super) const WINDOW_END: &str = "2026-10-27T00:00:00Z";
@@ -44,6 +45,8 @@ pub(super) struct FakeGithub {
     pub(super) repos: BTreeMap<u64, Vec<Repo>>,
     pub(super) pages: RefCell<BTreeMap<String, Page>>,
     pub(super) installations_called: RefCell<Vec<u64>>,
+    /// Installations whose repository listing GitHub refuses to protect a rate limit.
+    pub(super) throttled: BTreeSet<u64>,
     pub(super) get_log: RefCell<Vec<String>>,
     /// What the GraphQL API knows of each repository (`owner/name`), as one alias's answer.
     /// A repository with no entry is left out of the answer.
@@ -109,11 +112,15 @@ impl FakeGithub {
 }
 
 impl GithubApi for FakeGithub {
-    fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>> {
+    fn repositories(&self, installation: u64) -> Result<Option<Listing>> {
         self.installations_called.borrow_mut().push(installation);
-        Ok(Some(
-            self.repos.get(&installation).cloned().unwrap_or_default(),
-        ))
+        if self.throttled.contains(&installation) {
+            return Ok(None);
+        }
+        Ok(Some(Listing {
+            repos: self.repos.get(&installation).cloned().unwrap_or_default(),
+            without_id: 0,
+        }))
     }
 
     fn get(&self, _installation: u64, url: &str) -> Result<Page> {
@@ -184,8 +191,10 @@ impl GithubApi for FakeGithub {
     }
 }
 
+/// A repository with no id: a test that excludes repositories by id gives each its own.
 pub(super) fn repo(owner: &str, name: &str) -> Repo {
     Repo {
+        id: 0,
         owner: owner.to_owned(),
         name: name.to_owned(),
         default_branch: "main".to_owned(),
@@ -242,13 +251,32 @@ pub(super) fn run(
     request: &FetchRequest,
     config: &GithubConfig,
 ) -> Result<SourceOutcome> {
+    run_declaring(api, request, config, None)
+}
+
+/// [`run`], with `list_ids` as the value of `CTX_GMAIL_EXCLUDE_LIST_IDS`.
+pub(super) fn run_declaring(
+    api: &FakeGithub,
+    request: &FetchRequest,
+    config: &GithubConfig,
+    list_ids: Option<&str>,
+) -> Result<SourceOutcome> {
     let installations = installations(config)?;
+    let excluded = Excluded {
+        ids: excluded_repositories(config, None)?,
+        list_ids: declared_list_ids(list_ids),
+    };
     let schemes = Schemes::new(["github".to_owned()]);
     let request_enum = Request::Fetch(request.clone());
     let mut session = Session::new(&request_enum, &schemes);
-    let run = fetch_with_api(request, config, &installations, api, &mut |message| {
-        session.accept(message).map(|_| ())
-    });
+    let run = fetch_with_api(
+        request,
+        config,
+        &installations,
+        &excluded,
+        api,
+        &mut |message| session.accept(message).map(|_| ()),
+    );
     Ok(session.finish(run))
 }
 
@@ -257,6 +285,7 @@ pub(super) fn config(installations: Vec<u64>, budget: u32, floor: u32) -> Github
         installations,
         request_budget: budget,
         rate_limit_floor: floor,
+        exclude_repository_ids: Vec::new(),
     }
 }
 

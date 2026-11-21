@@ -1,8 +1,8 @@
 //! Drive feed and backfill fetching.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
@@ -12,8 +12,9 @@ use crate::source::{
     SliceCursor, TokenCursor, MAX_SLICE_DAYS, PROTOCOL_VERSION,
 };
 
-use super::api::DriveApi;
-use super::records::{file_timestamp, record_from_file, required_file_string, Bounds, Place};
+use super::super::content_net::{self, Hit};
+use super::api::{DriveApi, Permissions};
+use super::records::{file_timestamp, record_from_file, required_file_string, Bounds, Place, Read};
 use super::DriveConfig;
 
 /// Everything the user can see, through the Drive changes feed.
@@ -75,6 +76,161 @@ struct Collected {
     cursor: String,
     /// Folders this stream already read, which another stream must not repeat.
     covered_parents: BTreeSet<String>,
+    /// The addresses holding a permission on each shared drive this stream asked about, or
+    /// `None` when Drive refused to list them: each drive is asked once a stream.
+    drive_members: BTreeMap<String, Option<Vec<String>>>,
+}
+
+/// The fields of a file whose `emailAddress` names someone who takes part in it: its owners,
+/// whoever last modified it, whoever shared it with the caller, and its permissions.
+const PEOPLE_FIELDS: [&str; 4] = ["owners", "lastModifyingUser", "sharingUser", "permissions"];
+
+impl Collected {
+    /// Reads `file` into a record of `stream` and keeps it, with the warnings reading it raised,
+    /// unless the content net (`config.net`) withholds it: then neither is kept, so the window
+    /// holds nothing of the file, not even a warning naming it, and the drop is logged by its
+    /// pointer ([`content_net::withheld`]). Before anything is exported, a file is withheld when
+    /// its metadata (its name, its description or any other field the listing gives) names a key
+    /// or term, or an excluded address takes part in it ([`Collected::address_hit`]); after, when
+    /// its export, read up to Drive's own export limit though the record keeps
+    /// `max_export_bytes` of it, or its record names one. A file that is not a Google document,
+    /// or whose export Drive refuses, is stored as its metadata alone, which the net checks.
+    fn read<C: DriveApi + ?Sized>(
+        &mut self,
+        file: &Value,
+        stream: &str,
+        request: &FetchRequest,
+        api: &C,
+        config: &DriveConfig,
+        bounds: Bounds,
+    ) -> Result<()> {
+        let pointer = || {
+            format!(
+                "{}:{}",
+                request.source.scheme,
+                file.get("id").and_then(Value::as_str).unwrap_or_default()
+            )
+        };
+        let net = &config.net;
+        let hit = match net.hit_in_value(file) {
+            Some(hit) => Some(hit),
+            None => self.address_hit(file, api, config)?,
+        };
+        if let Some(hit) = hit {
+            content_net::withheld(&hit, &pointer());
+            return Ok(());
+        }
+        let mut warnings = Vec::new();
+        let read = record_from_file(
+            file,
+            stream,
+            &request.source.scheme,
+            api,
+            config.max_export_bytes,
+            net,
+            bounds,
+            &mut warnings,
+        )?;
+        let record = match read {
+            Read::Kept(record) => record,
+            Read::Withheld(hit) => {
+                content_net::withheld(&hit, &pointer());
+                return Ok(());
+            }
+        };
+        if let Some(hit) = net.hit_in_record(&record) {
+            content_net::withheld(&hit, &record.pointer);
+            return Ok(());
+        }
+        self.records.push(*record);
+        self.warnings.extend(warnings);
+        Ok(())
+    }
+
+    /// Why the net withholds `file` by who takes part in it, while it names an address: one is
+    /// among the file's [`PEOPLE_FIELDS`]; or, when the listing gives no `permissions`, as Drive
+    /// lists a shared-drive file or one the caller may only view, among the file's own
+    /// permissions or, for a shared-drive file, its drive's members, which Drive is asked for.
+    /// [`Hit::PermissionsUnread`] when Drive refuses to list those for a reason that is the file
+    /// or drive itself, as it answers a caller who may only view the file: the file is withheld,
+    /// since no address could be checked, and a drive's refusal is kept for the stream's other
+    /// files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the listing fails for any other reason (a spent limit after the
+    /// client's retries, a server error, the network, the token), so the stream ends before the
+    /// file and its cursor stays, as a failed export ends it.
+    fn address_hit<C: DriveApi + ?Sized>(
+        &mut self,
+        file: &Value,
+        api: &C,
+        config: &DriveConfig,
+    ) -> Result<Option<Hit>> {
+        let net = &config.net;
+        if !net.has_addresses() {
+            return Ok(None);
+        }
+        let listed = PEOPLE_FIELDS
+            .iter()
+            .filter_map(|field| file.get(field))
+            .flat_map(|people| match people {
+                Value::Array(people) => people.as_slice(),
+                person => std::slice::from_ref(person),
+            })
+            .filter_map(|person| person.get("emailAddress").and_then(Value::as_str))
+            .any(|address| net.is_excluded_address(address));
+        if listed {
+            return Ok(Some(Hit::Address));
+        }
+        if file.get("permissions").is_some() {
+            return Ok(None);
+        }
+        let id = file.get("id").and_then(Value::as_str).unwrap_or_default();
+        let Some(own) = permission_addresses(api, id)? else {
+            return Ok(Some(Hit::PermissionsUnread));
+        };
+        let drive = match file.get("driveId").and_then(Value::as_str) {
+            Some(drive) => {
+                if !self.drive_members.contains_key(drive) {
+                    let members = permission_addresses(api, drive)?;
+                    self.drive_members.insert(drive.to_owned(), members);
+                }
+                match self.drive_members.get(drive) {
+                    Some(Some(members)) => members.as_slice(),
+                    _ => return Ok(Some(Hit::PermissionsUnread)),
+                }
+            }
+            None => &[],
+        };
+        Ok(own
+            .iter()
+            .chain(drive)
+            .any(|address| net.is_excluded_address(address))
+            .then_some(Hit::Address))
+    }
+}
+
+/// The addresses holding a permission on the file or shared drive `id`, or `None` when Drive
+/// refused to list them for a reason that is the file or drive itself.
+///
+/// # Errors
+///
+/// Returns an error when the listing fails for any other reason.
+fn permission_addresses<C: DriveApi + ?Sized>(api: &C, id: &str) -> Result<Option<Vec<String>>> {
+    let listed = api
+        .permissions(id)
+        .with_context(|| format!("listing the permissions of drive:{id}"))?;
+    Ok(match listed {
+        Permissions::Listed(permissions) => Some(
+            permissions
+                .iter()
+                .filter_map(|permission| permission.get("emailAddress").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect(),
+        ),
+        Permissions::Refused => None,
+    })
 }
 
 pub(super) fn fetch_with_api<C: DriveApi + ?Sized>(
@@ -204,16 +360,7 @@ fn follow_changes<C: DriveApi + ?Sized>(
                 held += 1;
                 continue;
             }
-            let record = record_from_file(
-                file,
-                STREAM_CHANGES,
-                &request.source.scheme,
-                api,
-                config.max_export_bytes,
-                bounds,
-                &mut collected.warnings,
-            )?;
-            collected.records.push(record);
+            collected.read(file, STREAM_CHANGES, request, api, config, bounds)?;
             read += 1;
         }
         if held > 0 {
@@ -293,16 +440,7 @@ fn list_changes<C: DriveApi + ?Sized>(
             after_window += 1;
             continue;
         }
-        let record = record_from_file(
-            file,
-            STREAM_CHANGES,
-            &request.source.scheme,
-            api,
-            config.max_export_bytes,
-            bounds,
-            &mut collected.warnings,
-        )?;
-        collected.records.push(record);
+        collected.read(file, STREAM_CHANGES, request, api, config, bounds)?;
     }
     if after_window > 0 {
         collected.warnings.push(format!(
@@ -364,16 +502,7 @@ fn collect_meet<C: DriveApi + ?Sized>(
             if is_folder(entry) {
                 collect_meeting_folder(entry, api, config, request, &mut collected)?;
             } else if !is_reference(entry) {
-                let record = record_from_file(
-                    entry,
-                    STREAM_MEET,
-                    &request.source.scheme,
-                    api,
-                    config.max_export_bytes,
-                    bounds,
-                    &mut collected.warnings,
-                )?;
-                collected.records.push(record);
+                collected.read(entry, STREAM_MEET, request, api, config, bounds)?;
             }
         }
     }
@@ -403,16 +532,7 @@ fn collect_meeting_folder<C: DriveApi + ?Sized>(
         if is_reference(file) {
             continue;
         }
-        let record = record_from_file(
-            file,
-            STREAM_MEET,
-            &request.source.scheme,
-            api,
-            config.max_export_bytes,
-            bounds,
-            &mut collected.warnings,
-        )?;
-        collected.records.push(record);
+        collected.read(file, STREAM_MEET, request, api, config, bounds)?;
     }
     Ok(())
 }

@@ -1,6 +1,7 @@
 //! Source protocol types and validation shared by built-in and external sources.
 
 mod calendar;
+mod content_net;
 mod drive;
 mod external;
 pub mod github;
@@ -225,6 +226,50 @@ pub fn configured_schemes(sources: &[SourceConfig]) -> Result<Schemes> {
 pub fn config_json(spec: &SourceConfig) -> Result<serde_json::Value> {
     serde_json::to_value(&spec.settings)
         .with_context(|| format!("serializing source {} configuration", spec.id))
+}
+
+/// The value of the environment variable `name`, or `None` when it is not set.
+///
+/// # Errors
+///
+/// Returns an error when it is set to a value that is not Unicode, so a setting that cannot be
+/// read is never taken for one that is not set.
+pub(crate) fn environment(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("{name} is set to a value that is not Unicode")
+        }
+    }
+}
+
+/// The variables that set an exclusion setting of a built-in source, which only
+/// `--content-net` lets a source apply.
+pub const EXCLUSION_VARIABLES: [&str; 6] = [
+    gmail::EXCLUDE_LIST_IDS_ENV,
+    github::EXCLUDE_REPOSITORY_IDS_ENV,
+    content_net::EXCLUDE_KEYS_ENV,
+    content_net::EXCLUDE_TERMS_ENV,
+    content_net::EXCLUDE_REPOSITORIES_ENV,
+    content_net::EXCLUDE_EMAILS_ENV,
+];
+
+/// Turns the exclusion settings of the built-in sources on, as `--content-net` does. Until
+/// then a source refuses each it is given, so a deployment that sets them runs only a ctx that
+/// takes `--content-net`, which every ctx that applies them does.
+pub fn enable_content_net() {
+    content_net::enable();
+}
+
+/// Refuses each of [`EXCLUSION_VARIABLES`] that names anything, unless [`enable_content_net`]
+/// turned the settings on: `fetch` and `serve` call it before they read anything.
+///
+/// # Errors
+///
+/// Returns an error naming the first such variable, or one that cannot be read.
+pub fn refuse_exclusions_without_content_net() -> Result<()> {
+    content_net::refuse_unless_enabled(&EXCLUSION_VARIABLES)
 }
 
 /// Returns every tree record whose `field` starts with a stream identifier.

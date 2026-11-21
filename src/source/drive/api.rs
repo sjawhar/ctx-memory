@@ -6,10 +6,12 @@ use serde_json::Value;
 use crate::api::client;
 use crate::api::google::{self, Google, Text};
 
-/// The file fields every listing asks for.
-const FILE_FIELDS: &str = "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),parents),nextPageToken";
+/// The file fields every listing asks for. `description`, `permissions(emailAddress)`,
+/// `sharingUser` and `driveId` are asked for the content net alone, and the record stores none
+/// of them, nor `lastModifyingUser`'s address.
+const FILE_FIELDS: &str = "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),sharingUser(displayName,emailAddress),parents,driveId,description,permissions(emailAddress)),nextPageToken";
 /// The change fields the changes feed asks for.
-const CHANGE_FIELDS: &str = "changes(removed,fileId,file(id,name,mimeType,modifiedTime,trashed,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),parents)),nextPageToken,newStartPageToken";
+const CHANGE_FIELDS: &str = "changes(removed,fileId,file(id,name,mimeType,modifiedTime,trashed,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),sharingUser(displayName,emailAddress),parents,driveId,description,permissions(emailAddress))),nextPageToken,newStartPageToken";
 
 /// One page of the changes feed: the files it carries and the token that follows it.
 #[derive(Clone, Debug, Default)]
@@ -19,6 +21,16 @@ pub(super) struct Changes {
     pub(super) next_page_token: String,
     /// Drive named a page after this one.
     pub(super) more: bool,
+}
+
+/// Who holds a permission on a file or shared drive, as Drive answered.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum Permissions {
+    /// The permissions, each with its `emailAddress`.
+    Listed(Vec<Value>),
+    /// Drive refused to list them for a reason that is the file or drive itself
+    /// ([`google::PERMISSION_REFUSALS`]).
+    Refused,
 }
 
 pub(super) trait DriveApi {
@@ -31,6 +43,9 @@ pub(super) trait DriveApi {
     fn files(&self, query: &str) -> Result<Vec<Value>>;
     /// The text export of one file, or Drive's refusal to make it.
     fn export(&self, id: &str, mime: &str, limit: usize) -> Result<Text>;
+    /// The permissions on the file, or the shared drive, `id` names: what a listing leaves out
+    /// for a shared-drive file or one the caller may only view, or Drive's refusal to list them.
+    fn permissions(&self, id: &str) -> Result<Permissions>;
 }
 
 pub(super) struct GoogleDriveApi {
@@ -134,5 +149,46 @@ impl DriveApi for GoogleDriveApi {
             &[("mimeType", mime.to_owned())],
             limit,
         )
+    }
+
+    fn permissions(&self, id: &str) -> Result<Permissions> {
+        let listed = self.google.paginate_unless_refused(
+            &format!("drive/v3/files/{}/permissions", client::percent_encode(id)),
+            &[
+                ("supportsAllDrives", "true".to_owned()),
+                ("pageSize", "100".to_owned()),
+                (
+                    "fields",
+                    "permissions(emailAddress),nextPageToken".to_owned(),
+                ),
+            ],
+            "permissions",
+            &google::PERMISSION_REFUSALS,
+        )?;
+        Ok(match listed {
+            Ok(pages) => Permissions::Listed(pages.items),
+            Err(_) => Permissions::Refused,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CHANGE_FIELDS, FILE_FIELDS};
+
+    /// Both listings ask Drive for the fields the content net reads, on the changes feed and on
+    /// a listing alike: Drive answers only the fields a request names.
+    #[test]
+    fn both_listings_ask_for_the_fields_the_net_reads() {
+        for fields in [FILE_FIELDS, CHANGE_FIELDS] {
+            for wanted in [
+                "lastModifyingUser(displayName,emailAddress)",
+                "sharingUser(displayName,emailAddress)",
+                ",driveId,",
+                ",description,permissions(emailAddress))",
+            ] {
+                assert!(fields.contains(wanted), "{wanted}: {fields}");
+            }
+        }
     }
 }

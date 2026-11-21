@@ -10,18 +10,30 @@
 //! Mail that arrived after the window end waits for the next window. Mail dated later than any
 //! clock has reached ([`crate::source::latest_believable`]) is stored at the window end with a warning,
 //! so a wrong date cannot hold the cursor.
+//!
+//! Mail from a mailing list the deployment excludes by its `List-Id` ([`lists`]), mail whose
+//! text names a key of the content net ([`super::content_net`]), and mail from, to, cc or
+//! reply-to an address of the net, is never stored, on any path that makes a record of a
+//! message: a history walk, a listing, and a resolve. Each drop is logged to standard error by
+//! its pointer ([`super::content_net::withheld`]).
 
+mod addresses;
 mod fetch;
+mod lists;
 mod render;
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::content_net::{ContentNet, NetLists};
 use super::{Message, Request, Source};
 use fetch::{
     emit_fetch_hello, emit_resolve_hello, fetch_with_api, resolve_with_api, GoogleGmailApi,
+    Withheld,
 };
+use lists::ExcludedLists;
+pub(super) use lists::EXCLUDE_LIST_IDS_ENV;
 
 pub use render::record_from_message;
 
@@ -51,15 +63,17 @@ impl Source for GmailSource {
         match request {
             Request::Fetch(request) => {
                 let config = parse_config(&request.config)?;
+                let withheld = withheld(&config)?;
                 emit_fetch_hello(request, sink)?;
                 let api = GoogleGmailApi::load()?;
-                fetch_with_api(request, &config, &api, sink)
+                fetch_with_api(request, &config, &withheld, &api, sink)
             }
             Request::Resolve(request) => {
                 let config = parse_config(&request.config)?;
+                let withheld = withheld(&config)?;
                 emit_resolve_hello(request, sink)?;
                 let api = GoogleGmailApi::load()?;
-                resolve_with_api(request, &config, &api, sink)
+                resolve_with_api(request, &withheld, &api, sink)
             }
         }
     }
@@ -70,6 +84,32 @@ impl Source for GmailSource {
 struct GmailConfig {
     #[serde(default = "default_query")]
     query: String,
+    /// List-IDs whose mail is never stored ([`lists`]).
+    #[serde(default)]
+    exclude_list_ids: Vec<String>,
+    /// Keys of the content net: mail whose text names one is never stored.
+    #[serde(default)]
+    exclude_keys: Vec<String>,
+    /// Terms of the content net: mail whose text names one whole is never stored.
+    #[serde(default)]
+    exclude_terms: Vec<String>,
+    /// Repositories of the content net, `owner/name`: mail whose text names one is never stored.
+    #[serde(default)]
+    exclude_repositories: Vec<String>,
+    /// Addresses of the content net: mail from, to, cc or reply-to one is never stored.
+    #[serde(default)]
+    exclude_emails: Vec<String>,
+}
+
+impl GmailConfig {
+    fn net_lists(&self) -> NetLists<'_> {
+        NetLists {
+            keys: &self.exclude_keys,
+            terms: &self.exclude_terms,
+            repositories: &self.exclude_repositories,
+            addresses: &self.exclude_emails,
+        }
+    }
 }
 
 fn default_query() -> String {
@@ -78,6 +118,24 @@ fn default_query() -> String {
 
 fn parse_config(value: &Value) -> Result<GmailConfig> {
     serde_json::from_value(value.clone()).context("parsing Gmail source configuration")
+}
+
+/// The mail this source never stores, by its list, its text and its addresses: the
+/// configuration's `exclude_list_ids` and the content net's lists, and what
+/// [`EXCLUDE_LIST_IDS_ENV`] and the net's variables add, read in the environment of the process
+/// that runs the source, the fetch or the server, and never a caller's. Refused while
+/// `--content-net` did not turn the settings on.
+fn withheld(config: &GmailConfig) -> Result<Withheld> {
+    let lists = ExcludedLists::from_parts(
+        &config.exclude_list_ids,
+        super::environment(EXCLUDE_LIST_IDS_ENV)?.as_deref(),
+    )
+    .context("reading the Gmail source's excluded List-IDs")?;
+    if !lists.is_empty() {
+        super::content_net::require("exclude_list_ids or CTX_GMAIL_EXCLUDE_LIST_IDS")?;
+    }
+    let net = ContentNet::configured(&config.net_lists())?;
+    Ok(Withheld { lists, net })
 }
 
 #[cfg(test)]

@@ -510,9 +510,21 @@ impl App {
 /// One repository the app may read, with the branch its commits follow.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Repo {
+    /// GitHub's numeric id of the repository, which a rename or a transfer does not change.
+    pub id: u64,
     pub owner: String,
     pub name: String,
     pub default_branch: String,
+}
+
+/// The repositories one installation's listing names.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Listing {
+    /// Each repository the listing names with an id, an owner and a name.
+    pub repos: Vec<Repo>,
+    /// How many entries the listing gives with no id: they are not read, since no exclusion by
+    /// id could be checked against them.
+    pub without_id: usize,
 }
 
 /// What one request to a GitHub listing came back as.
@@ -704,14 +716,14 @@ impl GithubClient {
     ///
     /// Returns an error when the token cannot be minted or read, or GitHub refuses the listing
     /// for any other reason.
-    pub fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>> {
+    pub fn repositories(&self, installation: u64) -> Result<Option<Listing>> {
         self.read_tokens_again()?;
         let mut token = match self.token(installation) {
             Ok(token) => token,
             Err(error) if error.downcast_ref::<Throttled>().is_some() => return Ok(None),
             Err(error) => return Err(error),
         };
-        let mut repositories = Vec::new();
+        let mut listing = Listing::default();
         let mut url = Some(format!("{}/installation/repositories?per_page=100", base()));
         while let Some(current) = url {
             // The caller names the installation, so the error says it once.
@@ -738,14 +750,18 @@ impl GithubClient {
             }
             if let Some(items) = body.get("repositories").and_then(Value::as_array) {
                 for item in items {
-                    if let Some(repository) = parse_repo(item) {
-                        repositories.push(repository);
+                    match parse_repo(item) {
+                        Some(repository) => listing.repos.push(repository),
+                        None if item.get("id").and_then(Value::as_u64).is_none() => {
+                            listing.without_id += 1;
+                        }
+                        None => {}
                     }
                 }
             }
             url = link(&headers, "next");
         }
-        Ok(Some(repositories))
+        Ok(Some(listing))
     }
 
     /// `GET url` with the installation's token.
@@ -966,7 +982,7 @@ fn link(headers: &HeaderMap, rel: &str) -> Option<String> {
     })
 }
 
-/// One repository of an installation listing, when it names an owner, repo, and branch.
+/// One repository of an installation listing, when it names an id, an owner and a repo.
 fn parse_repo(item: &Value) -> Option<Repo> {
     let full_name = item.get("full_name").and_then(Value::as_str)?;
     let (owner, name) = full_name.split_once('/')?;
@@ -978,6 +994,7 @@ fn parse_repo(item: &Value) -> Option<Repo> {
         .and_then(Value::as_str)
         .unwrap_or("main");
     Some(Repo {
+        id: item.get("id").and_then(Value::as_u64)?,
         owner: owner.to_owned(),
         name: name.to_owned(),
         default_branch: default_branch.to_owned(),
@@ -1039,7 +1056,10 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     use reqwest::StatusCode;
 
-    use super::{diff_unavailable, repository_of, throttled, InstallationTokens, TokenRequest};
+    use super::{
+        diff_unavailable, parse_repo, repository_of, throttled, InstallationTokens, Repo,
+        TokenRequest,
+    };
     use crate::credentials::Secret;
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
@@ -1097,6 +1117,32 @@ mod tests {
         assert!(!diff_unavailable(
             &serde_json::json!({"message": "Unprocessable"})
         ));
+    }
+
+    /// A listed repository carries GitHub's id of it, by which a deployment excludes it whatever
+    /// it is called now. An item without one is not read: it could be a repository the
+    /// deployment excludes. Control: the same item with its id is read.
+    #[test]
+    fn a_listed_repository_is_read_with_its_id_and_never_without_one() {
+        let listed = serde_json::json!({
+            "id": 9_000_000_001_u64,
+            "full_name": "example-org/renamed",
+            "default_branch": "trunk"
+        });
+        assert_eq!(
+            parse_repo(&listed),
+            Some(Repo {
+                id: 9_000_000_001,
+                owner: "example-org".to_owned(),
+                name: "renamed".to_owned(),
+                default_branch: "trunk".to_owned(),
+            })
+        );
+        let mut without_id = listed;
+        if let Some(fields) = without_id.as_object_mut() {
+            fields.remove("id");
+        }
+        assert_eq!(parse_repo(&without_id), None);
     }
 
     #[test]

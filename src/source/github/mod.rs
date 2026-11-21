@@ -22,14 +22,14 @@ mod collect;
 mod cursor_state;
 mod records;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::api::github::{GithubClient, Page, Repo};
+use crate::api::github::{GithubClient, Listing, Page, Repo};
 use crate::credentials;
 use crate::exclude::Exclusion;
 
@@ -40,6 +40,9 @@ use records::stream_id;
 
 /// The installations to read, one id per comma, when the configuration names none.
 const INSTALLATIONS_ENV: &str = "CTX_GITHUB_INSTALLATIONS";
+/// GitHub's ids of repositories the source never reads, one per comma, added to the
+/// configuration's `exclude_repository_ids`.
+pub(super) const EXCLUDE_REPOSITORY_IDS_ENV: &str = "CTX_GITHUB_EXCLUDE_REPOSITORY_IDS";
 /// How many paid requests one run may spend before it holds every unfinished cursor.
 const DEFAULT_REQUEST_BUDGET: u32 = 600;
 /// A run stops reading an installation once GitHub reports its `core` rate limit under this.
@@ -76,8 +79,24 @@ impl Source for GithubSource {
             Request::Fetch(request) => {
                 let config = parse_config(&request.config)?;
                 let installations = installations(&config)?;
+                let excluded = excluded_repositories(
+                    &config,
+                    super::environment(EXCLUDE_REPOSITORY_IDS_ENV)?.as_deref(),
+                )?;
+                if !excluded.is_empty() {
+                    super::content_net::require(
+                        "exclude_repository_ids or CTX_GITHUB_EXCLUDE_REPOSITORY_IDS",
+                    )?;
+                }
+                let list_ids = declared_list_ids(
+                    super::environment(super::gmail::EXCLUDE_LIST_IDS_ENV)?.as_deref(),
+                );
                 let client = GithubClient::load(&credentials::Config::new())?;
-                fetch_with_api(request, &config, &installations, &client, sink)
+                let excluded = Excluded {
+                    ids: excluded,
+                    list_ids,
+                };
+                fetch_with_api(request, &config, &installations, &excluded, &client, sink)
             }
             Request::Resolve(request) => emit_resolve_hello(request, sink),
         }
@@ -89,7 +108,7 @@ trait GithubApi {
     /// Gets a read-only token for `installation`, minted or read from the token secret, and
     /// lists the repositories it covers, or `None` when GitHub refused that to protect a rate
     /// limit.
-    fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>>;
+    fn repositories(&self, installation: u64) -> Result<Option<Listing>>;
     /// `GET url` with `installation`'s token. With a token secret, a `401` is an error carrying
     /// [`crate::api::github::Unauthorized`].
     fn get(&self, installation: u64, url: &str) -> Result<Page>;
@@ -101,7 +120,7 @@ trait GithubApi {
 }
 
 impl GithubApi for GithubClient {
-    fn repositories(&self, installation: u64) -> Result<Option<Vec<Repo>>> {
+    fn repositories(&self, installation: u64) -> Result<Option<Listing>> {
         Self::repositories(self, installation)
     }
 
@@ -131,6 +150,9 @@ struct GithubConfig {
     /// this.
     #[serde(default = "default_floor")]
     rate_limit_floor: u32,
+    /// GitHub's ids of repositories never read, whatever GitHub calls them now.
+    #[serde(default)]
+    exclude_repository_ids: Vec<u64>,
 }
 
 const fn default_budget() -> u32 {
@@ -147,6 +169,7 @@ fn parse_config(value: &Value) -> Result<GithubConfig> {
             installations: Vec::new(),
             request_budget: DEFAULT_REQUEST_BUDGET,
             rate_limit_floor: DEFAULT_RATE_FLOOR,
+            exclude_repository_ids: Vec::new(),
         });
     }
     serde_json::from_value(value.clone()).context("parsing GitHub source configuration")
@@ -173,6 +196,34 @@ fn installations(config: &GithubConfig) -> Result<Vec<u64>> {
     }
     if ids.is_empty() {
         bail!("{INSTALLATIONS_ENV} names no installations");
+    }
+    Ok(ids)
+}
+
+/// The repositories the source never reads, by GitHub's id of each: the configuration's
+/// `exclude_repository_ids` and those `environment`, the value of
+/// [`EXCLUDE_REPOSITORY_IDS_ENV`], names. Both lists apply, so neither can take a repository
+/// off the other.
+fn excluded_repositories(
+    config: &GithubConfig,
+    environment: Option<&str>,
+) -> Result<BTreeSet<u64>> {
+    let mut ids = config
+        .exclude_repository_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for part in environment.into_iter().flat_map(|value| value.split(',')) {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = trimmed.parse::<u64>().with_context(|| {
+            format!(
+                "{EXCLUDE_REPOSITORY_IDS_ENV} names {trimmed:?}, which is no GitHub repository id"
+            )
+        })?;
+        ids.insert(id);
     }
     Ok(ids)
 }
@@ -204,38 +255,122 @@ fn emit_resolve_hello(
     })
 }
 
+/// What every installation's listing names, as one run reads it.
+struct Listed {
+    /// The repositories to read, each with its installation, in listing order.
+    repos: Vec<(u64, Repo)>,
+    /// The streams of the repositories the deployment excludes by id, as GitHub names them now.
+    withheld: BTreeSet<String>,
+    /// Whether GitHub refused to list an installation, to protect a rate limit.
+    any_throttled: bool,
+    /// What the run says of the listings: each refused one, and each that gave entries no id.
+    warnings: Vec<String>,
+}
+
+/// The repositories the deployment excludes by id, and the List-IDs its Gmail source excludes,
+/// lowercased, which a renamed repository's mail needs.
+#[derive(Default)]
+struct Excluded {
+    ids: BTreeSet<u64>,
+    list_ids: BTreeSet<String>,
+}
+
+/// The List-IDs `environment`, the value of `CTX_GMAIL_EXCLUDE_LIST_IDS`, names, lowercased.
+fn declared_list_ids(environment: Option<&str>) -> BTreeSet<String> {
+    environment
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Lists each installation's repositories and drops those the deployment excludes by id, each
+/// drop logged by the repository's stream ([`super::content_net::withheld`]). Every pointer,
+/// request and stream of a repository starts from its listing, so one excluded by id is dropped
+/// here, under whatever name GitHub gives it now. Its notification mail, though, the Gmail
+/// source drops by the List-ID of a name, `<repo>.<owner>.github.com`: a warning names an
+/// excluded repository whose current List-ID `CTX_GMAIL_EXCLUDE_LIST_IDS` does not, so a rename
+/// or a transfer is seen. An entry with no id is not read, since no exclusion by id could be
+/// checked against it; the warning counts such entries and names none, as a name may be one
+/// the deployment excludes.
+fn list_repositories<C: GithubApi + ?Sized>(
+    installations: &[u64],
+    excluded: &Excluded,
+    api: &C,
+) -> Result<Listed> {
+    let mut listed = Listed {
+        repos: Vec::new(),
+        withheld: BTreeSet::new(),
+        any_throttled: false,
+        warnings: Vec::new(),
+    };
+    let mut unidentified = Vec::new();
+    for &installation in installations {
+        let listing = api
+            .repositories(installation)
+            .with_context(|| format!("listing repositories for installation {installation}"))?;
+        // GitHub refused to say what this installation covers, so none of its streams are known
+        // this run. Their stored cursors stand untouched and the next fetch asks again.
+        let Some(listing) = listing else {
+            listed.any_throttled = true;
+            listed.warnings.push(format!(
+                "installation {installation}: GitHub refused its repository listing to protect its rate limit; its repositories are read by the next fetch"
+            ));
+            continue;
+        };
+        if listing.without_id > 0 {
+            unidentified.push((installation, listing.without_id));
+        }
+        for repo in listing.repos {
+            if !excluded.ids.contains(&repo.id) {
+                listed.repos.push((installation, repo));
+                continue;
+            }
+            let stream = stream_id(&repo);
+            super::content_net::withheld(&super::content_net::Hit::RepositoryId, &stream);
+            let mut list_id = format!("{}.{}.github.com", repo.name, repo.owner);
+            list_id.make_ascii_lowercase();
+            if !excluded.list_ids.contains(&list_id) {
+                listed.warnings.push(format!(
+                    "repository {}, which the deployment excludes by id, is {}/{} now; the Gmail source drops its notification mail by the List-ID {list_id}, which CTX_GMAIL_EXCLUDE_LIST_IDS does not name, so its mail is stored until the deployment names it",
+                    repo.id, repo.owner, repo.name
+                ));
+            }
+            listed.withheld.insert(stream);
+        }
+    }
+    for (installation, count) in unidentified {
+        listed.warnings.push(format!(
+            "installation {installation}: GitHub listed {count} repository entr{} without an id; {} not read",
+            if count == 1 { "y" } else { "ies" },
+            if count == 1 { "it is" } else { "they are" }
+        ));
+    }
+    Ok(listed)
+}
+
 fn fetch_with_api<C: GithubApi + ?Sized>(
     request: &FetchRequest,
     config: &GithubConfig,
     installations: &[u64],
+    excluded: &Excluded,
     api: &C,
     sink: &mut dyn FnMut(Message) -> Result<()>,
 ) -> Result<()> {
-    let mut repos = Vec::new();
-    let mut throttled = Vec::new();
-    for &installation in installations {
-        let listed = api
-            .repositories(installation)
-            .with_context(|| format!("listing repositories for installation {installation}"))?;
-        match listed {
-            Some(listed) => {
-                for repo in listed {
-                    repos.push((installation, repo));
-                }
-            }
-            // GitHub refused to say what this installation covers, so none of its streams are
-            // known this run. Their stored cursors stand untouched and the next fetch asks again.
-            None => throttled.push(installation),
-        }
-    }
+    let Listed {
+        repos,
+        withheld,
+        any_throttled,
+        warnings: listing_warnings,
+    } = list_repositories(installations, excluded, api)?;
     let streams: Vec<String> = repos.iter().map(|(_, repo)| stream_id(repo)).collect();
     emit_fetch_hello(request, &streams, sink)?;
-    for &installation in &throttled {
+    for message in listing_warnings {
         sink(Message::Warning {
             stream: None,
-            message: format!(
-                "installation {installation}: GitHub refused its repository listing to protect its rate limit; its repositories are read by the next fetch"
-            ),
+            message,
         })?;
     }
 
@@ -260,7 +395,8 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
         .as_deref()
         .and_then(|first| repos.iter().position(|(_, repo)| stream_id(repo) == first))
         .unwrap_or(0);
-    let unplanned = previous.filter(|first| !streams.contains(first));
+    // A start at a repository the deployment excludes is no start: that repository is not read.
+    let unplanned = previous.filter(|first| !streams.contains(first) && !withheld.contains(first));
     let mut first_stopped = None;
     // The installation whose repositories were read last. Every installation is listed before
     // any repository is read, so with a token secret the tokens the listings read can be a long
@@ -312,7 +448,11 @@ fn fetch_with_api<C: GithubApi + ?Sized>(
         )?;
     }
     state.first = first_stopped.or(unplanned);
-    if throttled.is_empty() {
+    // A repository the deployment excludes by id keeps no state, whichever installations answered.
+    for stream in &withheld {
+        state.unsettle(stream);
+    }
+    if !any_throttled {
         // Every installation answered, so a stream that is missing from this run is a
         // repository the app no longer reads.
         state.retain(&streams);

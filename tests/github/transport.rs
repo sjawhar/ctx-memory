@@ -46,7 +46,7 @@ fn github_with_one_repository(api: &FakeHttp, length: usize) -> Result<String> {
         200,
         &json!({
             "total_count": 1,
-            "repositories": [{ "full_name": format!("{OWNER}/{name}"), "default_branch": "main" }],
+            "repositories": [{ "id": 1006, "full_name": format!("{OWNER}/{name}"), "default_branch": "main" }],
         })
         .to_string(),
     )?;

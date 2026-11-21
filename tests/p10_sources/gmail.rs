@@ -107,6 +107,248 @@ fn gmail_message(id: &str, internal_date: &str) -> Value {
     })
 }
 
+/// `gmail_message` with the `List-Id` GitHub gives a repository's notification mail.
+fn notification(id: &str, internal_date: &str) -> Value {
+    let mut message = gmail_message(id, internal_date);
+    if let Some(headers) = message
+        .pointer_mut("/payload/headers")
+        .and_then(Value::as_array_mut)
+    {
+        headers.push(json!({
+            "name": "List-ID",
+            "value": "example-org/private <private.example-org.github.com>"
+        }));
+    }
+    message
+}
+
+/// With `CTX_GMAIL_EXCLUDE_LIST_IDS` naming a repository's List-ID, the built-in source stores
+/// none of that repository's notification mail from the history, and the cursor moves past it.
+/// Control: the same history without the variable stores it.
+#[test]
+fn mail_from_a_list_the_environment_excludes_is_not_fetched() -> Result<()> {
+    let _environment = environment_lock();
+    for excluded in [true, false] {
+        let root = scratch(&format!("gmail-list-{excluded}"))?;
+        let server = FakeGoogle::start(vec![
+            (
+                "/gmail/v1/users/me/history",
+                json!({
+                    "history": [{"id": "900", "messagesAdded": [
+                        {"message": {"id": "dddddddddddddddd"}},
+                        {"message": {"id": "aaaaaaaaaaaaaaaa"}}
+                    ]}],
+                    "historyId": "1000"
+                }),
+            ),
+            (
+                "/gmail/v1/users/me/messages/dddddddddddddddd",
+                notification("dddddddddddddddd", "1792944000000"),
+            ),
+            (
+                "/gmail/v1/users/me/messages/aaaaaaaaaaaaaaaa",
+                gmail_message("aaaaaaaaaaaaaaaa", "1792944000000"),
+            ),
+        ])?;
+        server.use_in_environment("ya29.gmail-test");
+        ctx_memory::source::enable_content_net();
+        if excluded {
+            std::env::set_var(
+                "CTX_GMAIL_EXCLUDE_LIST_IDS",
+                "other.example-org.github.com,private.example-org.github.com",
+            );
+        }
+
+        let spec = source_spec("gmail", "")?;
+        let request = Request::Fetch(FetchRequest {
+            protocol: source::PROTOCOL_VERSION,
+            source: SourceRef {
+                id: "gmail".to_owned(),
+                kind: "gmail".to_owned(),
+                scheme: "gmail".to_owned(),
+            },
+            config: json!({}),
+            window_end: timestamp("2026-10-25T18:00:00Z")?,
+            backfill_hours: 24,
+            cursors: BTreeMap::from([("me".to_owned(), "850@2026-10-24T00:00:00Z".to_owned())]),
+            discovered: Vec::new(),
+            state_dir: root.join("state"),
+            exclude: Vec::new(),
+        });
+        let source = source::open(&spec, "gmail")?;
+        let outcome = run_conformance(source.as_ref(), &request);
+
+        std::env::remove_var("CTX_GMAIL_EXCLUDE_LIST_IDS");
+        clear_google_environment();
+        remove_scratch(&root)?;
+
+        assert!(!outcome.has_errors(), "{:#?}", outcome.error);
+        let pointers: Vec<String> = outcome
+            .records
+            .iter()
+            .map(|record| record.pointer.clone())
+            .collect();
+        let stored = if excluded {
+            vec!["gmail:aaaaaaaaaaaaaaaa".to_owned()]
+        } else {
+            vec![
+                "gmail:dddddddddddddddd".to_owned(),
+                "gmail:aaaaaaaaaaaaaaaa".to_owned(),
+            ]
+        };
+        assert_eq!(pointers, stored, "excluded: {excluded}");
+        assert_eq!(
+            outcome
+                .streams
+                .get("me")
+                .and_then(|stream| stream.cursor.clone()),
+            Some("1000@2026-10-25T18:00:00Z".to_owned())
+        );
+    }
+    Ok(())
+}
+
+/// Runs the `ctx` binary against a tree whose one source is the built-in Gmail source, with
+/// `arguments` after the tree, the fake Google at `base` and `environment` set.
+fn run_ctx(
+    root: &std::path::Path,
+    base: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Result<std::process::Output> {
+    let tree = root.join("tree");
+    if !tree.exists() {
+        std::fs::create_dir(&tree).with_context(|| format!("creating {}", tree.display()))?;
+        std::fs::write(
+            tree.join("ctx.toml"),
+            "version = 1\nid = \"example\"\n\n[[sources]]\nid = \"gmail\"\nkind = \"gmail\"\n",
+        )?;
+    }
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ctx"));
+    command
+        .args([
+            "--json",
+            "--memory",
+            tree.to_str().context("tree path is not valid UTF-8")?,
+        ])
+        .args(arguments)
+        .env("CTX_STATE_DIR", root.join("state"))
+        .env("CTX_DATA_DIR", root.join("data"))
+        .env("CTX_GOOGLE_API_BASE", base)
+        .env("CTX_CREDENTIAL_GOOGLE", "ya29.gmail-test");
+    for variable in ctx_memory::source::EXCLUSION_VARIABLES {
+        command.env_remove(variable);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    command.output().context("running ctx")
+}
+
+/// `ctx --content-net resolve` of a thread, as the server runs it for a caller, answers none of
+/// the mail `CTX_GMAIL_EXCLUDE_LIST_IDS` names in the environment of the process that resolves,
+/// and the rest of the thread as before, and logs the drop to standard error by its pointer
+/// alone. Controls: without the variable it answers the whole thread and logs nothing; with the
+/// variable and without `--content-net` it refuses, naming the argument.
+#[test]
+fn a_resolve_answers_no_mail_from_a_list_the_environment_excludes() -> Result<()> {
+    let _environment = environment_lock();
+    for (excluded, content_net) in [(true, true), (false, false), (true, false)] {
+        let root = scratch(&format!("gmail-resolve-list-{excluded}-{content_net}"))?;
+        let server = FakeGoogle::start(vec![(
+            "/gmail/v1/users/me/threads/cccccccccccccccc",
+            json!({"messages": [
+                notification("dddddddddddddddd", "1792944000000"),
+                gmail_message("aaaaaaaaaaaaaaaa", "1792947600000"),
+            ]}),
+        )])?;
+        let mut arguments = vec!["resolve", "gmail:thread/cccccccccccccccc"];
+        if content_net {
+            arguments.insert(0, "--content-net");
+        }
+        let environment: &[(&str, &str)] = if excluded {
+            &[(
+                "CTX_GMAIL_EXCLUDE_LIST_IDS",
+                "Private.Example-Org.github.com",
+            )]
+        } else {
+            &[]
+        };
+        let output = run_ctx(&root, server.base(), &arguments, environment)?;
+        remove_scratch(&root)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if excluded && !content_net {
+            let said = format!("{stderr}{}", String::from_utf8_lossy(&output.stdout));
+            assert!(!output.status.success(), "{said}");
+            assert!(said.contains("--content-net"), "{said}");
+            continue;
+        }
+        assert!(output.status.success(), "{stderr}");
+        let response: Value = serde_json::from_slice(&output.stdout)?;
+        let text = response
+            .pointer("/data/results/0/text")
+            .and_then(Value::as_str)
+            .context("Gmail thread resolution returned text")?;
+        assert!(text.contains("Message-Id: aaaaaaaaaaaaaaaa"), "{text}");
+        assert_eq!(
+            text.contains("Message-Id: dddddddddddddddd"),
+            !excluded,
+            "excluded: {excluded}: {text}"
+        );
+        let logged = stderr
+            .lines()
+            .filter(|line| line.contains("\"withheld\""))
+            .collect::<Vec<_>>();
+        if excluded {
+            assert_eq!(
+                logged,
+                [
+                    r#"{"event":"withheld","reason":"private-list-id","pointer":"gmail:dddddddddddddddd"}"#
+                ]
+            );
+            assert!(!stderr.contains("example-org/private"), "{stderr}");
+        } else {
+            assert!(logged.is_empty(), "{stderr}");
+        }
+    }
+    Ok(())
+}
+
+/// `ctx fetch` given an exclusion variable that names anything, and no `--content-net`, stops
+/// before it reads anything, naming the variable and the argument, so a deployment that sets
+/// one never runs a ctx that would store what it excludes. Control: a value that names nothing,
+/// `,`, as a secret with no address yet holds, is no setting, and the fetch does not stop for it.
+#[test]
+fn a_fetch_given_an_exclusion_without_content_net_stops_before_it_reads() -> Result<()> {
+    let _environment = environment_lock();
+    for variable in ctx_memory::source::EXCLUSION_VARIABLES {
+        for (value, refused) in [("SYNTH", true), (",", false)] {
+            let root = scratch(&format!("fetch-gate-{variable}-{refused}"))?;
+            let server = FakeGoogle::start(Vec::new())?;
+            let output = run_ctx(&root, server.base(), &["fetch"], &[(variable, value)])?;
+            let requests = server.requests()?;
+            remove_scratch(&root)?;
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            if refused {
+                assert!(!output.status.success(), "{variable}: {said}");
+                assert!(
+                    said.contains("--content-net") && said.contains(variable),
+                    "{said}"
+                );
+                assert!(requests.is_empty(), "{variable}: {requests:?}");
+            } else {
+                assert!(!said.contains("--content-net"), "{variable}: {said}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn a_gmail_history_id_that_expires_mid_catch_up_lists_again_from_the_start() -> Result<()> {
     let _environment = environment_lock();
