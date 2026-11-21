@@ -133,7 +133,7 @@ pub(super) fn withheld_by(config: &Value) -> Result<Withheld> {
     let config = parse_config(config)?;
     Ok(Withheld {
         lists: ExcludedLists::from_parts(&config.exclude_list_ids, None)?,
-        net: ContentNet::from_lists(&config.net_lists())?,
+        net: ContentNet::build(&config.net_lists(), &|_| Ok(None))?,
     })
 }
 

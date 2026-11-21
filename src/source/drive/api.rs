@@ -23,6 +23,16 @@ pub(super) struct Changes {
     pub(super) more: bool,
 }
 
+/// Who holds a permission on a file or shared drive, as Drive answered.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum Permissions {
+    /// The permissions, each with its `emailAddress`.
+    Listed(Vec<Value>),
+    /// Drive refused to list them for a reason that is the file or drive itself
+    /// ([`google::PERMISSION_REFUSALS`]).
+    Refused { status: u16 },
+}
+
 pub(super) trait DriveApi {
     /// The changes token a first fetch starts from.
     fn start_page_token(&self) -> Result<String>;
@@ -33,9 +43,9 @@ pub(super) trait DriveApi {
     fn files(&self, query: &str) -> Result<Vec<Value>>;
     /// The text export of one file, or Drive's refusal to make it.
     fn export(&self, id: &str, mime: &str, limit: usize) -> Result<Text>;
-    /// The permissions on the file, or the shared drive, `id` names, each with its
-    /// `emailAddress`: what a listing leaves out for a shared-drive file.
-    fn permissions(&self, id: &str) -> Result<Vec<Value>>;
+    /// The permissions on the file, or the shared drive, `id` names: what a listing leaves out
+    /// for a shared-drive file or one the caller may only view, or Drive's refusal to list them.
+    fn permissions(&self, id: &str) -> Result<Permissions>;
 }
 
 pub(super) struct GoogleDriveApi {
@@ -141,8 +151,8 @@ impl DriveApi for GoogleDriveApi {
         )
     }
 
-    fn permissions(&self, id: &str) -> Result<Vec<Value>> {
-        let pages = self.google.paginate(
+    fn permissions(&self, id: &str) -> Result<Permissions> {
+        let listed = self.google.paginate_unless_refused(
             &format!("drive/v3/files/{}/permissions", client::percent_encode(id)),
             &[
                 ("supportsAllDrives", "true".to_owned()),
@@ -153,8 +163,14 @@ impl DriveApi for GoogleDriveApi {
                 ),
             ],
             "permissions",
+            &google::PERMISSION_REFUSALS,
         )?;
-        Ok(pages.items)
+        Ok(match listed {
+            Ok(pages) => Permissions::Listed(pages.items),
+            Err(refusal) => Permissions::Refused {
+                status: refusal.status,
+            },
+        })
     }
 }
 

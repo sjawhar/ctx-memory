@@ -1023,7 +1023,7 @@ mod tests {
     /// environment.
     fn run_fetch(api: &FakeCalendarApi, request: &FetchRequest) -> Result<Vec<Message>> {
         let mut config = parse_config(&request.config)?;
-        config.net = ContentNet::from_lists(&config.net_lists())?;
+        config.net = ContentNet::build(&config.net_lists(), &|_| Ok(None))?;
         let mut messages = Vec::new();
         fetch_with_api(request, &config, api, &mut |message| {
             messages.push(message);
@@ -2781,6 +2781,41 @@ mod tests {
             } else {
                 assert_eq!(stored.len(), 4, "{stored:?}");
             }
+        }
+        Ok(())
+    }
+
+    /// An event whose HTML description splits a key or a phrase over a block or line-break tag
+    /// is not stored: the tag reads as a line break, an inline tag as nothing. Control: the same
+    /// descriptions naming another key or phrase are stored.
+    #[test]
+    fn an_event_whose_html_blocks_name_a_key_or_phrase_is_not_stored() -> Result<()> {
+        let described = |id: &str, description: String| {
+            let mut item = event(id, "2026-10-25T09:00:00Z", "2026-10-25T10:00:00Z", None);
+            if let Some(fields) = item.as_object_mut() {
+                fields.insert("description".to_owned(), json!(description));
+            }
+            item
+        };
+        for (key, phrase, withheld) in [("SYNTH", "Falcon", true), ("SYNTHB", "Falconer", false)] {
+            let items = vec![
+                described("EVENT-P", format!("<p>Notes</p><p><b>{key}</b>-12</p>")),
+                described("EVENT-BR", format!("Notes<br><b>{key}</b>-12")),
+                described("EVENT-PHRASE", format!("Project<br>{phrase} weekly")),
+            ];
+            let fake = api(vec![listing("sync-2", items)]);
+            let mut request = request(Some("sync-1@2026-10-24T18:00:00Z"))?;
+            request.config = json!({
+                "calendars": ["team@example.com"],
+                "exclude_keys": ["SYNTH"],
+                "exclude_terms": ["Project Falcon"]
+            });
+            let stored = records(&run_fetch(&fake, &request)?);
+            assert_eq!(
+                stored.len(),
+                if withheld { 0 } else { 3 },
+                "{key}: {stored:?}"
+            );
         }
         Ok(())
     }

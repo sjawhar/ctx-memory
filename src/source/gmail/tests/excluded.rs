@@ -459,6 +459,29 @@ fn mail_that_names_an_excluded_key_is_not_stored_on_any_path() -> Result<()> {
     Ok(())
 }
 
+/// In mail that is HTML alone, a block or line-break tag reads as a line break and an inline tag
+/// as nothing: a key in the paragraph after `Notes`, or after a `<br>`, and a phrase split over a
+/// `<br>`, are named, so the message is stored on no path. Control: the same mail naming another
+/// key or phrase is stored on every path.
+#[test]
+fn html_mail_whose_blocks_name_a_key_or_phrase_is_not_stored_on_any_path() -> Result<()> {
+    let config = json!({"exclude_keys": ["SYNTH"], "exclude_terms": ["Project Falcon"]});
+    for (key, phrase, withheld) in [("SYNTH", "Falcon", true), ("SYNTHB", "Falconer", false)] {
+        let messages = [
+            html_only(
+                "00000000000000h1",
+                &format!("<p>Notes</p><p><b>{key}</b>-12</p>"),
+            ),
+            html_only("00000000000000h2", &format!("Notes<br><b>{key}</b>-12")),
+            html_only("00000000000000h3", &format!("Project<br>{phrase} weekly")),
+        ];
+        let stored = stored_on_each_path(&config, &messages)?;
+        let all = ["00000000000000h1", "00000000000000h2", "00000000000000h3"];
+        assert_each_path_stores(&stored, if withheld { &[] } else { &all }, key);
+    }
+    Ok(())
+}
+
 /// A List-ID is at most 255 octets (RFC 2919 §2): one of 255 is taken, one of 256 is refused.
 #[test]
 fn a_list_id_longer_than_255_octets_is_refused() {
@@ -739,6 +762,51 @@ fn an_excluded_address_is_named_however_a_header_writes_it() -> Result<()> {
             let ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
             assert_each_path_stores(&stored, &ids, address);
         }
+    }
+    Ok(())
+}
+
+/// An excluded address is named in an address header however malformed it is, since the raw
+/// value is scanned beside the parsed mailboxes: an unclosed `<`, an unquoted address in a display
+/// name, with and without a comment, and an unclosed quote. Each such message is stored on no
+/// path. Control: the same malformed headers naming a public address are stored on every path.
+#[test]
+fn an_excluded_address_is_named_in_a_malformed_header() -> Result<()> {
+    let config = json!({"exclude_emails": ["outside@partner.example"]});
+    for (address, excluded) in [
+        ("Outside@Partner.example", true),
+        ("ada@theorem.example", false),
+    ] {
+        let forms = [
+            ("From", format!("Out Side <{address}")),
+            ("From", format!("{address} via Busy <list@lists.example>")),
+            (
+                "Reply-To",
+                format!("{address} (Busy) via list <list@lists.example>"),
+            ),
+            ("To", format!("\"Out Side <{address}>")),
+        ];
+        let messages = forms
+            .iter()
+            .enumerate()
+            .map(|(index, (name, value))| {
+                with_header(
+                    message(
+                        &format!("{:016x}", index + 0x40),
+                        "1792944000000",
+                        "Zmlyc3Q=",
+                    ),
+                    name,
+                    value,
+                )
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..forms.len())
+            .map(|index| format!("{:016x}", index + 0x40))
+            .collect::<Vec<_>>();
+        let ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let stored = stored_on_each_path(&config, &messages)?;
+        assert_each_path_stores(&stored, if excluded { &[] } else { &ids }, address);
     }
     Ok(())
 }

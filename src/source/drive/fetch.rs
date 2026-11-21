@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
@@ -13,7 +13,7 @@ use crate::source::{
 };
 
 use super::super::content_net::{self, Hit};
-use super::api::DriveApi;
+use super::api::{DriveApi, Permissions};
 use super::records::{file_timestamp, record_from_file, required_file_string, Bounds, Place, Read};
 use super::DriveConfig;
 
@@ -77,7 +77,7 @@ struct Collected {
     /// Folders this stream already read, which another stream must not repeat.
     covered_parents: BTreeSet<String>,
     /// The addresses holding a permission on each shared drive this stream asked about, or
-    /// `None` when Drive would not list them: each drive is asked once a stream.
+    /// `None` when Drive refused to list them: each drive is asked once a stream.
     drive_members: BTreeMap<String, Option<Vec<String>>>,
 }
 
@@ -112,10 +112,11 @@ impl Collected {
             )
         };
         let net = &config.net;
-        if let Some(hit) = net
-            .hit_in_value(file)
-            .or_else(|| self.address_hit(file, api, config))
-        {
+        let hit = match net.hit_in_value(file) {
+            Some(hit) => Some(hit),
+            None => self.address_hit(file, api, config)?,
+        };
+        if let Some(hit) = hit {
             content_net::withheld(&hit, &pointer());
             return Ok(());
         }
@@ -148,19 +149,27 @@ impl Collected {
 
     /// Why the net withholds `file` by who takes part in it, while it names an address: one is
     /// among the file's [`PEOPLE_FIELDS`]; or, when the listing gives no `permissions`, as Drive
-    /// lists a shared-drive file or one the caller cannot share, among the file's own
+    /// lists a shared-drive file or one the caller may only view, among the file's own
     /// permissions or, for a shared-drive file, its drive's members, which Drive is asked for.
-    /// [`Hit::PermissionsUnread`] when Drive will not list those: the file is withheld, since no
-    /// address could be checked.
+    /// [`Hit::PermissionsUnread`] when Drive refuses to list those for a reason that is the file
+    /// or drive itself, as it answers a caller who may only view the file: the file is withheld,
+    /// since no address could be checked, and a drive's refusal is kept for the stream's other
+    /// files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the listing fails for any other reason (a spent limit after the
+    /// client's retries, a server error, the network, the token), so the stream ends before the
+    /// file and its cursor stays, as a failed export ends it.
     fn address_hit<C: DriveApi + ?Sized>(
         &mut self,
         file: &Value,
         api: &C,
         config: &DriveConfig,
-    ) -> Option<Hit> {
+    ) -> Result<Option<Hit>> {
         let net = &config.net;
         if !net.has_addresses() {
-            return None;
+            return Ok(None);
         }
         let listed = PEOPLE_FIELDS
             .iter()
@@ -172,46 +181,56 @@ impl Collected {
             .filter_map(|person| person.get("emailAddress").and_then(Value::as_str))
             .any(|address| net.is_excluded_address(address));
         if listed {
-            return Some(Hit::Address);
+            return Ok(Some(Hit::Address));
         }
         if file.get("permissions").is_some() {
-            return None;
+            return Ok(None);
         }
         let id = file.get("id").and_then(Value::as_str).unwrap_or_default();
-        let Some(own) = permission_addresses(api, id) else {
-            return Some(Hit::PermissionsUnread);
+        let Some(own) = permission_addresses(api, id)? else {
+            return Ok(Some(Hit::PermissionsUnread));
         };
         let drive = match file.get("driveId").and_then(Value::as_str) {
             Some(drive) => {
-                let members = self
-                    .drive_members
-                    .entry(drive.to_owned())
-                    .or_insert_with(|| permission_addresses(api, drive));
-                match members {
-                    Some(members) => members.as_slice(),
-                    None => return Some(Hit::PermissionsUnread),
+                if !self.drive_members.contains_key(drive) {
+                    let members = permission_addresses(api, drive)?;
+                    self.drive_members.insert(drive.to_owned(), members);
+                }
+                match self.drive_members.get(drive) {
+                    Some(Some(members)) => members.as_slice(),
+                    _ => return Ok(Some(Hit::PermissionsUnread)),
                 }
             }
             None => &[],
         };
-        own.iter()
+        Ok(own
+            .iter()
             .chain(drive)
             .any(|address| net.is_excluded_address(address))
-            .then_some(Hit::Address)
+            .then_some(Hit::Address))
     }
 }
 
 /// The addresses holding a permission on the file or shared drive `id`, or `None` when Drive
-/// will not list them.
-fn permission_addresses<C: DriveApi + ?Sized>(api: &C, id: &str) -> Option<Vec<String>> {
-    let permissions = api.permissions(id).ok()?;
-    Some(
-        permissions
-            .iter()
-            .filter_map(|permission| permission.get("emailAddress").and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect(),
-    )
+/// refused to list them for a reason that is the file or drive itself.
+///
+/// # Errors
+///
+/// Returns an error when the listing fails for any other reason.
+fn permission_addresses<C: DriveApi + ?Sized>(api: &C, id: &str) -> Result<Option<Vec<String>>> {
+    let listed = api
+        .permissions(id)
+        .with_context(|| format!("listing the permissions of drive:{id}"))?;
+    Ok(match listed {
+        Permissions::Listed(permissions) => Some(
+            permissions
+                .iter()
+                .filter_map(|permission| permission.get("emailAddress").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect(),
+        ),
+        Permissions::Refused { .. } => None,
+    })
 }
 
 pub(super) fn fetch_with_api<C: DriveApi + ?Sized>(

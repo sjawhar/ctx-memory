@@ -12,7 +12,7 @@ pub(super) use crate::record::Record;
 
 pub(super) use super::super::super::content_net::ContentNet;
 pub(super) use super::super::super::{FetchRequest, SourceRef, StreamStatus, PROTOCOL_VERSION};
-pub(super) use super::super::api::{Changes, DriveApi};
+pub(super) use super::super::api::{Changes, DriveApi, Permissions};
 pub(super) use super::super::fetch::{MAX_CHANGED_FILES, STREAM_CHANGES, STREAM_MEET};
 pub(super) use super::super::{emit_fetch_hello, fetch_with_api, parse_config, Message};
 
@@ -35,9 +35,13 @@ pub(super) struct FakeDriveApi {
     /// about the file, which `google::text_reply` turns into an error.
     pub(super) failed: BTreeMap<String, String>,
     pub(super) export_limits: RefCell<Vec<usize>>,
-    /// The addresses holding a permission on each file or shared drive, by id; an id missing
-    /// here is one whose permissions Drive will not list.
+    /// The addresses holding a permission on each file or shared drive, by id.
     pub(super) permission_lists: BTreeMap<String, Vec<String>>,
+    /// Files or shared drives whose permissions Drive refuses to list, with the status it answers.
+    pub(super) permission_refusals: BTreeMap<String, u16>,
+    /// Files or shared drives whose permissions listing fails, with the error the client returns.
+    /// An id in none of the three fails too.
+    pub(super) permission_failures: BTreeMap<String, String>,
 }
 
 impl DriveApi for FakeDriveApi {
@@ -86,17 +90,25 @@ impl DriveApi for FakeDriveApi {
             .ok_or_else(|| anyhow!("missing fake Drive export {id}"))
     }
 
-    fn permissions(&self, id: &str) -> Result<Vec<Value>> {
+    fn permissions(&self, id: &str) -> Result<Permissions> {
         self.calls.borrow_mut().push(format!("permissions {id}"));
-        self.permission_lists
-            .get(id)
-            .map(|addresses| {
+        if let Some(status) = self.permission_refusals.get(id) {
+            return Ok(Permissions::Refused { status: *status });
+        }
+        if let Some(addresses) = self.permission_lists.get(id) {
+            return Ok(Permissions::Listed(
                 addresses
                     .iter()
                     .map(|address| json!({"emailAddress": address}))
-                    .collect()
-            })
-            .ok_or_else(|| anyhow!("Drive answered 403 for the permissions of {id}"))
+                    .collect(),
+            ));
+        }
+        Err(anyhow!(
+            "{}",
+            self.permission_failures
+                .get(id)
+                .map_or("missing fake Drive permissions", String::as_str)
+        ))
     }
 }
 
@@ -141,7 +153,7 @@ pub(super) fn request(config: Value, cursor: Option<(&str, &str)>) -> Result<Fet
 /// environment.
 pub(super) fn run_fetch(api: &FakeDriveApi, request: &FetchRequest) -> Result<Vec<Message>> {
     let mut config = parse_config(&request.config)?;
-    config.net = ContentNet::from_lists(&config.net_lists())?;
+    config.net = ContentNet::build(&config.net_lists(), &|_| Ok(None))?;
     let mut messages = Vec::new();
     emit_fetch_hello(request, &config, &mut |message| {
         messages.push(message);

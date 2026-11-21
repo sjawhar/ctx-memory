@@ -75,16 +75,20 @@ pub(super) enum Read {
 /// The fields a listing asks for the content net alone, which a record never stores.
 const NET_ONLY_FIELDS: [&str; 4] = ["description", "permissions", "sharingUser", "driveId"];
 
-/// `file` as its record stores it: none of the [`NET_ONLY_FIELDS`], and no address of the
-/// person who last modified it, which only the net reads; the display name stays the author.
-fn stored_raw(file: &Value) -> Value {
+/// `file` as its record stores it: none of the [`NET_ONLY_FIELDS`], which the listing asks for the
+/// net alone; and, while the net names an address (`strip_addresses`), no address of the person
+/// who last modified it, which then only the net reads. With no address set the record keeps it,
+/// as it did before the net.
+fn stored_raw(file: &Value, strip_addresses: bool) -> Value {
     let mut raw = file.clone();
     if let Some(fields) = raw.as_object_mut() {
         for field in NET_ONLY_FIELDS {
             fields.remove(field);
         }
-        if let Some(Value::Object(user)) = fields.get_mut("lastModifyingUser") {
-            user.remove("emailAddress");
+        if strip_addresses {
+            if let Some(Value::Object(user)) = fields.get_mut("lastModifyingUser") {
+                user.remove("emailAddress");
+            }
         }
     }
     raw
@@ -179,13 +183,9 @@ pub(super) fn record_from_file<C: DriveApi + ?Sized>(
             (bounds.window_end, false)
         }
     };
-    let author = display_name(file.get("lastModifyingUser")).or_else(|| {
-        file.get("owners")
-            .and_then(Value::as_array)
-            .and_then(|owners| owners.first())
-            .and_then(|owner| display_name(Some(owner)))
-    });
-    let raw = stored_raw(file);
+    let strip_addresses = net.has_addresses();
+    let author = record_author(file, strip_addresses);
+    let raw = stored_raw(file, strip_addresses);
     Ok(Read::Kept(Box::new(Record {
         pointer: format!("{scheme}:{id}"),
         stream: stream.to_owned(),
@@ -226,6 +226,28 @@ pub(super) fn file_timestamp(file: &Value, field: &str) -> Result<DateTime<Utc>>
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
         .with_context(|| format!("parsing Drive file {field} {value:?}"))
+}
+
+/// The author of `file`'s record: whoever last modified it, by display name, else by address,
+/// else its first owner the same way. While the net names an address (`strip_addresses`) the last
+/// modifier is named by display name alone, since the record then keeps no address of that
+/// person.
+fn record_author(file: &Value, strip_addresses: bool) -> Option<String> {
+    let last = file.get("lastModifyingUser");
+    let by_last = if strip_addresses {
+        last.and_then(|user| user.get("displayName"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    } else {
+        display_name(last)
+    };
+    by_last.or_else(|| {
+        file.get("owners")
+            .and_then(Value::as_array)
+            .and_then(|owners| owners.first())
+            .and_then(|owner| display_name(Some(owner)))
+    })
 }
 
 fn display_name(user: Option<&Value>) -> Option<String> {

@@ -3,6 +3,8 @@
 
 use base64::Engine as _;
 
+use super::super::content_net::decode_hex_escapes;
+
 /// What an address header names.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(super) struct Mailboxes {
@@ -241,28 +243,11 @@ fn encoded_word(word: &str) -> Option<(String, usize)> {
 
 /// The bytes a `Q` encoded word's payload writes: `_` a space, `=XX` a byte.
 fn quoted_printable(payload: &str) -> Vec<u8> {
-    let hex = |byte: Option<&u8>| byte.and_then(|byte| char::from(*byte).to_digit(16));
-    let bytes = payload.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while let Some(&byte) = bytes.get(index) {
-        match byte {
-            b'_' => decoded.push(b' '),
-            b'=' => {
-                if let (Some(high), Some(low)) =
-                    (hex(bytes.get(index + 1)), hex(bytes.get(index + 2)))
-                {
-                    decoded.extend(u8::try_from(high * 16 + low).ok());
-                    index += 3;
-                    continue;
-                }
-                decoded.push(byte);
-            }
-            byte => decoded.push(byte),
-        }
-        index += 1;
-    }
-    decoded
+    let spaced = payload
+        .bytes()
+        .map(|byte| if byte == b'_' { b' ' } else { byte })
+        .collect::<Vec<_>>();
+    decode_hex_escapes(&spaced, b'=')
 }
 
 #[cfg(test)]

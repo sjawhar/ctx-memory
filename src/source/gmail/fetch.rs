@@ -643,12 +643,14 @@ pub(super) struct Withheld {
 
 impl Withheld {
     /// Why `message`, as Gmail answers it, is never stored, if it is not: it is from an excluded
-    /// list; an excluded address is in its `From`, `Sender`, `To`, `Cc`, `Bcc` or `Reply-To`; or
-    /// it names an excluded key in any string Gmail gives (its headers, snippet and file names
-    /// among them), in any part Gmail sends inline, whatever its type, in a text part Gmail keeps
-    /// apart, which `api` reads, or in the text its record would store. A part that is not text
-    /// and that Gmail keeps apart, such as a PDF, is not read: the record holds its file name
-    /// alone, which is checked.
+    /// list; an excluded address is in one of its [`ADDRESS_HEADERS`] (`From`, `Sender`, `To`,
+    /// `Cc`, `Bcc`, `Reply-To`, and the `X-Original-` and `Resent-` headers a list or a relay
+    /// carries the original sender and recipients in), read as [`Withheld::names_an_address`]
+    /// reads them; or it names an excluded key, term or repository in any string Gmail gives (its
+    /// headers, snippet and file names among them), in any part Gmail sends inline, whatever its
+    /// type, in a text part Gmail keeps apart, which `api` reads, or in the text its record would
+    /// store. A part that is not text and that Gmail keeps apart, such as a PDF, is not read: the
+    /// record holds its file name alone, which is checked.
     ///
     /// # Errors
     ///
@@ -700,9 +702,10 @@ impl Withheld {
         Ok(None)
     }
 
-    /// Whether an excluded address is in one of the [`ADDRESS_HEADERS`] of `message`, read as a
-    /// mailbox list ([`mailboxes`]): as a mailbox's address, or written in a display name or
-    /// comment.
+    /// Whether an excluded address is in one of the [`ADDRESS_HEADERS`] of `message`: as a
+    /// mailbox's address or in a display name or comment, the value read as a mailbox list
+    /// ([`mailboxes`]), or anywhere in the raw value, so a header too malformed to parse (an
+    /// unclosed `<` or quote, an address written bare in a display name) still names it.
     fn names_an_address(&self, message: &Value) -> bool {
         message
             .pointer("/payload/headers")
@@ -721,6 +724,9 @@ impl Withheld {
             })
             .filter_map(|header| header.get("value").and_then(Value::as_str))
             .any(|value| {
+                if self.net.names_address(value) {
+                    return true;
+                }
                 let read = mailboxes(value);
                 read.addresses
                     .iter()

@@ -64,6 +64,21 @@ const FILE_REFUSALS: [(u16, &str); 5] = [
     (404, "notFound"),
 ];
 
+/// The refusals of a permissions listing that are about the file or shared drive itself: the
+/// caller may only view it, so it may not see who holds it (`insufficientFilePermissions`, which
+/// Drive answered on 2026-11-21 for two files a Theorem login could only view), or it is gone, or
+/// the caller is no member of the drive (`notFound`). Every other refusal — a spent limit after
+/// retries, a token without the Drive scope, a `403` with no reason — is about the caller.
+pub const PERMISSION_REFUSALS: [(u16, &str); 2] =
+    [(403, "insufficientFilePermissions"), (404, "notFound")];
+
+/// A refusal whose reason is what was asked for itself, with its status and Google's own words.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Refusal {
+    pub status: u16,
+    pub message: String,
+}
+
 /// A short-lived Google access token.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessToken {
@@ -181,6 +196,38 @@ impl Google {
         paginate_with(query, items_key, |page_query| self.get(path, page_query))
     }
 
+    /// Every page of a list endpoint, as [`Self::paginate`] reads them, or the refusal Google
+    /// answered when its status and reason are one of `refusals`, which are about what was asked
+    /// for itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a page fails for any other reason, after the retries
+    /// [`Self::reply`] makes, or the API repeats a page token.
+    pub fn paginate_unless_refused(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        items_key: &str,
+        refusals: &[(u16, &str)],
+    ) -> Result<std::result::Result<Pages, Refusal>> {
+        let mut refused = None;
+        let pages = paginate_with(query, items_key, |page_query| {
+            let (status, body) = self.reply(path, page_query)?;
+            if (200..300).contains(&status) {
+                return Ok(body);
+            }
+            if let Some(refusal) = refusal_in(status, &body, refusals) {
+                refused = Some(refusal);
+            }
+            bail!("Google {path} returned {status}: {}", error_message(&body))
+        });
+        match (pages, refused) {
+            (_, Some(refusal)) => Ok(Err(refusal)),
+            (pages, None) => pages.map(Ok),
+        }
+    }
+
     /// Exports `path` as text, reading at most `limit` bytes.
     ///
     /// A reply Google asks a client to back off from is sent again, as [`Self::reply`] does. A
@@ -228,18 +275,24 @@ fn text_reply(
             truncated,
         });
     }
-    let names_the_file = reason(error).is_some_and(|reason| {
-        FILE_REFUSALS
-            .iter()
-            .any(|&(refused, named)| refused == status && named == reason)
-    });
-    if names_the_file {
-        return Ok(Text::Refused {
-            status,
-            message: error_message(error),
-        });
+    if let Some(Refusal { status, message }) = refusal_in(status, error, &FILE_REFUSALS) {
+        return Ok(Text::Refused { status, message });
     }
     bail!("Google {path} returned {status}: {}", error_message(error))
+}
+
+/// The refusal `status` and `body` are, when one of `refusals` names that status and the body's
+/// reason: a refusal about what was asked for itself. Any other reply is none, even a `404` or a
+/// `403` whose reason is about the caller.
+fn refusal_in(status: u16, body: &Value, refusals: &[(u16, &str)]) -> Option<Refusal> {
+    let reason = reason(body)?;
+    refusals
+        .iter()
+        .any(|&(refused, named)| refused == status && named == reason)
+        .then(|| Refusal {
+            status,
+            message: error_message(body),
+        })
 }
 
 fn paginate_with<F>(query: &[(&str, String)], items_key: &str, mut page: F) -> Result<Pages>
@@ -651,6 +704,55 @@ mod tests {
             "errors": [{"domain": "global", "reason": reason, "message": message}],
             "message": message
         }})
+    }
+
+    /// A permissions listing Drive refuses for the file or drive itself, as it answers a caller
+    /// who may only view the file (`403 insufficientFilePermissions`, measured 2026-11-21) or one
+    /// gone or out of reach (`404 notFound`), is a refusal. A refusal about the caller (a token
+    /// without the Drive scope, a spent limit, a `403` or `404` with no reason) and a server error
+    /// are none, so the source ends its stream instead of withholding the file.
+    #[test]
+    fn a_permissions_listing_refused_for_the_file_is_a_refusal_and_no_other() {
+        for (status, reason) in [(403, "insufficientFilePermissions"), (404, "notFound")] {
+            let body = drive_error(
+                status,
+                reason,
+                "The user does not have sufficient permissions for this file.",
+            );
+            assert_eq!(
+                refusal_in(status, &body, &PERMISSION_REFUSALS).map(|refusal| refusal.status),
+                Some(status),
+                "{status} {reason}"
+            );
+        }
+        for (status, body) in [
+            (
+                403,
+                drive_error(
+                    403,
+                    "insufficientPermissions",
+                    "Request had insufficient authentication scopes.",
+                ),
+            ),
+            (
+                403,
+                drive_error(403, "dailyLimitExceeded", "Daily Limit Exceeded"),
+            ),
+            (
+                403,
+                drive_error(403, "userRateLimitExceeded", "User Rate Limit Exceeded"),
+            ),
+            (404, json!({"error": {"code": 404, "message": "Not Found"}})),
+            (403, json!("<html><body>403 Forbidden</body></html>")),
+            (500, drive_error(500, "backendError", "Backend Error")),
+            (401, drive_error(401, "authError", "Invalid Credentials")),
+        ] {
+            assert_eq!(
+                refusal_in(status, &body, &PERMISSION_REFUSALS),
+                None,
+                "{status} {body}"
+            );
+        }
     }
 
     #[test]

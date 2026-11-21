@@ -316,9 +316,12 @@ fn document_with(id: &str, extra: Value) -> Value {
     file
 }
 
-/// A file an excluded address last modified, or shared with the caller, is not stored, and the
-/// record of a file kept stores neither address. Control: with no address configured, all three
-/// are stored.
+/// A file an excluded address last modified, or shared with the caller, is not stored. While
+/// addresses are set, the record of a file kept stores no address of the person who last modified
+/// it, nor of whoever shared it, and that person's address is never its author, though it has no
+/// display name. Control (R9): with no address configured, all three are stored as before the
+/// net: the record keeps the last modifier's address, and a last modifier with no display name is
+/// the author by address; `sharingUser`, which the listing asks for the net alone, is never kept.
 #[test]
 fn a_file_an_excluded_address_modified_or_shared_is_not_stored() -> Result<()> {
     let by = |address: &str| json!({"displayName": "Someone", "emailAddress": address});
@@ -333,7 +336,11 @@ fn a_file_an_excluded_address_modified_or_shared_is_not_stored() -> Result<()> {
         ),
         document_with(
             KEPT,
-            json!({"lastModifyingUser": by("ada@theorem.example"), "sharingUser": by("ada@theorem.example"), "permissions": []}),
+            json!({
+                "lastModifyingUser": {"emailAddress": "ada@theorem.example"},
+                "sharingUser": by("ada@theorem.example"),
+                "permissions": []
+            }),
         ),
     ];
     let exports =
@@ -347,33 +354,36 @@ fn a_file_an_excluded_address_modified_or_shared_is_not_stored() -> Result<()> {
         });
         let messages = run_fetch(&api, &request(config, None)?)?;
         let stored = records(&messages);
-        for record in &stored {
-            let raw = record.raw.to_string();
+        let kept = stored
+            .iter()
+            .find(|record| record.pointer == format!("drive:{KEPT}"))
+            .context("the public file is stored")?;
+        let raw = kept.raw.to_string();
+        assert!(kept.raw.get("sharingUser").is_none(), "{raw}");
+        if excluded {
+            assert!(!raw.contains("theorem.example"), "{raw}");
+            assert_ne!(kept.author.as_deref(), Some("ada@theorem.example"));
+            assert_eq!(stored.len(), 1, "{stored:?}");
+        } else {
             assert!(
-                !raw.contains("theorem.example") && !raw.contains("partner.example"),
+                raw.contains(r#""emailAddress":"ada@theorem.example""#),
                 "{raw}"
             );
-        }
-        let mut pointers = stored
-            .into_iter()
-            .map(|record| record.pointer)
-            .collect::<Vec<_>>();
-        pointers.sort();
-        if excluded {
-            assert_eq!(pointers, [format!("drive:{KEPT}")]);
-        } else {
-            assert_eq!(pointers.len(), 3, "{pointers:?}");
+            assert_eq!(kept.author.as_deref(), Some("ada@theorem.example"));
+            assert_eq!(stored.len(), 3, "{stored:?}");
         }
     }
     Ok(())
 }
 
-/// A file a listing gives no permissions for, as Drive lists a shared-drive file, is checked by
-/// its permissions and its shared drive's members, which the source asks Drive for, each drive
-/// once a run. A file an excluded address holds a permission on, or whose drive it is a member
-/// of, is not stored, nor is one whose permissions Drive will not list: that drop is logged as
-/// `permissions-unread`, by pointer. Control: with no address configured, no permissions are
-/// asked for and all five are stored.
+/// A file a listing gives no permissions for, as Drive lists a shared-drive file or one the
+/// caller may only view, is checked by its permissions and its shared drive's members, which the
+/// source asks Drive for, each drive once a stream. A file an excluded address holds a permission
+/// on, or whose drive it is a member of, is not stored; nor is one whose permissions, or whose
+/// drive's members, Drive refuses to list (`403 insufficientFilePermissions`, as Drive answers a
+/// reader, or `404 notFound`): that drop is logged as `permissions-unread`, by pointer, and the
+/// drive's refusal is asked once for both of its files. Control: with no address configured, no
+/// permissions are asked for and all six are stored.
 #[test]
 fn a_shared_drive_file_is_checked_by_its_own_and_its_drives_permissions() -> Result<()> {
     let files = vec![
@@ -382,6 +392,10 @@ fn a_shared_drive_file_is_checked_by_its_own_and_its_drives_permissions() -> Res
         document_with("file-public", json!({"driveId": "drive-public"})),
         document_with("file-unlisted", json!({})),
         document_with("file-drive-unlisted", json!({"driveId": "drive-unlisted"})),
+        document_with(
+            "file-drive-unlisted-2",
+            json!({"driveId": "drive-unlisted"}),
+        ),
     ];
     let ids = [
         "file-member",
@@ -389,37 +403,36 @@ fn a_shared_drive_file_is_checked_by_its_own_and_its_drives_permissions() -> Res
         "file-public",
         "file-unlisted",
         "file-drive-unlisted",
+        "file-drive-unlisted-2",
     ];
     let exports = BTreeMap::from(ids.map(|id| (id.to_owned(), ("plan".to_owned(), false))));
+    let listed = |address: &str| vec![address.to_owned()];
     let permission_lists = BTreeMap::from([
-        (
-            "file-member".to_owned(),
-            vec!["ada@theorem.example".to_owned()],
-        ),
+        ("file-member".to_owned(), listed("ada@theorem.example")),
         (
             "drive-outside".to_owned(),
-            vec!["Outside@Partner.example".to_owned()],
+            listed("Outside@Partner.example"),
         ),
-        (
-            "file-shared".to_owned(),
-            vec!["outside@partner.example".to_owned()],
-        ),
-        (
-            "file-public".to_owned(),
-            vec!["ada@theorem.example".to_owned()],
-        ),
-        (
-            "drive-public".to_owned(),
-            vec!["ada@theorem.example".to_owned()],
-        ),
+        ("file-shared".to_owned(), listed("outside@partner.example")),
+        ("file-public".to_owned(), listed("ada@theorem.example")),
+        ("drive-public".to_owned(), listed("ada@theorem.example")),
         (
             "file-drive-unlisted".to_owned(),
-            vec!["ada@theorem.example".to_owned()],
+            listed("ada@theorem.example"),
         ),
+        (
+            "file-drive-unlisted-2".to_owned(),
+            listed("ada@theorem.example"),
+        ),
+    ]);
+    let permission_refusals = BTreeMap::from([
+        ("file-unlisted".to_owned(), 403),
+        ("drive-unlisted".to_owned(), 404),
     ]);
     for excluded in [true, false] {
         let mut api = listing_of(files.clone(), exports.clone(), BTreeMap::new());
         api.permission_lists = permission_lists.clone();
+        api.permission_refusals = permission_refusals.clone();
         let config = listing_config(if excluded {
             json!({"exclude_emails": ["outside@partner.example"]})
         } else {
@@ -450,12 +463,14 @@ fn a_shared_drive_file_is_checked_by_its_own_and_its_drives_permissions() -> Res
                 line("private-address", "file-shared"),
                 line("permissions-unread", "file-unlisted"),
                 line("permissions-unread", "file-drive-unlisted"),
+                line("permissions-unread", "file-drive-unlisted-2"),
             ];
             want.sort();
             assert_eq!(logged, want);
             assert_eq!(asked("drive-public"), 1, "{:?}", api.calls.borrow());
+            assert_eq!(asked("drive-unlisted"), 1, "{:?}", api.calls.borrow());
         } else {
-            assert_eq!(stored.len(), 5, "{stored:?}");
+            assert_eq!(stored.len(), 6, "{stored:?}");
             assert!(
                 !api.calls
                     .borrow()
@@ -464,6 +479,57 @@ fn a_shared_drive_file_is_checked_by_its_own_and_its_drives_permissions() -> Res
                 "{:?}",
                 api.calls.borrow()
             );
+        }
+    }
+    Ok(())
+}
+
+/// A permissions listing that fails for a reason that is not the file or drive itself (a spent
+/// limit after retries, a server error, the network, the token) ends the stream with that error,
+/// on the file's own permissions and on its drive's members alike, as a failed export does: the
+/// stream proposes no cursor, so the next fetch reads the file again, and nothing of the file is
+/// stored. Control: when Drive lists the permissions, the stream ends with its cursor and the
+/// file is stored.
+#[test]
+fn a_failed_permissions_listing_ends_the_stream_before_the_file() -> Result<()> {
+    for (file, failing) in [
+        (document_with("file-a", json!({})), "file-a"),
+        (
+            document_with("file-a", json!({"driveId": "drive-a"})),
+            "drive-a",
+        ),
+    ] {
+        for fails in [true, false] {
+            let mut api = listing_of(
+                vec![file.clone()],
+                BTreeMap::from([("file-a".to_owned(), ("plan".to_owned(), false))]),
+                BTreeMap::new(),
+            );
+            api.permission_lists = BTreeMap::from([
+                ("file-a".to_owned(), vec!["ada@theorem.example".to_owned()]),
+                ("drive-a".to_owned(), vec!["ada@theorem.example".to_owned()]),
+            ]);
+            if fails {
+                api.permission_lists.remove(failing);
+                api.permission_failures = BTreeMap::from([(
+                    failing.to_owned(),
+                    "Google drive/v3/files/x/permissions returned 503: Backend Error".to_owned(),
+                )]);
+            }
+            let config = listing_config(json!({"exclude_emails": ["outside@partner.example"]}));
+            let messages = run_fetch(&api, &request(config, None)?)?;
+            let stored = records(&messages);
+            let cursor = stream_cursor(&messages, STREAM_CHANGES);
+            if fails {
+                assert!(stored.is_empty(), "{failing}: {stored:?}");
+                assert_eq!(cursor, None, "{failing}: the stream proposes no cursor");
+            } else {
+                assert_eq!(stored.len(), 1, "{failing}: {stored:?}");
+                assert!(
+                    cursor.is_some(),
+                    "{failing}: the stream proposes its cursor"
+                );
+            }
         }
     }
     Ok(())
