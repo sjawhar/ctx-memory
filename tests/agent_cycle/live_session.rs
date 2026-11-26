@@ -321,6 +321,13 @@ fn read_request(stream: &TcpStream, routes: &Mutex<Vec<Value>>) -> Result<(Strin
     Ok((request_line, body))
 }
 
+fn set_route_field(route: &mut Value, key: &str, value: Value) {
+    route
+        .as_object_mut()
+        .expect("a route control is an object")
+        .insert(key.to_owned(), value);
+}
+
 #[test]
 fn discovery_route_rejects_a_vendor_host_and_message_credential() {
     let host = "127.0.0.1:4567";
@@ -335,13 +342,41 @@ fn discovery_route_rejects_a_vendor_host_and_message_credential() {
     assert!(is_discovery_route(&discovery, host));
 
     let mut vendor_host = discovery.clone();
-    vendor_host["host"] = Value::from("api.anthropic.com");
+    set_route_field(&mut vendor_host, "host", Value::from("api.anthropic.com"));
     assert!(!is_discovery_route(&vendor_host, host));
 
     let mut message_credential = discovery;
-    message_credential["authorization"] = Value::from(format!("Bearer {MODEL_KEY}"));
-    message_credential["x-api-key"] = Value::Null;
+    set_route_field(
+        &mut message_credential,
+        "authorization",
+        Value::from(format!("Bearer {MODEL_KEY}")),
+    );
+    set_route_field(&mut message_credential, "x-api-key", Value::Null);
     assert!(!is_discovery_route(&message_credential, host));
+}
+
+fn serve_catalog(stream: &mut TcpStream) -> Result<()> {
+    let catalog = json!({
+        "data": [{
+            "type": "model",
+            "id": EXAMPLE_MODEL_ID,
+            "display_name": "Example model",
+            "created_at": "2024-01-01T00:00:00Z",
+        }],
+        "has_more": false,
+        "first_id": EXAMPLE_MODEL_ID,
+        "last_id": EXAMPLE_MODEL_ID,
+    })
+    .to_string();
+    stream.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{catalog}",
+            catalog.len()
+        )
+        .as_bytes(),
+    )?;
+    Ok(())
 }
 
 fn serve_one(
@@ -353,27 +388,7 @@ fn serve_one(
     let (request_line, body) = read_request(&stream, routes)?;
     let mut stream = stream;
     if request_line.starts_with("GET /v1/models ") {
-        let catalog = json!({
-            "data": [{
-                "type": "model",
-                "id": EXAMPLE_MODEL_ID,
-                "display_name": "Example model",
-                "created_at": "2024-01-01T00:00:00Z",
-            }],
-            "has_more": false,
-            "first_id": EXAMPLE_MODEL_ID,
-            "last_id": EXAMPLE_MODEL_ID,
-        })
-        .to_string();
-        stream.write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{catalog}",
-                catalog.len()
-            )
-            .as_bytes(),
-        )?;
-        return Ok(());
+        return serve_catalog(&mut stream);
     }
     if !request_line.starts_with("POST /v1/messages") {
         stream.write_all(
