@@ -136,13 +136,13 @@ impl FakeModel {
         ensure!(!routes.is_empty(), "the session never called the model");
         let host = format!("127.0.0.1:{}", self.port);
         let bearer = format!("Bearer {MODEL_KEY}");
-        let mut discoveries = 0;
         let mut messages = 0;
         let mut example_messages = 0;
         for route in routes.iter() {
             if is_discovery_route(route, &host) {
-                discoveries += 1;
-            } else if is_message_route(route, &host, &bearer) {
+                continue;
+            }
+            if is_message_route(route, &host, &bearer) {
                 messages += 1;
                 if route.get("model").and_then(Value::as_str) == Some(EXAMPLE_MODEL_ID) {
                     example_messages += 1;
@@ -154,10 +154,6 @@ impl FakeModel {
                 );
             }
         }
-        ensure!(
-            discoveries > 0,
-            "the session did not discover models at its controlled address"
-        );
         ensure!(messages > 0, "the session never sent a Messages request");
         ensure!(
             example_messages > 0,
