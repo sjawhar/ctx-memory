@@ -344,7 +344,11 @@ fn discovery_route_rejects_a_vendor_host_and_message_credential() {
     assert!(is_discovery_route(&discovery, host));
 
     let mut vendor_host = discovery.clone();
-    assert!(set_route_field(&mut vendor_host, "host", Value::from("api.anthropic.com")));
+    assert!(set_route_field(
+        &mut vendor_host,
+        "host",
+        Value::from("api.anthropic.com")
+    ));
     assert!(!is_discovery_route(&vendor_host, host));
 
     let mut message_credential = discovery;
@@ -353,7 +357,11 @@ fn discovery_route_rejects_a_vendor_host_and_message_credential() {
         "authorization",
         Value::from(format!("Bearer {MODEL_KEY}")),
     ));
-    assert!(set_route_field(&mut message_credential, "x-api-key", Value::Null));
+    assert!(set_route_field(
+        &mut message_credential,
+        "x-api-key",
+        Value::Null
+    ));
     assert!(!is_discovery_route(&message_credential, host));
 }
 
