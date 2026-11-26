@@ -74,12 +74,12 @@ fn cycle_omp_arguments(policy: &Path, session_dir: &Path, prompt: &str) -> Resul
 /// checks that every call carries it, and nothing else, as the model API's bearer token.
 const MODEL_KEY: &str = "live-probe-model-key";
 
-/// A scripted stand-in for the model API, an Anthropic Messages API. The answer to a request is
-/// the step at the index of the number of tool results the request carries, so a retry or a side
-/// request (omp asks for skill summaries) never advances the script. A step with `delay_ms` holds
-/// its answer back that long, as a slow model does. A step with `stream_error` answers `200` and
-/// starts the message, then sends an `error` event of that type in the stream, as a gateway that
-/// fails after the response has begun does.
+/// A scripted stand-in for the model API, an Anthropic Messages API and its model discovery
+/// endpoint. The answer to a Messages request is the step at the index of the number of tool
+/// results it carries, so a retry or a side request (omp asks for skill summaries) never advances
+/// the script. A step with `delay_ms` holds its answer back that long, as a slow model does. A
+/// step with `stream_error` answers `200` and starts the message, then sends an `error` event of
+/// that type in the stream, as a gateway that fails after the response has begun does.
 struct FakeModel {
     port: u16,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -124,25 +124,33 @@ impl FakeModel {
         })
     }
 
-    /// Every request reached the model API as `runner/models.example.yml` routes it: the model
-    /// is the example's model id, the one `run-cycle.sh` selects, sent as it is, and the one
-    /// credential is the key from the file models.yml names, as a bearer token.
+    /// Every request reached the model API as `runner/models.example.yml` routes it: discovery
+    /// uses the controlled address, `GET /v1/models`, and X-Api-Key; Messages use the example
+    /// model id, bearer token, and no X-Api-Key.
     fn check_gateway_route(&self) -> Result<()> {
         let routes = self
             .routes
             .lock()
             .map_err(|error| anyhow::anyhow!("reading the recorded routes: {error}"))?;
         ensure!(!routes.is_empty(), "the session never called the model");
+        let host = format!("127.0.0.1:{}", self.port);
         let bearer = format!("Bearer {MODEL_KEY}");
+        let mut discoveries = 0;
+        let mut messages = 0;
         for route in routes.iter() {
-            ensure!(
-                route.get("path").and_then(Value::as_str) == Some("/v1/messages")
-                    && route.get("model").and_then(Value::as_str) == Some(EXAMPLE_MODEL_ID)
-                    && route.get("authorization").and_then(Value::as_str) == Some(&bearer)
-                    && route.get("x-api-key").is_some_and(Value::is_null),
-                "a model call did not reach the model API as models.yml routes it: {route}"
-            );
+            if is_discovery_route(route, &host) {
+                discoveries += 1;
+            } else if is_message_route(route, &host, &bearer) {
+                messages += 1;
+            } else {
+                bail!(
+                    "a model discovery or message request did not reach the model API as \
+                     models.yml routes it: {route}"
+                );
+            }
         }
+        ensure!(discoveries > 0, "the session did not discover models at its controlled address");
+        ensure!(messages > 0, "the session never sent a Messages request");
         Ok(())
     }
 
@@ -242,8 +250,28 @@ impl FakeModel {
     }
 }
 
-/// Reads one request from `stream`: its request line and its body. Its path, model,
-/// `Authorization` and `X-Api-Key` go to `routes`.
+/// Whether `route` is the expected authenticated discovery call to the controlled model address.
+fn is_discovery_route(route: &Value, host: &str) -> bool {
+    route.get("method").and_then(Value::as_str) == Some("GET")
+        && route.get("path").and_then(Value::as_str) == Some("/v1/models")
+        && route.get("host").and_then(Value::as_str) == Some(host)
+        && route.get("model").is_some_and(Value::is_null)
+        && route.get("authorization").is_some_and(Value::is_null)
+        && route.get("x-api-key").and_then(Value::as_str) == Some(MODEL_KEY)
+}
+
+/// Whether `route` is the expected bearer-authenticated Messages call to the controlled address.
+fn is_message_route(route: &Value, host: &str, bearer: &str) -> bool {
+    route.get("method").and_then(Value::as_str) == Some("POST")
+        && route.get("path").and_then(Value::as_str) == Some("/v1/messages")
+        && route.get("host").and_then(Value::as_str) == Some(host)
+        && route.get("model").and_then(Value::as_str) == Some(EXAMPLE_MODEL_ID)
+        && route.get("authorization").and_then(Value::as_str) == Some(bearer)
+        && route.get("x-api-key").is_some_and(Value::is_null)
+}
+
+/// Reads one request from `stream`: its method, path, host, model, `Authorization` and
+/// `X-Api-Key` go to `routes`.
 fn read_request(stream: &TcpStream, routes: &Mutex<Vec<Value>>) -> Result<(String, Vec<u8>)> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -251,6 +279,7 @@ fn read_request(stream: &TcpStream, routes: &Mutex<Vec<Value>>) -> Result<(Strin
     let mut length = 0;
     let mut authorization = Value::Null;
     let mut api_key = Value::Null;
+    let mut host = Value::Null;
     loop {
         let mut header = String::new();
         reader.read_line(&mut header)?;
@@ -265,6 +294,8 @@ fn read_request(stream: &TcpStream, routes: &Mutex<Vec<Value>>) -> Result<(Strin
                 authorization = Value::from(value.trim());
             } else if name.eq_ignore_ascii_case("x-api-key") {
                 api_key = Value::from(value.trim());
+            } else if name.eq_ignore_ascii_case("host") {
+                host = Value::from(value.trim());
             }
         }
     }
@@ -277,12 +308,37 @@ fn read_request(stream: &TcpStream, routes: &Mutex<Vec<Value>>) -> Result<(Strin
         .lock()
         .map_err(|error| anyhow::anyhow!("recording a route: {error}"))?
         .push(json!({
+            "method": request_line.split_whitespace().next(),
             "path": request_line.split_whitespace().nth(1),
+            "host": host,
             "model": model,
             "authorization": authorization,
             "x-api-key": api_key,
         }));
     Ok((request_line, body))
+}
+
+#[test]
+fn discovery_route_rejects_a_vendor_host_and_message_credential() {
+    let host = "127.0.0.1:4567";
+    let discovery = json!({
+        "method": "GET",
+        "path": "/v1/models",
+        "host": host,
+        "model": null,
+        "authorization": null,
+        "x-api-key": MODEL_KEY,
+    });
+    assert!(is_discovery_route(&discovery, host));
+
+    let mut vendor_host = discovery.clone();
+    vendor_host["host"] = Value::from("api.anthropic.com");
+    assert!(!is_discovery_route(&vendor_host, host));
+
+    let mut message_credential = discovery;
+    message_credential["authorization"] = Value::from(format!("Bearer {MODEL_KEY}"));
+    message_credential["x-api-key"] = Value::Null;
+    assert!(!is_discovery_route(&message_credential, host));
 }
 
 fn serve_one(
@@ -293,6 +349,29 @@ fn serve_one(
 ) -> Result<()> {
     let (request_line, body) = read_request(&stream, routes)?;
     let mut stream = stream;
+    if request_line.starts_with("GET /v1/models ") {
+        let catalog = json!({
+            "data": [{
+                "type": "model",
+                "id": EXAMPLE_MODEL_ID,
+                "display_name": "Example model",
+                "created_at": "2024-01-01T00:00:00Z",
+            }],
+            "has_more": false,
+            "first_id": EXAMPLE_MODEL_ID,
+            "last_id": EXAMPLE_MODEL_ID,
+        })
+        .to_string();
+        stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{catalog}",
+                catalog.len()
+            )
+            .as_bytes(),
+        )?;
+        return Ok(());
+    }
     if !request_line.starts_with("POST /v1/messages") {
         stream.write_all(
             b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",

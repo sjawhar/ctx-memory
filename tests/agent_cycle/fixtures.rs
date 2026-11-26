@@ -89,9 +89,9 @@ pub(super) fn session_instructions() -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-/// The model the tests tell `run-cycle.sh` to select: the one provider of
-/// `runner/models.example.yml` and its one model, which omp sends as the request's model.
-pub(super) const EXAMPLE_MODEL: &str = "gateway/example-model";
+/// The model the tests tell `run-cycle.sh` to select: the built-in Anthropic provider of
+/// `runner/models.example.yml` and its one custom model, which omp sends as the request's model.
+pub(super) const EXAMPLE_MODEL: &str = "anthropic/example-model";
 pub(super) const EXAMPLE_MODEL_ID: &str = "example-model";
 
 pub(super) fn scratch(label: &str) -> Result<PathBuf> {
