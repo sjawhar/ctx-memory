@@ -321,11 +321,13 @@ fn read_request(stream: &TcpStream, routes: &Mutex<Vec<Value>>) -> Result<(Strin
     Ok((request_line, body))
 }
 
-fn set_route_field(route: &mut Value, key: &str, value: Value) {
-    route
-        .as_object_mut()
-        .expect("a route control is an object")
-        .insert(key.to_owned(), value);
+fn set_route_field(route: &mut Value, key: &str, value: Value) -> bool {
+    if let Some(object) = route.as_object_mut() {
+        object.insert(key.to_owned(), value);
+        true
+    } else {
+        false
+    }
 }
 
 #[test]
@@ -342,16 +344,16 @@ fn discovery_route_rejects_a_vendor_host_and_message_credential() {
     assert!(is_discovery_route(&discovery, host));
 
     let mut vendor_host = discovery.clone();
-    set_route_field(&mut vendor_host, "host", Value::from("api.anthropic.com"));
+    assert!(set_route_field(&mut vendor_host, "host", Value::from("api.anthropic.com")));
     assert!(!is_discovery_route(&vendor_host, host));
 
     let mut message_credential = discovery;
-    set_route_field(
+    assert!(set_route_field(
         &mut message_credential,
         "authorization",
         Value::from(format!("Bearer {MODEL_KEY}")),
-    );
-    set_route_field(&mut message_credential, "x-api-key", Value::Null);
+    ));
+    assert!(set_route_field(&mut message_credential, "x-api-key", Value::Null));
     assert!(!is_discovery_route(&message_credential, host));
 }
 
