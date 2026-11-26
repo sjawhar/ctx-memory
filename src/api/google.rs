@@ -6,7 +6,7 @@
 //! environment, so this module reads no tree configuration. The value is either the broker's
 //! `authorized_user` JSON (`client_id`, `client_secret`, `refresh_token`), which this module
 //! exchanges for an access token, or a bare access token, which a dev-box session receives
-//! from `secret-run`.
+//! from `agent-secrets`.
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
