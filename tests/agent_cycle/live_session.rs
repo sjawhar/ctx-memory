@@ -70,9 +70,10 @@ fn cycle_omp_arguments(policy: &Path, session_dir: &Path, prompt: &str) -> Resul
         .collect()
 }
 
-/// The key the probe's session holds, in the file the example models.yml names; the fake model
-/// checks that every call carries it, and nothing else, as the model API's bearer token.
+/// The key the probe's session holds, in the file the example models.yml names. Discovery uses
+/// it in X-Api-Key, and Messages requests use it as a bearer token.
 const MODEL_KEY: &str = "live-probe-model-key";
+const HELPER_MODEL_ID: &str = "claude-haiku-5-5";
 
 /// A scripted stand-in for the model API, an Anthropic Messages API and its model discovery
 /// endpoint. The answer to a Messages request is the step at the index of the number of tool
@@ -125,8 +126,8 @@ impl FakeModel {
     }
 
     /// Every request reached the model API as `runner/models.example.yml` routes it: discovery
-    /// uses the controlled address, `GET /v1/models`, and X-Api-Key; Messages use the example
-    /// model id, bearer token, and no X-Api-Key.
+    /// uses the controlled address, `GET /v1/models`, and X-Api-Key. Messages use a bearer token
+    /// with no X-Api-Key; omp may use its Haiku helper before the scheduled example model.
     fn check_gateway_route(&self) -> Result<()> {
         let routes = self
             .routes
@@ -137,11 +138,15 @@ impl FakeModel {
         let bearer = format!("Bearer {MODEL_KEY}");
         let mut discoveries = 0;
         let mut messages = 0;
+        let mut example_messages = 0;
         for route in routes.iter() {
             if is_discovery_route(route, &host) {
                 discoveries += 1;
             } else if is_message_route(route, &host, &bearer) {
                 messages += 1;
+                if route.get("model").and_then(Value::as_str) == Some(EXAMPLE_MODEL_ID) {
+                    example_messages += 1;
+                }
             } else {
                 bail!(
                     "a model discovery or message request did not reach the model API as \
@@ -154,6 +159,10 @@ impl FakeModel {
             "the session did not discover models at its controlled address"
         );
         ensure!(messages > 0, "the session never sent a Messages request");
+        ensure!(
+            example_messages > 0,
+            "the session never sent a Messages request for the example model"
+        );
         Ok(())
     }
 
@@ -263,12 +272,15 @@ fn is_discovery_route(route: &Value, host: &str) -> bool {
         && route.get("x-api-key").and_then(Value::as_str) == Some(MODEL_KEY)
 }
 
-/// Whether `route` is the expected bearer-authenticated Messages call to the controlled address.
+/// Whether `route` is an expected bearer-authenticated Messages call to the controlled address.
 fn is_message_route(route: &Value, host: &str, bearer: &str) -> bool {
     route.get("method").and_then(Value::as_str) == Some("POST")
         && route.get("path").and_then(Value::as_str) == Some("/v1/messages")
         && route.get("host").and_then(Value::as_str) == Some(host)
-        && route.get("model").and_then(Value::as_str) == Some(EXAMPLE_MODEL_ID)
+        && matches!(
+            route.get("model").and_then(Value::as_str),
+            Some(EXAMPLE_MODEL_ID | HELPER_MODEL_ID)
+        )
         && route.get("authorization").and_then(Value::as_str) == Some(bearer)
         && route.get("x-api-key").is_some_and(Value::is_null)
 }
